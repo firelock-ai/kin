@@ -116,6 +116,7 @@ fn admit(graph: &InMemoryGraph, path: &str) {
             }],
             admission_policy_delta: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         })
         .expect("admission goes through the repository tree transaction");
 }

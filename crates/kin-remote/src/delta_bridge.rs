@@ -191,6 +191,7 @@ mod tests {
             evidence: vec![],
             risk_summary: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         };
         change.id =
             compute_semantic_change_id(&change).expect("test change must be identity-exact");

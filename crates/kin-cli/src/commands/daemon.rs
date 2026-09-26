@@ -1455,8 +1455,10 @@ pub async fn stop(all: bool, machine: bool, when_unused: bool, json: bool) -> Re
 /// back anyway.
 ///
 /// The same budget `kin init` gives its own sweep, for the same reason: a
-/// language server can hang, and the sweep is resumable, so what this cuts
-/// short the next daemon start continues.
+/// language server can hang, and a command that never returns is worse than
+/// one that says where the sweep has reached. Only the wait ends here. The
+/// sweep keeps running in the daemon, which does not count a running sweep as
+/// idle, and publishes what it found when it finishes.
 const SWEEP_WAIT_BUDGET: Duration = Duration::from_secs(900);
 
 /// How often the wait re-reads sweep progress.
@@ -1526,12 +1528,35 @@ async fn wait_for_sweep(
     baseline: u64,
     json: bool,
 ) -> Result<()> {
-    let deadline = Instant::now() + SWEEP_WAIT_BUDGET;
+    wait_for_sweep_with(
+        || client.lsp_sweep_status(),
+        baseline,
+        SWEEP_WAIT_BUDGET,
+        SWEEP_POLL_INTERVAL,
+        json,
+    )
+    .await
+}
+
+/// [`wait_for_sweep`] with the status read, the budget and the poll interval
+/// taken as arguments, so a test can drive the wait to its budget without a
+/// daemon or a fifteen-minute sweep.
+async fn wait_for_sweep_with<F, Fut>(
+    mut read_status: F,
+    baseline: u64,
+    budget: Duration,
+    poll: Duration,
+    json: bool,
+) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<serde_json::Value>>,
+{
+    let deadline = Instant::now() + budget;
     let mut last_reported = 0u64;
     loop {
-        tokio::time::sleep(SWEEP_POLL_INTERVAL).await;
-        let status = client
-            .lsp_sweep_status()
+        tokio::time::sleep(poll).await;
+        let status = read_status()
             .await
             .context("read language-server sweep progress")?;
         let done = status
@@ -1585,14 +1610,35 @@ async fn wait_for_sweep(
             return Ok(());
         }
         if Instant::now() >= deadline {
-            bail!(
-                "the sweep did not finish within {}s and was left running; it resumes from \
-                 where it stopped on the next daemon start",
-                SWEEP_WAIT_BUDGET.as_secs()
-            );
+            bail!("{}", sweep_wait_ended(budget, done, total));
         }
     }
 }
+
+/// What `kin daemon sweep` says when it stops waiting on a sweep that is still
+/// running.
+///
+/// It used to say the sweep "was left running" and "resumes from where it
+/// stopped on the next daemon start", and neither half described the daemon.
+/// Nothing in the daemon stops a sweep because a waiter went away, so the next
+/// daemon start was not where it continued; and a daemon that was stopped
+/// anyway started its sweep over from the first file. The sentence now names
+/// what the daemon does next, and what a reader does to keep waiting.
+pub(crate) fn sweep_wait_ended(budget: Duration, done: u64, total: u64) -> String {
+    format!(
+        "stopped waiting after {}s with the sweep at {done}/{total} files. The daemon is still \
+         sweeping and publishes the cross-file edges it finds when it finishes; run `kin daemon \
+         sweep` again to keep waiting. {}",
+        budget.as_secs(),
+        SWEEP_INTERRUPTED_RESUMES
+    )
+}
+
+/// What happens to a sweep whose daemon stops before it finishes, in the words
+/// every surface that mentions it uses.
+pub(crate) const SWEEP_INTERRUPTED_RESUMES: &str =
+    "If the daemon stops before the sweep ends, the next daemon start resumes it, skipping the \
+     files already recorded as finished.";
 
 /// A registered daemon that does not belong to the caller's managed home.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1835,6 +1881,19 @@ async fn stop_current_repo(
     kin_root: Option<&Path>,
     mode: StopMode,
 ) -> Result<()> {
+    stop_current_repo_outcome(json, quiet, kin_root, mode)
+        .await
+        .map(|_| ())
+}
+
+/// [`stop_current_repo`], handing back what happened to the worker, or `None`
+/// when no worker was running.
+async fn stop_current_repo_outcome(
+    json: bool,
+    quiet: bool,
+    kin_root: Option<&Path>,
+    mode: StopMode,
+) -> Result<Option<StopOutcome>> {
     // The repository this stop is about, named by the caller when it has one.
     //
     // Discovering it from the process working directory is right for
@@ -1879,7 +1938,7 @@ async fn stop_current_repo(
                 println!("No worker daemon running for repo '{label}' (nothing to stop).");
             }
         }
-        return Ok(());
+        return Ok(None);
     };
 
     let mut steps = Vec::new();
@@ -1894,19 +1953,62 @@ async fn stop_current_repo(
         kind: "repo-daemon",
         label: label.clone(),
         pid,
-        outcome,
+        outcome: outcome.clone(),
         preserved_endpoint,
         steps,
     }];
-    if quiet {
-        return Ok(());
+    if !quiet {
+        finish_stop("current-repo", &report, json)?;
     }
-    finish_stop("current-repo", &report, json)
+    Ok(Some(outcome))
 }
 
 /// Stop this repository's worker daemon without writing a report to stdout.
 pub(crate) async fn stop_current_repo_quiet(kin_root: &Path) -> Result<()> {
     stop_current_repo(false, true, Some(kin_root), StopMode::Now).await
+}
+
+/// What asking this repository's worker to exit once nothing needs it came to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RetirementAnswer {
+    /// No worker was running, or it exited inside the wait.
+    Gone,
+    /// It is still needed, so it keeps running and exits by itself once what
+    /// it named has ended. Its own words.
+    StaysUntilDone(Vec<String>),
+    /// The request could not be delivered or was not answered. The daemon was
+    /// left exactly as it was.
+    NotAsked(String),
+}
+
+impl RetirementAnswer {
+    fn from_outcome(outcome: Option<StopOutcome>) -> Self {
+        match outcome {
+            None | Some(StopOutcome::NotRunning | StopOutcome::Stopped) => Self::Gone,
+            Some(StopOutcome::InUse(blocked_by)) => Self::StaysUntilDone(blocked_by),
+            Some(StopOutcome::SignalFailed(error)) => Self::NotAsked(error),
+            // A retirement never escalates, so a daemon that outlived the wait
+            // was asked and is still finishing, which is the in-use answer.
+            Some(StopOutcome::Timeout) => {
+                Self::StaysUntilDone(vec!["it has not finished exiting yet".to_string()])
+            }
+        }
+    }
+}
+
+/// Ask this repository's worker daemon to exit as soon as nothing needs it,
+/// without writing a report to stdout.
+///
+/// `kin init` uses this for the daemon it started when its wait for the sweep
+/// ran out. Stopping that daemon ended the sweep with it, so the conversion
+/// announced a sweep that "resumes on the next daemon start" and the next
+/// daemon started the sweep over from its first file. Retirement keeps every
+/// gate an idle exit keeps, running enrichment among them, so the daemon
+/// finishes the sweep, publishes it, and then exits by itself.
+pub(crate) async fn retire_current_repo_quiet(kin_root: &Path) -> Result<RetirementAnswer> {
+    let outcome =
+        stop_current_repo_outcome(false, true, Some(kin_root), StopMode::WhenUnused).await?;
+    Ok(RetirementAnswer::from_outcome(outcome))
 }
 
 /// Resolve the pid of the current repo's worker daemon, the way the daemon
@@ -4498,5 +4600,109 @@ mod tests {
         );
         release_tx.send(()).unwrap();
         server.await.unwrap();
+    }
+
+    /// A status a waiter reads while a sweep is still running.
+    fn running_sweep_status(done: u64, total: u64) -> serde_json::Value {
+        serde_json::json!({
+            "running": true,
+            "files_done": done,
+            "files_total": total,
+            "sweeps_completed": 0,
+        })
+    }
+
+    /// When `kin daemon sweep` stops waiting, the sweep is still running in the
+    /// daemon, and what the command says has to be what the daemon does next.
+    ///
+    /// It said the sweep "was left running" and "resumes from where it stopped
+    /// on the next daemon start". Measured on a 3,590-file TypeScript store,
+    /// the next daemon start swept every file again from the first, and nothing
+    /// about the waiter going away stops a sweep at all.
+    #[tokio::test]
+    async fn a_sweep_wait_that_runs_out_says_the_daemon_keeps_sweeping() {
+        let mut reads = 0u32;
+        let error = wait_for_sweep_with(
+            || {
+                reads += 1;
+                async move { Ok(running_sweep_status(1603, 3590)) }
+            },
+            0,
+            Duration::from_millis(40),
+            Duration::from_millis(5),
+            true,
+        )
+        .await
+        .expect_err("a sweep still running at the budget is not a finished sweep");
+        assert!(
+            reads > 1,
+            "the wait must poll until its budget, read {reads} times"
+        );
+        let said = format!("{error:#}");
+        assert!(said.contains("1603/3590"), "{said}");
+        assert!(
+            said.contains("The daemon is still sweeping"),
+            "the sentence must say the sweep keeps running: {said}"
+        );
+        assert!(
+            said.contains("run `kin daemon sweep` again to keep waiting"),
+            "{said}"
+        );
+        assert!(
+            !said.contains("resumes from where it stopped on the next daemon start"),
+            "the next daemon start is not where a running sweep continues: {said}"
+        );
+        assert!(!said.contains("left running"), "{said}");
+    }
+
+    /// The wait still returns on a sweep that finishes inside the budget.
+    #[tokio::test]
+    async fn a_sweep_that_finishes_inside_the_budget_ends_the_wait() {
+        let mut reads = 0u32;
+        wait_for_sweep_with(
+            || {
+                reads += 1;
+                let finished = reads >= 3;
+                async move {
+                    Ok(serde_json::json!({
+                        "running": !finished,
+                        "files_done": if finished { 4 } else { 2 },
+                        "files_total": 4,
+                        "sweeps_completed": u64::from(finished),
+                    }))
+                }
+            },
+            0,
+            Duration::from_secs(30),
+            Duration::from_millis(5),
+            true,
+        )
+        .await
+        .expect("a sweep that ends inside the budget ends the wait");
+        assert_eq!(reads, 3);
+    }
+
+    /// A conversion daemon asked to exit once its sweep ends answers in one of
+    /// three ways, and none of them is a stop.
+    #[test]
+    fn a_retirement_answer_never_reports_a_running_daemon_as_gone() {
+        assert_eq!(RetirementAnswer::from_outcome(None), RetirementAnswer::Gone);
+        assert_eq!(
+            RetirementAnswer::from_outcome(Some(StopOutcome::Stopped)),
+            RetirementAnswer::Gone
+        );
+        let blocked = vec!["language-server enrichment is running".to_string()];
+        assert_eq!(
+            RetirementAnswer::from_outcome(Some(StopOutcome::InUse(blocked.clone()))),
+            RetirementAnswer::StaysUntilDone(blocked)
+        );
+        assert!(matches!(
+            RetirementAnswer::from_outcome(Some(StopOutcome::Timeout)),
+            RetirementAnswer::StaysUntilDone(_)
+        ));
+        assert_eq!(
+            RetirementAnswer::from_outcome(Some(StopOutcome::SignalFailed("no port".into()))),
+            RetirementAnswer::NotAsked("no port".to_string())
+        );
     }
 }

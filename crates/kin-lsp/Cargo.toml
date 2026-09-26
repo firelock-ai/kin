@@ -19,10 +19,22 @@ tree-sitter = { workspace = true }
 tree-sitter-language = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = { workspace = true }
 tokio = { version = "1", features = ["process", "io-util", "sync", "time", "macros", "rt"] }
+toml = { workspace = true }
 tracing = "0.1"
 thiserror = "2"
 which = "7"
+# Analysis environments: hash-verified downloads of locked dependencies, and
+# unpacking of wheels, source archives and standalone CPython builds.
+reqwest = { workspace = true, features = ["blocking"] }
+# npm locks name sha1 integrity for packages published before sha512.
+sha1 = "0.11"
+zip = { workspace = true }
+tar = { workspace = true }
+flate2 = { workspace = true }
+# Signed tree heads from the Go checksum database.
+ed25519-dalek = { workspace = true }
 
 # Signals a language server's whole process group (`kill(-pgid, sig)`).
 [target.'cfg(unix)'.dependencies]

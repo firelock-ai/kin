@@ -30,8 +30,9 @@ use crate::local_repository_authority::{
 };
 use crate::repository_commit::{
     commit_native_plan_with_authored_projection, load_native_commit_base_from,
-    load_native_source_blob, plan_native_commit_from_base_declaring_carry, recover_native_commit,
-    NativeCommitBase, NativeCommitResult,
+    load_native_source_blob, load_native_source_blob_from,
+    plan_native_commit_from_base_declaring_carry, recover_native_commit, NativeCommitBase,
+    NativeCommitResult,
 };
 use crate::state::DaemonState;
 
@@ -800,6 +801,15 @@ fn commit_exact_transaction_inner(
         },
     };
 
+    // The publication went through the daemon's held authority, which now holds
+    // the successor it wrote and the graph section refreshed after it. While
+    // the record on disk is still the one those writes installed, finalization
+    // below and every reader after it keep that authority instead of reopening
+    // the store to load the state it already holds: a whole-store decode and a
+    // re-verification of every body in CAS, four to seven seconds a commit on a
+    // converted 3,600-file TypeScript repository.
+    crate::api::relabel_held_authority_after_own_commit(state);
+
     #[cfg(test)]
     if state
         .mcp_fail_after_authority_once
@@ -1455,7 +1465,7 @@ fn plan_exact_transaction(
                 // Source-base freshness was checked under the existing authority
                 // locks. Read only the exact committed CAS body, never the
                 // materialized file, and let the shared planner publish it.
-                let original = load_native_source_blob(authority_context, hash)
+                let original = load_native_source_blob_from(held_authority, hash)
                     .map_err(|error| format!("load exact patch source: {error}"))?;
                 let body = original
                     .get(span.start_byte..span.end_byte)
@@ -1610,7 +1620,7 @@ fn plan_exact_transaction(
                 ))
             }
         };
-        let original = load_native_source_blob(authority_context, old_hash)
+        let original = load_native_source_blob_from(held_authority, old_hash)
             .map_err(|error| format!("load exact source body for {file_id}: {error}"))?;
         std::str::from_utf8(&original).map_err(|error| {
             format!(
@@ -1789,7 +1799,7 @@ fn plan_exact_transaction(
         state,
         &prospective,
         &pipeline,
-        authority_context,
+        held_authority,
         &native,
         &mut layouts,
     )? {
@@ -2720,7 +2730,7 @@ fn derive_carried_pending_semantics(
     state: &DaemonState,
     prospective: &kin_db::InMemoryGraph,
     pipeline: &kin_index::IndexPipeline,
-    authority_context: &LocalRepositoryAuthorityContext,
+    held_authority: &kin_db::RepositoryAuthorityManager<kin_db::LocalFileBackend>,
     planned: &crate::repository_commit::NativeCommitPlan,
     layouts: &mut Vec<FileLayout>,
 ) -> Result<CarriedDerivation, String> {
@@ -2828,7 +2838,7 @@ fn derive_carried_pending_semantics(
                 continue;
             }
         };
-        let body = load_native_source_blob(authority_context, hash)
+        let body = load_native_source_blob_from(held_authority, hash)
             .map_err(|error| format!("load carried source body for {path}: {error}"))?;
         let digest = state
             .blobs
@@ -3513,12 +3523,23 @@ fn transaction_delta_between(
         kin_core::exact_tree_correction(&current.resolved_tree, &desired.resolved_tree).map_err(
             |error| format!("derive exact tree correction from committed authority: {error}"),
         )?;
+    // External symbols and resolution records move to the desired graph's,
+    // exactly, with the relations that name them.
+    let nodes = kin_core::with_resolution_node_transition(
+        kin_model::WorkspaceSemanticDelta::default(),
+        &current.external_references,
+        &current.resolution_records,
+        &desired.external_references,
+        &desired.resolution_records,
+    )
+    .map_err(|error| format!("derive exact external symbols from committed authority: {error}"))?;
     Ok(TransactionDelta {
         entity_deltas,
         relation_deltas,
         tree_deltas,
         admission_policy_delta: None,
-        external_reference_deltas: Vec::new(),
+        external_reference_deltas: nodes.external_reference_deltas().to_vec(),
+        resolution_record_deltas: nodes.resolution_record_deltas().to_vec(),
     })
 }
 
@@ -3630,6 +3651,7 @@ fn stabilize_layout_ids(
 #[cfg(test)]
 pub(crate) mod tests {
     include!("entity_lifecycle_commit_test.rs");
+    include!("commit_settled_guesses_test.rs");
     use super::*;
     use std::path::Path;
     use std::sync::OnceLock;
@@ -5042,23 +5064,46 @@ pub(crate) mod tests {
         );
     }
 
-    /// One exact MCP commit pays no whole-store open of its own when the daemon already
-    /// holds the authority for the current publication.
+    /// One exact MCP commit opens no whole store when the daemon already holds the
+    /// authority for the current publication.
     ///
-    /// Its base, its plan and its publication read and commit through that one held
-    /// authority. The only open is the finalize's, because the commit moved
-    /// `authority.json`: it is the one fresh load the new publication costs, and the
-    /// readers after the commit borrow it. Before, the base and the plan each opened
-    /// the whole store and the finalize opened it a third time without keeping it.
+    /// Its base, its source-base check, its plan and its publication read and commit
+    /// through that one held authority, and the commit relabels it as the authority for
+    /// the publication it made, so finalization and every reader after it borrow it.
+    /// Before, the source-base check and each body the plan read opened the whole store
+    /// again, three opens for one guarded patch, and the finalize reopened it for the
+    /// state the held authority had just written.
     #[test]
     fn an_exact_commit_reads_and_commits_through_the_held_authority() {
         let (_dir, state) = test_state();
-        install_exact_source(&state, "src/lib.rs", TRACKED_RS.as_bytes(), "value");
-        // Hold the current publication first, so the count below is the commit's.
+        let (value, _) = install_exact_source(&state, "src/lib.rs", TRACKED_RS.as_bytes(), "value");
+        let sessions = test_sessions();
+
+        // A guarded entity edit, the shape every agent edit takes. Staged first,
+        // because the fixture's own read of the source base opens the store.
+        let (_, arguments) = stage_entity_edit(
+            &state,
+            &sessions,
+            &value,
+            "pub fn value() -> u8 {\n    2\n}",
+        );
         crate::api::held_repository_authority(&state).unwrap();
         let before = kin_core::authority_opens();
+        let result = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_ne!(
+            result.is_error,
+            Some(true),
+            "the commit must land for its open count to mean anything: {}",
+            result_text(&result)
+        );
+        assert_eq!(
+            kin_core::authority_opens() - before,
+            0,
+            "a guarded entity edit must read its base, its source base and its body through \
+             the held authority, and keep that authority for the publication it made"
+        );
 
-        let sessions = test_sessions();
+        // A whole-file replacement, the same way.
         let result = replace_and_commit(&state, &sessions, "src/lib.rs", DOCUMENTED_RS);
         assert_ne!(
             result.is_error,
@@ -5068,17 +5113,17 @@ pub(crate) mod tests {
         );
         assert_eq!(
             kin_core::authority_opens() - before,
-            1,
-            "an exact commit must read its base and plan through the held authority and pay \
-             only the finalize's one fresh load for the publication it made"
+            0,
+            "an exact commit must read its base and plan through the held authority and keep \
+             it for the publication it made"
         );
 
         crate::api::cached_authority_admission(&state).unwrap();
         crate::api::held_repository_authority(&state).unwrap();
         assert_eq!(
             kin_core::authority_opens() - before,
-            1,
-            "the readers after the commit must borrow the finalize's load, not pay their own"
+            0,
+            "the readers after the commit must borrow the held authority, not pay their own load"
         );
     }
 

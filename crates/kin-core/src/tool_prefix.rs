@@ -140,12 +140,36 @@ pub fn augment_path_with_managed_tools() -> bool {
     let search = language_tool_search_dirs();
     let managed = managed_tool_dirs();
     let current = std::env::var_os("PATH");
+    // Kept before the first change, so a caller can still ask what the person
+    // who started this process put on PATH. A later call finds the value
+    // already set and leaves it alone.
+    let _ = INHERITED_PATH.set(current.clone());
     match path_with_tool_dirs(current.as_ref(), &search, &managed) {
         Some(updated) => {
             std::env::set_var("PATH", updated);
             true
         }
         None => false,
+    }
+}
+
+/// The `PATH` this process started with, before
+/// [`augment_path_with_managed_tools`] added to it.
+static INHERITED_PATH: std::sync::OnceLock<Option<OsString>> = std::sync::OnceLock::new();
+
+/// The `PATH` the person or program that started this process gave it.
+///
+/// The augmented `PATH` finds tools in the usual install places, which is
+/// right for starting a language server and wrong for deciding whether Kin may
+/// run an installer that writes into a shared prefix. A first run on a clean
+/// macOS account found `/opt/homebrew/bin/npm` that way, with npm nowhere on
+/// the user's own `PATH`, and ran `npm install -g pyright` into the Homebrew
+/// prefix. Code that decides whether a tool is the user's own asks this
+/// instead. It is the current `PATH` when nothing augmented it.
+pub fn inherited_path() -> Option<OsString> {
+    match INHERITED_PATH.get() {
+        Some(path) => path.clone(),
+        None => std::env::var_os("PATH"),
     }
 }
 
@@ -616,6 +640,16 @@ mod tests {
         );
         let after = std::env::var_os("PATH").expect("PATH must still be set");
         let entries = parts(&after);
+        // The PATH the process was started with stays readable after the
+        // change, because deciding whether a tool is the user's own has to be
+        // asked of that one. This is the only test here that augments.
+        assert_eq!(
+            inherited_path(),
+            Some(os("/usr/bin")),
+            "the inherited PATH is the one from before augmentation, got {:?}",
+            inherited_path()
+        );
+        assert_ne!(inherited_path(), Some(after.clone()));
         for dir in managed_tool_dirs() {
             assert!(
                 entries.contains(&dir),

@@ -2316,6 +2316,28 @@ pub(crate) struct DurableAuthorityIdentity {
     frames: Vec<(Generation, String)>,
 }
 
+thread_local! {
+    /// The local publication record this thread's latest record write
+    /// installed: its repository and the SHA-256 of its exact bytes.
+    static INSTALLED_LOCAL_AUTHORITY_RECORD: std::cell::RefCell<Option<(String, [u8; 32])>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Take the digest of the local publication record this thread's latest
+/// record write installed for `repo_id`, clearing it either way.
+///
+/// The write that sets it runs under the repository's exclusive local lock
+/// and computes the digest over the exact bytes it renames into place, so a
+/// caller that clears this, makes one synchronous save, and takes it again
+/// holds the digest of the record that save left, and of no other. A save
+/// that wrote no record, whose record's durability is unconfirmed, or that
+/// ran on another thread leaves nothing to take.
+pub(crate) fn take_installed_local_authority_record(repo_id: &str) -> Option<[u8; 32]> {
+    INSTALLED_LOCAL_AUTHORITY_RECORD
+        .with(|installed| installed.borrow_mut().take())
+        .and_then(|(installed_repo, digest)| (installed_repo == repo_id).then_some(digest))
+}
+
 impl DurableAuthorityIdentity {
     /// A journal-free head: one full snapshot and nothing over it.
     pub(crate) fn full_snapshot(generation: Generation, snapshot_sha256: String) -> Self {
@@ -7640,13 +7662,22 @@ impl LocalFileBackend {
         record.validate_session_shape()?;
         let relative = Self::authority_relative_path();
         let path = namespace.display(relative);
+        // Cleared first, so a write that fails or cannot be confirmed leaves
+        // no digest behind for bytes that may not be the ones on disk.
+        INSTALLED_LOCAL_AUTHORITY_RECORD.with(|installed| installed.borrow_mut().take());
         match mmap::atomic_write_bytes_no_magic_outcome_at(
             &namespace.directory,
             relative,
             &namespace.display_path,
             &bytes,
         )? {
-            AtomicWriteOutcome::Durable => Ok(()),
+            AtomicWriteOutcome::Durable => {
+                INSTALLED_LOCAL_AUTHORITY_RECORD.with(|installed| {
+                    *installed.borrow_mut() =
+                        Some((namespace.repo_id.clone(), Sha256::digest(&bytes).into()));
+                });
+                Ok(())
+            }
             AtomicWriteOutcome::InstalledButUnconfirmed(error) => {
                 Err(KinDbError::SnapshotPersistenceIndeterminate(format!(
                     "local authority {} was installed but its durability or exact post-install verification is unconfirmed: {error}",

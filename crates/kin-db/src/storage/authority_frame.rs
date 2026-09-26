@@ -468,7 +468,7 @@ impl AuthorityFrame {
     /// Version 3 appends [`CollaborationPatch`]. A frame is written at the
     /// version its contents need ([`Self::wire_version`]), so only a frame
     /// that carries collaboration is a version 3 frame.
-    pub const CURRENT_VERSION: u32 = Self::OWED_DERIVATION_VERSION;
+    pub const CURRENT_VERSION: u32 = Self::CALL_SITE_LEDGERS_VERSION;
 
     /// The version a schema5 frame whose owed derivation ledger did not move
     /// is written at, binding-history capability included.
@@ -477,6 +477,30 @@ impl AuthorityFrame {
     /// The version a frame that moves the owed derivation ledger is written
     /// at, whatever its envelope schema.
     pub const OWED_DERIVATION_VERSION: u32 = 5;
+
+    /// The version a frame that carries language-server enrichment marks is
+    /// written at, whatever else it moves: a successor workspace that holds
+    /// some, or an operation that records or retires some. The marks sit
+    /// inside positional workspace and delta arrays that an older reader
+    /// decodes at a fixed length, so it refuses the frame at its header
+    /// rather than deep inside it.
+    pub const ENRICHMENT_MARKS_VERSION: u32 = 6;
+
+    /// The version a frame that carries resolution records is written at,
+    /// whatever else it moves: a successor workspace whose overlay holds some,
+    /// an operation that moved some, or an appended change that moves some.
+    /// They sit inside positional workspace, delta and change arrays that an
+    /// older reader decodes at a fixed length, so it refuses the frame at its
+    /// header rather than deep inside it.
+    pub const RESOLUTION_RECORDS_VERSION: u32 = 7;
+
+    /// The version a frame that carries a call-site ledger is written at: a
+    /// successor workspace whose overlay holds one, an operation that moved
+    /// one, or an appended change that moves one. The layout is version7's. A
+    /// reader of at most version7 was built before anything wrote a ledger, and
+    /// it would decode one and then mishandle it, so it refuses the frame at
+    /// its header instead.
+    pub const CALL_SITE_LEDGERS_VERSION: u32 = 8;
 
     /// The oldest frame format version this binary reads, and the version a
     /// frame that carries no collaboration is still written at.
@@ -494,11 +518,25 @@ impl AuthorityFrame {
     /// The version these exact contents are written at.
     ///
     /// Derived from the contents, as a snapshot's version is: a frame that
-    /// moves the owed derivation ledger uses version5 at any schema. Otherwise
-    /// a frame that requires schema5 uses version4, including the required
-    /// binding-history capability. In legacy schemas, collaboration uses
-    /// version3 and a frame without it keeps the version2 body byte for byte.
+    /// carries a call-site ledger uses version8, one that carries any other
+    /// resolution record uses version7, one that carries enrichment marks uses
+    /// version6, and one that moves the owed derivation ledger uses version5,
+    /// at any schema. A ledger is a record, so only a frame that carries
+    /// records is asked whether it carries one. Otherwise a frame that
+    /// requires schema5 uses version4, including the required binding-history
+    /// capability. In legacy schemas, collaboration uses version3 and a frame
+    /// without it keeps the version2 body byte for byte.
     pub fn wire_version(&self) -> u32 {
+        if self.carries_resolution_records() {
+            return if self.carries_call_site_ledgers() {
+                Self::CALL_SITE_LEDGERS_VERSION
+            } else {
+                Self::RESOLUTION_RECORDS_VERSION
+            };
+        }
+        if self.carries_enrichment_marks() {
+            return Self::ENRICHMENT_MARKS_VERSION;
+        }
         if !self.owed_derivations.is_unchanged() {
             return Self::OWED_DERIVATION_VERSION;
         }
@@ -510,6 +548,48 @@ impl AuthorityFrame {
         } else {
             3
         }
+    }
+
+    /// Whether this frame's operation moves resolution records, a successor
+    /// workspace it carries holds some in its overlay, or a change it appends
+    /// moves some.
+    fn carries_resolution_records(&self) -> bool {
+        self.operation.carries_resolution_records()
+            || self.workspaces.iter().any(|workspace| {
+                !workspace
+                    .semantic_overlay
+                    .resolution_record_deltas()
+                    .is_empty()
+            })
+            || self
+                .changes
+                .iter()
+                .any(|change| !change.resolution_record_deltas.is_empty())
+    }
+
+    /// Whether this frame's operation moves a call-site ledger, a successor
+    /// workspace it carries holds one in its overlay, or a change it appends
+    /// moves one.
+    fn carries_call_site_ledgers(&self) -> bool {
+        use super::format::moves_call_site_ledgers;
+        super::format::operation_moves_call_site_ledgers(&self.operation)
+            || self.workspaces.iter().any(|workspace| {
+                moves_call_site_ledgers(workspace.semantic_overlay.resolution_record_deltas())
+            })
+            || self
+                .changes
+                .iter()
+                .any(|change| moves_call_site_ledgers(&change.resolution_record_deltas))
+    }
+
+    /// Whether this frame's operation records or retires enrichment marks, or
+    /// a successor workspace it carries holds some.
+    fn carries_enrichment_marks(&self) -> bool {
+        self.operation.carries_enrichment_marks()
+            || self
+                .workspaces
+                .iter()
+                .any(|workspace| !workspace.enrichment_marks.is_empty())
     }
 
     /// Logical generation of the successor this frame produces.
@@ -569,22 +649,7 @@ impl AuthorityFrame {
                 .try_into()
                 .map_err(|_| KinDbError::SliceConversionError("version bytes".to_string()))?,
         );
-        if version > Self::CURRENT_VERSION {
-            return Err(KinDbError::StorageError(format!(
-                "unsupported authority frame version: {version} (this kin-db reads versions {} to {}); \
-                 a newer kin-db wrote it, so open this store with a kin built on a kin-db that reads \
-                 frame version {version}",
-                Self::MIN_SUPPORTED_VERSION,
-                Self::CURRENT_VERSION
-            )));
-        }
-        if version < Self::MIN_SUPPORTED_VERSION {
-            return Err(KinDbError::StorageError(format!(
-                "unsupported authority frame version: {version} (this kin-db reads versions {} to {})",
-                Self::MIN_SUPPORTED_VERSION,
-                Self::CURRENT_VERSION
-            )));
-        }
+        Self::check_readable_version(version, Self::CURRENT_VERSION)?;
         let body_len = u64::from_le_bytes(
             data[8..16]
                 .try_into()
@@ -626,6 +691,34 @@ impl AuthorityFrame {
         Ok((version, body))
     }
 
+    /// Refuse a header version that a reader whose newest readable version is
+    /// `newest_readable` does not open, naming the version and the range.
+    ///
+    /// Every read checks with [`Self::CURRENT_VERSION`]. Checking with an
+    /// older binary's newest version instead shows what that binary does with
+    /// the frames this one writes.
+    pub(crate) fn check_readable_version(
+        version: u32,
+        newest_readable: u32,
+    ) -> Result<(), KinDbError> {
+        if version > newest_readable {
+            return Err(KinDbError::StorageError(format!(
+                "unsupported authority frame version: {version} (this kin-db reads versions {} to \
+                 {newest_readable}); a newer kin-db wrote it, so open this store with a kin built \
+                 on a kin-db that reads frame version {version}",
+                Self::MIN_SUPPORTED_VERSION,
+            )));
+        }
+        if version < Self::MIN_SUPPORTED_VERSION {
+            return Err(KinDbError::StorageError(format!(
+                "unsupported authority frame version: {version} (this kin-db reads versions {} to \
+                 {newest_readable})",
+                Self::MIN_SUPPORTED_VERSION,
+            )));
+        }
+        Ok(())
+    }
+
     /// Deserialize a frame from bytes with header and checksum validation.
     ///
     /// The header must declare the version the decoded contents are written
@@ -640,9 +733,10 @@ impl AuthorityFrame {
         if frame.wire_version() != declared {
             return Err(KinDbError::StorageError(format!(
                 "authority frame declares version {declared} but its contents are written at \
-                 version {}; a moved owed derivation ledger requires version5, schema5 \
-                 requires version4, while legacy frames use version3 with collaboration \
-                 records and version2 without them",
+                 version {}; call-site ledgers require version8, other resolution records \
+                 require version7, enrichment marks require version6, a moved owed derivation \
+                 ledger requires version5, schema5 requires version4, while legacy frames use \
+                 version3 with collaboration records and version2 without them",
                 frame.wire_version()
             )));
         }
@@ -1195,6 +1289,7 @@ pub(crate) fn first_difference(
         materialized_graph: _,
         // Runtime-only capability is reconstructed from admitted authority.
         verified_binding_history: _,
+        resolution_records,
     } = reconstructed;
     let GraphSnapshot {
         version: _,
@@ -1235,6 +1330,7 @@ pub(crate) fn first_difference(
         materialized_graph: _,
         // Runtime-only capability is reconstructed from admitted authority.
         verified_binding_history: _,
+        resolution_records: next_resolution_records,
     } = next;
     let checks = [
         ("entities", entities == next_entities),
@@ -1330,6 +1426,10 @@ pub(crate) fn first_difference(
         (
             "external references",
             external_references == next_external_references,
+        ),
+        (
+            "resolution records",
+            resolution_records == next_resolution_records,
         ),
     ];
     Ok(checks
@@ -1731,11 +1831,11 @@ mod tests {
     fn frame_versions_outside_the_supported_range_refuse_by_name() {
         let body = b"never decoded";
         for (version, needle) in [
-            (1, "this kin-db reads versions 2 to 5"),
+            (1, "this kin-db reads versions 2 to 8"),
             (
                 AuthorityFrame::CURRENT_VERSION + 1,
                 "a newer kin-db wrote it, so open this store with a kin built on a kin-db that \
-                 reads frame version 6",
+                 reads frame version 9",
             ),
         ] {
             let mut bytes = frame_bytes_from(body);

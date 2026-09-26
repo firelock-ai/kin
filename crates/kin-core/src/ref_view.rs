@@ -1147,6 +1147,7 @@ mod tests {
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         };
         change.id = crate::compute_semantic_change_id(&change).unwrap();
         let id = change.id;
@@ -1911,6 +1912,7 @@ def uri_encoder(value):\n    return value.replace(' ', '%20')\n",
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         };
         let remove_change = SemanticChange {
             id: remove_id,
@@ -1930,6 +1932,7 @@ def uri_encoder(value):\n    return value.replace(' ', '%20')\n",
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         };
 
         let lifecycle = RefLifecycle::from_changes(&[create_change, remove_change]);

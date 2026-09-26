@@ -79,8 +79,11 @@ pub fn get_optional_string_array(
 
 // ── ID parsing helpers ──
 
+/// An entity id, bare or spelled `entity:<uuid>` as a call-site row names its
+/// target, so every id a payload serves is one this parser accepts.
 pub fn parse_entity_id(s: &str) -> Result<EntityId> {
-    serde_json::from_value(serde_json::json!(s))
+    let bare = s.trim().strip_prefix("entity:").unwrap_or(s);
+    serde_json::from_value(serde_json::json!(bare))
         .map_err(|e| McpError::InvalidParams(format!("invalid entity_id: {}", e)))
 }
 
@@ -1356,6 +1359,10 @@ pub enum ReferenceLinesAbsent {
     FederatedXref,
     /// Sites exist but their occurrence authority does not license attribution.
     UnconfirmedSitesWithheld,
+    /// The target is a symbol outside the repository, and its sites are served
+    /// under `sites`, each addressed inside the caller rather than as a file
+    /// line.
+    SitesInEntity,
 }
 
 impl ReferenceLinesAbsent {
@@ -1365,6 +1372,7 @@ impl ReferenceLinesAbsent {
             Self::SpanOutsideCallerFile => "span_outside_caller_file",
             Self::FederatedXref => "federated_xref",
             Self::UnconfirmedSitesWithheld => "unconfirmed_sites_withheld",
+            Self::SitesInEntity => "sites_in_entity",
         }
     }
 }
@@ -4723,6 +4731,58 @@ pub fn parse_annotation_target(s: &str) -> Result<kin_model::AnnotationTarget> {
         .ok_or_else(|| {
             McpError::InvalidParams(unrecognized_scope_message(s, ANNOTATION_TARGET_FORMS))
         })
+}
+
+/// What an annotation target names when the graph holds nothing to anchor an
+/// annotation to.
+#[derive(Debug, Clone)]
+pub enum UnanchoredTarget {
+    /// A symbol declared outside the repository, by its address, as an
+    /// `entity:` scope or by its bare id. No read of a repository entity
+    /// recalls an annotation on it.
+    External(super::external_symbols::ExternalSymbolNode),
+    /// An `external_reference:` address this graph holds no symbol under.
+    UnknownExternalAddress(String),
+    /// An entity id this graph holds no entity and no symbol under.
+    NotInGraph(EntityId),
+}
+
+/// Whether `target` names something the graph holds nothing to anchor an
+/// annotation to, and what. `None` for every other target, including one that
+/// does not parse, which [`parse_annotation_target`] refuses in its own words.
+///
+/// The one check the `kin_annotation_add` tool and `kin note add` share, so
+/// neither stores an annotation the other would refuse, and neither stores one
+/// that no read will ever recall.
+pub fn unanchored_annotation_target<G: GraphStore>(
+    store: &G,
+    target: &str,
+) -> Result<Option<UnanchoredTarget>> {
+    use super::external_symbols::{is_external_address, lookup_external_symbol};
+    if is_external_address(target) {
+        return Ok(Some(match lookup_external_symbol(store, target)? {
+            Some(node) => UnanchoredTarget::External(node),
+            None => UnanchoredTarget::UnknownExternalAddress(target.trim().to_string()),
+        }));
+    }
+    let Ok(kin_model::AnnotationTarget::Scope(kin_model::WorkScope::Entity(entity_id))) =
+        parse_annotation_target(target)
+    else {
+        return Ok(None);
+    };
+    if store
+        .get_entity(&entity_id)
+        .map_err(McpError::graph)?
+        .is_some()
+    {
+        return Ok(None);
+    }
+    Ok(Some(
+        match lookup_external_symbol(store, &entity_id.to_string())? {
+            Some(node) => UnanchoredTarget::External(node),
+            None => UnanchoredTarget::NotInGraph(entity_id),
+        },
+    ))
 }
 
 pub fn parse_single_work_scope(s: &str) -> Result<kin_model::WorkScope> {

@@ -156,6 +156,11 @@ pub struct ContextDependencySelection {
     pub same_file_candidates: usize,
     /// Same-file neighbours the cap or the token budget dropped.
     pub same_file_dropped: usize,
+    /// Rows in [`ContextResponse::external_calls`], the calls the focal makes
+    /// into symbols outside the repository. Counted apart from `returned`
+    /// because no entity stands at their far end.
+    #[serde(default)]
+    pub external_calls_returned: usize,
 }
 
 /// The context response, structured half added alongside the rendered lines.
@@ -220,6 +225,27 @@ pub struct ContextResponse {
     /// than the one asked, and the difference is invisible in the pack itself.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unresolved: Vec<String>,
+    /// The calls the focals make into symbols outside the repository that a
+    /// language server proved, one row per target in the shape
+    /// `get_context_pack` serves under the same key: `kind: external_symbol`,
+    /// the `external_reference:<uuid>` id, `name`, `package`, `stdlib`,
+    /// `symbol`, `site_state`, `proof` and `sites` addressed inside the
+    /// caller. A multi-focal pack names each row's focal in `caller_id`.
+    ///
+    /// Always serialized, empty included, as the MCP group is. The dependency
+    /// section is built from entity-to-entity edges and has no row for these.
+    #[serde(default)]
+    pub external_calls: Vec<serde_json::Value>,
+    /// External calls past the per-list cap, present only when the cap cut.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_calls_withheld: Option<usize>,
+    /// The focal's own call sites, in the `call_sites` block
+    /// `get_context_pack` serves: one row per site, addressed inside the
+    /// focal, beside the counts by state and the clauses the verdict reads. A
+    /// pack built from several focals carries the counts over every focal
+    /// without rows. Absent from a refusal and from a daemon that predates it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_sites: Option<serde_json::Value>,
 }
 
 /// What one pack section lost to the token budget.
@@ -418,6 +444,13 @@ fn build_context_response_inner(
 
     let assistant_hint = assistant_hint_from(request.assistant.as_deref());
 
+    // A symbol outside the repository has no body or neighborhood here to
+    // build a pack around. Refused as `get_context_pack` refuses it, naming
+    // the command that lists its callers, rather than as a name nobody knows.
+    if let Some(lines) = external_focal_refusal(graph, &request.entity)? {
+        return Ok(refusal_response(lines, &request.entity));
+    }
+
     // A member name several owners share names none of them, so the pack is
     // refused with every candidate rather than built around one of them.
     let shared = shared_member_focal_candidates(graph, &request.entity)?.map(|candidates| {
@@ -433,22 +466,7 @@ fn build_context_response_inner(
     };
     let Some(target) = target else {
         let lines = shared.unwrap_or_else(|| context_not_found_guidance(&request.entity));
-        let measured_tokens = kin_context::estimate_tokens(&lines.join("\n"));
-        return Ok(ContextResponse {
-            error: Some(lines.join("\n")),
-            lines,
-            // Stamped even here: an unresolved entity is an answer, and leaving
-            // this empty would report it as a daemon too old to answer at all.
-            schema_version: CONTEXT_RESPONSE_SCHEMA_VERSION.to_string(),
-            target: None,
-            pack: None,
-            dependency_selection: None,
-            budget_elisions: BTreeMap::new(),
-            focals: Vec::new(),
-            multi_focal: None,
-            measured_tokens,
-            unresolved: vec![request.entity.clone()],
-        });
+        return Ok(refusal_response(lines, &request.entity));
     };
     let opts = kin_context::ContextOptions {
         budget: token_budget,
@@ -458,6 +476,17 @@ fn build_context_response_inner(
         include_traffic: false,
         assistant_hint,
     };
+
+    let mut provider = provider;
+    // Read before the pack is fitted, through the pack's own body reader, and
+    // listed beside the pack rather than inside what is fitted to the budget,
+    // as `get_context_pack` serves them.
+    let external = ExternalCalls::read(
+        graph,
+        std::slice::from_ref(&target),
+        false,
+        provider.as_deref_mut(),
+    )?;
 
     if let Some(provider) = provider {
         let (pack, selection, projections) = kin_context::build_context_pack_with_provider(
@@ -475,6 +504,7 @@ fn build_context_response_inner(
                     pack.clone(),
                     selection,
                     Some(projections),
+                    None,
                 )
                 .map_err(|error| kin_context::ContextError::Other(error.to_string()))?;
                 measure_response(&mut response)
@@ -487,13 +517,204 @@ fn build_context_response_inner(
             pack,
             &selection,
             Some(&projections),
+            Some(&external),
         )?;
         measure_response(&mut response)?;
         return Ok(response);
     }
     let (pack, selection) =
         kin_context::build_context_pack_with_provenance(graph, &target.id, &opts)?;
-    render_single_response(graph, &target, token_budget, pack, &selection, None)
+    render_single_response(
+        graph,
+        &target,
+        token_budget,
+        pack,
+        &selection,
+        None,
+        Some(&external),
+    )
+}
+
+/// The answer for a focal no pack can be built around: the guidance in both
+/// fields, stamped with the schema, and the token named as unresolved.
+fn refusal_response(lines: Vec<String>, entity: &str) -> ContextResponse {
+    let measured_tokens = kin_context::estimate_tokens(&lines.join("\n"));
+    ContextResponse {
+        error: Some(lines.join("\n")),
+        lines,
+        // Stamped even here: an unresolved entity is an answer, and leaving
+        // this empty would report it as a daemon too old to answer at all.
+        schema_version: CONTEXT_RESPONSE_SCHEMA_VERSION.to_string(),
+        target: None,
+        pack: None,
+        dependency_selection: None,
+        budget_elisions: BTreeMap::new(),
+        focals: Vec::new(),
+        multi_focal: None,
+        measured_tokens,
+        unresolved: vec![entity.to_string()],
+        external_calls: Vec::new(),
+        external_calls_withheld: None,
+        call_sites: None,
+    }
+}
+
+/// Why a focal token that names a symbol outside the repository, or is
+/// spelled as one, cannot be a focal. `None` for any other token.
+fn external_focal_refusal(
+    graph: &kin_db::InMemoryGraph,
+    token: &str,
+) -> Result<Option<Vec<String>>> {
+    crate::commands::external_symbols::entity_argument_refusal(
+        graph,
+        token,
+        "`kin context` has no body or neighborhood of its own here to build a pack around",
+    )
+}
+
+/// The calls the focals make into symbols outside the repository, in the rows
+/// `get_context_pack` serves, and how many there were before the per-list cap,
+/// beside the focals' own call-site block, read with the same body reader.
+struct ExternalCalls {
+    rows: Vec<serde_json::Value>,
+    total: usize,
+    /// The `call_sites` block `get_context_pack` serves: one focal's sites
+    /// with a row each, or several focals' counts without rows.
+    call_sites: serde_json::Value,
+}
+
+impl ExternalCalls {
+    /// Read every focal's external calls. A site's text is cut from the
+    /// focal's own body through `provider`, the reader the pack reads bodies
+    /// with, and is left out when there is none. A multi-focal pack names each
+    /// row's focal in `caller_id`, however many focals resolved, as
+    /// `get_context_pack` does.
+    fn read<'p>(
+        graph: &kin_db::InMemoryGraph,
+        focals: &[Entity],
+        multi_focal: bool,
+        provider: Option<&mut (dyn kin_context::ContextProjectionProvider + 'p)>,
+    ) -> Result<Self> {
+        let mut provider = provider;
+        let text =
+            crate::commands::external_symbols::BodySiteText::new(|caller: &Entity| match provider
+                .as_mut()?
+                .full_body(caller, kin_context::ProjectionLimits::default())
+            {
+                Ok(kin_context::BodyCandidate::Exact { body }) => Some(body),
+                _ => None,
+            });
+        let (rows, total) = match focals {
+            [focal] if !multi_focal => {
+                kin_mcp::handlers::external_symbols::external_call_rows(graph, focal, &text)
+            }
+            _ => {
+                kin_mcp::handlers::external_symbols::focals_external_call_rows(graph, focals, &text)
+            }
+        }
+        .map_err(|error| anyhow::anyhow!("read external calls: {error}"))?;
+        let call_sites = match focals {
+            [focal] if !multi_focal => kin_mcp::call_sites::focal_block(graph, focal, &text),
+            _ => {
+                kin_mcp::call_sites::callers_block(graph, focals, kin_mcp::call_sites::FOCALS_SCOPE)
+            }
+        };
+        Ok(Self {
+            rows,
+            total,
+            call_sites,
+        })
+    }
+
+    /// The call-site section, after the pack, in the words the MCP block uses.
+    fn call_site_lines(&self) -> Vec<String> {
+        let mut lines = vec![String::new(), "--- Call sites ---".to_string()];
+        lines.extend(kin_mcp::call_sites::text_lines(&self.call_sites));
+        lines
+    }
+
+    /// Calls past the per-list cap.
+    fn withheld(&self) -> usize {
+        self.total.saturating_sub(self.rows.len())
+    }
+
+    /// The header line, present only when there are rows.
+    fn header_line(&self) -> Option<String> {
+        if self.rows.is_empty() {
+            return None;
+        }
+        let withheld = self.withheld();
+        Some(format!(
+            "  External calls: {} entries{}",
+            self.rows.len(),
+            if withheld > 0 {
+                format!(
+                    " ({withheld} more past the {}-row cap)",
+                    kin_mcp::handlers::external_symbols::EXTERNAL_CALLS_MAX
+                )
+            } else {
+                String::new()
+            }
+        ))
+    }
+
+    /// The section listing each row, after the pack. `caller_name` names the
+    /// focal a row belongs to in a pack built from several.
+    fn section_lines(
+        &self,
+        caller_name: impl Fn(&serde_json::Value) -> Option<String>,
+    ) -> Vec<String> {
+        use crate::commands::external_symbols as external;
+        if self.rows.is_empty() {
+            return Vec::new();
+        }
+        let mut lines = vec![String::new(), "--- External calls ---".to_string()];
+        for row in &self.rows {
+            let line = external::call_line(row);
+            lines.push(match caller_name(row) {
+                Some(caller) => format!("{caller}: {line}"),
+                None => line,
+            });
+        }
+        let withheld = self.withheld();
+        if withheld > 0 {
+            lines.push(format!(
+                "({withheld} more external calls past the {}-row cap are not listed)",
+                kin_mcp::handlers::external_symbols::EXTERNAL_CALLS_MAX
+            ));
+        }
+        if self.rows.iter().any(|row| {
+            row["sites"]
+                .as_array()
+                .is_some_and(|sites| !sites.is_empty())
+        }) {
+            lines.push(external::SITE_OFFSET_NOTE.to_string());
+        }
+        lines
+    }
+
+    /// Put the rows in a response's structured half, with the cap's elision
+    /// under the reason `get_context_pack` gives it.
+    fn fill(&self, response: &mut ContextResponse) {
+        response.call_sites = Some(self.call_sites.clone());
+        response.external_calls = self.rows.clone();
+        let withheld = self.withheld();
+        if withheld > 0 {
+            response.external_calls_withheld = Some(withheld);
+            response.budget_elisions.insert(
+                kin_mcp::handlers::external_symbols::EXTERNAL_CALLS_KEY.to_string(),
+                ContextElision {
+                    elided: withheld,
+                    kept: self.rows.len(),
+                    total: self.total,
+                    reason: kin_mcp::budget::ELISION_REASON_EXTERNAL_CALLS_CAP.to_string(),
+                },
+            );
+        }
+        if let Some(selection) = response.dependency_selection.as_mut() {
+            selection.external_calls_returned = self.rows.len();
+        }
+    }
 }
 
 fn render_single_response(
@@ -503,6 +724,7 @@ fn render_single_response(
     pack: kin_model::ContextPack,
     selection: &kin_context::DependencySelection,
     projections: Option<&kin_context::ProjectionReport>,
+    external: Option<&ExternalCalls>,
 ) -> Result<ContextResponse> {
     let dependents_returned = count_dependents(&pack, &selection);
     let dependencies_returned = pack.dependency_signatures.len() - dependents_returned;
@@ -573,6 +795,10 @@ fn render_single_response(
             withheld(kin_context::group::TESTS)
         ),
     ];
+    // Present only when the focal has any, like the two lines below: an edge
+    // into a symbol outside the repository exists only where a language
+    // server proved one, so a zero here would certify nothing.
+    lines.extend(external.and_then(ExternalCalls::header_line));
     // Work items and annotations have never had a line of their own, because a
     // pack usually carries none and a row of zeroes is noise. A section the
     // budget took rows from is the case where saying nothing is the defect, so
@@ -598,7 +824,11 @@ fn render_single_response(
     // One line naming the lever, because a per-section count says what was lost
     // and not what recovers it. Present only when something was cut, so a whole
     // pack never carries a note about a cut that did not happen.
-    let total_elided: usize = elisions.values().map(|elision| elision.elided).sum();
+    let total_elided: usize = elisions
+        .values()
+        .filter(|elision| elision.reason == CONTEXT_ELISION_REASON_TOKEN_BUDGET)
+        .map(|elision| elision.elided)
+        .sum();
     if total_elided > 0 {
         lines.push(format!(
             "  Raise --budget above {max_tokens} to recover the {total_elided} \
@@ -644,6 +874,10 @@ fn render_single_response(
     for entry in &pack.transitive_deps {
         lines.push(entry.content.clone());
     }
+    if let Some(external) = external {
+        lines.extend(external.section_lines(|_| None));
+        lines.extend(external.call_site_lines());
+    }
 
     let measured_tokens = kin_context::estimate_tokens(&lines.join("\n"));
     let focal_target = ContextTarget {
@@ -653,7 +887,7 @@ fn render_single_response(
         budget_tokens: token_budget.max_tokens(),
     };
 
-    Ok(ContextResponse {
+    let mut response = ContextResponse {
         lines,
         schema_version: CONTEXT_RESPONSE_SCHEMA_VERSION.to_string(),
         target: Some(focal_target.clone()),
@@ -663,6 +897,7 @@ fn render_single_response(
             dependents_returned,
             same_file_candidates: selection.same_file_candidates(),
             same_file_dropped: selection.same_file_dropped(),
+            external_calls_returned: 0,
         }),
         budget_elisions: elisions,
         error: None,
@@ -670,8 +905,15 @@ fn render_single_response(
         multi_focal: None,
         measured_tokens,
         unresolved: Vec::new(),
+        external_calls: Vec::new(),
+        external_calls_withheld: None,
         pack: Some(pack),
-    })
+        call_sites: None,
+    };
+    if let Some(external) = external {
+        external.fill(&mut response);
+    }
+    Ok(response)
 }
 
 /// What the token budget refused, per section, keyed by the group names the two
@@ -982,6 +1224,9 @@ fn resolve_focal(
     graph: &kin_db::InMemoryGraph,
     token: &str,
 ) -> Result<std::result::Result<ResolvedFocal, Vec<String>>> {
+    if let Some(lines) = external_focal_refusal(graph, token)? {
+        return Ok(Err(lines));
+    }
     let reference = crate::entity_ref::parse_entity_ref(token);
     let resolved =
         crate::entity_identity::resolve_identity(graph, &reference.name, &reference.qualifiers)?;
@@ -1042,6 +1287,16 @@ pub fn resolve_focal_for_mcp(
     graph: &kin_db::InMemoryGraph,
     token: &str,
 ) -> Result<Option<serde_json::Value>> {
+    // A symbol outside the repository is no miss, and a token this returns
+    // nothing for is dropped as one. It is handed on under its address, and
+    // the pack reports it unresolved by what it is.
+    if let Some(node) = crate::commands::external_symbols::lookup(graph, token)? {
+        return Ok(Some(serde_json::json!({
+            "entity_id": node.address(),
+            "route": "id",
+            "query": token,
+        })));
+    }
     let Ok(focal) = resolve_focal(graph, token)? else {
         return Ok(None);
     };
@@ -1195,11 +1450,34 @@ fn build_multi_focal_response(
             )),
             measured_tokens,
             unresolved,
+            external_calls: Vec::new(),
+            external_calls_withheld: None,
+            call_sites: None,
         });
     }
 
+    let mut provider = provider;
+    let mut focal_entities = Vec::with_capacity(focals.len());
+    for id in &focals.ids {
+        if let Some(entity) = graph.get_entity(id)? {
+            focal_entities.push(entity);
+        }
+    }
+    let external = ExternalCalls::read(graph, &focal_entities, true, provider.as_deref_mut())?;
+    // The call-site section is printed beside the pack and a multi-focal pack
+    // never measures above its budget, so the pack is fitted into what the
+    // section leaves. The report still names the budget the caller asked for.
+    let call_site_reserve =
+        kin_context::estimate_tokens(&external.call_site_lines().join("\n")) + 1;
+    let fitted_budget = TokenBudget::Custom(
+        token_budget
+            .max_tokens()
+            .saturating_sub(call_site_reserve)
+            .max(1),
+    );
+
     let opts = kin_context::MultiFocalOptions {
-        budget: token_budget,
+        budget: fitted_budget,
         max_depth: 2,
         include_tests: true,
         include_contracts: true,
@@ -1222,10 +1500,13 @@ fn build_multi_focal_response(
                     &guidance,
                     &unresolved,
                     Some(projections),
+                    None,
                 );
                 measure_response(&mut response)
             },
         )?;
+        let mut report = report;
+        report.budget_tokens = token_budget.max_tokens();
         let mut response = render_multi_response(
             pack,
             report,
@@ -1233,11 +1514,13 @@ fn build_multi_focal_response(
             &guidance,
             &unresolved,
             Some(&projections),
+            Some(&external),
         );
         measure_response(&mut response)?;
         return Ok(response);
     }
-    let (pack, report) = kin_context::build_multi_focal_pack(graph, &focals.ids, &opts)?;
+    let (pack, mut report) = kin_context::build_multi_focal_pack(graph, &focals.ids, &opts)?;
+    report.budget_tokens = token_budget.max_tokens();
     Ok(render_multi_response(
         pack,
         report,
@@ -1245,6 +1528,7 @@ fn build_multi_focal_response(
         &guidance,
         &unresolved,
         None,
+        Some(&external),
     ))
 }
 
@@ -1255,8 +1539,25 @@ fn render_multi_response(
     guidance: &[String],
     unresolved: &[String],
     projections: Option<&kin_context::ProjectionReport>,
+    external: Option<&ExternalCalls>,
 ) -> ContextResponse {
     let mut lines = kin_context::render_multi_focal_lines(&pack, &report);
+    // Beside the fitted pack, as in a single-focal pack, each row naming the
+    // focal that makes the call.
+    let external_lines = external.map_or_else(Vec::new, |external| {
+        external.section_lines(|row| {
+            let caller = row["caller_id"].as_str()?;
+            targets
+                .iter()
+                .find(|target| target.id == caller)
+                .map(|target| target.name.clone())
+        })
+    });
+    let listed_external = !external_lines.is_empty() || external.is_some();
+    lines.extend(external_lines);
+    if let Some(external) = external {
+        lines.extend(external.call_site_lines());
+    }
     if !guidance.is_empty() {
         // The misses go after the pack, so a reader sees the answer first and
         // then what it does not cover.
@@ -1290,7 +1591,14 @@ fn render_multi_response(
         })
         .collect();
 
-    ContextResponse {
+    // The pack's own measure does not see the external or call-site lines
+    // beside it, so an answer that lists any is measured whole.
+    let measured_tokens = if listed_external {
+        kin_context::estimate_tokens(&lines.join("\n"))
+    } else {
+        report.measured_tokens
+    };
+    let mut response = ContextResponse {
         error: None,
         lines,
         schema_version: CONTEXT_RESPONSE_SCHEMA_VERSION.to_string(),
@@ -1299,10 +1607,17 @@ fn render_multi_response(
         dependency_selection: None,
         budget_elisions,
         focals: targets.to_vec(),
-        measured_tokens: report.measured_tokens,
+        measured_tokens,
         multi_focal: Some(report),
         unresolved: unresolved.to_vec(),
+        external_calls: Vec::new(),
+        external_calls_withheld: None,
+        call_sites: None,
+    };
+    if let Some(external) = external {
+        external.fill(&mut response);
     }
+    response
 }
 
 /// The report a multi-focal request that resolved no focal still carries, so a
@@ -2343,6 +2658,9 @@ mod tests {
             multi_focal: None,
             measured_tokens: 9,
             unresolved: Vec::new(),
+            external_calls: Vec::new(),
+            external_calls_withheld: None,
+            call_sites: None,
         };
         assert!(
             answered_a_narrower_question(&multi, &old_daemon),
@@ -2383,6 +2701,293 @@ mod tests {
         assert_eq!(
             request.focal_tokens(),
             vec!["first".to_string(), "second".to_string()]
+        );
+    }
+
+    // ---- calls into symbols outside the repository ----------------------
+
+    use crate::commands::external_symbols::fixture;
+
+    /// A pack is built around a repository entity, and a symbol outside the
+    /// repository has no body or neighborhood here. `kin context` refuses it
+    /// as `get_context_pack` does, by its address or its bare id, naming the
+    /// symbol and the command that lists its callers, never as a miss.
+    #[test]
+    fn context_refuses_an_external_symbol_and_names_kin_refs() {
+        let store = fixture::external_store(false);
+        let hint = format!("kin refs {}", store.address());
+        for entity in [store.address(), store.node.id.to_string()] {
+            let response =
+                build_context_response(&store.graph, &ContextRequest::one(entity.clone(), "8k"))
+                    .unwrap();
+            let error = response.error.as_deref().expect("a refusal");
+            assert!(error.contains("Array.map"), "{error}");
+            assert!(error.contains(&hint), "{error}");
+            assert!(!error.contains("not found"), "{error}");
+            assert!(response.pack.is_none());
+            assert_eq!(response.unresolved, vec![entity.clone()]);
+        }
+
+        // Beside a focal that resolves, the symbol is what the pack does not
+        // cover, and it says why in the same words.
+        let response = build_context_response(
+            &store.graph,
+            &ContextRequest {
+                entity: "render".to_string(),
+                entities: vec![store.address()],
+                budget: "8k".to_string(),
+                ..ContextRequest::default()
+            },
+        )
+        .unwrap();
+        assert!(response.error.is_none(), "{:?}", response.error);
+        assert_eq!(response.unresolved, vec![store.address()]);
+        assert!(response.lines.join("\n").contains(&hint));
+
+        let unknown = build_context_response(
+            &store.graph,
+            &ContextRequest::one(
+                "external_reference:00000000-0000-8000-8000-000000000000",
+                "8k",
+            ),
+        )
+        .unwrap();
+        let error = unknown.error.expect("a refusal");
+        assert!(
+            error.contains("names no symbol outside the repository"),
+            "{error}"
+        );
+    }
+
+    /// The daemon resolves `get_context_pack`'s `entities` through this
+    /// function, and a token it returns nothing for is dropped as a miss. A
+    /// symbol outside the repository is no miss, so it comes back under its
+    /// address for the pack to report by what it is. An address the graph
+    /// holds no symbol under stays a miss.
+    #[test]
+    fn resolve_focal_for_mcp_hands_an_external_symbol_on_by_its_address() {
+        let store = fixture::external_store(false);
+        for token in [store.address(), store.node.id.to_string()] {
+            let entry = resolve_focal_for_mcp(&store.graph, &token)
+                .unwrap()
+                .unwrap_or_else(|| panic!("{token} was dropped as a miss"));
+            assert_eq!(entry["entity_id"], store.address(), "{entry}");
+            assert_eq!(entry["route"], "id", "{entry}");
+            assert_eq!(entry["query"], token, "{entry}");
+        }
+        assert!(resolve_focal_for_mcp(
+            &store.graph,
+            "external_reference:00000000-0000-8000-8000-000000000000"
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    /// A pack lists the calls its focal makes into symbols outside the
+    /// repository, in the rows `get_context_pack` serves under
+    /// `external_calls`, and renders each as one line. An entity dependency
+    /// is still a dependency, and an entity with no external call carries no
+    /// external line.
+    #[test]
+    fn context_lists_the_focals_proven_external_calls() {
+        let store = fixture::external_store(false);
+        let response =
+            build_context_response(&store.graph, &ContextRequest::one("render", "8k")).unwrap();
+        assert_eq!(response.external_calls.len(), 1, "{response:#?}");
+        let row = &response.external_calls[0];
+        assert_eq!(row["id"], store.address());
+        assert_eq!(row["kind"], "external_symbol");
+        assert_eq!(row["name"], "Array.map");
+        assert_eq!(row["stdlib"], true);
+        assert_eq!(row["site_state"], "proven_external");
+        assert_eq!(row["proof"]["resolver"], "lsp:tsserver");
+        assert_eq!(row["proof"]["resolver_version"], "5.6.3");
+        let lines: Vec<u64> = row["sites"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|site| site["line_in_entity"].as_u64().unwrap())
+            .collect();
+        assert_eq!(lines, [2, 5]);
+        let selection = response.dependency_selection.as_ref().unwrap();
+        assert_eq!(selection.external_calls_returned, 1);
+        assert_eq!(selection.returned, 1, "helper is still a dependency");
+        assert_eq!(
+            response.pack.as_ref().unwrap().dependency_signatures[0].entity_id,
+            store.helper.id
+        );
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["external_calls"][0]["id"], store.address());
+
+        let text = response.lines.join("\n");
+        assert!(text.contains("  External calls: 1 entries"), "{text}");
+        assert!(
+            text.contains(&format!(
+                "[Calls ->] Array.map (external symbol, npm typescript 5.6.3, standard \
+                 library) proven_external by lsp:tsserver 5.6.3 (lsp_definition), sites +2, +5, \
+                 id {}",
+                store.address()
+            )),
+            "{text}"
+        );
+        assert!(text.contains("a site is +N"), "{text}");
+
+        let helper =
+            build_context_response(&store.graph, &ContextRequest::one("helper", "8k")).unwrap();
+        assert!(helper.external_calls.is_empty());
+        assert!(!helper.lines.join("\n").contains("External calls"));
+        assert_eq!(
+            serde_json::to_value(&helper).unwrap()["external_calls"],
+            serde_json::json!([]),
+            "the group is always present, empty included"
+        );
+    }
+
+    /// With the pack's own body reader, each site quotes the text at it, cut
+    /// from the caller's body and nowhere else.
+    #[test]
+    fn context_quotes_each_site_from_the_callers_own_body() {
+        struct Bodies {
+            render: EntityId,
+            reads: usize,
+        }
+        impl kin_context::ContextProjectionProvider for Bodies {
+            fn full_body(
+                &mut self,
+                entity: &Entity,
+                _limits: kin_context::ProjectionLimits,
+            ) -> kin_context::Result<kin_context::BodyCandidate> {
+                self.reads += 1;
+                Ok(if entity.id == self.render {
+                    kin_context::BodyCandidate::Exact {
+                        body: fixture::render_body(),
+                    }
+                } else {
+                    kin_context::BodyCandidate::Unavailable {
+                        reason: "not in this fixture".to_string(),
+                    }
+                })
+            }
+        }
+        let store = fixture::external_store(false);
+        let mut provider = Bodies {
+            render: store.caller.id,
+            reads: 0,
+        };
+        let response = build_context_response_inner(
+            &store.graph,
+            &ContextRequest::one("render", "8k"),
+            Some(&mut provider),
+        )
+        .unwrap();
+        let row = &response.external_calls[0];
+        assert_eq!(row["sites"][0]["callee"], "map", "{row:#}");
+        assert_eq!(row["sites"][1]["callee"], "map", "{row:#}");
+        let text = response.lines.join("\n");
+        assert!(text.contains("sites +2 `map`, +5 `map`"), "{text}");
+    }
+
+    /// A pack carries its focal's own call sites in the `call_sites` block
+    /// `get_context_pack` serves, and prints them as lines, each site addressed
+    /// inside the focal with the text cut from the focal's own body.
+    #[test]
+    fn context_prints_the_focals_own_call_sites() {
+        use crate::commands::call_site_fixture::{admit, spanned};
+        use kin_model::{CallSiteState, UnresolvedReason};
+        const BODY: &str = "def run(db):\n    load(db)\n    render(db)\n";
+        struct Bodies(EntityId);
+        impl kin_context::ContextProjectionProvider for Bodies {
+            fn full_body(
+                &mut self,
+                entity: &Entity,
+                _limits: kin_context::ProjectionLimits,
+            ) -> kin_context::Result<kin_context::BodyCandidate> {
+                Ok(if entity.id == self.0 {
+                    kin_context::BodyCandidate::Exact {
+                        body: BODY.to_string(),
+                    }
+                } else {
+                    kin_context::BodyCandidate::Unavailable {
+                        reason: "not in this fixture".to_string(),
+                    }
+                })
+            }
+        }
+        let graph = kin_db::InMemoryGraph::new();
+        let run = spanned("run", "app.py", 0, BODY);
+        admit(
+            &graph,
+            &[&run],
+            vec![(
+                &run,
+                BODY,
+                vec![
+                    ("load", CallSiteState::ProvenOutside),
+                    (
+                        "render",
+                        CallSiteState::Unresolved {
+                            reason: UnresolvedReason::NoAnswer,
+                        },
+                    ),
+                ],
+            )],
+        );
+        let mut provider = Bodies(run.id);
+        let response = build_context_response_inner(
+            &graph,
+            &ContextRequest::one(run.id.to_string(), "8k"),
+            Some(&mut provider),
+        )
+        .unwrap();
+        let block = response
+            .call_sites
+            .as_ref()
+            .expect("the pack carries its sites");
+        assert_eq!(block["scope"], kin_mcp::call_sites::FOCAL_SCOPE, "{block}");
+        assert_eq!(block["rows"][0]["callee"], "load", "{block}");
+        assert_eq!(block["rows"][1]["line_in_entity"], 2, "{block}");
+        let text = response.lines.join("\n");
+        assert!(text.contains("--- Call sites ---"), "{text}");
+        assert!(text.contains("  +1 `load` proven_outside"), "{text}");
+        assert!(
+            text.contains("  +2 `render` unresolved (no_answer)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("  not settled: call_sites_unresolved: 1 of the 2 call sites"),
+            "{text}"
+        );
+    }
+
+    /// A pack built from several focals lists each focal's external calls,
+    /// each naming the focal that makes it, as `get_context_pack` does.
+    #[test]
+    fn a_multi_focal_pack_lists_each_focals_external_calls() {
+        let store = fixture::external_store(false);
+        let response = build_context_response(
+            &store.graph,
+            &ContextRequest {
+                entity: "render".to_string(),
+                entities: vec!["helper".to_string()],
+                budget: "8k".to_string(),
+                ..ContextRequest::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(response.external_calls.len(), 1, "{:?}", response.lines);
+        assert_eq!(
+            response.external_calls[0]["caller_id"],
+            store.caller.id.to_string()
+        );
+        let text = response.lines.join("\n");
+        assert!(
+            text.contains("render: [Calls ->] Array.map (external symbol"),
+            "{text}"
+        );
+        assert_eq!(
+            response.measured_tokens,
+            kin_context::estimate_tokens(&text),
+            "the external lines are counted in what the rendering costs"
         );
     }
 }

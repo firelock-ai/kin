@@ -11,11 +11,12 @@ use kin_model::LanguageId;
 use tokio::io::AsyncReadExt;
 use tokio::process::{ChildStderr, Command};
 use tokio::sync::{Mutex, Notify};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
-use crate::client::JsonRpcClient;
+use crate::adapters::{LoadCheck, Readiness, ServerLaunch};
+use crate::client::{JsonRpcClient, ServerRequestAnswers, ServerWatch};
 use crate::error::{LspError, Result};
-use crate::protocol::{self, InitializeParams, InitializeResult};
+use crate::protocol::{self, InitializeParams, InitializeResult, WorkspaceFolder};
 use crate::registry::{
     BinaryFinder, ProviderGap, ProviderGapReason, ProviderProbe, ProviderRegistry,
     SystemBinaryFinder,
@@ -40,7 +41,79 @@ pub struct LspServer {
     pub capabilities: protocol::ServerCapabilities,
     process: ServerProcess,
     stderr_tail: StderrTail,
+    /// The label of the [`ServerLaunch`] this server runs under.
+    configuration: String,
+    /// How this server shows it can answer, from its launch.
+    readiness: Readiness,
     typescript_grammars: Option<TypeScriptGrammars>,
+    /// What this server's proofs are made under.
+    proof_basis: crate::proof_context::ProofBasis,
+    /// Names the declarations outside the repository this server answers
+    /// with, keeping what it learned about each dependency file.
+    external_symbols: Arc<crate::external_symbols::ExternalSymbolNamer>,
+    /// The source files no build of the repository compiles, as its launch's
+    /// resolution named them, so no configuration of this server answers for
+    /// them.
+    not_in_any_build: Arc<std::collections::HashSet<std::path::PathBuf>>,
+}
+
+/// How long a settling launch waits for a server's first status report before
+/// it concludes the server does not send one. rust-analyzer sends its first
+/// the moment it is initialized.
+const FIRST_STATUS_WAIT: Duration = Duration::from_secs(15);
+
+/// How long a settling launch waits for a server to report its project
+/// loaded. Loading includes `cargo metadata` for every linked project, which
+/// can fetch dependencies, so this is generous; a server still loading when it
+/// runs out is used as it is.
+pub const LOAD_BUDGET: Duration = Duration::from_secs(180);
+
+/// What a server reported about loading its project.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoadOutcome {
+    /// It finished loading. `health` is its own word for the result (`ok`,
+    /// `warning`), with its message when it gave one.
+    Loaded {
+        health: String,
+        message: Option<String>,
+    },
+    /// It finished, and said it could not load a project under this
+    /// configuration. Carries the server's message.
+    Failed(String),
+    /// It was still loading when the budget ran out.
+    StillLoading,
+    /// It sent no status report at all, or died before finishing.
+    Unreported,
+}
+
+impl LoadOutcome {
+    /// Read one rust-analyzer status report that says `quiescent`.
+    ///
+    /// A failed project load is reported as a `health` other than `ok` whose
+    /// message names Cargo's metadata: rust-analyzer then falls back to the
+    /// workspace members alone, without their dependencies, and says so. Other
+    /// warnings (a missing standard-library source, say) are no failure of the
+    /// project configuration, and a fallback would not change them.
+    pub fn from_server_status(status: &serde_json::Value) -> Self {
+        let health = status
+            .get("health")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("ok")
+            .to_string();
+        let message = status
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let project_failed = health != "ok"
+            && message.as_deref().is_some_and(|message| {
+                let lower = message.to_ascii_lowercase();
+                lower.contains("cargo metadata") || lower.contains("failed to load workspaces")
+            });
+        match (project_failed, message) {
+            (true, Some(message)) => Self::Failed(message),
+            (_, message) => Self::Loaded { health, message },
+        }
+    }
 }
 
 /// What a server that stopped answering left behind.
@@ -185,7 +258,8 @@ fn require_utf16(capabilities: &protocol::ServerCapabilities) -> Result<()> {
 }
 
 impl LspServer {
-    /// Start an LSP server process and perform the initialize handshake.
+    /// Start an LSP server process and perform the initialize handshake, with
+    /// initialization options as its whole configuration.
     ///
     /// `typescript_grammars` are the grammars the call-hierarchy join parses
     /// TypeScript and TSX sources with to prove a binding initializer's call
@@ -199,10 +273,40 @@ impl LspServer {
         initialization_options: Option<serde_json::Value>,
         typescript_grammars: Option<TypeScriptGrammars>,
     ) -> Result<Self> {
-        info!(command, ?args, "starting LSP server");
+        Self::launch(
+            command,
+            args,
+            workspace_root,
+            &ServerLaunch::with_initialization_options(initialization_options),
+            typescript_grammars,
+        )
+        .await
+    }
+
+    /// Start an LSP server with one adapter's whole configuration and perform
+    /// the initialize handshake.
+    ///
+    /// The server runs with the launch's environment beside the inherited
+    /// one, in the directory this process runs in. It is not moved into the
+    /// workspace root: a version manager's shim there would pick the version
+    /// the repository pins, and a pinned version that is not installed would
+    /// stop `node` or `python` from starting at all. What the repository
+    /// selects reaches the server through its settings instead, such as the
+    /// Python interpreter pyright is told to use. The client answers the
+    /// server's requests from the launch's settings and the one workspace
+    /// folder. `typescript_grammars` are as for [`Self::start`].
+    pub async fn launch(
+        command: &str,
+        args: &[&str],
+        workspace_root: &Path,
+        launch: &ServerLaunch,
+        typescript_grammars: Option<TypeScriptGrammars>,
+    ) -> Result<Self> {
+        info!(command, ?args, configuration = %launch.label, "starting LSP server");
 
         let mut invocation = Command::new(command);
         invocation.args(args);
+        invocation.envs(launch.env.iter().map(|(name, value)| (name, value)));
         let mut process = ServerProcess::spawn(invocation)
             .map_err(|e| LspError::ServerStartFailed(format!("{}: {}", command, e)))?;
 
@@ -215,10 +319,20 @@ impl LspServer {
             .ok_or_else(|| LspError::ServerStartFailed("failed to capture stderr".to_string()))?;
         let stderr_tail = drain_stderr(stderr);
 
-        let client = JsonRpcClient::new(stdin, stdout);
+        let client = JsonRpcClient::watching(
+            stdin,
+            stdout,
+            ServerRequestAnswers {
+                settings: launch.settings.clone(),
+                workspace_folders: vec![WorkspaceFolder::for_root(workspace_root)],
+            },
+            ServerWatch {
+                backend_exit_report: launch.backend_exit_report.clone(),
+            },
+        );
 
         // Perform LSP initialize handshake.
-        let init_params = InitializeParams::for_workspace(workspace_root, initialization_options);
+        let init_params = InitializeParams::for_launch(workspace_root, launch);
 
         let handshake = tokio::time::timeout(
             std::time::Duration::from_secs(30),
@@ -254,13 +368,211 @@ impl LspServer {
             "server initialized"
         );
 
+        let server_info = init_result.server_info.unwrap_or_default();
+        let proof_basis = crate::proof_context::ProofBasis::of(
+            launch,
+            workspace_root,
+            command,
+            Some(server_info.name.as_str()),
+            server_info.version.as_deref(),
+        );
+        let external_symbols = Arc::new(crate::external_symbols::ExternalSymbolNamer::new(
+            crate::external_symbols::StdlibVersions::from_resolution(launch.resolution.as_ref()),
+        ));
+        let not_in_any_build = Arc::new(
+            launch
+                .resolution
+                .as_ref()
+                .map(|resolution| resolution.not_in_any_build.iter().cloned().collect())
+                .unwrap_or_default(),
+        );
         Ok(Self {
             client,
             capabilities: init_result.capabilities,
             process,
             stderr_tail,
+            configuration: launch.label.clone(),
+            readiness: launch.readiness,
             typescript_grammars,
+            proof_basis,
+            external_symbols,
+            not_in_any_build,
         })
+    }
+
+    /// The proof context of this server's answers about `language`.
+    pub fn proof_context(&self, language: kin_model::LanguageId) -> kin_model::ProofContext {
+        self.proof_basis.proof_context(language)
+    }
+
+    /// Whether `path` is a source file no build of the repository compiles,
+    /// as this server's launch resolved the repository, so no configuration
+    /// of it answers for the file.
+    pub fn in_no_build(&self, path: &std::path::Path) -> bool {
+        self.not_in_any_build.contains(path)
+            || crate::call_sites::real_path(path)
+                .is_some_and(|real| self.not_in_any_build.contains(&real))
+    }
+
+    /// The namer of the declarations outside the repository this server
+    /// answers with.
+    pub fn external_symbols(&self) -> &crate::external_symbols::ExternalSymbolNamer {
+        &self.external_symbols
+    }
+
+    /// [`Self::launch`], then, for a launch with a load check, wait until the
+    /// server reports its project loaded, and fall back when it could not load
+    /// it under this configuration.
+    ///
+    /// With a fallback, a failed load stops this server and starts the
+    /// fallback. When the fallback fails the same way, the configuration was
+    /// not the cause (a manifest that is broken whatever the features, say),
+    /// so the first configuration, which loads at least as much, is started
+    /// again and kept. A server that reports nothing, or is still loading when
+    /// [`LOAD_BUDGET`] runs out, is kept as it is. Every server it starts,
+    /// the fallback included, gets `typescript_grammars`.
+    pub async fn launch_settled(
+        command: &str,
+        args: &[&str],
+        workspace_root: &Path,
+        launch: &ServerLaunch,
+        typescript_grammars: Option<TypeScriptGrammars>,
+    ) -> Result<Self> {
+        let server =
+            Self::launch(command, args, workspace_root, launch, typescript_grammars).await?;
+        let Some(check) = launch.load_check else {
+            return Ok(server);
+        };
+        let outcome = server.wait_for_load(check, LOAD_BUDGET).await;
+        info!(configuration = %launch.label, ?outcome, "language server finished loading");
+        let (LoadOutcome::Failed(reason), Some(fallback)) = (&outcome, launch.fallback.as_deref())
+        else {
+            return Ok(server);
+        };
+        if !launch.fallback_trigger.as_deref().is_none_or(|trigger| {
+            reason
+                .to_ascii_lowercase()
+                .contains(&trigger.to_ascii_lowercase())
+        }) {
+            warn!(
+                configuration = %launch.label,
+                %reason,
+                "the language server could not load part of the project, for a reason its \
+                 fallback would not change"
+            );
+            return Ok(server);
+        }
+        warn!(
+            configuration = %launch.label,
+            fallback = %fallback.label,
+            %reason,
+            "the language server could not load the project under its configuration; \
+             starting it with the fallback"
+        );
+        server.shutdown().await?;
+        // A fallback shares its parent's model and environment, which name
+        // the standard libraries its answers land in and the environment its
+        // proofs are made under.
+        let mut fallback = fallback.clone();
+        if fallback.resolution.is_none() {
+            fallback.resolution = launch.resolution.clone();
+        }
+        let fallback = &fallback;
+        let second =
+            Self::launch(command, args, workspace_root, fallback, typescript_grammars).await?;
+        let second_outcome = second.wait_for_load(check, LOAD_BUDGET).await;
+        if !matches!(second_outcome, LoadOutcome::Failed(_)) {
+            info!(configuration = %fallback.label, outcome = ?second_outcome, "fallback loaded");
+            return Ok(second);
+        }
+        warn!(
+            configuration = %launch.label,
+            fallback = %fallback.label,
+            "the fallback could not load the project either, so the configuration was not \
+             the cause; starting the first configuration again"
+        );
+        second.shutdown().await?;
+        let primary =
+            Self::launch(command, args, workspace_root, launch, typescript_grammars).await?;
+        let _ = primary.wait_for_load(check, LOAD_BUDGET).await;
+        Ok(primary)
+    }
+
+    /// Wait, at most `budget`, for this server to report that it finished
+    /// loading its project, and read that report.
+    pub async fn wait_for_load(&self, check: LoadCheck, budget: Duration) -> LoadOutcome {
+        match check {
+            LoadCheck::ServerStatus => {
+                let mut status = self.client.server_status();
+                let reported = matches!(
+                    tokio::time::timeout(
+                        FIRST_STATUS_WAIT.min(budget),
+                        status.wait_for(Option::is_some),
+                    )
+                    .await,
+                    Ok(Ok(_))
+                );
+                if !reported {
+                    return LoadOutcome::Unreported;
+                }
+                let quiescent = |status: &Option<serde_json::Value>| {
+                    status
+                        .as_ref()
+                        .and_then(|status| status.get("quiescent"))
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false)
+                };
+                let outcome = match tokio::time::timeout(budget, status.wait_for(quiescent)).await {
+                    Err(_) => LoadOutcome::StillLoading,
+                    Ok(Err(_)) => LoadOutcome::Unreported,
+                    Ok(Ok(report)) => report
+                        .as_ref()
+                        .map(LoadOutcome::from_server_status)
+                        .unwrap_or(LoadOutcome::Unreported),
+                };
+                outcome
+            }
+        }
+    }
+
+    /// The label of the configuration this server runs under.
+    pub fn configuration(&self) -> &str {
+        &self.configuration
+    }
+
+    /// How this server shows it can answer.
+    pub fn readiness(&self) -> Readiness {
+        self.readiness
+    }
+
+    /// Wait, at most `budget`, until the server answers a request about the
+    /// document at `uri`, which the caller has just opened, and return how
+    /// long that took.
+    ///
+    /// For a [`Readiness::PerDocument`] server, opening a document loads its
+    /// project, and a request about the document is answered only after
+    /// that. Its document symbols are the cheapest such request. Any answer,
+    /// an empty one or an error about the document included, means the
+    /// server has taken the document in, so its queries after this are not
+    /// queued behind a project load. A timeout is returned as one, and the
+    /// caller goes on with the server as it is.
+    pub async fn wait_for_document(&self, uri: &str, budget: Duration) -> Result<Duration> {
+        let started = tokio::time::Instant::now();
+        match self
+            .client
+            .request_within(
+                "textDocument/documentSymbol",
+                serde_json::json!({ "textDocument": { "uri": uri } }),
+                budget,
+            )
+            .await
+        {
+            Ok(_) => Ok(started.elapsed()),
+            Err(error) if error.ends_the_session() || matches!(error, LspError::Timeout) => {
+                Err(error)
+            }
+            Err(_) => Ok(started.elapsed()),
+        }
     }
 
     /// The grammars this server was started with for proving TypeScript binding
@@ -303,6 +615,11 @@ impl LspServer {
             if let Some(status) = self.process.exit_status() {
                 break Some(describe_exit(status));
             }
+            // A server that reported its backend gone runs on, so its own
+            // report is how it ended.
+            if let Some(report) = self.client.backend_exit() {
+                break Some(format!("it reported that its backend exited: {report}"));
+            }
             if tokio::time::Instant::now() >= deadline {
                 break None;
             }
@@ -343,12 +660,42 @@ impl LspServer {
             capabilities: protocol::ServerCapabilities::default(),
             process,
             stderr_tail: drain_stderr(stderr.expect("captured stderr")),
+            configuration: String::new(),
+            readiness: Readiness::default(),
             typescript_grammars: None,
+            proof_basis: crate::proof_context::ProofBasis::of(
+                &ServerLaunch::default(),
+                Path::new("/"),
+                "scripted",
+                None,
+                None,
+            ),
+            external_symbols: Arc::default(),
+            not_in_any_build: Arc::default(),
         }
     }
 
     #[cfg(test)]
     pub(crate) fn scripted_for_tests(script: &str, responses: serde_json::Value) -> Self {
+        Self::scripted_for_tests_answering(script, responses, ServerRequestAnswers::default())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scripted_for_tests_answering(
+        script: &str,
+        responses: serde_json::Value,
+        answers: ServerRequestAnswers,
+    ) -> Self {
+        Self::scripted_for_tests_watching(script, responses, answers, ServerWatch::default())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scripted_for_tests_watching(
+        script: &str,
+        responses: serde_json::Value,
+        answers: ServerRequestAnswers,
+        watch: ServerWatch,
+    ) -> Self {
         let mut invocation = Command::new("python3");
         invocation
             .args(["-u", "-c", script])
@@ -357,9 +704,11 @@ impl LspServer {
             ServerProcess::spawn(invocation).expect("spawn the scripted JSON-RPC peer");
         let (stdin, stdout, stderr) = process.take_stdio();
         Self {
-            client: JsonRpcClient::new(
+            client: JsonRpcClient::watching(
                 stdin.expect("captured stdin"),
                 stdout.expect("captured stdout"),
+                answers,
+                watch,
             ),
             capabilities: serde_json::from_value(serde_json::json!({
                 "callHierarchyProvider": true,
@@ -372,7 +721,18 @@ impl LspServer {
             .unwrap(),
             process,
             stderr_tail: drain_stderr(stderr.expect("captured stderr")),
+            configuration: String::new(),
+            readiness: Readiness::default(),
             typescript_grammars: None,
+            proof_basis: crate::proof_context::ProofBasis::of(
+                &ServerLaunch::default(),
+                Path::new("/"),
+                "scripted",
+                None,
+                None,
+            ),
+            external_symbols: Arc::default(),
+            not_in_any_build: Arc::default(),
         }
     }
 
@@ -560,6 +920,234 @@ pub async fn probe_readiness_with(
                 probed_capabilities,
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod settle_tests {
+    use super::*;
+    use crate::adapters::repo_scan::Fixture;
+
+    /// A rust-analyzer stand-in. It records the features of every start in
+    /// the file named by its first argument, and once initialized reports its
+    /// load the way rust-analyzer does, through `experimental/serverStatus`.
+    /// The second argument decides that report:
+    ///
+    /// - `clean`: every load is healthy;
+    /// - `feature`: a load with all features fails over a feature, the way
+    ///   Cargo fails when `--all-features` activates `dep/missing`;
+    /// - `feature-always`: every load fails with that feature error;
+    /// - `manifest`: every load fails over a manifest, naming no feature.
+    const FAKE_RUST_ANALYZER: &str = r#"
+import json, sys
+record, mode = sys.argv[1], sys.argv[2]
+
+def read():
+    headers = {}
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            sys.exit(0)
+        if line in (b"\n", b"\r\n"):
+            break
+        name, value = line.decode().split(":", 1)
+        headers[name.lower()] = value.strip()
+    return json.loads(sys.stdin.buffer.read(int(headers["content-length"])))
+
+def write(message):
+    payload = json.dumps(dict(jsonrpc="2.0", **message)).encode()
+    sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(payload) + payload)
+    sys.stdout.buffer.flush()
+
+features = None
+while True:
+    message = read()
+    method = message.get("method")
+    if method == "initialize":
+        params = message["params"]
+        assert params["capabilities"]["experimental"]["serverStatusNotification"] is True
+        features = ((params.get("initializationOptions") or {}).get("cargo") or {}).get("features", "default")
+        with open(record, "a") as f:
+            f.write(features + "\n")
+        write({"id": message["id"], "result": {"capabilities": {"definitionProvider": True}}})
+    elif method == "initialized":
+        write({"method": "experimental/serverStatus", "params": {"health": "ok", "quiescent": False}})
+        failure = {
+            "feature": "package `app` depends on `dep` with feature `missing` but `dep` does not have that feature" if features == "all" else None,
+            "feature-always": "package `app` depends on `dep` with feature `missing` but `dep` does not have that feature",
+            "manifest": "no matching package named `gone` found",
+        }.get(mode)
+        if failure:
+            status = {"health": "warning", "quiescent": True,
+                      "message": "Failed to read Cargo metadata with dependencies for `Cargo.toml`: `cargo metadata` exited with an error: " + failure}
+        else:
+            status = {"health": "ok", "quiescent": True, "message": None}
+        write({"method": "experimental/serverStatus", "params": status})
+    elif method == "exit":
+        sys.exit(0)
+    elif "id" in message:
+        write({"id": message["id"], "result": None})
+"#;
+
+    fn launch() -> ServerLaunch {
+        crate::adapters::rust_analyzer::launch_for(Default::default())
+    }
+
+    async fn settle(mode: &str) -> (String, Vec<String>, LspServer) {
+        let fixture = Fixture::new("settle");
+        let record = fixture.root.join("starts");
+        let launch = launch();
+        let server = LspServer::launch_settled(
+            "python3",
+            &[
+                "-u",
+                "-c",
+                FAKE_RUST_ANALYZER,
+                record.to_str().unwrap(),
+                mode,
+            ],
+            &fixture.root,
+            &launch,
+            None,
+        )
+        .await
+        .expect("the stand-in starts");
+        let starts = std::fs::read_to_string(&record)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        (server.configuration().to_string(), starts, server)
+    }
+
+    #[tokio::test]
+    async fn a_clean_load_with_all_features_starts_once() {
+        let (configuration, starts, server) = settle("clean").await;
+        assert_eq!(starts, vec!["all"]);
+        assert_eq!(configuration, launch().label);
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_feature_failure_settles_on_the_default_features() {
+        let (configuration, starts, server) = settle("feature").await;
+        assert_eq!(starts, vec!["all", "default"]);
+        assert_eq!(configuration, launch().fallback.unwrap().label);
+        server.shutdown().await.unwrap();
+    }
+
+    /// The fallback failed the same way, so features were not the cause, and
+    /// the first configuration, which loads more, is started again and kept.
+    #[tokio::test]
+    async fn a_failure_the_fallback_shares_returns_to_all_features() {
+        let (configuration, starts, server) = settle("feature-always").await;
+        assert_eq!(starts, vec!["all", "default", "all"]);
+        assert_eq!(configuration, launch().label);
+        server.shutdown().await.unwrap();
+    }
+
+    /// A broken manifest is no feature's fault: no restart is tried.
+    #[tokio::test]
+    async fn a_failure_that_names_no_feature_keeps_the_first_start() {
+        let (configuration, starts, server) = settle("manifest").await;
+        assert_eq!(starts, vec!["all"]);
+        assert_eq!(configuration, launch().label);
+        server.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn a_status_report_is_read_as_the_load_it_describes() {
+        assert_eq!(
+            LoadOutcome::from_server_status(
+                &serde_json::json!({"health": "ok", "quiescent": true})
+            ),
+            LoadOutcome::Loaded {
+                health: "ok".into(),
+                message: None
+            }
+        );
+        assert!(matches!(
+            LoadOutcome::from_server_status(&serde_json::json!({
+                "health": "warning", "quiescent": true,
+                "message": "Failed to read Cargo metadata with dependencies for `x`"
+            })),
+            LoadOutcome::Failed(_)
+        ));
+        assert!(matches!(
+            LoadOutcome::from_server_status(&serde_json::json!({
+                "health": "error", "quiescent": true,
+                "message": "Failed to load workspaces."
+            })),
+            LoadOutcome::Failed(_)
+        ));
+        // A missing standard-library source is a warning, not a failed load.
+        assert!(matches!(
+            LoadOutcome::from_server_status(&serde_json::json!({
+                "health": "warning", "quiescent": true,
+                "message": "can't load standard library, try installing `rust-src`"
+            })),
+            LoadOutcome::Loaded { .. }
+        ));
+    }
+
+    /// A server that never reports is not waited on for the whole budget.
+    #[tokio::test]
+    async fn a_server_that_sends_no_status_is_unreported() {
+        let server = LspServer::scripted_for_tests(
+            include_str!("enrichment_test_peer.py"),
+            serde_json::json!({}),
+        );
+        let started = std::time::Instant::now();
+        assert_eq!(
+            server
+                .wait_for_load(LoadCheck::ServerStatus, Duration::from_millis(200))
+                .await,
+            LoadOutcome::Unreported
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        server.shutdown().await.unwrap();
+    }
+
+    /// The launch's environment reaches the server.
+    #[tokio::test]
+    async fn the_server_runs_with_the_launch_environment() {
+        let fixture = Fixture::new("launch-env");
+        let record = fixture.root.join("seen");
+        let script = r#"
+import json, os, sys
+open(sys.argv[1], "w").write(json.dumps({"env": os.environ.get("KIN_TEST_LAUNCH")}))
+exec(open(sys.argv[2]).read())
+"#;
+        let peer = fixture.write("peer.py", include_str!("enrichment_test_peer.py"));
+        let responses = serde_json::json!({
+            "initialize": {"result": {"capabilities": {}}}
+        });
+        let launch = ServerLaunch {
+            env: vec![
+                ("KIN_TEST_LAUNCH".into(), "present".into()),
+                ("KIN_LSP_TEST_RESPONSES".into(), responses.to_string()),
+            ],
+            ..ServerLaunch::default()
+        };
+        let server = LspServer::launch(
+            "python3",
+            &[
+                "-u",
+                "-c",
+                script,
+                record.to_str().unwrap(),
+                peer.to_str().unwrap(),
+            ],
+            &fixture.root,
+            &launch,
+            None,
+        )
+        .await
+        .expect("the peer initializes");
+        let seen: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&record).unwrap()).unwrap();
+        assert_eq!(seen["env"], "present");
+        server.shutdown().await.unwrap();
     }
 }
 

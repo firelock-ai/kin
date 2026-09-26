@@ -117,6 +117,30 @@ const HAND_WRITTEN_SERIALIZATIONS: &[(&str, &str, &str)] = &[
         "",
     ),
     (
+        // Writes external_reference_deltas, even empty, whenever enrichment
+        // marks follow it, so a marks-only delta keeps each field in its place.
+        "WorkspaceSemanticDelta",
+        "enrichment_marks_keep_the_semantic_delta_wire_compatible",
+        "",
+    ),
+    (
+        // Writes external_reference_deltas, even empty, whenever resolution
+        // records follow it, and matches the derive it replaced otherwise.
+        "SemanticChange",
+        "a_change_with_records_keeps_every_field_in_place_and_moves_its_identity",
+        "",
+    ),
+    (
+        "TransactionDelta",
+        "a_transaction_delta_keeps_its_bytes_until_it_carries_records",
+        "",
+    ),
+    (
+        "ResolvedGraphState",
+        "a_resolved_state_keeps_its_bytes_until_it_carries_records",
+        "",
+    ),
+    (
         // A test-only replica of the positional encoding as kin-model 0.7.24
         // wrote it, kept so the release before `collaboration_delta` has a
         // wire this crate can still produce and diff against. It is registered

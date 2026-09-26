@@ -1891,14 +1891,14 @@
     },
     {
       "file": "crates/kin-lsp/src/client.rs",
-      "reason": "Pinned to the exact site rather than exempted whole, so any other filesystem or subprocess primitive added to this file still fails the guard. It moved into crates/ from its own repository on 2026-09-11. The ChildStdin and ChildStdout pipe types of the JSON-RPC channel to the language server lifecycle.rs spawned; types, not a spawn.",
+      "reason": "Pinned to the exact site rather than exempted whole, so any other filesystem or subprocess primitive added to this file still fails the guard. It moved into crates/ from its own repository on 2026-09-11. The ChildStdin and ChildStdout pipe types of the JSON-RPC channel to the language server lifecycle.rs spawned; types, not a spawn. ChildStdout appears four times, each as that one pipe's type: in the parameters of JsonRpcClient::new, JsonRpcClient::answering, the constructor that answers the server's own requests from configured answers, and JsonRpcClient::watching, the constructor that also watches the server's notifications for its backend's exit, and in the reader read_one_message takes frames from.",
       "owner": "kin-lsp",
       "expiration": "2028-01-28",
       "allow_match": [
         "tokio::process::ChildStdin",
         {
           "expr": "tokio::process::ChildStdout",
-          "count": 2
+          "count": 4
         }
       ]
     },
@@ -1907,6 +1907,417 @@
       "reason": "Not runtime. lib.rs declares it '#[cfg(test)] mod enrichment_integrity_tests;', so it compiles only into tests; it writes a throwaway source file for a peer server to read. The checker's test rule matches '_test.rs' and not '_tests.rs', and the file keeps its imported name. It moved into crates/ on 2026-09-11.",
       "owner": "kin-lsp",
       "expiration": "2028-01-28"
+    },
+    {
+      "file": "crates/kin-lsp/src/adapters/clangd.rs",
+      "reason": "Language-server configuration boundary. compilation_database checks the two fixed places a repository ships compile_commands.json, its root and build/, so clangd is pointed at the repository's own compilation database; it reads no file content and starts nothing. The path only configures the server, which is an ingestion input to enrichment and never the answer to a query. Pinned to that one function rather than exempted whole, so any other filesystem or subprocess primitive added to this file still fails the guard.",
+      "owner": "kin-lsp",
+      "expiration": "2027-11-12",
+      "allow_fn": [
+        "compilation_database"
+      ]
+    },
+    {
+      "file": "crates/kin-lsp/src/adapters/contract.rs",
+      "reason": "Analysis-environment identity boundary. file_digest hashes the bytes of the lockfile an adapter already chose, so an environment's content identity changes when its lock does. The digest names an environment in Kin's cache and is never an entity, relation or query answer. Pinned to that one function rather than exempted whole, so any other filesystem or subprocess primitive added to this file still fails the guard.",
+      "owner": "kin-lsp",
+      "expiration": "2027-11-12",
+      "allow_fn": [
+        "file_digest"
+      ]
+    },
+    {
+      "file": "crates/kin-lsp/src/call_sites.rs",
+      "reason": "Language-server answer placement boundary. real_path resolves the symbolic links in a path a language server named in its answer, so a file reached through a package manager's link to a workspace package (pnpm's node_modules/<package>) is placed in the repository source it links to, and a dependency directory is recognised by where the file really is. It reads no file content, and the graph, not the file system, decides which files are the repository's. Pinned to that one function rather than exempted whole, so any other filesystem or subprocess primitive added to this file still fails the guard.",
+      "owner": "kin-lsp",
+      "expiration": "2027-11-12",
+      "allow_fn": [
+        "real_path"
+      ]
+    },
+    {
+      "file": "crates/kin-lsp/src/adapters/go.rs",
+      "reason": "Language-server configuration boundary for gopls. go_layout walks the repository with the bounded, read-only repo_scan walk to find go.mod files, and reads only the //go:build lines before each .go file's package clause, to learn the build tags gopls loads with. project_model_for reads each go.mod for its module directive, root_go_work checks for a root go.work, and the two probes in environment_with check whether the go.work and go.work.sum Kin writes under its cache, outside the repository, exist. These choose the server's launch configuration before it starts and run nothing; the server is an ingestion input to enrichment, and no entity, relation or query answer derives from them. Pinned to the named functions and exact sites rather than exempted whole, so any other filesystem or subprocess primitive added to this file still fails the guard.",
+      "owner": "kin-lsp",
+      "expiration": "2027-11-12",
+      "allow_match": [
+        "std::fs::read_to_string(module)",
+        ".filter(|file| file.is_file())",
+        ".filter(|sum| sum.is_file())"
+      ],
+      "allow_fn": [
+        "go_layout",
+        "root_go_work"
+      ]
+    },
+    {
+      "file": "crates/kin-lsp/src/adapters/java.rs",
+      "reason": "Language-server configuration boundary for the Java server. project_model_for reads the root pom.xml for its modules, and without one checks which Gradle build file is present only to report the project model missing, since Gradle builds its model by running build scripts, which Kin never does. The model chooses the server's launch configuration; the server is an ingestion input to enrichment, and no entity, relation or query answer derives from it. Pinned to that one function rather than exempted whole, so any other filesystem or subprocess primitive added to this file still fails the guard.",
+      "owner": "kin-lsp",
+      "expiration": "2027-11-12",
+      "allow_fn": [
+        "project_model_for"
+      ]
+    },
+    {
+      "file": "crates/kin-lsp/src/adapters/python.rs",
+      "reason": "Language-server configuration boundary for pyright. These functions find the Python environment a developer's own tools would pick for the repository, and read its version without running it: a virtual environment in the repository or the active one, uv's project environment, Poetry's environment in its cache, the conda environment environment.yml names, and the pyenv version .python-version names. They also list the repository's Python projects one or two directories deep and read their declared names from pyproject.toml or setup.cfg. Everything read is a manifest, a configuration file or an environment's layout, used to choose the server's launch configuration; nothing is run, the server is an ingestion input to enrichment, and no entity, relation or query answer derives from these reads. Pinned to the named functions rather than exempted whole, so any other filesystem or subprocess primitive added elsewhere in this file still fails the guard.",
+      "owner": "kin-lsp",
+      "expiration": "2027-11-12",
+      "allow_fn": [
+        "venv_interpreter",
+        "interpreter_in",
+        "read_toml",
+        "poetry_project",
+        "poetry_environment",
+        "conda_env_name",
+        "conda_environment",
+        "pyenv_root",
+        "pyenv_version",
+        "version_file_lines",
+        "pyenv_environment",
+        "find_environments",
+        "environment_python",
+        "declared_name",
+        "python_projects"
+      ]
+    },
+    {
+      "file": "crates/kin-lsp/src/adapters/repo_scan.rs",
+      "reason": "Language-server configuration boundary. walk_dir is the bounded, read-only directory walk adapters use before a server starts to find manifests (Cargo.toml, go.mod, package.json) and build-tag headers; it follows no symbolic link, stops after a fixed entry budget and depth, and returns names to its caller's visitor. is_generated_dir checks for the CACHEDIR.TAG and pyvenv.cfg markers so build output and virtual environments are skipped. Neither reads file content, and the walk feeds launch configuration, never an entity, relation or query answer. Pinned to the named functions rather than exempted whole, so any other filesystem or subprocess primitive added elsewhere in this file still fails the guard.",
+      "owner": "kin-lsp",
+      "expiration": "2027-11-12",
+      "allow_fn": [
+        "is_generated_dir",
+        "walk_dir"
+      ]
+    },
+    {
+      "file": "crates/kin-lsp/src/adapters/rust_analyzer.rs",
+      "reason": "Language-server configuration boundary for rust-analyzer. read_manifest reads a Cargo.toml's workspace, package, lib path and trybuild dependency; trybuild_inputs reads the .rs files one directory or more below a package's tests directory for a main function, to report trybuild cases that no build compiles, which are logged and never sent to the server. In cargo_layout the exact probes skip vendored crates by their .cargo-checksum.json, find a package's src/lib.rs or src/main.rs entry and its src directory; in environment_settings the probe checks the completion marker of the Cargo home Kin built under its cache. These choose linked projects and environment variables before the server starts and run nothing; the server is an ingestion input to enrichment, and no entity, relation or query answer derives from them. Pinned to the named functions and exact sites rather than exempted whole, so any other filesystem or subprocess primitive added to this file still fails the guard.",
+      "owner": "kin-lsp",
+      "expiration": "2027-11-12",
+      "allow_match": [
+        "manifest.dir.join(\".cargo-checksum.json\").is_file()",
+        ".find(|file| file.is_file())",
+        "src.is_dir()",
+        "home.join(\".complete\").is_file()"
+      ],
+      "allow_fn": [
+        "read_manifest",
+        "trybuild_inputs"
+      ]
+    },
+    {
+      "file": "crates/kin-lsp/src/adapters/typescript.rs",
+      "reason": "Language-server configuration boundary for the TypeScript server. workspace_patterns and workspace_packages read pnpm-workspace.yaml, the root package.json and lerna.json, then each matching package.json and whether it has a tsconfig.json; source_entries and source_of map a workspace package's manifest entries to its source files; package_version reads an installed TypeScript's version. write_if_changed writes the workspace-source tsserver plugin and its workspace map under Kin's cache, never into the repository, through a staged name keyed by the process id and a rename. The exact probes in environment_with and configure_with check for the locked TypeScript's lib/tsserver.js and the completion marker of Kin's dependency layout. These choose the server's launch configuration and run nothing; the server is an ingestion input to enrichment, and no entity, relation or query answer derives from them. Pinned to the named functions and exact sites rather than exempted whole, so any other filesystem or subprocess primitive added to this file still fails the guard.",
+      "owner": "kin-lsp",
+      "expiration": "2027-11-12",
+      "allow_match": [
+        "dir.join(\"lib/tsserver.js\").is_file()",
+        "dir.join(\".complete\").is_file()"
+      ],
+      "allow_fn": [
+        "workspace_patterns",
+        "workspace_packages",
+        "write_if_changed",
+        "source_of",
+        "source_entries",
+        "package_version"
+      ]
+    },
+    {
+      "file": "crates/kin-lsp/src/analysis_env/fetch.rs",
+      "reason": "Analysis-environment boundary: it prepares, outside the repository and under Kin's cache, the dependencies and toolchain a repository's lockfile pins, so a language server can resolve calls into them. It fetches hash-verified bytes, unpacks them as data, and never runs what it fetched or any repository code. The language server is an ingestion input to enrichment, and no entity, relation or query answer derives from these files. download_verified and download_verified_any remove a download whose bytes do not match the lock's digest, digest_file hashes a downloaded file to check it, and write_hashed streams a response body into the store while hashing it, within a byte budget. The exact read in the HTTP client's constructor loads the CA bundle the user's package-tool configuration or SSL_CERT_FILE names. Pinned to the named functions and exact sites rather than exempted whole, so any other filesystem or subprocess primitive added to this file still fails the guard.",
+      "owner": "kin-lsp",
+      "expiration": "2027-11-12",
+      "allow_match": [
+        "std::fs::read(bundle)"
+      ],
+      "allow_fn": [
+        "download_verified",
+        "digest_file",
+        "download_verified_any",
+        "write_hashed"
+      ]
+    },
+    {
+      "file": "crates/kin-lsp/src/analysis_env/mod.rs",
+      "reason": "Analysis-environment boundary: it prepares, outside the repository and under Kin's cache, the dependencies and toolchain a repository's lockfile pins, so a language server can resolve calls into them. It fetches hash-verified bytes, unpacks them as data, and never runs what it fetched or any repository code. The language server is an ingestion input to enrichment, and no entity, relation or query answer derives from these files. failed_attempt_age reads the attempt record Kin keeps in its store for an environment identity, and its age, so a fetch that left artifacts out is retried after a day rather than on every server start; write_atomically writes store files through a staged name and a rename. Pinned to the named functions rather than exempted whole, so any other filesystem or subprocess primitive added elsewhere in this file still fails the guard.",
+      "owner": "kin-lsp",
+      "expiration": "2027-11-12",
+      "allow_fn": [
+        "failed_attempt_age",
+        "write_atomically"
+      ]
+    },
+    {
+      "file": "crates/kin-lsp/src/analysis_env/unpack.rs",
+      "reason": "Analysis-environment boundary: it prepares, outside the repository and under Kin's cache, the dependencies and toolchain a repository's lockfile pins, so a language server can resolve calls into them. It fetches hash-verified bytes, unpacks them as data, and never runs what it fetched or any repository code. The language server is an ingestion input to enrichment, and no entity, relation or query answer derives from these files. This module unpacks archives that already matched the lock's digest into a staging directory in the store: unzip and untar_gz read the archive and create its entries, copy_bounded writes each file within fixed byte and entry budgets, make_executable sets the executable bit on a toolchain's binaries, and make_link recreates a link that stays inside the tree. Every entry path is checked before it lands, so none lands outside the tree, and nothing unpacked is executed. Each function is IO in whole, so each is named. Pinned to the named functions rather than exempted whole, so any other filesystem or subprocess primitive added elsewhere in this file still fails the guard.",
+      "owner": "kin-lsp",
+      "expiration": "2027-11-12",
+      "allow_fn": [
+        "copy_bounded",
+        "unzip",
+        "untar_gz",
+        {
+          "fn": "make_executable",
+          "count": 2
+        },
+        {
+          "fn": "make_link",
+          "count": 2
+        }
+      ]
+    },
+    {
+      "file": "crates/kin-lsp/src/analysis_env/go/mod.rs",
+      "reason": "Analysis-environment boundary: it prepares, outside the repository and under Kin's cache, the dependencies and toolchain a repository's lockfile pins, so a language server can resolve calls into them. It fetches hash-verified bytes, unpacks them as data, and never runs what it fetched or any repository code. The language server is an ingestion input to enrichment, and no entity, relation or query answer derives from these files. The three read constructors read the Go settings file go env -w writes (GoEnv::read), the repository's go.sum files (Sums::read), and its go.mod files with their vendor/modules.txt and the containment of directory replacements (Workspace::read). sum_files keeps the go.sum and go.work.sum files that exist, and write_kin_go_work and proved_sums write and read the go.work and go.work.sum Kin keeps under its cache, outside the repository. Pinned to the named functions rather than exempted whole, so any other filesystem or subprocess primitive added elsewhere in this file still fails the guard.",
+      "owner": "kin-lsp",
+      "expiration": "2027-11-12",
+      "allow_fn": [
+        {
+          "fn": "read",
+          "count": 3
+        },
+        "sum_files",
+        "write_kin_go_work",
+        "proved_sums"
+      ]
+    },
+    {
+      "file": "crates/kin-lsp/src/analysis_env/go/modcache.rs",
+      "reason": "Analysis-environment boundary: it prepares, outside the repository and under Kin's cache, the dependencies and toolchain a repository's lockfile pins, so a language server can resolve calls into them. It fetches hash-verified bytes, unpacks them as data, and never runs what it fetched or any repository code. The language server is an ingestion input to enrichment, and no entity, relation or query answer derives from these files. These functions fill a Go module cache in Kin's store in the layout the go command reads with GOMODCACHE: hash_zip computes a module zip's go.sum hash, has_go_mod and has_module check what the cache already holds against go.sum, ensure_module downloads a zip and keeps it only when its hash matches, and unpack_module unpacks it under its module@version prefix and publishes it whole. Nothing in a module is run. Pinned to the named functions rather than exempted whole, so any other filesystem or subprocess primitive added elsewhere in this file still fails the guard.",
+      "owner": "kin-lsp",
+      "expiration": "2027-11-12",
+      "allow_fn": [
+        "hash_zip",
+        "has_go_mod",
+        "has_module",
+        "ensure_module",
+        "unpack_module"
+      ]
+    },
+    {
+      "file": "crates/kin-lsp/src/analysis_env/go/toolchain.rs",
+      "reason": "Analysis-environment boundary: it prepares, outside the repository and under Kin's cache, the dependencies and toolchain a repository's lockfile pins, so a language server can resolve calls into them. It fetches hash-verified bytes, unpacks them as data, and never runs what it fetched or any repository code. The language server is an ingestion input to enrichment, and no entity, relation or query answer derives from these files. requirement reads the go and toolchain lines of the repository's go.mod and go.work files, installation_at and installation_of read an installed Go's VERSION file and resolve a go executable's links, and ensure downloads the Go distribution go.dev lists, checks its digest, unpacks it into the store and removes the staging files. The Go toolchain is never run here. Pinned to the named functions rather than exempted whole, so any other filesystem or subprocess primitive added elsewhere in this file still fails the guard.",
+      "owner": "kin-lsp",
+      "expiration": "2027-11-12",
+      "allow_fn": [
+        "requirement",
+        "installation_at",
+        "installation_of",
+        "ensure"
+      ]
+    },
+    {
+      "file": "crates/kin-lsp/src/analysis_env/python/index.rs",
+      "reason": "Analysis-environment boundary: it prepares, outside the repository and under Kin's cache, the dependencies and toolchain a repository's lockfile pins, so a language server can resolve calls into them. It fetches hash-verified bytes, unpacks them as data, and never runs what it fetched or any repository code. The language server is an ingestion input to enrichment, and no entity, relation or query answer derives from these files. index_config reads the user's pip and uv configuration files for the package index, proxy and CA bundle to fetch from, and keeps only CA bundles that exist. Pinned to that one function rather than exempted whole, so any other filesystem or subprocess primitive added to this file still fails the guard.",
+      "owner": "kin-lsp",
+      "expiration": "2027-11-12",
+      "allow_fn": [
+        "index_config"
+      ]
+    },
+    {
+      "file": "crates/kin-lsp/src/analysis_env/python/interpreter.rs",
+      "reason": "Analysis-environment boundary: it prepares, outside the repository and under Kin's cache, the dependencies and toolchain a repository's lockfile pins, so a language server can resolve calls into them. It fetches hash-verified bytes, unpacks them as data, and never runs what it fetched or any repository code. The language server is an ingestion input to enrichment, and no entity, relation or query answer derives from these files. is_executable checks that a stored CPython build's interpreter file is executable, one version per platform, and ensure downloads a pinned CPython build, checks its digest, unpacks it into the store and replaces an older copy. The interpreter is never started here. Pinned to the named functions rather than exempted whole, so any other filesystem or subprocess primitive added elsewhere in this file still fails the guard.",
+      "owner": "kin-lsp",
+      "expiration": "2027-11-12",
+      "allow_fn": [
+        {
+          "fn": "is_executable",
+          "count": 2
+        },
+        "ensure"
+      ]
+    },
+    {
+      "file": "crates/kin-lsp/src/analysis_env/python/lockfile.rs",
+      "reason": "Analysis-environment boundary: it prepares, outside the repository and under Kin's cache, the dependencies and toolchain a repository's lockfile pins, so a language server can resolve calls into them. It fetches hash-verified bytes, unpacks them as data, and never runs what it fetched or any repository code. The language server is an ingestion input to enrichment, and no entity, relation or query answer derives from these files. find_lock reads the repository's lockfiles in the order Python tools prefer them (uv.lock, pylock.toml, poetry.lock, pdm.lock, Pipfile.lock, then requirements files), and file_names_in lists the regular files in the root or requirements/ directory to find them. Every other function in this file parses text it is handed. Pinned to the named functions rather than exempted whole, so any other filesystem or subprocess primitive added elsewhere in this file still fails the guard.",
+      "owner": "kin-lsp",
+      "expiration": "2027-11-12",
+      "allow_fn": [
+        "find_lock",
+        "file_names_in"
+      ]
+    },
+    {
+      "file": "crates/kin-lsp/src/analysis_env/python/mod.rs",
+      "reason": "Analysis-environment boundary: it prepares, outside the repository and under Kin's cache, the dependencies and toolchain a repository's lockfile pins, so a language server can resolve calls into them. It fetches hash-verified bytes, unpacks them as data, and never runs what it fetched or any repository code. The language server is an ingestion input to enrichment, and no entity, relation or query answer derives from these files. requires_python reads pyproject.toml's requires-python. The exact sites read the Python version .python-version names in pin_python, and in assess check for and read a resolution Kin cached in its store for an unlocked project, and check that a built environment's interpreter link exists. Pinned to the named functions and exact sites rather than exempted whole, so any other filesystem or subprocess primitive added to this file still fails the guard.",
+      "owner": "kin-lsp",
+      "expiration": "2027-11-12",
+      "allow_match": [
+        "std::fs::read_to_string(root.join(\".python-version\"))",
+        "path.is_file()",
+        "std::fs::read_to_string(file).ok()",
+        "dir.join(\"bin/python3\").is_file()"
+      ],
+      "allow_fn": [
+        "requires_python"
+      ]
+    },
+    {
+      "file": "crates/kin-lsp/src/analysis_env/python/plan.rs",
+      "reason": "Analysis-environment boundary: it prepares, outside the repository and under Kin's cache, the dependencies and toolchain a repository's lockfile pins, so a language server can resolve calls into them. It fetches hash-verified bytes, unpacks them as data, and never runs what it fetched or any repository code. The language server is an ingestion input to enrichment, and no entity, relation or query answer derives from these files. in_repository resolves a lock's directory source to its canonical path to decide whether it lies inside the repository, where it resolves to source, and reads nothing. Pinned to that one function rather than exempted whole, so any other filesystem or subprocess primitive added to this file still fails the guard.",
+      "owner": "kin-lsp",
+      "expiration": "2027-11-12",
+      "allow_fn": [
+        "in_repository"
+      ]
+    },
+    {
+      "file": "crates/kin-lsp/src/analysis_env/python/provision.rs",
+      "reason": "Analysis-environment boundary: it prepares, outside the repository and under Kin's cache, the dependencies and toolchain a repository's lockfile pins, so a language server can resolve calls into them. It fetches hash-verified bytes, unpacks them as data, and never runs what it fetched or any repository code. The language server is an ingestion input to enrichment, and no entity, relation or query answer derives from these files. The two exact probes in fetch_one check whether the store already holds an unpacked artifact for a locked package, so it is used without a download. Pinned to the exact sites rather than exempted whole, so any other filesystem or subprocess primitive added to this file still fails the guard.",
+      "owner": "kin-lsp",
+      "expiration": "2027-11-12",
+      "allow_match": [
+        {
+          "expr": "dir.is_dir()",
+          "count": 2
+        }
+      ]
+    },
+    {
+      "file": "crates/kin-lsp/src/analysis_env/python/store.rs",
+      "reason": "Analysis-environment boundary: it prepares, outside the repository and under Kin's cache, the dependencies and toolchain a repository's lockfile pins, so a language server can resolve calls into them. It fetches hash-verified bytes, unpacks them as data, and never runs what it fetched or any repository code. The language server is an ingestion input to enrichment, and no entity, relation or query answer derives from these files. This module is the content-addressed store itself: ensure_artifact downloads a verified wheel or sdist and unpacks it, merge_wheel_data moves a wheel's purelib and platlib contents to its root, extract_sdist and copy_importable_source copy a pure-Python sdist's importable source and refuse one that needs a build, build_env writes an environment's pyvenv.cfg and links its artifacts into site-packages, merge_into rewrites .pth files to their path lines and leaves out startup hooks so nothing runs when an interpreter starts, and publish_dir, copy_tree, link, is_importable, artifact_tags, installed_distributions and site_packages_under are their file helpers. Each named function is store IO in whole. The exact std::process::id() only names staging files uniquely; it starts no process. Pinned to the named functions and exact sites rather than exempted whole, so any other filesystem or subprocess primitive added to this file still fails the guard.",
+      "owner": "kin-lsp",
+      "expiration": "2027-11-12",
+      "allow_match": [
+        "std::process::id()"
+      ],
+      "allow_fn": [
+        "publish_dir",
+        "artifact_tags",
+        "ensure_artifact",
+        "merge_wheel_data",
+        "extract_sdist",
+        "copy_importable_source",
+        "is_importable",
+        "copy_tree",
+        {
+          "fn": "link",
+          "count": 2
+        },
+        "merge_into",
+        "build_env",
+        "installed_distributions",
+        "site_packages_under"
+      ]
+    },
+    {
+      "file": "crates/kin-lsp/src/analysis_env/python/unlocked.rs",
+      "reason": "Analysis-environment boundary: it prepares, outside the repository and under Kin's cache, the dependencies and toolchain a repository's lockfile pins, so a language server can resolve calls into them. It fetches hash-verified bytes, unpacks them as data, and never runs what it fetched or any repository code. The language server is an ingestion input to enrichment, and no entity, relation or query answer derives from these files. For a project that locks nothing, requirement_lines and declared_requirements read the requirements it declares in pyproject.toml and requirements files, and resolve_with_uv writes them to a file in the store and starts the user's uv with pip compile --no-build, its working directory and cache in the store, so versions come only from published wheel metadata and no package code runs. It keeps the resolution only when uv succeeds, within a timeout. The exact import names the Command and Stdio types that one start uses. Pinned to the named functions and exact sites rather than exempted whole, so any other filesystem or subprocess primitive added to this file still fails the guard.",
+      "owner": "kin-lsp",
+      "expiration": "2027-11-12",
+      "allow_match": [
+        "use std::process::{Command, Stdio};"
+      ],
+      "allow_fn": [
+        "requirement_lines",
+        "declared_requirements",
+        "resolve_with_uv"
+      ]
+    },
+    {
+      "file": "crates/kin-lsp/src/analysis_env/js/layout.rs",
+      "reason": "Analysis-environment boundary: it prepares, outside the repository and under Kin's cache, the dependencies and toolchain a repository's lockfile pins, so a language server can resolve calls into them. It fetches hash-verified bytes, unpacks them as data, and never runs what it fetched or any repository code. The language server is an ingestion input to enrichment, and no entity, relation or query answer derives from these files. These functions build Kin's node_modules layout for one lock under its cache, outside the repository: link_tree hard-links a stored package's files, symlink, link_relative and link_absolute create the dependency links, link_target finds a workspace package's source directory a link points to, build_into writes the layout and its completion marker, and build publishes it whole and retires the previous one. A link into the repository only reads it; nothing is written into the repository, and no lifecycle script runs. Pinned to the named functions rather than exempted whole, so any other filesystem or subprocess primitive added elsewhere in this file still fails the guard.",
+      "owner": "kin-lsp",
+      "expiration": "2027-11-12",
+      "allow_fn": [
+        {
+          "fn": "symlink",
+          "count": 2
+        },
+        "link_relative",
+        "link_absolute",
+        "link_tree",
+        "link_target",
+        "build",
+        "build_into"
+      ]
+    },
+    {
+      "file": "crates/kin-lsp/src/analysis_env/js/lockfile.rs",
+      "reason": "Analysis-environment boundary: it prepares, outside the repository and under Kin's cache, the dependencies and toolchain a repository's lockfile pins, so a language server can resolve calls into them. It fetches hash-verified bytes, unpacks them as data, and never runs what it fetched or any repository code. The language server is an ingestion input to enrichment, and no entity, relation or query answer derives from these files. find_lock checks which of the repository's JavaScript lockfiles exist and reads them, and read_lock reads one lockfile. Every other function in this file parses text it is handed. Pinned to the named functions rather than exempted whole, so any other filesystem or subprocess primitive added elsewhere in this file still fails the guard.",
+      "owner": "kin-lsp",
+      "expiration": "2027-11-12",
+      "allow_fn": [
+        "find_lock",
+        "read_lock"
+      ]
+    },
+    {
+      "file": "crates/kin-lsp/src/analysis_env/js/mod.rs",
+      "reason": "Analysis-environment boundary: it prepares, outside the repository and under Kin's cache, the dependencies and toolchain a repository's lockfile pins, so a language server can resolve calls into them. It fetches hash-verified bytes, unpacks them as data, and never runs what it fetched or any repository code. The language server is an ingestion input to enrichment, and no entity, relation or query answer derives from these files. Registries::read and read_yarnrc read the user's and repository's .npmrc, .yarnrc and .yarnrc.yml for the registry, proxy, CA bundle and credentials to fetch with; ensure_package downloads a package tarball, checks it against the lock's digests and unpacks it as data into the store; check_node_modules reads the version of each directly installed package to decide whether the repository's own node_modules matches the lock. The exact sites in assess read the root package.json of a repository that locks nothing, check for its node_modules, and check the completion marker of Kin's layout. Pinned to the named functions and exact sites rather than exempted whole, so any other filesystem or subprocess primitive added to this file still fails the guard.",
+      "owner": "kin-lsp",
+      "expiration": "2027-11-12",
+      "allow_match": [
+        "std::fs::read_to_string(root.join(\"package.json\"))",
+        "root.join(\"node_modules\").is_dir()",
+        "dir.join(\".complete\").is_file()"
+      ],
+      "allow_fn": [
+        "read",
+        "read_yarnrc",
+        "ensure_package",
+        "check_node_modules"
+      ]
+    },
+    {
+      "file": "crates/kin-lsp/src/analysis_env/rust/lockfile.rs",
+      "reason": "Analysis-environment boundary: it prepares, outside the repository and under Kin's cache, the dependencies and toolchain a repository's lockfile pins, so a language server can resolve calls into them. It fetches hash-verified bytes, unpacks them as data, and never runs what it fetched or any repository code. The language server is an ingestion input to enrichment, and no entity, relation or query answer derives from these files. read_locks reads the Cargo.lock beside each linked manifest. Every other function in this file parses text it is handed. Pinned to that one function rather than exempted whole, so any other filesystem or subprocess primitive added to this file still fails the guard.",
+      "owner": "kin-lsp",
+      "expiration": "2027-11-12",
+      "allow_fn": [
+        "read_locks"
+      ]
+    },
+    {
+      "file": "crates/kin-lsp/src/analysis_env/rust/mod.rs",
+      "reason": "Analysis-environment boundary: it prepares, outside the repository and under Kin's cache, the dependencies and toolchain a repository's lockfile pins, so a language server can resolve calls into them. It fetches hash-verified bytes, unpacks them as data, and never runs what it fetched or any repository code. The language server is an ingestion input to enrichment, and no entity, relation or query answer derives from these files. check_cargo_home checks whether the user's Cargo home already holds every locked crate unpacked with its index entry and every git checkout; read_channel_record reads the rust-src record Kin keeps in its store; declares_dependencies reads manifests for dependency tables; link and build_home write Kin's Cargo home, a config.toml replacing each locked registry with a directory source over the stored crates, and publish it whole. The exact sites read an installed toolchain's channel manifest in choose_std and check the completion marker of Kin's Cargo home in assess. Pinned to the named functions and exact sites rather than exempted whole, so any other filesystem or subprocess primitive added to this file still fails the guard.",
+      "owner": "kin-lsp",
+      "expiration": "2027-11-12",
+      "allow_match": [
+        "std::fs::read_to_string(dir.join(\"lib/rustlib/multirust-channel-manifest.toml\"))",
+        "dir.join(\".complete\").is_file()"
+      ],
+      "allow_fn": [
+        "check_cargo_home",
+        "read_channel_record",
+        "declares_dependencies",
+        {
+          "fn": "link",
+          "count": 2
+        },
+        "build_home"
+      ]
+    },
+    {
+      "file": "crates/kin-lsp/src/analysis_env/rust/registry.rs",
+      "reason": "Analysis-environment boundary: it prepares, outside the repository and under Kin's cache, the dependencies and toolchain a repository's lockfile pins, so a language server can resolve calls into them. It fetches hash-verified bytes, unpacks them as data, and never runs what it fetched or any repository code. The language server is an ingestion input to enrichment, and no entity, relation or query answer derives from these files. CargoConfig::read reads the .cargo/config.toml files Cargo reads for the repository and the Cargo home, token reads a registry's token from Cargo's credentials only to authenticate a download, and ensure_crate downloads a .crate, checks it against the lock's sha256, unpacks it as data and marks it with the checksum file a Cargo directory source reads. Pinned to the named functions rather than exempted whole, so any other filesystem or subprocess primitive added elsewhere in this file still fails the guard.",
+      "owner": "kin-lsp",
+      "expiration": "2027-11-12",
+      "allow_fn": [
+        "read",
+        "token",
+        "ensure_crate"
+      ]
+    },
+    {
+      "file": "crates/kin-lsp/src/analysis_env/rust/toolchain.rs",
+      "reason": "Analysis-environment boundary: it prepares, outside the repository and under Kin's cache, the dependencies and toolchain a repository's lockfile pins, so a language server can resolve calls into them. It fetches hash-verified bytes, unpacks them as data, and never runs what it fetched or any repository code. The language server is an ingestion input to enrichment, and no entity, relation or query answer derives from these files. pinned_channel reads rust-toolchain.toml or rust-toolchain, rustup_home, installed, default_toolchain, library_of and stored_library probe rustup's installed toolchains and the rust-src component, and ensure downloads rust-src, checks its sha256 and keeps only its library tree in the store. No toolchain is run or installed here. Pinned to the named functions rather than exempted whole, so any other filesystem or subprocess primitive added elsewhere in this file still fails the guard.",
+      "owner": "kin-lsp",
+      "expiration": "2027-11-12",
+      "allow_fn": [
+        "pinned_channel",
+        "rustup_home",
+        "installed",
+        "default_toolchain",
+        "library_of",
+        "stored_library",
+        "ensure"
+      ]
     },
     {
       "file": "crates/kin-vfs-core/src/provider.rs",
@@ -2395,6 +2806,16 @@
       ]
     },
     {
+      "file": "crates/kin-db/src/storage/enrichment_marks_format_tests.rs",
+      "reason": "This file is included only by repository.rs inside its cfg(test) tests module, and the guard reads its two fixture helpers because they carry no test attribute of their own. The two pinned accessors are typed RepositoryAuthorityState metadata reads on a test manager's authority lease: enrichment_marks_transaction reads the first workspace to build an enrichment publication's workspace mutation, and holding_enrichment_mark reads it to find a file the fixture tree holds. Neither reads host file metadata, file content or a source. Only those exact expressions are excused, and the file stays scanned.",
+      "owner": "kin-db",
+      "expiration": "2027-07-12",
+      "allow_match": [
+        "manager.read_authority().metadata()",
+        "lease.metadata()"
+      ]
+    },
+    {
       "file": "crates/kin-db/src/storage/repository/session_publication.rs",
       "reason": "Review 2026-09-20: The two exact next.metadata()/current.metadata() accesses read typed DB authority states when recording or replaying acknowledged prepared semantics. No filesystem metadata probe or repository-source search is excused; all preparation and replay code remains scanned.",
       "owner": "kin-db",
@@ -2511,6 +2932,31 @@
           "expr": "std::fs::read_to_string(&config_path)",
           "count": 2
         }
+      ]
+    },
+    {
+      "file": "crates/kin-lsp/src/external_symbols.rs",
+      "reason": "External-symbol naming boundary: when a language server answers a definition outside the repository, Kin names the external symbol from the dependency that holds the answer. It reads that dependency's package metadata (package.json, a Python distribution's RECORD and METADATA, typeshed's METADATA.toml, Cargo.toml, the toolchain channel manifest, Go's VERSION) and opens the dependency file on the server only to ask for its document symbols. These files live outside the repository, in dependency stores and toolchains the resolver already loaded. Nothing in the repository is read, no query answer reads these files, and only the package and descriptor names of the external symbol are kept. Pinned to the named functions.",
+      "owner": "kin-lsp",
+      "expiration": "2027-06-25",
+      "allow_fn": [
+        "document_symbols",
+        "npm_package_of",
+        "python_package_of",
+        "distribution_owning",
+        "cargo_package_of",
+        "sysroot_release",
+        "go_package_of"
+      ]
+    },
+    {
+      "file": "crates/kin-db/src/storage/resolution_records_format_tests.rs",
+      "reason": "Authority metadata, not filesystem metadata: RepositoryAuthorityManager::read_authority().metadata() returns the stored authority's workspace list, and the scanner's filesystem metadata pattern matches the method name. Pinned to the two exact expressions.",
+      "owner": "kin-db",
+      "expiration": "2027-06-25",
+      "allow_match": [
+        "manager.read_authority().metadata().workspaces[0].clone()",
+        "lease.metadata().workspaces[0].clone()"
       ]
     }
   ]

@@ -1613,10 +1613,11 @@ enum Command {
         /// Apply safe automatic repairs (shell hook, MCP configs, config dirs)
         #[arg(long, default_value_t = false)]
         fix: bool,
-        /// Install the missing language servers this build enriches with
+        /// Install the missing language servers this repository's languages need
         ///
-        /// Each install is a network download into a shared prefix (npm global,
-        /// or the active rustup toolchain), so it never runs unasked: an
+        /// Only for the languages the repository uses. An install can write
+        /// outside Kin's directory (npm global, or the active rustup toolchain),
+        /// and the run says so before it does, so it never runs unasked: an
         /// interactive run asks first, and a scripted one needs this flag.
         #[arg(long = "install-language-servers", default_value_t = false)]
         install_language_servers: bool,
@@ -1679,11 +1680,13 @@ enum Command {
         /// actually call Kin (for a scripted install with no repository yet)
         #[arg(long, global = true)]
         skip_mcp_check: bool,
-        /// Install the missing language servers this build enriches with
+        /// Install the missing language servers, without asking
         ///
-        /// Each install is a network download into a shared prefix (npm global,
-        /// or the active rustup toolchain), so it never runs unasked: an
-        /// interactive run asks first, and a scripted one needs this flag.
+        /// Only for the languages the repository setup runs in uses, and for
+        /// every language outside one. An install can write outside Kin's
+        /// directory (npm global, or the active rustup toolchain), and the run
+        /// says so before it does, so it never runs unasked: an interactive
+        /// run asks first, and a scripted one needs this flag.
         #[arg(long = "install-language-servers", global = true)]
         install_language_servers: bool,
         /// Record this machine's resource profile without the advanced prompt
@@ -2007,7 +2010,13 @@ enum SpecAction {
 #[derive(Subcommand)]
 enum GraphAction {
     /// Quick health check of the semantic graph
-    Status,
+    Status {
+        /// Output machine-readable JSON: the rendered lines beside the
+        /// structured reference-edge coverage, relation census, graph section
+        /// and call-site shares
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// Structural integrity validation
     Validate,
     /// Persist the current workspace base graph section for faster reopen
@@ -2017,9 +2026,10 @@ enum GraphAction {
         json: bool,
     },
     /// Show the owed derivation ledger repository authority holds: each source
-    /// body owed a parse, and the re-derivation that last paid the workspace.
-    /// Reads the local store only; starts no daemon, admits nothing, and
-    /// migrates no earlier build's records
+    /// body owed a parse, and the re-derivation that last paid the workspace,
+    /// then the files whose callers are owed enrichment. Reads the local store
+    /// only; starts no daemon, admits nothing, and migrates no earlier build's
+    /// records
     Owed {
         /// Output machine-readable JSON (`kin.graph.owed-derivations.v1`)
         #[arg(long, default_value_t = false)]
@@ -2943,9 +2953,10 @@ enum DaemonAction {
     Sweep {
         /// Return as soon as the sweep is queued, instead of waiting for it
         ///
-        /// The sweep is background work, so a daemon this command started can
-        /// reach its idle timeout and stop while the sweep is still running.
-        /// Waiting is the default for that reason.
+        /// The daemon runs the sweep either way. Its idle timeout does not
+        /// count a running sweep, so it keeps sweeping after this command
+        /// returns and publishes what it finds when the sweep ends. Waiting
+        /// reports progress and the outcome, for up to 900 seconds.
         #[arg(long, default_value_t = false)]
         no_wait: bool,
         /// Emit machine-readable JSON
@@ -4532,7 +4543,7 @@ fn run() -> Result<()> {
                     } => commands::cache::gc(dry_run, budget_gb, prune_stale_schema).await,
                 },
                 Command::Graph { action } => match action {
-                    GraphAction::Status => commands::graph::status().await,
+                    GraphAction::Status { json } => commands::graph::status(json).await,
                     GraphAction::Validate => commands::graph::validate().await,
                     GraphAction::Materialize { json } => commands::graph::materialize(json).await,
                     GraphAction::Owed { json } => commands::graph_owed::owed(json).await,

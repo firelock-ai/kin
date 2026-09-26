@@ -1886,6 +1886,9 @@ fn scrub_inherited_kin_authority(command: &mut std::process::Command) {
         command.env_remove(key);
     }
     command.env("KIN_VFS_DISABLE", "1");
+    // A test never fetches a language server's analysis environment; a test
+    // that exercises fetching sets the switch itself.
+    command.env("KIN_ANALYSIS_ENVIRONMENTS", "0");
 }
 
 #[cfg(unix)]
@@ -1905,6 +1908,7 @@ fn scrub_inherited_kin_guardian_authority(
         environment.env_remove(key);
     }
     environment.env("KIN_VFS_DISABLE", "1");
+    environment.env("KIN_ANALYSIS_ENVIRONMENTS", "0");
 }
 
 fn is_kin_authority(key: &OsStr) -> bool {

@@ -92,6 +92,36 @@ impl From<ExternalReferenceId> for GraphNodeId {
     }
 }
 
+/// Domain of [`RelationId::resolver`].
+const RESOLVER_RELATION_ID_DOMAIN_V1: &[u8] = b"kin.relation.resolver.v1\0";
+
+impl RelationId {
+    /// The identity of an edge a resolver proved, from its kind and both of
+    /// its ends, whatever kind of node each end is.
+    ///
+    /// SHA-256 over a domain-separated, length-prefixed preimage of the kind's
+    /// name and each end's typed spelling (`entity:<uuid>`,
+    /// `external_reference:<uuid>`), truncated to a UUID-v8. Stable across
+    /// toolchains and processes, unlike an edge keyed through the standard
+    /// library's default hasher, and able to name an end outside the
+    /// repository, which an entity-keyed identity cannot.
+    pub fn resolver(kind: RelationKind, src: &GraphNodeId, dst: &GraphNodeId) -> Self {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(RESOLVER_RELATION_ID_DOMAIN_V1);
+        for part in [format!("{kind:?}"), src.to_string(), dst.to_string()] {
+            hasher.update((part.len() as u64).to_le_bytes());
+            hasher.update(part.as_bytes());
+        }
+        let digest = hasher.finalize();
+        let mut bytes = [0_u8; 16];
+        bytes.copy_from_slice(&digest[..16]);
+        bytes[6] = (bytes[6] & 0x0f) | 0x80;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        Self::from_bytes(bytes)
+    }
+}
+
 /// A typed edge in the semantic graph.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Relation {
@@ -318,6 +348,34 @@ mod tests {
             let parsed: RelationKind = serde_json::from_str(&json).unwrap();
             assert_eq!(parsed, k);
         }
+    }
+
+    #[test]
+    fn resolver_relation_ids_are_pinned_and_name_every_end() {
+        let caller = GraphNodeId::Entity(EntityId(uuid::Uuid::from_u128(1)));
+        let external =
+            GraphNodeId::ExternalReference(ExternalReferenceId(uuid::Uuid::from_u128(2)));
+        let id = RelationId::resolver(RelationKind::Calls, &caller, &external);
+        assert_eq!(id.to_string(), "07ce52ca-0d43-8649-8a7e-f05a445544ad");
+        assert_eq!(id.0.get_version_num(), 8);
+        assert_eq!(
+            RelationId::resolver(RelationKind::Calls, &caller, &external),
+            id,
+            "the same edge has one identity"
+        );
+        assert_ne!(
+            RelationId::resolver(RelationKind::References, &caller, &external),
+            id
+        );
+        assert_ne!(
+            RelationId::resolver(
+                RelationKind::Calls,
+                &caller,
+                &GraphNodeId::Entity(EntityId(uuid::Uuid::from_u128(2)))
+            ),
+            id,
+            "an end's kind of node is part of the identity"
+        );
     }
 
     #[test]

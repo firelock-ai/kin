@@ -272,6 +272,10 @@ fn init_materializes_before_the_first_daemon_reopen() {
     );
     let initialized: Value =
         serde_json::from_slice(&init.stdout).expect("init stdout should be JSON");
+    // `--json --no-enrich` is the invocation the MCP `kin_init` tool makes and
+    // forwards as its report. Nothing it starts publishes after admission, so
+    // the report says its values are admission's.
+    assert_eq!(initialized["authority_as_of"], "admission", "{initialized}");
     let automatic = &initialized["graph_section_materialization"];
     assert_eq!(automatic["state"], "persisted", "{initialized}");
     assert_eq!(automatic["scope"], "workspace_base", "{initialized}");
@@ -469,6 +473,10 @@ fn init_and_status_report_the_same_admission_enrichment() {
     assert_eq!(
         reported["semantic_enrichment"], admitted["semantic_enrichment"],
         "init and status report the same generation-bound durable authority view"
+    );
+    assert_eq!(
+        reported["repository"]["generation"], admitted["authority_generation"],
+        "init reports the generation the store ended at, which is the one status reads"
     );
 }
 

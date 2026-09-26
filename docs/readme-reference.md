@@ -1,4 +1,4 @@
-# Kin: setup, architecture, and alpha details
+# Kin: setup, architecture, and beta details
 
 Start with the [README](../README.md) for an introduction and the short setup path.
 This page holds the longer installation notes, architecture, recorded walkthroughs,
@@ -196,7 +196,7 @@ machine-readable health checklist with `kin setup status --json`.
 [Works with your agent](#works-with-your-agent) has the per-client one-liners
 and the standard MCP entry.
 
-## What is real today, and what is alpha
+## What is real today, and what is beta
 
 Real today. The graph is the repository. Kin has its own commits, branches, and
 merges, with Git import and export beside them. The exact source is preserved
@@ -218,7 +218,7 @@ one in the last third below it is warned about; the forecast counts commits,
 tracked files and the bytes of history reachable from HEAD, names which of the
 three decided it, and its coefficients are floors read off measured conversions,
 a floor and not a predictor: across the repositories measured a conversion held
-between one and three times its floor. Measured on the bytes this release ships,
+between one and three times its floor. Measured on Kin 0.7.x release bytes,
 without enrichment, with commits counted from HEAD: `redis/hiredis`, 1,141
 commits over 79 files, admits in 74 seconds at a 1.4 GB peak and leaves a 256 MB
 store; `psf/requests`, 6,493 commits over 130 files, admits in about ten minutes
@@ -689,23 +689,26 @@ compiler, build system, or Git interoperability while Kin becomes authoritative.
 
 ## Platform and maturity
 
-The core runtime and the filesystem projection have different support
-boundaries:
+The core runtime ships on every platform below. The deprecated `kin-vfs`
+filesystem projection does not: release archives carry `kin`, `kin-daemon` and
+their documentation, with no VFS executable or preload shim.
 
 | Platform | Core Kin runtime | `kin-vfs` projection |
 | --- | --- | --- |
-| macOS, Apple Silicon and Intel | Native graph, vector, daemon, setup, MCP, and review surfaces ship in the release archive. | Shipped and exercised on both architectures. It uses `DYLD_INSERT_LIBRARIES`; SIP-protected or hardened programs may reject injection. |
-| Linux x86_64 and arm64 | `kin` and `kin-daemon` are static musl builds intended to run on glibc and musl distributions. | The public VFS executable and shim are GNU/glibc builds, not musl builds. They are built against a pinned glibc floor of 2.31 and link OpenSSL 3, so a projection host needs both; Debian 12 loads them, and Alpine and other musl distributions are not supported projection hosts. The release refuses to publish a Linux archive whose binaries ask for more glibc than that floor. The arm64 release proof runs on Ubuntu 24.04. |
-| Native Windows x86_64 | Early support: repositories admit, graph and lexical queries answer natively, and the install proof runs agent setup and graph-backed MCP tool calls there, but review workflows are not yet tested on Windows. WSL2 remains the recommended path for full Kin. | Not shipped. Use WSL2 with a Linux distribution that meets the glibc boundary for projection. |
+| macOS, Apple Silicon and Intel | Native graph, vector, daemon, setup, MCP, and review surfaces ship in the release archive. | Not in the release archive. The deprecated `kin-vfs` executable and preload shim are not shipped. |
+| Linux x86_64 and arm64 | `kin` and `kin-daemon` are static musl builds intended to run on glibc and musl distributions. The arm64 release proof runs on Ubuntu 24.04. | Not in the release archive. The deprecated `kin-vfs` executable and preload shim are not shipped. |
+| Native Windows x86_64 | Early support: repositories admit, graph and lexical queries answer natively, and the install proof runs agent setup and graph-backed MCP tool calls there, but review workflows are not yet tested on Windows. WSL2 remains the recommended path for full Kin. | Not shipped. |
 
 The graph is the authority in every case above. The shim, an NFS mount, a FUSE
 mount, and Windows ProjFS are four ways to see that truth as files, and Kin
 picks between them by probing what this host can run: a mount where one is
 available, because the kernel serves it and no process can have it stripped,
 with the injected shim as the compatibility fallback on macOS and Linux and
-ProjFS leading on Windows, where no shim exists. `kin vfs on` engages the chosen
-one, `kin vfs off` disengages it, and `kin doctor` carries a row saying which is
-in force and whether it is working. Where a mode is missing, Kin prints the
+ProjFS leading on Windows, where no shim exists. Every one of those modes is
+served by `kin-vfs`, which release archives no longer carry, so they work only
+with a `kin-vfs` you build from its repository and name with `KIN_VFS_BIN`.
+`kin vfs on` engages the chosen one, `kin vfs off` disengages it, and
+`kin doctor` carries a row saying which is in force and whether it is working. Where a mode is missing, Kin prints the
 exact line that installs or enables it for your platform.
 [docs/projection.md](projection.md) has the full per-platform table.
 
@@ -718,7 +721,7 @@ noticeably longer to answer.
 Bounded arm64 testing found the core graph and lexical path usable at 512 MB,
 but full embedding downloads a roughly 522 MB model and currently needs 2 GB as
 the safe operating floor; 1 GB is an unsafe edge and 512 MB can terminate during
-embedding. These are observed alpha constraints, not universal sizing promises.
+embedding. These are observed beta constraints, not universal sizing promises.
 
 A successful `kin --version` establishes only that the core binary runs. It
 does not establish VFS compatibility or a live graph-backed projection. On a

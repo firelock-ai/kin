@@ -108,16 +108,15 @@ async fn query(server: &LspServer, fixture: &Fixture, method: &str) -> Result<Ve
         _ => None,
     };
     match method {
-        PREPARE_CALL | CALLS => {
-            enrichment::enrich_entity_calls(
-                server,
-                &fixture.source,
-                &fixture.index,
-                &fixture.root,
-                Some(&provider),
-            )
-            .await
-        }
+        PREPARE_CALL | CALLS => enrichment::enrich_entity_calls(
+            server,
+            &fixture.source,
+            &fixture.index,
+            &fixture.root,
+            Some(&provider),
+        )
+        .await
+        .map(|calls| calls.relations),
         PREPARE_TYPE | SUPERTYPES => {
             enrichment::enrich_entity_overrides(
                 server,
@@ -769,7 +768,8 @@ async fn fresh_lsp_call_uses_utf16_request_and_exact_source_bytes() {
         Some(&|path| (path == "source.py").then(|| text.to_owned())),
     )
     .await
-    .unwrap();
+    .unwrap()
+    .relations;
     let requests = seen(&server).await;
     let prepare = requests
         .iter()
@@ -1169,6 +1169,8 @@ async fn fresh_lsp_validation_range_after_site_cap_is_not_hidden() {
     server.shutdown().await.unwrap();
 }
 
+/// A call the server reports with no site at all proves nothing about the
+/// caller. It is counted, and no edge is minted for it.
 #[tokio::test]
 async fn fresh_lsp_validation_empty_call_sites_are_unproven() {
     let f = Fixture::new(None);
@@ -1182,17 +1184,19 @@ async fn fresh_lsp_validation_empty_call_sites_are_unproven() {
         &f.root,
         Some(&|_| Some("Widget".into())),
     )
-    .await;
+    .await
+    .expect("an unproven call is counted, not a failed answer");
     assert!(
-        answer.is_err(),
+        answer.relations.is_empty(),
         "a Calls row without a site cannot manufacture occurrence evidence: {answer:?}"
     );
+    assert_eq!(answer.unproven_calls, 1, "{answer:?}");
     assert!(received(&server, CALLS).await);
     server.shutdown().await.unwrap();
 }
 
 #[tokio::test]
-async fn fresh_lsp_validation_call_range_outside_queried_caller_refuses() {
+async fn fresh_lsp_validation_call_range_outside_queried_caller_is_not_an_edge() {
     let f = Fixture::new(None);
     let mut responses = f.responses();
     responses[CALLS]["result"][0]["fromRanges"] = json!([
@@ -1206,13 +1210,310 @@ async fn fresh_lsp_validation_call_range_outside_queried_caller_refuses() {
         &f.root,
         Some(&|_| Some("Widget\nwork()".into())),
     )
-    .await;
+    .await
+    .expect("an unproven call is counted, not a failed answer");
     assert!(
-        answer.is_err(),
+        answer.relations.is_empty(),
         "another source line cannot be attributed to the queried caller: {answer:?}"
     );
+    assert_eq!(answer.unproven_calls, 1, "{answer:?}");
     assert!(received(&server, CALLS).await);
     server.shutdown().await.unwrap();
+}
+
+/// A caller whose call hierarchy names three calls, one of them only at a line
+/// outside the caller, and a fourth with one site inside and one outside.
+struct ThreeCalls {
+    root: PathBuf,
+    caller: EntityRef,
+    inside: [EntityRef; 2],
+    outside: EntityRef,
+    mixed: EntityRef,
+    index: EntityIndex,
+    text: String,
+}
+
+impl ThreeCalls {
+    fn new() -> Self {
+        let root = std::env::temp_dir().join(format!("kin-lsp-calls-{}", EntityId::new()));
+        std::fs::create_dir(&root).unwrap();
+        let entity = |name: &str, file: &str, start: u32, end: u32| EntityRef {
+            id: EntityId::new(),
+            name: name.into(),
+            file_path: file.into(),
+            start_line: start,
+            start_col: 0,
+            end_line: end,
+            name_line: start,
+            name_col: 4,
+            declares_name: true,
+            kind: kin_model::EntityKind::Function,
+        };
+        // Line 0 is a decorator above the caller's own lines, which run 1 to 4.
+        let text =
+            "@wrap(audit())\ndef work():\n    first()\n    second()\n    third()\n".to_owned();
+        let caller = entity("work", "source.py", 1, 4);
+        let inside = [
+            entity("first", "targets.py", 0, 1),
+            entity("second", "targets.py", 2, 3),
+        ];
+        let outside = entity("audit", "targets.py", 4, 5);
+        let mixed = entity("third", "targets.py", 6, 7);
+        let index = EntityIndex::new(
+            vec![
+                caller.clone(),
+                inside[0].clone(),
+                inside[1].clone(),
+                outside.clone(),
+                mixed.clone(),
+            ],
+            &root,
+        );
+        Self {
+            root,
+            caller,
+            inside,
+            outside,
+            mixed,
+            index,
+            text,
+        }
+    }
+
+    fn uri(&self, file: &str) -> String {
+        crate::protocol::path_to_uri(&self.root.join(file))
+    }
+
+    fn item(&self, entity: &EntityRef) -> Value {
+        let line = entity.start_line;
+        let width = entity.name.len() as u32;
+        json!({
+            "name": entity.name, "kind": 12, "uri": self.uri(&entity.file_path),
+            "range": {"start": {"line": line, "character": 0},
+                      "end": {"line": line, "character": 4 + width}},
+            "selectionRange": {"start": {"line": line, "character": 4},
+                               "end": {"line": line, "character": 4 + width}},
+        })
+    }
+
+    /// The range of `token`, on the caller's `line`, in UTF-16 units.
+    fn site(&self, line: u32, token: &str) -> Value {
+        let text = self.text.lines().nth(line as usize).unwrap();
+        let start = text.find(token).unwrap() as u32;
+        json!({"start": {"line": line, "character": start},
+               "end": {"line": line, "character": start + token.len() as u32}})
+    }
+
+    fn responses(&self) -> Value {
+        json!({
+            PREPARE_CALL: {"result": [self.item(&self.caller)]},
+            CALLS: {"result": [
+                {"to": self.item(&self.inside[0]), "fromRanges": [self.site(2, "first")]},
+                {"to": self.item(&self.outside), "fromRanges": [self.site(0, "audit")]},
+                {"to": self.item(&self.inside[1]), "fromRanges": [self.site(3, "second")]},
+                {"to": self.item(&self.mixed),
+                 "fromRanges": [self.site(0, "wrap"), self.site(4, "third")]},
+            ]},
+        })
+    }
+
+    async fn calls(&self, server: &LspServer) -> Result<enrichment::EntityCalls> {
+        let text = self.text.clone();
+        enrichment::enrich_entity_calls(
+            server,
+            &self.caller,
+            &self.index,
+            &self.root,
+            Some(&move |path| (path == "source.py").then(|| text.clone())),
+        )
+        .await
+    }
+}
+
+impl Drop for ThreeCalls {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.root).unwrap();
+    }
+}
+
+/// One call without a site inside the caller drops that call, not the caller.
+///
+/// A decorator's call sits on a line above the function it decorates, and a
+/// server can report it among the function's own outgoing calls. That one call
+/// used to refuse the whole answer, and the caller's two proven calls went
+/// with it. Now the proven calls stand, the unproven one is counted and never
+/// minted, and a call with sites on both sides keeps only the one inside.
+#[tokio::test]
+async fn an_out_of_range_call_drops_that_call_and_keeps_the_callers_others() {
+    let f = ThreeCalls::new();
+    let server = LspServer::scripted_for_tests(PEER, f.responses());
+    let answer = f
+        .calls(&server)
+        .await
+        .expect("the caller's proven calls stand");
+    let edge = |target: &EntityRef| {
+        answer
+            .relations
+            .iter()
+            .find(|r| r.dst == GraphNodeId::Entity(target.id))
+    };
+    for target in &f.inside {
+        let edge = edge(target).unwrap_or_else(|| panic!("{} survives: {answer:?}", target.name));
+        assert_eq!(edge.src, GraphNodeId::Entity(f.caller.id));
+        assert_eq!(edge.kind, RelationKind::Calls);
+    }
+    assert!(
+        edge(&f.outside).is_none(),
+        "a call with no site inside the caller is not an edge: {answer:?}"
+    );
+    assert_eq!(answer.unproven_calls, 1, "{answer:?}");
+    let mixed = edge(&f.mixed).expect("a call with one site inside keeps its edge");
+    let lines: Vec<u32> = mixed
+        .evidence
+        .iter()
+        .map(|e| e.source_span.as_ref().unwrap().start_line)
+        .collect();
+    assert_eq!(lines, [4], "only the site inside the caller is evidence");
+    assert_eq!(answer.relations.len(), 3, "{answer:?}");
+    server.shutdown().await.unwrap();
+
+    // The file pass keeps the proven calls, counts the unproven one, and
+    // still holds the file back, since the answer was not proven whole.
+    let server = LspServer::scripted_for_tests(PEER, f.responses());
+    let pass = crate::file_enrichment::enrich_file_definitions(
+        &server,
+        &f.root.join("source.py"),
+        &f.text,
+        &f.index,
+        &f.root,
+        None,
+    )
+    .await
+    .expect("only a server that can answer nothing ends the pass");
+    for target in [&f.inside[0], &f.inside[1], &f.mixed] {
+        assert!(
+            has_edge(&pass.relations, RelationKind::Calls, target.id),
+            "{}: {pass:?}",
+            target.name
+        );
+    }
+    assert!(!has_edge(
+        &pass.relations,
+        RelationKind::Calls,
+        f.outside.id
+    ));
+    // The same server reports the same unplaceable call every time, so it is
+    // refused, not owed: nothing holds the file back or names a failure.
+    assert_eq!(
+        (
+            pass.failed_queries,
+            pass.refused_queries,
+            pass.unproven_calls
+        ),
+        (0, 1, 1),
+        "{pass:?}"
+    );
+    assert_eq!(pass.first_failure, None, "{pass:?}");
+    assert_eq!(pass.unprovable.len(), 1, "{pass:?}");
+    let (entity, reason) = &pass.unprovable[0];
+    assert_eq!(*entity, f.caller.id);
+    assert!(
+        reason.contains("work") && reason.contains("1 call(s)"),
+        "{pass:?}"
+    );
+    assert!(pass.call_hierarchy_complete, "{pass:?}");
+    server.shutdown().await.unwrap();
+}
+
+/// Several prepared items, exactly one of which is the caller at the position
+/// that was asked: that one is queried.
+///
+/// The others here are an item in another file and an item in the caller's
+/// file whose selection is not the asked name. Every such answer used to be
+/// refused as ambiguous, and the caller lost all of its calls.
+#[tokio::test]
+async fn an_ambiguous_prepare_with_one_provable_item_proceeds() {
+    let f = ThreeCalls::new();
+    let mut responses = f.responses();
+    let caller = f.item(&f.caller);
+    let mut foreign = caller.clone();
+    foreign["uri"] = json!(f.uri("elsewhere.py"));
+    let mut beside = caller.clone();
+    // The same line, and so the same innermost entity, but the selection is
+    // `def`, not the name the query was asked at.
+    beside["selectionRange"] = json!({"start": {"line": 1, "character": 0},
+                                      "end": {"line": 1, "character": 3}});
+    responses[PREPARE_CALL] = json!({"result": [foreign, beside, caller]});
+    let server = LspServer::scripted_for_tests(PEER, responses);
+    let answer = f
+        .calls(&server)
+        .await
+        .expect("the one item that is the caller is chosen");
+    assert!(
+        answer
+            .relations
+            .iter()
+            .any(|r| r.dst == GraphNodeId::Entity(f.inside[0].id)),
+        "{answer:?}"
+    );
+    let requests = seen(&server).await;
+    let outgoing = requests
+        .iter()
+        .find(|r| r["method"] == CALLS)
+        .expect("the outgoing calls are asked");
+    let chosen = f.item(&f.caller);
+    assert_eq!(outgoing["params"]["item"]["uri"], chosen["uri"]);
+    assert_eq!(
+        outgoing["params"]["item"]["selectionRange"],
+        chosen["selectionRange"]
+    );
+    server.shutdown().await.unwrap();
+}
+
+/// Several prepared items with no single one provably the caller are still
+/// refused, before any outgoing query: choosing one would be a guess.
+#[tokio::test]
+async fn an_ambiguous_prepare_without_one_provable_item_is_refused() {
+    let f = ThreeCalls::new();
+    let caller = f.item(&f.caller);
+    let mut foreign = caller.clone();
+    foreign["uri"] = json!(f.uri("elsewhere.py"));
+    // The caller's line, with a selection that is not the asked name.
+    let mut unasked = caller.clone();
+    unasked["selectionRange"] = json!({"start": {"line": 1, "character": 0},
+                                       "end": {"line": 1, "character": 3}});
+    // The decorator's line, which no entity owns.
+    let mut unowned = caller.clone();
+    unowned["range"] = json!({"start": {"line": 0, "character": 0},
+                              "end": {"line": 0, "character": 5}});
+    unowned["selectionRange"] = json!({"start": {"line": 0, "character": 1},
+                                       "end": {"line": 0, "character": 5}});
+    for (case, items) in [
+        (
+            "no item holds the asked name",
+            json!([foreign.clone(), unasked]),
+        ),
+        ("two items are the caller", json!([caller.clone(), caller])),
+        (
+            "no item is on the caller's lines",
+            json!([foreign, unowned]),
+        ),
+    ] {
+        let mut responses = f.responses();
+        responses[PREPARE_CALL] = json!({ "result": items });
+        let server = LspServer::scripted_for_tests(PEER, responses);
+        let answer = f.calls(&server).await;
+        assert!(
+            matches!(&answer, Err(LspError::Protocol(reason)) if reason.contains("ambiguous")),
+            "{case}: {answer:?}"
+        );
+        assert!(received(&server, PREPARE_CALL).await, "{case}");
+        assert!(
+            !received(&server, CALLS).await,
+            "{case}: refused on the prepare answer, before the outgoing query"
+        );
+        server.shutdown().await.unwrap();
+    }
 }
 
 #[tokio::test]
@@ -1671,13 +1972,52 @@ async fn one_unprovable_call_hierarchy_is_counted_without_emptying_the_file() {
     let server = LspServer::scripted_for_tests(PEER, responses);
     let answer = f.file_pass(&server).await.unwrap();
     assert_eq!(
-        answer.failed_queries, 1,
-        "the unprovable answer is a failure the caller can see: {answer:?}"
+        (answer.failed_queries, answer.refused_queries),
+        (0, 1),
+        "the unprovable answer is a refusal the caller can see, not owed work: {answer:?}"
     );
+    assert_eq!(answer.first_failure, None, "{answer:?}");
+    assert!(answer.call_hierarchy_complete, "{answer:?}");
     assert!(!f.edge(&answer.relations, RelationKind::Calls, &f.login));
     assert!(f.edge(&answer.relations, RelationKind::References, &f.module));
     assert!(f.edge(&answer.relations, RelationKind::References, &f.login));
     server.shutdown().await.unwrap();
+}
+
+/// A definition query TypeScript's compiler asserts on is refused, settled
+/// as unprovable, and holds nothing owed: the same bytes assert the same way
+/// every time, so asking again learns nothing.
+#[tokio::test]
+async fn a_typescript_internal_assertion_settles_its_query_as_unprovable() {
+    use kin_model::EntityKind;
+    let root = Workspace::new("debug-failure");
+    let text = "function run() {\n      find(1)\n}\n";
+    let run = entity_at("run", "source.ts", (0, 2), (0, 9), EntityKind::Function);
+    let index = EntityIndex::new(vec![run.clone()], &root.0);
+    let uri = root.uri("source.ts");
+    let mut responses = json!({});
+    responses[format!("{DEFINITION}@{uri}#6")] = json!({"error": {"code": 1, "message":
+        "<main> TypeScript Server Error (5.6.3)\nDebug Failure.\nError: Debug Failure.\n    at getTextOfPropertyName (typescript.js:17277:16)"}});
+    let server = LspServer::scripted_for_tests(PEER, responses);
+    let pass = crate::file_enrichment::enrich_file_definitions(
+        &server,
+        &root.0.join("source.ts"),
+        text,
+        &index,
+        &root.0,
+        None,
+    )
+    .await
+    .unwrap();
+    server.shutdown().await.unwrap();
+    assert_eq!(
+        (pass.failed_queries, pass.refused_queries),
+        (0, 1),
+        "{pass:?}"
+    );
+    assert_eq!(pass.first_failure, None, "{pass:?}");
+    assert_eq!(pass.unprovable.len(), 1, "{pass:?}");
+    assert_eq!(pass.unprovable[0].0, run.id);
 }
 
 #[tokio::test]
@@ -1762,6 +2102,7 @@ async fn decorated_python_same_spelling_queries_use_only_the_declaration_identit
             )
             .await
             .unwrap()
+            .relations
             .is_empty());
         }
         let requests = seen(&server).await;
@@ -2124,6 +2465,10 @@ async fn a_timed_out_call_hierarchy_skips_only_that_entity() {
     assert!(asked(&requests, PREPARE_CALL, 4) && asked(&requests, PREPARE_CALL, 5));
     assert_eq!(answer.failed_queries, 1, "{answer:?}");
     assert!(
+        !answer.call_hierarchy_complete,
+        "an entity whose call hierarchy timed out is still to be asked: {answer:?}"
+    );
+    assert!(
         edges_of(&answer).contains(&(
             RelationKind::Calls,
             GraphNodeId::Entity(walk.id),
@@ -2161,6 +2506,7 @@ async fn three_timeouts_in_a_row_stop_the_pass_with_what_it_proved() {
         !asked(&requests, DEFINITION, 9),
         "nothing after the third timeout is asked"
     );
+    assert!(!answer.call_hierarchy_complete, "{answer:?}");
     assert!(
         !requests
             .iter()
@@ -2295,16 +2641,21 @@ async fn an_unlocatable_candidate_costs_its_join_and_not_the_file() {
     )
     .await
     .expect("one candidate that cannot be asked about must not fail the file");
-    assert_eq!(answer.failed_queries, 1, "{answer:?}");
+    assert_eq!(
+        (answer.failed_queries, answer.refused_queries),
+        (0, 1),
+        "{answer:?}"
+    );
     assert_eq!(
         answer.declined_queries, 0,
         "unasked is not a semantic decline"
     );
+    assert_eq!(answer.first_failure, None, "{answer:?}");
     assert!(
         answer
-            .first_failure
-            .as_deref()
-            .is_some_and(|reason| reason.contains("could not locate 1 candidate declaration")),
+            .unprovable
+            .iter()
+            .any(|(_, reason)| reason.contains("could not locate a candidate declaration")),
         "{answer:?}"
     );
     assert_eq!(
@@ -3097,4 +3448,1313 @@ mod colliding_file_paths {
             unbound.join("\n"),
         );
     }
+}
+
+/// The file pass hands back a site answer for exactly the identifiers whose
+/// definition answer was definite.
+///
+/// `helper` answers at its own declaration in another file, so it proves that
+/// entity. `dumps` answers in the standard library, outside the workspace, so
+/// it proves the call leaves the repository. `cb` answers at the caller's own
+/// parameter, which names no entity. `nothing` gets no answer, and `mixed`
+/// gets two locations that disagree. None of the last three proves anything.
+#[tokio::test]
+async fn the_file_pass_answers_a_site_only_when_its_definition_is_definite() {
+    let root = std::env::temp_dir().join(format!("kin-lsp-site-answers-{}", EntityId::new()));
+    // The scripted server answers by column alone, so every answered
+    // identifier starts at a column nothing else in the file starts at.
+    let text = [
+        "def run(cb):",
+        "      helper(1)",
+        "          dumps(2)",
+        "            cb(3)",
+        "              nothing(4)",
+        "                mixed(5)",
+        "",
+    ]
+    .join("\n");
+    let uri = crate::protocol::path_to_uri(&root.join("source.py"));
+    let lib = crate::protocol::path_to_uri(&root.join("lib.py"));
+    let entity = |name: &str, file: &str, start, end, name_col| EntityRef {
+        id: EntityId::new(),
+        name: name.into(),
+        file_path: file.into(),
+        start_line: start,
+        start_col: 0,
+        end_line: end,
+        name_line: start,
+        name_col,
+        declares_name: true,
+        kind: kin_model::EntityKind::Function,
+    };
+    let run = entity("run", "source.py", 0, 5, 4);
+    let helper = entity("helper", "lib.py", 3, 4, 4);
+    let index = EntityIndex::new(vec![run.clone(), helper.clone()], &root);
+    let at = |uri: &str, line: u32, start: u32, end: u32| {
+        json!({"uri": uri, "range": {
+            "start": {"line": line, "character": start},
+            "end": {"line": line, "character": end}}})
+    };
+    let outside = "file:///usr/lib/python3.12/json/__init__.py";
+    let mut responses = json!({});
+    responses[format!("{DEFINITION}@{uri}#6")] = json!({"result": [at(&lib, 3, 4, 10)]});
+    responses[format!("{DEFINITION}@{uri}#10")] = json!({"result": [at(outside, 182, 4, 9)]});
+    responses[format!("{DEFINITION}@{uri}#12")] = json!({"result": [at(&uri, 0, 8, 10)]});
+    responses[format!("{DEFINITION}@{uri}#16")] =
+        json!({"result": [at(&lib, 3, 4, 10), at(outside, 7, 0, 5)]});
+    let server = LspServer::scripted_for_tests(PEER, responses);
+    let answer = crate::file_enrichment::enrich_file_definitions(
+        &server,
+        &root.join("source.py"),
+        &text,
+        &index,
+        &root,
+        None,
+    )
+    .await
+    .unwrap();
+    server.shutdown().await.unwrap();
+
+    let answers: Vec<_> = answer
+        .site_answers
+        .iter()
+        .map(|site| {
+            (
+                &text[site.site.start_byte..site.site.end_byte],
+                site.site.start_line,
+                site.source,
+                placed(&site.target),
+                site.rule,
+            )
+        })
+        .collect();
+    assert_eq!(
+        answers,
+        [
+            (
+                "helper",
+                1,
+                run.id,
+                Placed::Entity(helper.id),
+                crate::call_sites::DEFINITION_RULE
+            ),
+            (
+                "dumps",
+                2,
+                run.id,
+                Placed::Outside,
+                crate::call_sites::DEFINITION_RULE
+            ),
+        ],
+        "{answer:?}"
+    );
+    // The reference edges the pass already minted are unchanged by it.
+    let edges: Vec<_> = answer
+        .relations
+        .iter()
+        .map(|relation| (relation.kind, relation.src, relation.dst))
+        .collect();
+    assert_eq!(
+        edges,
+        [(
+            RelationKind::References,
+            GraphNodeId::Entity(run.id),
+            GraphNodeId::Entity(helper.id)
+        )]
+    );
+}
+
+/// A temporary workspace root for one test, removed when it is dropped.
+struct Workspace(PathBuf);
+
+impl Workspace {
+    fn new(label: &str) -> Self {
+        let root = std::env::temp_dir().join(format!("kin-lsp-{label}-{}", EntityId::new()));
+        std::fs::create_dir_all(&root).unwrap();
+        Self(root)
+    }
+
+    fn uri(&self, file: &str) -> String {
+        crate::protocol::path_to_uri(&self.0.join(file))
+    }
+
+    fn at(&self, file: &str, line: u32, start: u32, end: u32) -> Value {
+        json!({"uri": self.uri(file), "range": {
+            "start": {"line": line, "character": start},
+            "end": {"line": line, "character": end}}})
+    }
+}
+
+impl Drop for Workspace {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn entity_at(
+    name: &str,
+    file: &str,
+    (start, end): (u32, u32),
+    (name_line, name_col): (u32, u32),
+    kind: kin_model::EntityKind,
+) -> EntityRef {
+    EntityRef {
+        id: EntityId::new(),
+        name: name.into(),
+        file_path: file.into(),
+        start_line: start,
+        start_col: 0,
+        end_line: end,
+        name_line,
+        name_col,
+        declares_name: EntityRef::kind_declares_name(kind),
+        kind,
+    }
+}
+
+/// Every site answer as (token text, line, source, target, rule).
+fn site_answers_of<'t>(
+    text: &'t str,
+    pass: &crate::file_enrichment::FileEnrichmentResult,
+) -> Vec<(&'t str, u32, EntityId, Placed, &'static str)> {
+    pass.site_answers
+        .iter()
+        .map(|answer| {
+            (
+                &text[answer.site.start_byte..answer.site.end_byte],
+                answer.site.start_line,
+                answer.source,
+                placed(&answer.target),
+                answer.rule,
+            )
+        })
+        .collect()
+}
+
+fn asked_at(requests: &[Value], method: &str, line: u32, column: u32) -> usize {
+    requests
+        .iter()
+        .filter(|request| {
+            request["method"] == method
+                && request["params"]["position"]["line"] == line
+                && request["params"]["position"]["character"] == column
+        })
+        .count()
+}
+
+/// A TypeScript overload signature is not an entity: Kin keeps one entity
+/// for an overloaded function, spanning its implementation. The server names
+/// the signature the call matched, which lies above that span, so the answer
+/// used to land in the module and prove nothing. typeorm's `@Column()` is such
+/// a function, and its property decorators were never proven. The signature
+/// now proves the implementation below it.
+#[tokio::test]
+async fn an_answer_on_an_overload_signature_proves_the_implementation() {
+    use kin_model::EntityKind;
+    let root = Workspace::new("overload");
+    let text = "function run() {\n    pick(1)\n}\n";
+    let lib = [
+        "export function pick(a: string): string",
+        "export function pick(a: number): number",
+        "// the implementation",
+        "export function pick(a: any): any {",
+        "  return a",
+        "}",
+    ]
+    .join("\n");
+    let run = entity_at("run", "source.ts", (0, 2), (0, 9), EntityKind::Function);
+    let module = entity_at("lib", "lib.ts", (0, 5), (0, 0), EntityKind::Module);
+    let pick = entity_at("pick", "lib.ts", (3, 5), (3, 16), EntityKind::Function);
+    let index = EntityIndex::new(vec![run.clone(), module, pick.clone()], &root.0);
+    let mut responses = json!({});
+    responses[format!("{DEFINITION}@{}#4", root.uri("source.ts"))] =
+        json!({"result": [root.at("lib.ts", 1, 16, 20)]});
+    let server = LspServer::scripted_for_tests(PEER, responses);
+    let provider = |path: &str| (path == "lib.ts").then(|| lib.clone());
+    let pass = crate::file_enrichment::enrich_file_definitions(
+        &server,
+        &root.0.join("source.ts"),
+        text,
+        &index,
+        &root.0,
+        Some(&provider),
+    )
+    .await
+    .unwrap();
+    server.shutdown().await.unwrap();
+    assert_eq!(
+        site_answers_of(text, &pass),
+        [(
+            "pick",
+            1,
+            run.id,
+            Placed::Entity(pick.id),
+            crate::call_sites::DEFINITION_RULE
+        )],
+        "{pass:?}"
+    );
+}
+
+/// A call whose answer proves nothing says what the answer came to: a local
+/// or a parameter of the caller is a binding, a declaration elsewhere in the
+/// repository that the graph holds no entity for is outside the graph, and an
+/// empty answer is no answer. A call site the pass asked at is never silent.
+#[tokio::test]
+async fn an_unproven_call_site_says_what_its_answer_came_to() {
+    use crate::call_sites::UnprovenAnswer;
+    use kin_model::EntityKind;
+    let root = Workspace::new("unproven");
+    // The scripted server answers by column alone, so each call sits at a
+    // column no other identifier starts at.
+    let text = "function run(cb) {\n  cb(1)\n    pick(2)\n      gone(3)\n}\n";
+    let lib = "// pick is made here without a declaration Kin reads\nexport default make()\n";
+    let run = entity_at("run", "source.ts", (0, 4), (0, 9), EntityKind::Function);
+    let module = entity_at("lib", "lib.ts", (0, 1), (0, 0), EntityKind::Module);
+    let index = EntityIndex::new(vec![run.clone(), module], &root.0);
+    let mut responses = json!({});
+    let source = root.uri("source.ts");
+    for (column, answer) in [
+        (2, json!([root.at("source.ts", 0, 13, 15)])),
+        (4, json!([root.at("lib.ts", 1, 15, 19)])),
+        (6, json!([])),
+    ] {
+        responses[format!("{DEFINITION}@{source}#{column}")] = json!({"result": answer});
+    }
+    let server = LspServer::scripted_for_tests(PEER, responses);
+    let provider = |path: &str| (path == "lib.ts").then(|| lib.to_string());
+    let pass = crate::file_enrichment::enrich_file_definitions(
+        &server,
+        &root.0.join("source.ts"),
+        text,
+        &index,
+        &root.0,
+        Some(&provider),
+    )
+    .await
+    .unwrap();
+    server.shutdown().await.unwrap();
+    let said = |name: &str| {
+        pass.unproven_sites
+            .iter()
+            .find(|site| &text[site.start_byte..site.end_byte] == name && site.source == run.id)
+            .map(|site| site.answer)
+    };
+    assert_eq!(said("cb"), Some(UnprovenAnswer::Binding), "{pass:?}");
+    assert_eq!(
+        said("pick"),
+        Some(UnprovenAnswer::OutsideTheGraph),
+        "{pass:?}"
+    );
+    assert_eq!(said("gone"), Some(UnprovenAnswer::NoAnswer), "{pass:?}");
+    assert!(pass.site_answers.is_empty(), "{pass:?}");
+    assert!(!pass.stopped_early);
+}
+
+/// A signature of some other name, or another declaration between the
+/// signature and the entity below it, maps nothing.
+#[tokio::test]
+async fn an_overload_is_mapped_only_across_signatures_of_its_own_name() {
+    use kin_model::EntityKind;
+    let root = Workspace::new("overload-refused");
+    let text = "function run() {\n    pick(1)\n}\n";
+    let lib = [
+        "export function pick(a: string): string",
+        "export function other(a: number): number",
+        "export function pick(a: any): any {",
+        "  return a",
+        "}",
+    ]
+    .join("\n");
+    let run = entity_at("run", "source.ts", (0, 2), (0, 9), EntityKind::Function);
+    let module = entity_at("lib", "lib.ts", (0, 4), (0, 0), EntityKind::Module);
+    let pick = entity_at("pick", "lib.ts", (2, 4), (2, 16), EntityKind::Function);
+    let index = EntityIndex::new(vec![run.clone(), module, pick.clone()], &root.0);
+    let mut responses = json!({});
+    responses[format!("{DEFINITION}@{}#4", root.uri("source.ts"))] =
+        json!({"result": [root.at("lib.ts", 0, 16, 20)]});
+    let server = LspServer::scripted_for_tests(PEER, responses);
+    let provider = |path: &str| (path == "lib.ts").then(|| lib.clone());
+    let pass = crate::file_enrichment::enrich_file_definitions(
+        &server,
+        &root.0.join("source.ts"),
+        text,
+        &index,
+        &root.0,
+        Some(&provider),
+    )
+    .await
+    .unwrap();
+    server.shutdown().await.unwrap();
+    assert!(pass.site_answers.is_empty(), "{pass:?}");
+}
+
+/// `const { reject } = make()` binds `reject` locally, and the server answers
+/// a call of it at that binding, which names no entity. One more definition
+/// asked there lands on the declaration the binding takes its value from.
+///
+/// When that declaration is a slot a value flows into, an interface member,
+/// a property or a field typed as a function, it is not what the call runs:
+/// whatever implementation was stored there is. drizzle-orm's
+/// `const { prepareTyping } = config; prepareTyping(chunk.encoder)` hopped to
+/// `BuildQueryConfig.prepareTyping`, a property of an interface that
+/// `PgDialect` and `GelDialect` fill. Proving the slot served a callee no
+/// call runs and would retire the guesses that may be the ones that run, so
+/// the site stays unresolved and the linker's candidates stand.
+#[tokio::test]
+async fn an_alias_hop_onto_a_value_slot_proves_nothing() {
+    use kin_model::EntityKind;
+    let root = Workspace::new("alias-slot");
+    // The scripted server answers by column alone, so every answered
+    // identifier starts at a column nothing else in the file starts at.
+    let text = "function run() {\n  const { reject, typing, field } = make()\n      reject()\n        typing()\n            field()\n}\n";
+    let lib = "interface Resolvers {\n  /** Rejects. */\n  reject(reason: string): void;\n}\nclass Config {\n  typing?: (encoder: string) => string;\n  field: Handler = defaultHandler;\n}\n";
+    let run = entity_at("run", "source.ts", (0, 5), (0, 9), EntityKind::Function);
+    let contract = entity_at(
+        "Resolvers",
+        "lib.ts",
+        (0, 3),
+        (0, 10),
+        EntityKind::Interface,
+    );
+    let member = entity_at(
+        "Resolvers.reject",
+        "lib.ts",
+        (2, 2),
+        (2, 2),
+        EntityKind::Method,
+    );
+    let config = entity_at("Config", "lib.ts", (4, 7), (4, 6), EntityKind::Class);
+    let typing = entity_at(
+        "Config.typing",
+        "lib.ts",
+        (5, 5),
+        (5, 2),
+        EntityKind::Method,
+    );
+    let field = entity_at("Config.field", "lib.ts", (6, 6), (6, 2), EntityKind::Field);
+    let index = EntityIndex::new(
+        vec![
+            run.clone(),
+            contract,
+            member.clone(),
+            config,
+            typing.clone(),
+            field.clone(),
+        ],
+        &root.0,
+    );
+    let source = root.uri("source.ts");
+    let mut responses = json!({});
+    // Each call answers at its binding; each binding answers at a slot.
+    responses[format!("{DEFINITION}@{source}#6")] =
+        json!({"result": [root.at("source.ts", 1, 10, 16)]});
+    responses[format!("{DEFINITION}@{source}#10")] =
+        json!({"result": [root.at("lib.ts", 2, 2, 8)]});
+    responses[format!("{DEFINITION}@{source}#8")] =
+        json!({"result": [root.at("source.ts", 1, 18, 24)]});
+    responses[format!("{DEFINITION}@{source}#18")] =
+        json!({"result": [root.at("lib.ts", 5, 2, 8)]});
+    responses[format!("{DEFINITION}@{source}#12")] =
+        json!({"result": [root.at("source.ts", 1, 26, 31)]});
+    responses[format!("{DEFINITION}@{source}#26")] =
+        json!({"result": [root.at("lib.ts", 6, 2, 7)]});
+    let server = LspServer::scripted_for_tests(PEER, responses);
+    let texts = |path: &str| match path {
+        "source.ts" => Some(text.to_owned()),
+        "lib.ts" => Some(lib.to_owned()),
+        _ => None,
+    };
+    let pass = crate::file_enrichment::enrich_file_definitions(
+        &server,
+        &root.0.join("source.ts"),
+        text,
+        &index,
+        &root.0,
+        Some(&texts),
+    )
+    .await
+    .unwrap();
+    server.shutdown().await.unwrap();
+    let answers = site_answers_of(text, &pass);
+    for (call, line) in [("reject", 2), ("typing", 3), ("field", 4)] {
+        assert!(
+            !answers
+                .iter()
+                .any(|answer| (answer.0, answer.1) == (call, line)),
+            "{call}: {answers:?}"
+        );
+    }
+    assert_eq!(pass.alias_hops, 0, "{pass:?}");
+}
+
+/// A hop that lands on a body that runs keeps its proof: a function-valued
+/// const, a function expression, and a method with a body.
+#[tokio::test]
+async fn an_alias_hop_onto_a_callable_body_is_proven() {
+    use kin_model::EntityKind;
+    let root = Workspace::new("alias-callable");
+    let text = "function run() {\n  const { arrow, expr, body } = make()\n      arrow()\n        expr()\n            body()\n}\n";
+    let lib = "export const arrow = async (x: number): Promise<number> => x + 1;\nexport const expr = function (x) { return x; };\nclass Service {\n  body(x: number): number {\n    return x;\n  }\n}\n";
+    let run = entity_at("run", "source.ts", (0, 5), (0, 9), EntityKind::Function);
+    let arrow = entity_at("arrow", "lib.ts", (0, 0), (0, 13), EntityKind::Constant);
+    let expr = entity_at("expr", "lib.ts", (1, 1), (1, 13), EntityKind::Constant);
+    let service = entity_at("Service", "lib.ts", (2, 6), (2, 6), EntityKind::Class);
+    let body = entity_at("Service.body", "lib.ts", (3, 5), (3, 2), EntityKind::Method);
+    let index = EntityIndex::new(
+        vec![
+            run.clone(),
+            arrow.clone(),
+            expr.clone(),
+            service,
+            body.clone(),
+        ],
+        &root.0,
+    );
+    let source = root.uri("source.ts");
+    let mut responses = json!({});
+    responses[format!("{DEFINITION}@{source}#6")] =
+        json!({"result": [root.at("source.ts", 1, 10, 15)]});
+    responses[format!("{DEFINITION}@{source}#10")] =
+        json!({"result": [root.at("lib.ts", 0, 13, 18)]});
+    responses[format!("{DEFINITION}@{source}#8")] =
+        json!({"result": [root.at("source.ts", 1, 17, 21)]});
+    responses[format!("{DEFINITION}@{source}#17")] =
+        json!({"result": [root.at("lib.ts", 1, 13, 17)]});
+    responses[format!("{DEFINITION}@{source}#12")] =
+        json!({"result": [root.at("source.ts", 1, 23, 27)]});
+    responses[format!("{DEFINITION}@{source}#23")] =
+        json!({"result": [root.at("lib.ts", 3, 2, 6)]});
+    let server = LspServer::scripted_for_tests(PEER, responses);
+    let texts = |path: &str| match path {
+        "source.ts" => Some(text.to_owned()),
+        "lib.ts" => Some(lib.to_owned()),
+        _ => None,
+    };
+    let pass = crate::file_enrichment::enrich_file_definitions(
+        &server,
+        &root.0.join("source.ts"),
+        text,
+        &index,
+        &root.0,
+        Some(&texts),
+    )
+    .await
+    .unwrap();
+    server.shutdown().await.unwrap();
+    let answers = site_answers_of(text, &pass);
+    for (name, line, target) in [
+        ("arrow", 2, arrow.id),
+        ("expr", 3, expr.id),
+        ("body", 4, body.id),
+    ] {
+        assert!(
+            answers.contains(&(
+                name,
+                line,
+                run.id,
+                Placed::Entity(target),
+                crate::call_sites::DEFINITION_ALIAS_RULE
+            )),
+            "{name}: {answers:?}"
+        );
+    }
+    assert_eq!(pass.alias_hops, 3, "{pass:?}");
+}
+
+/// A binding that answers with itself, like a plain local, proves nothing on
+/// the second ask either.
+#[tokio::test]
+async fn a_local_that_answers_with_itself_is_not_hopped_into_a_proof() {
+    use kin_model::EntityKind;
+    let root = Workspace::new("alias-self");
+    let text = "function run() {\n  const handler = make()\n      handler()\n}\n";
+    let run = entity_at("run", "source.ts", (0, 3), (0, 9), EntityKind::Function);
+    let index = EntityIndex::new(vec![run.clone()], &root.0);
+    let source = root.uri("source.ts");
+    let mut responses = json!({});
+    responses[format!("{DEFINITION}@{source}#6")] =
+        json!({"result": [root.at("source.ts", 1, 8, 15)]});
+    responses[format!("{DEFINITION}@{source}#8")] =
+        json!({"result": [root.at("source.ts", 1, 8, 15)]});
+    let server = LspServer::scripted_for_tests(PEER, responses);
+    let pass = crate::file_enrichment::enrich_file_definitions(
+        &server,
+        &root.0.join("source.ts"),
+        text,
+        &index,
+        &root.0,
+        None,
+    )
+    .await
+    .unwrap();
+    server.shutdown().await.unwrap();
+    assert!(pass.site_answers.is_empty(), "{pass:?}");
+    assert_eq!(pass.alias_hops, 0);
+}
+
+/// Call hierarchy answers a call it resolved outside the repository by
+/// naming that declaration, and the pass used to drop it at debug level. It
+/// now refutes the in-repository guesses at that call's range, under the
+/// call-hierarchy rule. A declaration in an installed copy of a module the
+/// workspace itself provides is the repository's own code under another
+/// path, so it refutes nothing.
+#[tokio::test]
+async fn call_hierarchy_outside_answers_refute_except_in_an_installed_copy() {
+    use kin_model::EntityKind;
+    let root = Workspace::new("hierarchy-outside");
+    let text = "def run():\n    dumps(x)\n    get(y)\n";
+    let run = entity_at("run", "source.py", (0, 2), (0, 4), EntityKind::Function);
+    let provided = entity_at("get", "pkg/models.py", (0, 1), (0, 4), EntityKind::Function);
+    let index = EntityIndex::new(vec![run.clone(), provided], &root.0);
+    let item = |name: &str, uri: &str, line: u32, start: u32| {
+        let end = start + name.len() as u32;
+        json!({"name": name, "kind": 12, "uri": uri,
+            "range": {"start": {"line": line, "character": start}, "end": {"line": line, "character": end}},
+            "selectionRange": {"start": {"line": line, "character": start}, "end": {"line": line, "character": end}}})
+    };
+    let range = |line: u32, start: u32, end: u32| json!({"start": {"line": line, "character": start}, "end": {"line": line, "character": end}});
+    let source = root.uri("source.py");
+    let mut responses = json!({});
+    responses[format!("{PREPARE_CALL}@{source}#4")] =
+        json!({"result": [item("run", &source, 0, 4)]});
+    responses[CALLS] = json!({"result": [
+        {"to": item("dumps", "file:///usr/lib/python3.12/json/__init__.py", 182, 4),
+         "fromRanges": [range(1, 4, 9)]},
+        {"to": item("get", "file:///venv/lib/python3.12/site-packages/pkg/models.py", 50, 4),
+         "fromRanges": [range(2, 4, 7)]},
+    ]});
+    let server = LspServer::scripted_for_tests(PEER, responses);
+    let pass = crate::file_enrichment::enrich_file_definitions(
+        &server,
+        &root.0.join("source.py"),
+        text,
+        &index,
+        &root.0,
+        None,
+    )
+    .await
+    .unwrap();
+    server.shutdown().await.unwrap();
+    assert_eq!(
+        site_answers_of(text, &pass),
+        [(
+            "dumps",
+            1,
+            run.id,
+            Placed::Outside,
+            crate::call_sites::CALL_HIERARCHY_RULE
+        )],
+        "{pass:?}"
+    );
+}
+
+/// A repository that runs its own TypeScript keeps it under its own
+/// `node_modules`, inside the workspace root. A definition there, in the
+/// standard library's declarations, still leaves the repository and refutes
+/// the in-repository guesses at its site. A workspace package pnpm links into
+/// `node_modules` is the repository's source: a definition reached through
+/// the link proves the declaration it names, and one in the package's own
+/// build output refutes nothing.
+#[cfg(unix)]
+#[tokio::test]
+async fn definitions_in_node_modules_refute_and_linked_workspace_sources_prove() {
+    use kin_model::EntityKind;
+    let root = Workspace::new("node-modules-definitions");
+    let real = std::fs::canonicalize(&root.0).unwrap();
+    let write = |relative: &str, text: &str| {
+        let path = real.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    };
+    write(
+        "node_modules/.pnpm/typescript@5.6.3/node_modules/typescript/lib/lib.es5.d.ts",
+        "interface Array<T> {}\n",
+    );
+    std::os::unix::fs::symlink(
+        ".pnpm/typescript@5.6.3/node_modules/typescript",
+        real.join("node_modules/typescript"),
+    )
+    .unwrap();
+    write(
+        "packages/pkg/src/lib.ts",
+        "// the package\nexport function helper() {}\n",
+    );
+    write(
+        "packages/pkg/dist/lib.d.ts",
+        "export declare function built(): void;\n",
+    );
+    std::os::unix::fs::symlink("../packages/pkg", real.join("node_modules/pkg")).unwrap();
+
+    // The scripted server answers by column alone, so every answered
+    // identifier starts at a column nothing else in the file starts at.
+    let text = "function run() {\n      find(1)\n        helper(2)\n          built(3)\n}\n";
+    let run = entity_at("run", "source.ts", (0, 4), (0, 9), EntityKind::Function);
+    let helper = entity_at(
+        "helper",
+        "packages/pkg/src/lib.ts",
+        (1, 1),
+        (1, 16),
+        EntityKind::Function,
+    );
+    let index = EntityIndex::new(vec![run.clone(), helper.clone()], &real);
+    let uri = crate::protocol::path_to_uri(&real.join("source.ts"));
+    let at = |relative: &str, line: u32, start: u32, end: u32| {
+        json!({"uri": crate::protocol::path_to_uri(&real.join(relative)), "range": {
+            "start": {"line": line, "character": start},
+            "end": {"line": line, "character": end}}})
+    };
+    let mut responses = json!({});
+    responses[format!("{DEFINITION}@{uri}#6")] = json!({"result": [at(
+        "node_modules/.pnpm/typescript@5.6.3/node_modules/typescript/lib/lib.es5.d.ts",
+        1300,
+        4,
+        8
+    )]});
+    responses[format!("{DEFINITION}@{uri}#8")] =
+        json!({"result": [at("node_modules/pkg/src/lib.ts", 1, 16, 22)]});
+    responses[format!("{DEFINITION}@{uri}#10")] =
+        json!({"result": [at("node_modules/pkg/dist/lib.d.ts", 0, 24, 29)]});
+    let server = LspServer::scripted_for_tests(PEER, responses);
+    let pass = crate::file_enrichment::enrich_file_definitions(
+        &server,
+        &real.join("source.ts"),
+        text,
+        &index,
+        &real,
+        None,
+    )
+    .await
+    .unwrap();
+    server.shutdown().await.unwrap();
+    assert_eq!(
+        site_answers_of(text, &pass),
+        [
+            (
+                "find",
+                1,
+                run.id,
+                Placed::Outside,
+                crate::call_sites::DEFINITION_RULE
+            ),
+            (
+                "helper",
+                2,
+                run.id,
+                Placed::Entity(helper.id),
+                crate::call_sites::DEFINITION_RULE
+            ),
+        ],
+        "{pass:?}"
+    );
+}
+
+/// Call hierarchy that resolves a call into the repository's own
+/// `node_modules` refutes the in-repository guesses at its range, as one that
+/// resolves it outside the root does.
+#[tokio::test]
+async fn call_hierarchy_answers_in_node_modules_refute() {
+    use kin_model::EntityKind;
+    let root = Workspace::new("hierarchy-node-modules");
+    let text = "function run() {\n    find(x)\n}\n";
+    let run = entity_at("run", "source.ts", (0, 2), (0, 9), EntityKind::Function);
+    let index = EntityIndex::new(vec![run.clone()], &root.0);
+    let range = |line: u32, start: u32, end: u32| json!({"start": {"line": line, "character": start}, "end": {"line": line, "character": end}});
+    let item = |name: &str, uri: &str, line: u32, start: u32| {
+        let end = start + name.len() as u32;
+        json!({"name": name, "kind": 12, "uri": uri,
+            "range": range(line, start, end), "selectionRange": range(line, start, end)})
+    };
+    let source = root.uri("source.ts");
+    let mut responses = json!({});
+    responses[format!("{PREPARE_CALL}@{source}#9")] =
+        json!({"result": [item("run", &source, 0, 9)]});
+    responses[CALLS] = json!({"result": [
+        {"to": item("find", &root.uri("node_modules/typescript/lib/lib.es2015.core.d.ts"), 40, 4),
+         "fromRanges": [range(1, 4, 8)]},
+    ]});
+    let server = LspServer::scripted_for_tests(PEER, responses);
+    let pass = crate::file_enrichment::enrich_file_definitions(
+        &server,
+        &root.0.join("source.ts"),
+        text,
+        &index,
+        &root.0,
+        None,
+    )
+    .await
+    .unwrap();
+    server.shutdown().await.unwrap();
+    assert_eq!(
+        site_answers_of(text, &pass),
+        [(
+            "find",
+            1,
+            run.id,
+            Placed::Outside,
+            crate::call_sites::CALL_HIERARCHY_RULE
+        )],
+        "{pass:?}"
+    );
+}
+
+/// A request the client stops waiting for is cancelled with the server,
+/// after the request it names, and a request that was answered is not. A
+/// server left to finish an abandoned request goes on computing: on
+/// drizzle-orm one references query Kin had given up on grew tsserver to its
+/// heap ceiling, and tsserver died of it.
+#[tokio::test]
+async fn a_request_the_client_stops_waiting_for_is_cancelled() {
+    let server = LspServer::scripted_for_tests(
+        PEER,
+        json!({REFERENCES: {"hold": true}, DEFINITION: {"result": []}}),
+    );
+    server.client.request(DEFINITION, json!({})).await.unwrap();
+    let abandoned = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        server.client.request(REFERENCES, json!({})),
+    )
+    .await;
+    assert!(abandoned.is_err(), "the peer holds the references request");
+    let sent = seen(&server).await;
+    server.shutdown().await.unwrap();
+
+    let methods: Vec<&str> = sent
+        .iter()
+        .filter_map(|message| message["method"].as_str())
+        .collect();
+    assert_eq!(
+        methods,
+        [DEFINITION, REFERENCES, "$/cancelRequest"],
+        "{sent:?}"
+    );
+    assert_eq!(sent[2]["params"]["id"], sent[1]["id"], "{sent:?}");
+}
+
+/// A document's readiness is the server answering about it: an answer, even
+/// an empty one or an error about the document, means it has taken the
+/// document in. A server that never answers runs the budget out, and the
+/// request is cancelled.
+#[tokio::test]
+async fn a_document_is_ready_when_the_server_answers_about_it() {
+    const SYMBOLS: &str = "textDocument/documentSymbol";
+    let budget = std::time::Duration::from_millis(300);
+    let server = LspServer::scripted_for_tests(PEER, json!({SYMBOLS: {"result": []}}));
+    assert!(server
+        .wait_for_document("file:///w/a.ts", budget)
+        .await
+        .is_ok());
+    server.shutdown().await.unwrap();
+    let server = LspServer::scripted_for_tests(
+        PEER,
+        json!({SYMBOLS: {"error": {"code": 1, "message": "No Project."}}}),
+    );
+    assert!(server
+        .wait_for_document("file:///w/a.ts", budget)
+        .await
+        .is_ok());
+    server.shutdown().await.unwrap();
+    let server = LspServer::scripted_for_tests(PEER, json!({SYMBOLS: {"hold": true}}));
+    assert!(matches!(
+        server.wait_for_document("file:///w/a.ts", budget).await,
+        Err(LspError::Timeout)
+    ));
+    let sent = seen(&server).await;
+    server.shutdown().await.unwrap();
+    assert!(
+        sent.iter()
+            .any(|message| message["method"] == "$/cancelRequest"),
+        "{sent:?}"
+    );
+}
+
+/// typescript-language-server outlives its tsserver: it logs the exit and
+/// then answers every request with an empty result. Kin used to read those
+/// as nothing found, and on drizzle-orm every file after tsserver ran out of
+/// heap was recorded as asked and answered with nothing. The report now ends
+/// the connection, so the pass ends on a server that cannot answer, and the
+/// server's departure names the report.
+#[tokio::test]
+async fn a_server_whose_backend_exited_ends_the_pass() {
+    use kin_model::EntityKind;
+    let root = Workspace::new("backend-exit");
+    let text = "function run() {\n      find(1)\n        helper(2)\n}\n";
+    let run = entity_at("run", "source.ts", (0, 3), (0, 9), EntityKind::Function);
+    let index = EntityIndex::new(vec![run.clone()], &root.0);
+    let uri = root.uri("source.ts");
+    let exited = json!({"method": "window/logMessage", "params": {"type": 1,
+        "message": "[lspserver] [tsclient] [tsserver] Exited. Code: null. Signal: SIGABRT"}});
+    let mut responses = json!({});
+    responses[format!("{DEFINITION}@{uri}#6")] = json!({"before": [exited], "result": null});
+    let mut server = LspServer::scripted_for_tests_watching(
+        PEER,
+        responses,
+        Default::default(),
+        crate::client::ServerWatch {
+            backend_exit_report: Some(crate::adapters::typescript::TSSERVER_EXIT_REPORT.into()),
+        },
+    );
+    let pass = crate::file_enrichment::enrich_file_definitions(
+        &server,
+        &root.0.join("source.ts"),
+        text,
+        &index,
+        &root.0,
+        None,
+    )
+    .await;
+    assert!(matches!(pass, Err(LspError::ServerDied)), "{pass:?}");
+    assert!(server.is_disconnected());
+    assert!(matches!(
+        server.client.request(DEFINITION, json!({})).await,
+        Err(LspError::ServerDied)
+    ));
+    let departure = server.departure().await;
+    assert!(
+        departure
+            .exit
+            .as_deref()
+            .is_some_and(|exit| exit.contains("[tsserver] Exited. Code: null. Signal: SIGABRT")),
+        "{departure:?}"
+    );
+    server.abandon().await;
+}
+
+/// Only an error-level report carrying the text the launch names counts:
+/// the same words logged as information, and another error, leave the
+/// server connected.
+#[tokio::test]
+async fn other_server_messages_do_not_end_the_connection() {
+    let messages = json!([
+        {"method": "window/logMessage", "params": {"type": 3,
+            "message": "[tsclient] [tsserver] Exited. Code: 0. Signal: null"}},
+        {"method": "window/logMessage", "params": {"type": 1,
+            "message": "[tsclient] TypeScript Server Error (5.6.3) Debug Failure."}},
+        {"method": "window/showMessage", "params": {"type": 2,
+            "message": "[tsserver] Exited"}},
+    ]);
+    let server = LspServer::scripted_for_tests_watching(
+        PEER,
+        json!({DEFINITION: {"before": messages, "result": []}}),
+        Default::default(),
+        crate::client::ServerWatch {
+            backend_exit_report: Some(crate::adapters::typescript::TSSERVER_EXIT_REPORT.into()),
+        },
+    );
+    assert_eq!(
+        server.client.request(DEFINITION, json!({})).await.unwrap(),
+        json!([])
+    );
+    assert!(!server.is_disconnected());
+    server.shutdown().await.unwrap();
+}
+
+/// A class's call hierarchy lists the calls its property decorators make,
+/// and those sites lie inside the property's own lines. The call belongs to
+/// the entity whose lines hold it, the same entity the parser records it
+/// for, so the proof lands on the parser's edge instead of beside it.
+#[tokio::test]
+async fn a_call_inside_a_nested_member_is_attributed_to_that_member() {
+    use kin_model::EntityKind;
+    let root = Workspace::new("attribution");
+    let text = "export class Post {\n    @PrimaryColumn() id: number\n    title: string\n}\n";
+    let post = entity_at("Post", "source.ts", (0, 3), (0, 13), EntityKind::Class);
+    let id = entity_at("Post.id", "source.ts", (1, 1), (1, 21), EntityKind::Method);
+    let decorator = entity_at(
+        "PrimaryColumn",
+        "lib.ts",
+        (0, 2),
+        (0, 16),
+        EntityKind::Function,
+    );
+    let index = EntityIndex::new(vec![post.clone(), id.clone(), decorator.clone()], &root.0);
+    let source = root.uri("source.ts");
+    let responses = json!({
+        PREPARE_CALL: {"result": [{"name": "Post", "kind": 5, "uri": source,
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 3, "character": 1}},
+            "selectionRange": {"start": {"line": 0, "character": 13}, "end": {"line": 0, "character": 17}}}]},
+        CALLS: {"result": [{"to": {"name": "PrimaryColumn", "kind": 12, "uri": root.uri("lib.ts"),
+            "range": {"start": {"line": 0, "character": 16}, "end": {"line": 0, "character": 29}},
+            "selectionRange": {"start": {"line": 0, "character": 16}, "end": {"line": 0, "character": 29}}},
+            "fromRanges": [{"start": {"line": 1, "character": 5}, "end": {"line": 1, "character": 18}}]}]},
+    });
+    let server = LspServer::scripted_for_tests(PEER, responses);
+    let owned = text.to_owned();
+    let calls = enrichment::enrich_entity_calls(
+        &server,
+        &post,
+        &index,
+        &root.0,
+        Some(&move |path| (path == "source.ts").then(|| owned.clone())),
+    )
+    .await
+    .unwrap();
+    server.shutdown().await.unwrap();
+    let edges: Vec<_> = calls
+        .relations
+        .iter()
+        .map(|relation| (relation.src, relation.dst))
+        .collect();
+    assert_eq!(
+        edges,
+        [(
+            GraphNodeId::Entity(id.id),
+            GraphNodeId::Entity(decorator.id)
+        )],
+        "{calls:?}"
+    );
+}
+
+/// A pass that has to stop early keeps what it proved, so it asks at the
+/// identifiers that open a call before the others. Three slow answers used
+/// to stop the pass before it ever reached the call below them.
+#[tokio::test]
+async fn call_sites_are_asked_before_the_other_identifiers() {
+    let run = declared_at("run", "source.py", 0, 2, 4);
+    let helper = declared_at("helper", "lib.py", 3, 4, 4);
+    let (answer, requests) = pass_with_held_requests(
+        "def run():\n  alpha beta gamma\n      helper()\n",
+        vec![run.clone(), helper.clone()],
+        &[(DEFINITION, 6, located("lib.py", 3, 4, 10))],
+        &[],
+        &[(DEFINITION, 2), (DEFINITION, 8), (DEFINITION, 13)],
+    )
+    .await;
+    let answer = answer.unwrap();
+    assert_eq!(asked_at(&requests, DEFINITION, 2, 6), 1, "{requests:?}");
+    assert_eq!(
+        answer
+            .site_answers
+            .iter()
+            .map(|site| (site.site.start_line, placed(&site.target)))
+            .collect::<Vec<_>>(),
+        [(2, Placed::Entity(helper.id))],
+        "{answer:?}"
+    );
+}
+
+/// Keywords, comments and the insides of docstrings name no declaration, so
+/// the pass does not ask about them; the call among them is still asked.
+#[tokio::test]
+async fn keywords_comments_and_docstrings_are_not_asked() {
+    let run = declared_at("run", "source.py", 0, 5, 4);
+    let text = "def run():\n    \"\"\"\n    helper words\n    \"\"\"\n    # helper again\n    return helper()\n";
+    let (answer, requests) = pass_with_held_requests(text, vec![run.clone()], &[], &[], &[]).await;
+    let answer = answer.unwrap();
+    assert_eq!(
+        asked_at(&requests, DEFINITION, 5, 11),
+        1,
+        "the call is asked"
+    );
+    assert_eq!(asked_at(&requests, DEFINITION, 0, 4), 1, "a name is asked");
+    for (line, column, what) in [
+        (0, 0, "`def`"),
+        (2, 4, "a docstring word"),
+        (2, 11, "a docstring word"),
+        (4, 6, "a comment word"),
+        (4, 13, "a comment word"),
+        (5, 4, "`return`"),
+    ] {
+        assert_eq!(
+            asked_at(&requests, DEFINITION, line, column),
+            0,
+            "{what} at {line}:{column} is not asked"
+        );
+    }
+    assert_eq!(answer.definition_queries, 2, "{answer:?}");
+    assert_eq!(answer.definition_queries_saved, 6, "{answer:?}");
+}
+
+/// A value receiver's definition is asked once. The pass asked it as a
+/// receiver, to tell a module from a value, and then asked the very same
+/// position again as an identifier.
+#[tokio::test]
+async fn a_value_receiver_is_asked_once() {
+    let run = declared_at("run", "source.py", 0, 1, 4);
+    let root = held_root();
+    let at_self = json!({"result": [{
+        "uri": crate::protocol::path_to_uri(&root.join("source.py")),
+        "range": {"start": {"line": 0, "character": 8}, "end": {"line": 0, "character": 12}},
+    }]});
+    let (answer, requests) = pass_with_held_requests(
+        "def run(self):\n    self.helper()\n",
+        vec![run.clone()],
+        &[(DEFINITION, 4, at_self)],
+        &[],
+        &[],
+    )
+    .await;
+    let answer = answer.unwrap();
+    assert_eq!(asked_at(&requests, DEFINITION, 1, 4), 1, "{requests:?}");
+    assert_eq!(answer.definition_queries_saved, 2, "`def` and the reuse");
+}
+
+/// Asking call sites first does not move a reference edge's recorded site:
+/// the edge still carries the earliest position that proved it, as it did
+/// when the pass asked in source order.
+#[tokio::test]
+async fn a_reference_keeps_its_earliest_site_whatever_the_order_asked() {
+    let run = declared_at("run", "source.py", 0, 2, 4);
+    let helper = declared_at("helper", "lib.py", 3, 4, 4);
+    let (answer, _) = pass_with_held_requests(
+        "def run():\n    x = helper\n      helper()\n",
+        vec![run.clone(), helper.clone()],
+        &[
+            (DEFINITION, 8, located("lib.py", 3, 4, 10)),
+            (DEFINITION, 6, located("lib.py", 3, 4, 10)),
+        ],
+        &[],
+        &[],
+    )
+    .await;
+    let answer = answer.unwrap();
+    let references: Vec<_> = answer
+        .relations
+        .iter()
+        .filter(|relation| relation.kind == RelationKind::References)
+        .map(|relation| {
+            let site = relation.evidence[0].source_span.as_ref().unwrap();
+            (relation.dst, site.start_line, site.start_col)
+        })
+        .collect();
+    assert_eq!(
+        references,
+        [(GraphNodeId::Entity(helper.id), 1, 8)],
+        "{answer:?}"
+    );
+}
+
+/// TypeScript answers a call with the declaration of the signature it
+/// resolved, and through a receiver typed as a union of classes that is one
+/// constituent's method, whichever the checker created first. Such a call
+/// proves no single declaration: not through a union-typed name, whose type
+/// definition names both classes, and not through a cast to a union. A
+/// receiver of one class still proves its call.
+#[tokio::test]
+async fn a_typescript_call_through_a_union_receiver_proves_nothing() {
+    use kin_model::EntityKind;
+    let root = Workspace::new("union-receiver");
+    let text =
+        "function run() {\n    d.wrap(1)\n       y = (d as A | B).wrap(2)\n        e.wrap(3)\n}\n";
+    let run = entity_at("run", "source.ts", (0, 4), (0, 9), EntityKind::Function);
+    let a = entity_at("A", "lib.ts", (0, 2), (0, 6), EntityKind::Class);
+    let a_wrap = entity_at("A.wrap", "lib.ts", (1, 1), (1, 2), EntityKind::Method);
+    let b = entity_at("B", "lib.ts", (3, 5), (3, 6), EntityKind::Class);
+    let b_wrap = entity_at("B.wrap", "lib.ts", (4, 4), (4, 2), EntityKind::Method);
+    let index = EntityIndex::new(vec![run.clone(), a, a_wrap.clone(), b, b_wrap], &root.0);
+    let source = root.uri("source.ts");
+    let mut responses = json!({});
+    for column in [6, 24, 10] {
+        responses[format!("{DEFINITION}@{source}#{column}")] =
+            json!({"result": [root.at("lib.ts", 1, 2, 6)]});
+    }
+    responses[format!("{TYPES}@{source}#4")] =
+        json!({"result": [root.at("lib.ts", 0, 6, 7), root.at("lib.ts", 3, 6, 7)]});
+    responses[format!("{TYPES}@{source}#8")] = json!({"result": [root.at("lib.ts", 0, 6, 7)]});
+    let server = LspServer::scripted_for_tests(PEER, responses);
+    let pass = crate::file_enrichment::enrich_file_definitions(
+        &server,
+        &root.0.join("source.ts"),
+        text,
+        &index,
+        &root.0,
+        None,
+    )
+    .await
+    .unwrap();
+    server.shutdown().await.unwrap();
+    assert_eq!(
+        site_answers_of(text, &pass),
+        [(
+            "wrap",
+            3,
+            run.id,
+            Placed::Entity(a_wrap.id),
+            crate::call_sites::DEFINITION_RULE
+        )],
+        "{pass:?}"
+    );
+}
+
+/// Call hierarchy names an overloaded TypeScript function by the signature
+/// the call matched, which lies above the one entity Kin keeps for it, and
+/// names a function a macro generates at the top of a module by that module's
+/// line. The first is a call of the implementation. The second names no
+/// entity, and a call of a module surface is no call: nothing is minted.
+#[tokio::test]
+async fn call_hierarchy_targets_on_a_signature_or_a_module_line_are_placed_or_refused() {
+    use kin_model::EntityKind;
+    let root = Workspace::new("hierarchy-targets");
+    let text = "function run() {\n    pick(1)\n    get(2)\n}\n";
+    let lib = [
+        "// overloads",
+        "export function pick(a: string): string",
+        "export function pick(a: number): number",
+        "export function pick(a: any): any {",
+        "  return a",
+        "}",
+    ]
+    .join("\n");
+    let run = entity_at("run", "source.ts", (0, 3), (0, 9), EntityKind::Function);
+    let lib_module = entity_at("lib", "lib.ts", (0, 5), (0, 0), EntityKind::Module);
+    let pick = entity_at("pick", "lib.ts", (3, 5), (3, 16), EntityKind::Function);
+    let routing = entity_at("routing", "routing.ts", (0, 9), (0, 0), EntityKind::Module);
+    let index = EntityIndex::new(
+        vec![run.clone(), lib_module, pick.clone(), routing],
+        &root.0,
+    );
+    let item = |name: &str, file: &str, line: u32, start: u32| {
+        let end = start + name.len() as u32;
+        json!({"name": name, "kind": 12, "uri": root.uri(file),
+            "range": {"start": {"line": line, "character": start}, "end": {"line": line, "character": end}},
+            "selectionRange": {"start": {"line": line, "character": start}, "end": {"line": line, "character": end}}})
+    };
+    let range = |line: u32, start: u32, end: u32| json!({"start": {"line": line, "character": start}, "end": {"line": line, "character": end}});
+    let responses = json!({
+        PREPARE_CALL: {"result": [item("run", "source.ts", 0, 9)]},
+        CALLS: {"result": [
+            {"to": item("pick", "lib.ts", 1, 16), "fromRanges": [range(1, 4, 8)]},
+            {"to": item("get", "routing.ts", 4, 20), "fromRanges": [range(2, 4, 7)]},
+        ]},
+    });
+    let server = LspServer::scripted_for_tests(PEER, responses);
+    let own = text.to_owned();
+    let provider = move |path: &str| match path {
+        "source.ts" => Some(own.clone()),
+        "lib.ts" => Some(lib.clone()),
+        _ => None,
+    };
+    let calls = enrichment::enrich_entity_calls(&server, &run, &index, &root.0, Some(&provider))
+        .await
+        .unwrap();
+    server.shutdown().await.unwrap();
+    let edges: Vec<_> = calls
+        .relations
+        .iter()
+        .map(|relation| (relation.src, relation.dst))
+        .collect();
+    assert_eq!(
+        edges,
+        [(GraphNodeId::Entity(run.id), GraphNodeId::Entity(pick.id))],
+        "{calls:?}"
+    );
+    assert!(calls.outside_sites.is_empty(), "{calls:?}");
+}
+
+/// Where a site answer landed, as these tests compare it: the entity it names,
+/// or outside the workspace wherever there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Placed {
+    Entity(EntityId),
+    Outside,
+}
+
+fn placed(target: &crate::call_sites::SiteTarget) -> Placed {
+    match target {
+        crate::call_sites::SiteTarget::Entity(entity) => Placed::Entity(*entity),
+        crate::call_sites::SiteTarget::Outside(_) => Placed::Outside,
+    }
+}
+
+/// An answer outside the workspace is named as an external symbol from the
+/// server's own symbols for the file it landed in and the package that holds
+/// that file, and a place the symbols do not name stays unnamed.
+#[tokio::test]
+async fn the_file_pass_names_an_outside_answer_by_its_package_and_symbols() {
+    let base = Workspace::new("external-names");
+    let root = base.0.join("repo");
+    std::fs::create_dir_all(&root).unwrap();
+    let typescript = base.0.join("deps/node_modules/typescript");
+    std::fs::create_dir_all(typescript.join("lib")).unwrap();
+    std::fs::write(
+        typescript.join("package.json"),
+        r#"{"name":"typescript","version":"5.6.3"}"#,
+    )
+    .unwrap();
+    let lib_path = typescript.join("lib/lib.es5.d.ts");
+    std::fs::write(
+        &lib_path,
+        "interface Array<T> {\n    map(): void;\n    pop(): T;\n}\n",
+    )
+    .unwrap();
+    let lib = crate::protocol::path_to_uri(&lib_path);
+
+    let text = "function run(items) {\n  items.map(f)\n    xs.pop()\n}\n";
+    let uri = crate::protocol::path_to_uri(&root.join("source.ts"));
+    let run = entity_at(
+        "run",
+        "source.ts",
+        (0, 3),
+        (0, 9),
+        kin_model::EntityKind::Function,
+    );
+    let index = EntityIndex::new(vec![run.clone()], &root);
+    let at = |line: u32, start: u32, end: u32| {
+        json!({"uri": lib, "range": {
+            "start": {"line": line, "character": start},
+            "end": {"line": line, "character": end}}})
+    };
+    let mut responses = json!({});
+    // `map` lands on the name the symbols give; `pop` on a place they do not.
+    responses[format!("{DEFINITION}@{uri}#8")] = json!({"result": [at(1, 4, 7)]});
+    responses[format!("{DEFINITION}@{uri}#7")] = json!({"result": [at(2, 4, 7)]});
+    responses[format!("textDocument/documentSymbol@{lib}#")] = json!({"result": [{
+        "name": "Array",
+        "kind": 11,
+        "range": {"start": {"line": 0, "character": 0}, "end": {"line": 3, "character": 1}},
+        "selectionRange": {"start": {"line": 0, "character": 10}, "end": {"line": 0, "character": 15}},
+        "children": [{
+            "name": "map",
+            "kind": 6,
+            "range": {"start": {"line": 1, "character": 4}, "end": {"line": 1, "character": 16}},
+            "selectionRange": {"start": {"line": 1, "character": 4}, "end": {"line": 1, "character": 7}}
+        }]
+    }]});
+    let server = LspServer::scripted_for_tests(PEER, responses);
+    let pass = crate::file_enrichment::enrich_file_definitions(
+        &server,
+        &root.join("source.ts"),
+        text,
+        &index,
+        &root,
+        None,
+    )
+    .await
+    .unwrap();
+    server.shutdown().await.unwrap();
+
+    let outside: Vec<_> = pass
+        .site_answers
+        .iter()
+        .filter_map(|answer| match &answer.target {
+            crate::call_sites::SiteTarget::Outside(location) => Some(location.clone()),
+            crate::call_sites::SiteTarget::Entity(_) => None,
+        })
+        .collect();
+    assert_eq!(
+        outside
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        2,
+        "both calls leave the repository: {pass:?}"
+    );
+    let named: Vec<_> = pass
+        .external_names
+        .values()
+        .map(|symbol| (symbol.package.encode(), symbol.encode_descriptors()))
+        .collect();
+    assert_eq!(
+        named,
+        [(
+            "npm typescript 5.6.3".to_string(),
+            "`lib.es5.d.ts`/Array#map().".to_string()
+        )],
+        "{pass:?}"
+    );
+    assert!(
+        pass.external_names
+            .keys()
+            .all(|location| !location.uri.is_empty() && location.uri.starts_with("file://")),
+        "the place is only a key for naming"
+    );
 }

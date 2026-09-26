@@ -506,6 +506,7 @@ fn build_fixture(repository: &RepositoryId) -> Fixture {
             spec_link: None,
             evidence: Vec::new(),
             risk_summary: None,
+            resolution_record_deltas: Vec::new(),
         };
         change.id = compute_semantic_change_id(&change).expect("change id computes");
         aliases.push(ExternalChangeAlias::new(

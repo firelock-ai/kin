@@ -183,10 +183,23 @@ pub fn execute_verify_command(
     }
 }
 
+/// Why `kin verify` has nothing to report for a symbol outside the
+/// repository, in the words that finish its refusal.
+const VERIFY_EXTERNAL_WHY: &str =
+    "`kin verify` has no tests linked to it here, since tests link to repository entities";
+
 fn build_entity_verify_response(
     graph: &kin_db::InMemoryGraph,
     entity: &str,
 ) -> Result<VerifyCommandResponse> {
+    // A symbol outside the repository is refused by what it is, never with
+    // the absence line the daemon waits out as a query that matched nothing.
+    // An address naming nothing held stays that absence line below.
+    if let Some(node) = crate::commands::external_symbols::lookup(graph, entity)? {
+        return Ok(VerifyCommandResponse {
+            lines: crate::commands::external_symbols::refusal_lines(&node, VERIFY_EXTERNAL_WHY),
+        });
+    }
     let filter = EntityFilter {
         name_pattern: Some(entity.to_string()),
         ..Default::default()
@@ -861,6 +874,14 @@ where
     G: GraphStore,
     <G as GraphStore>::Error: std::fmt::Display + Send + Sync + 'static,
 {
+    // A plan or a run is refused for a symbol outside the repository the way
+    // the entity report is, and not as an unresolved query, which the daemon
+    // would wait out as an absence.
+    if let Some(node) = crate::commands::external_symbols::lookup(graph, entity_query)? {
+        anyhow::bail!(
+            crate::commands::external_symbols::refusal_lines(&node, VERIFY_EXTERNAL_WHY).join("\n")
+        );
+    }
     let entities = verify_query_matches(graph, entity_query)?;
 
     match entities.as_slice() {
@@ -1372,6 +1393,7 @@ mod tests {
             risk_summary: None,
             admission_policy_delta: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         };
 
         let plan = build_change_verification_plan(graph.as_ref(), &change, 1).unwrap();
@@ -1383,5 +1405,39 @@ mod tests {
         assert_eq!(plan.tests.len(), 1);
         assert_eq!(plan.tests[0].test_id, caller_test.test_id);
         assert!(plan.removed_entities.is_empty());
+    }
+
+    /// `kin verify` reports the tests linked to repository entities, and a
+    /// symbol outside the repository has none here. It is refused by what it
+    /// is, never with the absence line the daemon waits out, and a plan or a
+    /// run is refused the same way rather than as an unresolved query. An
+    /// address the graph holds no symbol under keeps that absence line exactly.
+    #[test]
+    fn verify_refuses_an_external_symbol_and_keeps_the_absence_line_for_a_miss() {
+        let store = crate::commands::external_symbols::fixture::external_store(false);
+        for entity in [store.address(), store.node.id.to_string()] {
+            let response = build_entity_verify_response(&store.graph, &entity).unwrap();
+            assert_ne!(response.lines, [entity_not_found_line(&entity)]);
+            let text = response.lines.join("\n");
+            assert!(text.contains("Array.map"), "{text}");
+            assert!(
+                text.contains(&format!("kin refs {}", store.address())),
+                "{text}"
+            );
+            let error = match build_verification_plan(&store.graph, &entity, 1) {
+                Ok(_) => panic!("{entity} was planned"),
+                Err(error) => error,
+            };
+            assert!(
+                !error
+                    .chain()
+                    .any(|cause| cause.downcast_ref::<VerifyEntityUnresolved>().is_some()),
+                "a symbol the graph holds is not an unresolved query: {error:#}"
+            );
+            assert!(format!("{error:#}").contains("Array.map"), "{error:#}");
+        }
+        let unknown = "external_reference:00000000-0000-8000-8000-000000000000";
+        let response = build_entity_verify_response(&store.graph, unknown).unwrap();
+        assert_eq!(response.lines, [entity_not_found_line(unknown)]);
     }
 }

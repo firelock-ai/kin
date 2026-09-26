@@ -6429,6 +6429,64 @@ mod tests {
         );
     }
 
+    /// An unsettled `call_sites` block refuses the verdict and the absence
+    /// object together, so a response never carries an authoritative `trust`
+    /// under an inconclusive verdict; a settled block leaves the fully resolved
+    /// answer exactly as it was.
+    #[test]
+    fn a_call_sites_block_qualifies_the_verdict_and_the_absence_object_together() {
+        let with_block = |tally: &kin_model::CallSiteTally| {
+            let result = reference_payload(5, "present");
+            let mut payload = annotated_value(&result);
+            payload[crate::call_sites::CALL_SITES_KEY] =
+                crate::call_sites::block_json(tally, crate::call_sites::FAMILY_SCOPE);
+            ToolCallResult::text(payload.to_string())
+        };
+        let mut unsettled = kin_model::CallSiteTally::default();
+        unsettled.add(&kin_model::CallerSites::OwedEnrichment);
+        let value = annotated_value(&finalize(
+            with_block(&unsettled),
+            ready_daemon_envelope(),
+            "find_references",
+        ));
+        let verdict = &value[ENVELOPE_KEY]["verdict"];
+        assert_eq!(verdict["state"], "inconclusive", "{value}");
+        assert_eq!(verdict["inputs"]["call_sites"], "inconclusive", "{value}");
+        assert!(
+            verdict["limiting_factor"]
+                .as_str()
+                .is_some_and(|factor| factor.contains("call_sites_owed")),
+            "{verdict}"
+        );
+        assert_ne!(
+            value[crate::negative::NEGATIVE_KEY]["trust"],
+            "authoritative",
+            "the absence object reads the same gap: {value}"
+        );
+        assert!(
+            crate::verdict::disagreements(&value).is_empty(),
+            "{:?}",
+            crate::verdict::disagreements(&value)
+        );
+
+        let mut settled = kin_model::CallSiteTally::default();
+        settled.add(&kin_model::CallerSites::NoSites);
+        let value = annotated_value(&finalize(
+            with_block(&settled),
+            ready_daemon_envelope(),
+            "find_references",
+        ));
+        assert_eq!(
+            value[ENVELOPE_KEY]["verdict"]["state"], "certified",
+            "{value}"
+        );
+        assert_eq!(
+            value[ENVELOPE_KEY]["verdict"]["inputs"]["call_sites"], "certified",
+            "{value}"
+        );
+        assert!(crate::verdict::disagreements(&value).is_empty());
+    }
+
     /// FIR-2505 and FIR-2492, on the block that carried the sentence. Shipped
     /// v0.5.43 answered `status: "complete"`, `bound: "exact"`, `decided_by:
     /// ["calls"]` and "so the counts here are the whole set" on expressjs/express,

@@ -33,12 +33,17 @@ use sha2::{Digest, Sha256};
 
 use crate::error::{DaemonError, Result};
 
-/// The three delta slices that constitute a semantic commit.
+/// The delta slices that constitute a semantic commit.
 #[derive(Debug)]
 pub struct CommitDeltas {
     pub entity_deltas: Vec<EntityDelta>,
     pub relation_deltas: Vec<RelationDelta>,
     pub tree_deltas: Vec<TreeDelta>,
+    /// The external symbols the committed relations name, minted in the same
+    /// change, and the ones nothing names any longer.
+    pub external_reference_deltas: Vec<kin_model::ExternalReferenceDelta>,
+    /// The resolution records the change carries.
+    pub resolution_record_deltas: Vec<kin_model::ResolutionRecordDelta>,
     /// Exact graph-owned tree that the change must resolve to.
     pub expected_tree: ResolvedTree,
 }
@@ -162,6 +167,7 @@ pub fn compute_deltas_vs_repository_authority(
             &HashMap::new(),
             &HashMap::new(),
             &ResolvedTree::default(),
+            CommittedNodes::none(),
         );
     };
     match baseline_from_materialized_section(authority_snapshot, parent) {
@@ -180,6 +186,10 @@ pub fn compute_deltas_vs_repository_authority(
                 &committed.entities,
                 &committed.relations,
                 &committed.tree,
+                CommittedNodes {
+                    external_references: &committed.external_references,
+                    resolution_records: &committed.resolution_records,
+                },
             )
         }
     }
@@ -329,6 +339,7 @@ pub fn compute_selected_checkout_delta(
         tree_deltas: kin_core::exact_tree_correction(&current.resolved_tree, desired_tree)?,
         admission_policy_delta: None,
         external_reference_deltas: Vec::new(),
+        resolution_record_deltas: Vec::new(),
     };
 
     let preflight = InMemoryGraph::from_snapshot(current).map_err(DaemonError::Graph)?;
@@ -536,7 +547,33 @@ fn compute_deltas_from_resolved_state(
         &committed.entities,
         &committed.relations,
         &committed.tree,
+        CommittedNodes {
+            external_references: &committed.external_references,
+            resolution_records: &committed.resolution_records,
+        },
     )
+}
+
+/// The external symbols and resolution records the committed parent holds.
+#[derive(Clone, Copy)]
+struct CommittedNodes<'a> {
+    external_references: &'a HashMap<kin_model::ExternalReferenceId, kin_model::ExternalReference>,
+    resolution_records: &'a HashMap<kin_model::ResolutionRecordId, kin_model::ResolutionRecord>,
+}
+
+impl CommittedNodes<'static> {
+    fn none() -> Self {
+        static EXTERNAL: std::sync::OnceLock<
+            HashMap<kin_model::ExternalReferenceId, kin_model::ExternalReference>,
+        > = std::sync::OnceLock::new();
+        static RECORDS: std::sync::OnceLock<
+            HashMap<kin_model::ResolutionRecordId, kin_model::ResolutionRecord>,
+        > = std::sync::OnceLock::new();
+        Self {
+            external_references: EXTERNAL.get_or_init(HashMap::new),
+            resolution_records: RECORDS.get_or_init(HashMap::new),
+        }
+    }
 }
 
 fn compute_deltas_from_current_state(
@@ -544,6 +581,7 @@ fn compute_deltas_from_current_state(
     committed_entities: &HashMap<EntityId, Entity>,
     committed_relations: &HashMap<RelationId, Relation>,
     committed_tree: &ResolvedTree,
+    committed_nodes: CommittedNodes<'_>,
 ) -> Result<CommitDeltas> {
     // One coherent live snapshot keeps entity, relation, and exact-tree deltas
     // on the same graph generation.
@@ -611,6 +649,19 @@ fn compute_deltas_from_current_state(
     }
     relation_deltas.sort_by_key(RelationDelta::target_id);
 
+    // The external symbols and resolution records the live graph holds move
+    // into history with the relations that name them, so a committed edge
+    // into a symbol outside the repository keeps its endpoint.
+    let nodes = kin_core::with_resolution_node_transition(
+        kin_model::WorkspaceSemanticDelta::default(),
+        committed_nodes.external_references,
+        committed_nodes.resolution_records,
+        &current.external_references,
+        &current.resolution_records,
+    )?;
+    let external_reference_deltas = nodes.external_reference_deltas().to_vec();
+    let resolution_record_deltas = nodes.resolution_record_deltas().to_vec();
+
     let expected_tree = current.resolved_tree;
     let tree_deltas = kin_core::exact_tree_correction(committed_tree, &expected_tree)?;
 
@@ -618,6 +669,8 @@ fn compute_deltas_from_current_state(
         entity_deltas,
         relation_deltas,
         tree_deltas,
+        external_reference_deltas,
+        resolution_record_deltas,
         expected_tree,
     })
 }
@@ -1053,6 +1106,7 @@ mod tests {
                 .unwrap(),
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             })
             .unwrap();
         let target = ResolvedGraphState {
@@ -1066,6 +1120,7 @@ mod tests {
             entity_tombstones: Default::default(),
             relation_tombstones: Default::default(),
             external_references: HashMap::new(),
+            resolution_records: Default::default(),
         };
 
         let delta = compute_selected_checkout_delta(
@@ -1147,6 +1202,7 @@ mod tests {
             entity_tombstones: Default::default(),
             relation_tombstones: Default::default(),
             external_references: HashMap::new(),
+            resolution_records: Default::default(),
         };
 
         let delta =
@@ -1246,6 +1302,7 @@ mod tests {
             entity_tombstones: Default::default(),
             relation_tombstones: Default::default(),
             external_references: HashMap::new(),
+            resolution_records: Default::default(),
         };
 
         let delta =
@@ -1330,6 +1387,7 @@ mod tests {
                 entity_tombstones: Default::default(),
                 relation_tombstones: Default::default(),
                 external_references: HashMap::from([(reference.id, reference.clone())]),
+                resolution_records: Default::default(),
             };
 
             let delta =
@@ -1373,6 +1431,7 @@ mod tests {
             evidence: vec![],
             risk_summary: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         };
         change.id = kin_core::compute_semantic_change_id(&change).unwrap();
         change
@@ -1403,6 +1462,7 @@ mod tests {
             evidence: vec![],
             risk_summary: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         };
         change.id = kin_core::compute_semantic_change_id(&change).unwrap();
         let change_id = change.id;
@@ -1419,6 +1479,7 @@ mod tests {
                 tree_deltas: correction,
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             })
             .expect("publish committed tree as live test authority");
         change_id
@@ -1464,6 +1525,7 @@ mod tests {
             tree_deltas,
             admission_policy_delta: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         })?;
         Ok(())
     }
@@ -1534,6 +1596,117 @@ mod tests {
             "no entity changes since the commit; deltas must be empty"
         );
         assert!(deltas.tree_deltas.is_empty());
+    }
+
+    /// A commit carries the external symbols and resolution records its
+    /// relations name, so the change replays and the edge keeps its endpoint;
+    /// the next commit, with nothing moved, carries none.
+    #[test]
+    fn a_commit_carries_external_symbols_and_records_with_the_edges_naming_them() {
+        let graph = Arc::new(kin_db::InMemoryGraph::new());
+        let genesis = genesis_change();
+        graph.create_change(&genesis).unwrap();
+        let caller = make_entity("load", "src/lib.rs", [7; 32]);
+        graph.upsert_entity(&caller).unwrap();
+        let head = record_commit(
+            &graph,
+            vec![EntityDelta::Added {
+                new: caller.clone(),
+            }],
+            vec![],
+            vec![],
+            &genesis.id,
+            "main",
+        );
+
+        let symbol = kin_model::ExternalSymbol::new(
+            kin_model::ScipPackage::new("npm", "typescript", "5.6.3").unwrap(),
+            vec![
+                kin_model::ScipDescriptor::namespace("lib.es5.d.ts"),
+                kin_model::ScipDescriptor::type_("Array"),
+                kin_model::ScipDescriptor::method("map"),
+            ],
+        )
+        .unwrap();
+        let reference = symbol.to_reference().unwrap();
+        let context = kin_model::ResolutionRecord::ProofContext(kin_model::ProofContext {
+            language: kin_model::LanguageId::TypeScript,
+            resolver: "lsp:typescript-language-server".to_string(),
+            resolver_version: "4.3.3".to_string(),
+            configuration_hash: Hash256::from_bytes([3; 32]),
+            environment_hash: Hash256::from_bytes([4; 32]),
+            environment_summary: "typescript 5.6.3".to_string(),
+        });
+        let edge = kin_lsp::call_sites::proven_external_call(
+            caller.id,
+            reference.id,
+            vec![kin_model::RelationEvidence {
+                parser_rule: Some(kin_lsp::call_sites::DEFINITION_RULE.to_string()),
+                token: Some(context.id().context_token()),
+                ..Default::default()
+            }],
+        );
+        graph
+            .apply_transaction_delta(&kin_model::TransactionDelta {
+                relation_deltas: vec![RelationDelta::Added { new: edge.clone() }],
+                external_reference_deltas: vec![kin_model::ExternalReferenceDelta::Added {
+                    new: reference.clone(),
+                }],
+                resolution_record_deltas: vec![kin_model::ResolutionRecordDelta::Added {
+                    new: context.clone(),
+                }],
+                ..Default::default()
+            })
+            .unwrap();
+
+        let deltas = compute_deltas_vs_last_commit(&graph, &head).unwrap();
+        assert_eq!(
+            deltas.external_reference_deltas,
+            vec![kin_model::ExternalReferenceDelta::Added {
+                new: reference.clone()
+            }]
+        );
+        assert_eq!(
+            deltas.resolution_record_deltas,
+            vec![kin_model::ResolutionRecordDelta::Added {
+                new: context.clone()
+            }]
+        );
+        let mut change = kin_model::SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+            origin: kin_model::ChangeOrigin::Native,
+            parents: vec![head],
+            author: AuthorId::new("test".to_string()),
+            message: "commit the proof".to_string(),
+            timestamp: Timestamp::now(),
+            entity_deltas: deltas.entity_deltas,
+            relation_deltas: deltas.relation_deltas,
+            tree_deltas: deltas.tree_deltas,
+            admission_policy_delta: None,
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            external_reference_deltas: deltas.external_reference_deltas,
+            resolution_record_deltas: deltas.resolution_record_deltas,
+        };
+        change.id = kin_core::compute_semantic_change_id(&change).unwrap();
+        graph.create_change(&change).expect("the change admits");
+        let resolved = graph.resolve_graph_at(&change.id).unwrap();
+        assert_eq!(resolved.relations.get(&edge.id), Some(&edge));
+        assert_eq!(
+            resolved.external_references.get(&reference.id),
+            Some(&reference)
+        );
+        assert_eq!(
+            resolved.resolution_records.get(&context.id()),
+            Some(&context)
+        );
+
+        let again = compute_deltas_vs_last_commit(&graph, &change.id).unwrap();
+        assert!(again.external_reference_deltas.is_empty());
+        assert!(again.resolution_record_deltas.is_empty());
+        assert!(again.relation_deltas.is_empty());
     }
 
     /// A fingerprint change on an existing committed entity produces a Modified
@@ -2589,6 +2762,7 @@ mod tests {
             evidence: Vec::new(),
             risk_summary: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         };
         change.id = kin_model::compute_semantic_change_id(&change).unwrap();
         change

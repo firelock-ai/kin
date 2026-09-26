@@ -2752,6 +2752,11 @@ pub(crate) enum EnrichmentFlush {
 enum SnapshotSaveMode {
     Incremental,
     Full,
+    /// An incremental save a running language-server sweep takes to commit
+    /// what it has finished. It publishes exactly what an incremental save
+    /// publishes, and defers the read-index rebuild to the save that ends the
+    /// sweep (see [`DaemonState::defer_committed_generation_finalization`]).
+    SweepCheckpoint,
 }
 
 fn authority_holds_entity(
@@ -2762,6 +2767,301 @@ fn authority_holds_entity(
         kin_model::GraphNodeId::Entity(entity_id) => authority.entities.contains_key(entity_id),
         _ => false,
     }
+}
+
+/// Whether the enrichment publication can carry this language-server relation:
+/// authority holds its source entity, and its destination is an entity
+/// authority holds or a symbol outside the repository the live graph or
+/// authority holds, which the publication mints beside it.
+fn lsp_relation_is_publishable(
+    live: &kin_db::GraphSnapshot,
+    authority: &kin_db::GraphSnapshot,
+    relation: &kin_model::Relation,
+) -> bool {
+    authority_holds_entity(authority, &relation.src)
+        && (authority_holds_entity(authority, &relation.dst)
+            || matches!(
+                relation.dst,
+                kin_model::GraphNodeId::ExternalReference(id)
+                    if authority.external_references.contains_key(&id)
+                        || live.external_references.contains_key(&id)
+            ))
+}
+
+/// The external symbols and proof contexts a publication's desired relations
+/// and call-site ledgers name, minted beside them, the ledgers themselves, and
+/// the symbols and contexts authority holds that nothing names any longer,
+/// collected in the same delta.
+///
+/// Only symbols in Kin's own `kin-scip-v1` namespace and proof-context
+/// records are collected: those are the ones enrichment mints. A symbol or a
+/// context a record authority keeps still names is never collected, so the
+/// delta can never leave a record naming a node the graph does not hold.
+fn resolution_node_deltas<'a>(
+    live: &kin_db::GraphSnapshot,
+    authority: &kin_db::GraphSnapshot,
+    desired: impl IntoIterator<Item = &'a kin_model::Relation>,
+    ledgers: &[kin_model::ResolutionRecord],
+) -> (
+    Vec<kin_model::ExternalReferenceDelta>,
+    Vec<kin_model::ResolutionRecordDelta>,
+) {
+    let mut named_references = std::collections::BTreeSet::new();
+    let mut named_contexts = std::collections::BTreeSet::new();
+    for relation in desired {
+        for node in [relation.src, relation.dst] {
+            if let kin_model::GraphNodeId::ExternalReference(id) = node {
+                named_references.insert(id);
+            }
+        }
+        for evidence in &relation.evidence {
+            if let Some(id) = evidence
+                .token
+                .as_deref()
+                .and_then(kin_model::ResolutionRecordId::from_context_token)
+            {
+                named_contexts.insert(id);
+            }
+        }
+    }
+    // The records authority will hold: its own, with the ledgers this
+    // publication writes in place of the ones they replace.
+    let replaced: std::collections::BTreeSet<kin_model::ResolutionRecordId> = ledgers
+        .iter()
+        .map(kin_model::ResolutionRecord::id)
+        .collect();
+    let desired_records = authority
+        .resolution_records
+        .iter()
+        .filter(|(id, _)| !replaced.contains(id))
+        .map(|(_, record)| record)
+        .chain(ledgers.iter());
+    let mut named_by_records: std::collections::BTreeSet<kin_model::ResolutionRecordId> =
+        std::collections::BTreeSet::new();
+    for record in desired_records {
+        named_by_records.extend(record.referenced_records());
+        for node in record.named_nodes() {
+            if let kin_model::GraphNodeId::ExternalReference(id) = node {
+                named_references.insert(id);
+            }
+        }
+    }
+    let mut reference_deltas = Vec::new();
+    for id in &named_references {
+        if authority.external_references.contains_key(id) {
+            continue;
+        }
+        if let Some(reference) = live.external_references.get(id) {
+            reference_deltas.push(kin_model::ExternalReferenceDelta::Added {
+                new: reference.clone(),
+            });
+        }
+    }
+    for (id, reference) in &authority.external_references {
+        if !named_references.contains(id)
+            && reference.resolution_namespace == kin_model::EXTERNAL_SYMBOL_NAMESPACE
+        {
+            reference_deltas.push(kin_model::ExternalReferenceDelta::Removed {
+                old: reference.clone(),
+            });
+        }
+    }
+    let mut record_deltas = Vec::new();
+    for id in named_contexts.iter().chain(named_by_records.iter()) {
+        if authority.resolution_records.contains_key(id)
+            || record_deltas
+                .iter()
+                .any(|delta: &kin_model::ResolutionRecordDelta| delta.target_id() == *id)
+        {
+            continue;
+        }
+        if let Some(record) = live.resolution_records.get(id) {
+            if record.as_proof_context().is_some() {
+                record_deltas.push(kin_model::ResolutionRecordDelta::Added {
+                    new: record.clone(),
+                });
+            }
+        }
+    }
+    for ledger in ledgers {
+        match authority.resolution_records.get(&ledger.id()) {
+            None => record_deltas.push(kin_model::ResolutionRecordDelta::Added {
+                new: ledger.clone(),
+            }),
+            Some(held) if held != ledger => {
+                record_deltas.push(kin_model::ResolutionRecordDelta::Modified {
+                    old: held.clone(),
+                    new: ledger.clone(),
+                })
+            }
+            Some(_) => {}
+        }
+    }
+    // A context another record still names stays; only contexts no relation
+    // and no record names are collected.
+    for (id, record) in &authority.resolution_records {
+        if record.as_proof_context().is_some()
+            && !named_contexts.contains(id)
+            && !named_by_records.contains(id)
+        {
+            record_deltas.push(kin_model::ResolutionRecordDelta::Removed {
+                old: record.clone(),
+            });
+        }
+    }
+    (reference_deltas, record_deltas)
+}
+
+/// The call-site ledgers the live graph holds that an enrichment publication
+/// carries into authority.
+///
+/// A ledger is carried when authority does not already hold it as it is,
+/// authority holds its caller with the behavior the ledger was written over,
+/// and every entity it names is one authority holds. An external symbol it
+/// names needs no check here: every proof of one is carried by an edge the
+/// same publication adds the symbol for. A ledger that cannot be carried
+/// leaves its file unmarked, and the next sweep proves the file again.
+fn publishable_ledgers(
+    live: &kin_db::GraphSnapshot,
+    authority: &kin_db::GraphSnapshot,
+) -> Vec<kin_model::ResolutionRecord> {
+    let mut ledgers: Vec<kin_model::ResolutionRecord> = live
+        .resolution_records
+        .iter()
+        .filter(|(id, record)| {
+            let Some(ledger) = record.as_call_sites() else {
+                return false;
+            };
+            if authority.resolution_records.get(id) == Some(record) {
+                return false;
+            }
+            let caller_holds = authority
+                .entities
+                .get(&ledger.caller)
+                .is_some_and(|caller| caller.fingerprint.behavior_hash == ledger.behavior_hash);
+            caller_holds
+                && record.named_nodes().iter().all(|node| match node {
+                    kin_model::GraphNodeId::Entity(id) => authority.entities.contains_key(id),
+                    kin_model::GraphNodeId::ExternalReference(id) => {
+                        authority.external_references.contains_key(id)
+                            || live.external_references.contains_key(id)
+                    }
+                    _ => false,
+                })
+                && record.referenced_records().iter().all(|id| {
+                    authority.resolution_records.contains_key(id)
+                        || live.resolution_records.contains_key(id)
+                })
+        })
+        .map(|(_, record)| record.clone())
+        .collect();
+    ledgers.sort_by_key(kin_model::ResolutionRecord::id);
+    ledgers
+}
+
+/// What an enrichment publication does to authority's copy of one settled
+/// call edge: `None` leaves it alone, `Some(None)` retires it, and
+/// `Some(Some(narrowed))` replaces it with the sites the live graph kept.
+///
+/// Three kinds of edge are settled: a linker `Calls` guess a language server
+/// contradicted at its call site, a language-server `Calls` proof a file's
+/// sweep retracted because the file was proven again and no longer proves the
+/// edge at those sites, and a language-server `References` edge the file's
+/// definitions pass no longer produces. Only an id the live graph
+/// recorded as settled reaches here, so an edge the live graph merely lacks
+/// for any other reason stays. The delta the publication commits and the
+/// marks it commits beside it both read this, so a mark digests exactly the
+/// calls its file is left with.
+fn settled_guess_successor<'a>(
+    relation_id: &kin_model::RelationId,
+    live: &'a kin_db::GraphSnapshot,
+    authority: &kin_db::GraphSnapshot,
+) -> Option<Option<&'a kin_model::Relation>> {
+    let held = authority.relations.get(relation_id)?;
+    let settles = held.kind == kin_model::RelationKind::Calls
+        || (held.kind == kin_model::RelationKind::References
+            && held.origin == kin_model::RelationOrigin::Lsp);
+    if !settles {
+        return None;
+    }
+    match live.relations.get(relation_id) {
+        None => Some(None),
+        Some(narrowed) if narrowed.kind == held.kind && narrowed.src == held.src => {
+            Some(Some(narrowed))
+        }
+        Some(_) => None,
+    }
+}
+
+/// Whether `tree` holds `body` at `path`.
+fn tree_holds_body(tree: &ResolvedTree, path: &str, body: &Hash256) -> bool {
+    let Ok(path) = RepoPath::from_utf8(path.to_string()) else {
+        return false;
+    };
+    matches!(
+        tree.artifact_at_path(&path).map(|artifact| &artifact.entry),
+        Some(TreeEntry::Blob { hash, .. }) if hash == body
+    )
+}
+
+/// The files a sweep may skip, from the enrichment marks the workspace
+/// authority carries.
+///
+/// Storage keeps a mark only while it holds, and this asks again against the
+/// exact workspace graph this daemon opened, so a skip needs nothing but
+/// authority: this enrichment version wrote the mark, the tree still holds the
+/// body it was taken over, and the relations the workspace holds for the path
+/// still digest to what it recorded.
+pub(crate) fn resumable_enrichment_files<'a>(
+    marks: &[kin_model::EnrichmentMark],
+    tree: &ResolvedTree,
+    entities: &std::collections::HashMap<kin_model::EntityId, kin_model::Entity>,
+    relations: impl IntoIterator<Item = &'a kin_model::Relation>,
+    records: impl IntoIterator<Item = &'a kin_model::ResolutionRecord>,
+    python_scope_current: bool,
+) -> std::collections::BTreeMap<String, Hash256> {
+    let current: Vec<&kin_model::EnrichmentMark> = marks
+        .iter()
+        .filter(|mark| crate::daemon::enrichment_version_still_covers(mark.version, &mark.path))
+        // A Python file's completion waits for the workspace scope upgrade,
+        // as the completion marker's does.
+        .filter(|mark| python_scope_current || !kin_core::lsp_scope::is_python_path(&mark.path))
+        .filter(|mark| tree_holds_body(tree, &mark.path, &mark.body))
+        .collect();
+    if current.is_empty() {
+        return std::collections::BTreeMap::new();
+    }
+    let entity_file = |id: &kin_model::EntityId| entity_file_in(entities, id);
+    let by_path = kin_model::enrichment_relations_by_owner_file(relations, entity_file);
+    let ledgers_by_path = kin_model::enrichment_ledgers_by_file(records, entity_file);
+    current
+        .into_iter()
+        .filter(|mark| {
+            kin_model::enrichment_relations_digest(
+                &mark.path,
+                by_path.get(&mark.path).into_iter().flatten().copied(),
+                entity_file,
+                ledgers_by_path
+                    .get(&mark.path)
+                    .into_iter()
+                    .flatten()
+                    .copied(),
+            ) == mark.relations
+        })
+        .map(|mark| (mark.path.clone(), mark.body))
+        .collect()
+}
+
+/// The file `entities` declares `id` in, the way a mark's digest assigns a
+/// references query to its destination's file.
+fn entity_file_in<'e>(
+    entities: &'e std::collections::HashMap<kin_model::EntityId, kin_model::Entity>,
+    id: &kin_model::EntityId,
+) -> Option<&'e str> {
+    entities
+        .get(id)
+        .and_then(|entity| entity.file_origin.as_ref())
+        .map(|file| file.0.as_str())
 }
 
 fn exact_source_storage_error(message: impl Into<String>) -> DaemonError {
@@ -4020,6 +4320,25 @@ pub struct DaemonState {
     /// any of that: it records what the sweep DID, which is the only thing a
     /// skip is entitled to act on.
     pub lsp_enriched_files: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Files repository authority records as finished by the language-server
+    /// enrichment, read from the workspace's enrichment marks at open: the
+    /// workspace still holds the bytes each was asked about, and the relations
+    /// its mark recorded. A sweep skips them.
+    pub(crate) lsp_resumed_files:
+        std::sync::Mutex<std::collections::BTreeMap<String, kin_model::Hash256>>,
+    /// Files the running sweep finished whose marks no publication has
+    /// committed yet, each with the body it was asked about. The enrichment
+    /// publication commits them with the relations they describe.
+    pub(crate) lsp_pending_marks:
+        std::sync::Mutex<std::collections::BTreeMap<String, kin_model::Hash256>>,
+    /// How many enrichment marks this process has committed to authority.
+    pub(crate) lsp_marks_committed: AtomicU64,
+    /// Per file, the questions the latest sweep of it asked that the language
+    /// server answered in a way this build cannot prove. Settled rather than
+    /// owed: the file is finished and marked, and these are named on
+    /// `/lsp/sweep/status` instead of being asked again.
+    pub(crate) lsp_unprovable:
+        std::sync::Mutex<std::collections::BTreeMap<String, Vec<crate::daemon::UnprovableQuery>>>,
     /// Files a sweep owes: their language-server queries failed, so they carry
     /// no completion marker, and each waits out a backoff before it is asked
     /// again. Loaded from and persisted to the owed-enrichment record, and
@@ -4033,6 +4352,27 @@ pub struct DaemonState {
     /// live and reach authority at the next publication, and a crash before it
     /// loses them, which is what status says about exactly these files.
     pub(crate) lsp_evidence_unrecorded: std::sync::Mutex<std::collections::BTreeSet<String>>,
+    /// Call edges this daemon retired or narrowed in its live graph and that
+    /// local repository authority has not been told about yet: name-only
+    /// guesses a language server contradicted at their call site, and
+    /// language-server proofs a file's sweep retracted because the file was
+    /// proven again and its ledgers no longer hold them.
+    ///
+    /// The next enrichment publication carries the live graph's version of
+    /// each one (its absence, or its narrowed sites) in the same commit that
+    /// publishes the proving relations, and forgets the ids it carried. Held
+    /// only in memory: a daemon that dies first published no marker for the
+    /// files that proved them, so the next sweep proves them again.
+    pub(crate) lsp_settled_guesses:
+        std::sync::Mutex<std::collections::BTreeSet<kin_model::RelationId>>,
+    /// The proof context each language's server answered under, as this
+    /// daemon last started one. A ledger proven under any other context for
+    /// its language is stale, and a sweep proves its file again rather than
+    /// skipping it. Empty until a server starts: a daemon that has not run
+    /// one does not know, and judges no ledger stale.
+    pub(crate) lsp_current_contexts: std::sync::Mutex<
+        std::collections::HashMap<kin_model::LanguageId, kin_model::ResolutionRecordId>,
+    >,
 
     /// What an earlier build's owed-work records still owe, held from this
     /// daemon's startup judgment until one of its authority transactions
@@ -6244,6 +6584,14 @@ impl DaemonState {
             changes_in_store = graph_section.changes_in_store,
             "resolved the workspace base graph"
         );
+        let resumable_files = resumable_enrichment_files(
+            lease.workspace_enrichment_marks(&workspace_id),
+            &workspace_snapshot.resolved_tree,
+            &workspace_snapshot.entities,
+            workspace_snapshot.relations.values(),
+            workspace_snapshot.resolution_records.values(),
+            kin_core::lsp_scope::upgrade_recorded(&layout),
+        );
         let text_index_path = layout.text_index_dir();
         let locate_only = Self::locate_only_snapshot_mode();
         let generation = lease.roots().generation;
@@ -6499,9 +6847,15 @@ impl DaemonState {
             lsp_sweep_pending: AtomicBool::new(false),
             lsp_enriched_marker_epoch: AtomicU64::new(0),
             lsp_enriched_files: std::sync::Mutex::new(std::collections::HashSet::new()),
+            lsp_resumed_files: std::sync::Mutex::new(resumable_files),
+            lsp_pending_marks: std::sync::Mutex::new(Default::default()),
+            lsp_marks_committed: AtomicU64::new(0),
+            lsp_unprovable: std::sync::Mutex::new(Default::default()),
             lsp_owed_files: std::sync::Mutex::new(Default::default()),
             lsp_retry_owed_now: AtomicBool::new(false),
             lsp_evidence_unrecorded: std::sync::Mutex::new(Default::default()),
+            lsp_settled_guesses: std::sync::Mutex::new(Default::default()),
+            lsp_current_contexts: std::sync::Mutex::new(Default::default()),
             legacy_owed_derivations: std::sync::Mutex::new(None),
             cached_repo_id,
             cached_workspace_id: Some(workspace_id),
@@ -6736,6 +7090,9 @@ impl DaemonState {
         };
 
         crate::accepted_enrichment::replay(&layout, graph.as_ref());
+        // Enrichment marks live in local repository authority, which a
+        // storage-backend daemon does not hold.
+        let resumable_files = std::collections::BTreeMap::new();
 
         let blobs = BlobStore::new(layout.ingest_cas_dir()).map_err(DaemonError::from)?;
         let backend: Arc<dyn StorageBackend> = Arc::from(backend);
@@ -6932,9 +7289,15 @@ impl DaemonState {
             lsp_sweep_pending: AtomicBool::new(false),
             lsp_enriched_marker_epoch: AtomicU64::new(0),
             lsp_enriched_files: std::sync::Mutex::new(std::collections::HashSet::new()),
+            lsp_resumed_files: std::sync::Mutex::new(resumable_files),
+            lsp_pending_marks: std::sync::Mutex::new(Default::default()),
+            lsp_marks_committed: AtomicU64::new(0),
+            lsp_unprovable: std::sync::Mutex::new(Default::default()),
             lsp_owed_files: std::sync::Mutex::new(Default::default()),
             lsp_retry_owed_now: AtomicBool::new(false),
             lsp_evidence_unrecorded: std::sync::Mutex::new(Default::default()),
+            lsp_settled_guesses: std::sync::Mutex::new(Default::default()),
+            lsp_current_contexts: std::sync::Mutex::new(Default::default()),
             legacy_owed_derivations: std::sync::Mutex::new(None),
             cached_repo_id: repo_id.to_string(),
             cached_workspace_id: None,
@@ -12326,12 +12689,23 @@ impl DaemonState {
                     .push(kin_model::ExternalReferenceDelta::Added { new: new.clone() });
             }
         }
+        // Resolution records likewise: the durable workspace graph's, exactly.
+        let resolution_record_deltas = kin_core::with_resolution_node_transition(
+            kin_model::WorkspaceSemanticDelta::default(),
+            &HashMap::new(),
+            &live_snapshot.resolution_records,
+            &HashMap::new(),
+            &authority_snapshot.resolution_records,
+        )?
+        .resolution_record_deltas()
+        .to_vec();
         let finalization_delta = TransactionDelta {
             entity_deltas: semantics.entity_deltas().to_vec(),
             relation_deltas: semantics.relation_deltas().to_vec(),
             tree_deltas,
             admission_policy_delta: planned_delta.admission_policy_delta.clone(),
             external_reference_deltas,
+            resolution_record_deltas,
         };
         let graph_changed = finalization_delta != TransactionDelta::default();
         if graph_changed {
@@ -12345,6 +12719,7 @@ impl DaemonState {
                 || preflight_snapshot.entities != authority_snapshot.entities
                 || preflight_snapshot.relations != authority_snapshot.relations
                 || preflight_snapshot.external_references != authority_snapshot.external_references
+                || preflight_snapshot.resolution_records != authority_snapshot.resolution_records
             {
                 return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
                     "preflighted repository delta does not produce the durable workspace graph"
@@ -12360,6 +12735,7 @@ impl DaemonState {
             || live_snapshot.entities != authority_snapshot.entities
             || live_snapshot.relations != authority_snapshot.relations
             || live_snapshot.external_references != authority_snapshot.external_references
+            || live_snapshot.resolution_records != authority_snapshot.resolution_records
         {
             return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
                 "repository graph finalization did not install the durable workspace graph"
@@ -12797,6 +13173,13 @@ impl DaemonState {
         self.save_snapshot_reporting(SnapshotSaveMode::Incremental)
     }
 
+    /// [`Self::save_snapshot_reporting_enrichment`] for a running sweep's
+    /// checkpoint: the same publication, with the read-index rebuild left to
+    /// the save that ends the sweep.
+    pub(crate) fn save_sweep_checkpoint(&self) -> Result<EnrichmentFlush> {
+        self.save_snapshot_reporting(SnapshotSaveMode::SweepCheckpoint)
+    }
+
     fn save_snapshot_reporting(&self, mode: SnapshotSaveMode) -> Result<EnrichmentFlush> {
         // Serialize the whole kndb + generation-marker + kidx write sequence
         // against any other save (persist loop, idle flush, embed worker).
@@ -13059,7 +13442,11 @@ impl DaemonState {
                 .store(true, Ordering::SeqCst);
         }
         if self.post_commit_finalization_pending.load(Ordering::SeqCst) {
-            self.finalize_committed_generation(new_gen)?;
+            if mode == SnapshotSaveMode::SweepCheckpoint && self.storage_backend.is_none() {
+                self.defer_committed_generation_finalization(new_gen)?;
+            } else {
+                self.finalize_committed_generation(new_gen)?;
+            }
         }
 
         info!(
@@ -13352,6 +13739,29 @@ impl DaemonState {
         Ok(())
     }
 
+    /// Retire the read index a committed generation left stale, and leave its
+    /// rebuild to the next save that finalizes.
+    ///
+    /// A running sweep commits its progress every minute or so, and the full
+    /// finalize rebuilt the read index each time from a fresh materialization
+    /// of the whole workspace graph: on a 3,590-file TypeScript repository
+    /// that was about a quarter of every checkpoint, growing with the store,
+    /// for an index nothing reads while the daemon runs. It is a startup
+    /// artifact: an open whose marker and index do not name its generation
+    /// rebuilds it from the graph it loaded. So a checkpoint removes the old
+    /// index and advances the marker, which is the crash-safe state the full
+    /// finalize also passes through, and stays pending, so the save that ends
+    /// the sweep (or any later save) runs the full finalize.
+    fn defer_committed_generation_finalization(&self, generation: u64) -> Result<()> {
+        self.invalidate_canonical_read_index()?;
+        self.write_generation_marker(generation)?;
+        debug!(
+            generation,
+            "deferred the read-index rebuild for a sweep checkpoint to the save that ends the sweep"
+        );
+        Ok(())
+    }
+
     fn invalidate_canonical_read_index(&self) -> Result<std::path::PathBuf> {
         let index_path = self.layout.kindb_snapshot_path().with_extension("kidx");
         match std::fs::remove_file(&index_path) {
@@ -13486,15 +13896,35 @@ impl DaemonState {
         }
 
         let live_snapshot = self.graph.to_snapshot();
+        // The guesses a language server contradicted since the last
+        // publication, read once so the ids this publication carries are the
+        // ids it forgets.
+        let settled = self
+            .lsp_settled_guesses
+            .lock()
+            .map(|held| held.clone())
+            .unwrap_or_default();
+        let pending_marks = self
+            .lsp_pending_marks
+            .lock()
+            .map(|pending| pending.clone())
+            .unwrap_or_default();
         // Whether there is anything to publish is decided from the live graph
-        // alone. This publication carries language-server relations and nothing
-        // else, so a live graph holding none cannot produce a delta, and asking
-        // authority to materialize its workspace graph to learn that was the
-        // whole cost of an idle flush.
-        if !live_snapshot
-            .relations
-            .values()
-            .any(|relation| relation.origin == kin_model::RelationOrigin::Lsp)
+        // alone. This publication carries language-server relations, the
+        // guesses they contradicted, and the marks of files a sweep finished,
+        // and nothing else, so a live graph holding none of them cannot
+        // produce a delta, and asking authority to materialize its workspace
+        // graph to learn that was the whole cost of an idle flush.
+        if settled.is_empty()
+            && pending_marks.is_empty()
+            && !live_snapshot
+                .relations
+                .values()
+                .any(|relation| relation.origin == kin_model::RelationOrigin::Lsp)
+            && !live_snapshot
+                .resolution_records
+                .values()
+                .any(|record| record.as_call_sites().is_some())
         {
             return Ok(Some(expected_generation));
         }
@@ -13515,15 +13945,58 @@ impl DaemonState {
         // does not.
         drop(lease);
 
-        let (semantic_delta, unpublishable) =
-            Self::language_server_enrichment_delta(&live_snapshot, &authority_snapshot)?;
+        // The call-site ledgers this publication carries, read once so the
+        // delta and the marks beside it agree about every one.
+        let ledgers = publishable_ledgers(&live_snapshot, &authority_snapshot);
+        let (semantic_delta, unpublishable) = Self::language_server_enrichment_delta(
+            &live_snapshot,
+            &authority_snapshot,
+            &settled,
+            &ledgers,
+        )?;
         if unpublishable > 0 {
             debug!(
                 unpublishable,
                 "language-server relations name a node this workspace authority does not hold and were not published"
             );
         }
+        let (marks, unmarkable) = Self::enrichment_marks_to_commit(
+            &pending_marks,
+            &workspace.tree,
+            &live_snapshot,
+            &authority_snapshot,
+            &settled,
+            &ledgers,
+        );
+        if !unmarkable.is_empty() {
+            // A file whose bytes moved on, or with a relation authority cannot
+            // hold, is not finished as far as authority is concerned. It stays
+            // unmarked and the next sweep asks about it again.
+            if let Ok(mut pending) = self.lsp_pending_marks.lock() {
+                for path in &unmarkable {
+                    if pending.get(path) == pending_marks.get(path) {
+                        pending.remove(path);
+                    }
+                }
+            }
+        }
+        let semantic_delta = if marks.is_empty() {
+            semantic_delta
+        } else {
+            semantic_delta
+                .with_enrichment_marks(kin_model::EnrichmentMarksDelta {
+                    retire_all: false,
+                    marks: marks.clone(),
+                })
+                .map_err(|error| {
+                    DaemonError::Graph(kin_db::KinDbError::StorageError(format!(
+                        "record language-server enrichment marks: {error}"
+                    )))
+                })?
+        };
         if semantic_delta.is_empty() {
+            // Authority already agrees with the live graph about every one.
+            self.forget_settled_guesses(&settled);
             return Ok(Some(expected_generation));
         }
         // Decided after the delta, so a flush with nothing new to publish still
@@ -13590,13 +14063,160 @@ impl DaemonState {
             )
             .map_err(DaemonError::from)?;
         self.record_repository_authority_commit(receipt.generation)?;
+        // The commit went through the daemon's held authority, which now holds
+        // the successor it wrote. While the record on disk is still the one
+        // that commit installed, the next reader keeps it rather than
+        // reopening the store to load it.
+        crate::api::relabel_held_authority_after_own_commit(self);
+        self.forget_settled_guesses(&settled);
+        if !marks.is_empty() {
+            if let Ok(mut pending) = self.lsp_pending_marks.lock() {
+                for mark in &marks {
+                    if pending.get(&mark.path) == Some(&mark.body) {
+                        pending.remove(&mark.path);
+                    }
+                }
+            }
+            self.lsp_marks_committed
+                .fetch_add(marks.len() as u64, Ordering::SeqCst);
+        }
         info!(
             repo_id = self.cached_repo_id.as_str(),
             published,
+            settled_guesses = settled.len(),
+            finished_files = marks.len(),
             generation = receipt.generation,
             "published language-server enrichment into workspace authority"
         );
         Ok(Some(receipt.generation))
+    }
+
+    /// Forget the settled guesses a publication carried. Ids settled while it
+    /// ran stay for the next one.
+    fn forget_settled_guesses(&self, carried: &std::collections::BTreeSet<kin_model::RelationId>) {
+        if carried.is_empty() {
+            return;
+        }
+        if let Ok(mut held) = self.lsp_settled_guesses.lock() {
+            held.retain(|id| !carried.contains(id));
+        }
+    }
+
+    /// The enrichment marks this publication commits, and the pending files it
+    /// cannot mark.
+    ///
+    /// A mark records the relations the workspace will hold for its file once
+    /// this publication commits: what authority already holds, plus the
+    /// language-server relations this publication adds, with the call guesses
+    /// it settles retired or narrowed, and the call-site ledgers of the
+    /// callers the file declares, digested exactly as storage digests them
+    /// when it checks the mark. A file whose bytes the workspace no longer
+    /// holds, with a relation this publication cannot carry, or with a caller
+    /// no ledger describes once it commits, is not finished as far as
+    /// authority is concerned: a mark says every call site in its file has one
+    /// state, and a caller without a ledger has none.
+    fn enrichment_marks_to_commit(
+        pending: &std::collections::BTreeMap<String, Hash256>,
+        tree: &ResolvedTree,
+        live: &kin_db::GraphSnapshot,
+        authority: &kin_db::GraphSnapshot,
+        settled: &std::collections::BTreeSet<kin_model::RelationId>,
+        ledgers: &[kin_model::ResolutionRecord],
+    ) -> (Vec<kin_model::EnrichmentMark>, Vec<String>) {
+        if pending.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+        let mut desired: std::collections::HashMap<&kin_model::RelationId, &kin_model::Relation> =
+            authority.relations.iter().collect();
+        let entity_file = |id: &kin_model::EntityId| {
+            entity_file_in(&authority.entities, id).or_else(|| entity_file_in(&live.entities, id))
+        };
+        let mut unpublishable = Vec::new();
+        for (id, relation) in &live.relations {
+            if relation.origin != kin_model::RelationOrigin::Lsp {
+                continue;
+            }
+            if lsp_relation_is_publishable(live, authority, relation) {
+                desired.insert(id, relation);
+            } else {
+                unpublishable.push(relation);
+            }
+        }
+        // A file whose own passes produced a relation authority cannot hold is
+        // not finished as far as authority is concerned.
+        let unpublishable_paths =
+            kin_model::enrichment_relations_by_owner_file(unpublishable, entity_file);
+        for relation_id in settled {
+            match settled_guess_successor(relation_id, live, authority) {
+                Some(None) => {
+                    desired.remove(relation_id);
+                }
+                Some(Some(narrowed)) => {
+                    desired.insert(&narrowed.id, narrowed);
+                }
+                None => {}
+            }
+        }
+        let by_path =
+            kin_model::enrichment_relations_by_owner_file(desired.values().copied(), entity_file);
+        // The ledgers authority holds once this publication commits: its own,
+        // with the ones this publication writes in their place.
+        let replaced: std::collections::BTreeSet<kin_model::ResolutionRecordId> = ledgers
+            .iter()
+            .map(kin_model::ResolutionRecord::id)
+            .collect();
+        let desired_records = authority
+            .resolution_records
+            .iter()
+            .filter(|(id, _)| !replaced.contains(id))
+            .map(|(_, record)| record)
+            .chain(ledgers.iter());
+        let ledgers_by_path = kin_model::enrichment_ledgers_by_file(desired_records, entity_file);
+        // The pending files with a caller no ledger will describe: every
+        // entity with source text in the file needs one before it is marked,
+        // unless the parser read no call in its file at all.
+        let mut unledgered: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        for entity in authority.entities.values() {
+            let Some(file) = entity.file_origin.as_ref() else {
+                continue;
+            };
+            if entity.span.is_none()
+                || kin_model::in_a_file_without_calls(entity)
+                || !pending.contains_key(&file.0)
+            {
+                continue;
+            }
+            let ledger = kin_model::ResolutionRecordId::call_sites(entity.id);
+            if !ledgers_by_path
+                .get(&file.0)
+                .is_some_and(|held| held.contains(&ledger))
+            {
+                unledgered.insert(file.0.as_str());
+            }
+        }
+        let mut marks = Vec::new();
+        let mut unmarkable = Vec::new();
+        for (path, body) in pending {
+            if !tree_holds_body(tree, path, body)
+                || unpublishable_paths.contains_key(path)
+                || unledgered.contains(path.as_str())
+            {
+                unmarkable.push(path.clone());
+                continue;
+            }
+            marks.push(kin_model::EnrichmentMark {
+                path: path.clone(),
+                body: *body,
+                version: crate::daemon::LSP_ENRICHMENT_MARKER_VERSION,
+                relations: kin_model::enrichment_relations_digest(
+                    path,
+                    by_path.get(path).into_iter().flatten().copied(),
+                    entity_file,
+                    ledgers_by_path.get(path).into_iter().flatten().copied(),
+                ),
+            });
+        }
+        (marks, unmarkable)
     }
 
     /// The canonical workspace semantic transition that publishes every
@@ -13618,9 +14238,18 @@ impl DaemonState {
     /// endpoint an enrichment edge names may be an artifact, a test, or a
     /// symbol owned outside this repository; publishing one of those here would
     /// ask authority to accept a relation into a node it cannot resolve.
+    ///
+    /// The one retraction is `settled`: name-only call guesses a language
+    /// server contradicted at their call site, which the live graph retired or
+    /// narrowed when it installed the proof. For each one authority still
+    /// holds, the live graph's version is what is published: its absence, or
+    /// the sites it kept. Nothing outside `settled` is ever retracted, so a
+    /// guess the live graph merely lacks for any other reason stays.
     fn language_server_enrichment_delta(
         live: &kin_db::GraphSnapshot,
         authority: &kin_db::GraphSnapshot,
+        settled: &std::collections::BTreeSet<kin_model::RelationId>,
+        ledgers: &[kin_model::ResolutionRecord],
     ) -> Result<(kin_model::WorkspaceSemanticDelta, usize)> {
         let mut desired = authority.relations.clone();
         let mut unpublishable = 0usize;
@@ -13628,13 +14257,22 @@ impl DaemonState {
             if relation.origin != kin_model::RelationOrigin::Lsp {
                 continue;
             }
-            if !authority_holds_entity(authority, &relation.src)
-                || !authority_holds_entity(authority, &relation.dst)
-            {
+            if !lsp_relation_is_publishable(live, authority, relation) {
                 unpublishable += 1;
                 continue;
             }
             desired.insert(*relation_id, relation.clone());
+        }
+        for relation_id in settled {
+            match settled_guess_successor(relation_id, live, authority) {
+                Some(None) => {
+                    desired.remove(relation_id);
+                }
+                Some(Some(narrowed)) => {
+                    desired.insert(*relation_id, narrowed.clone());
+                }
+                None => {}
+            }
         }
         let delta = kin_core::diff_workspace_semantics(
             &authority.entities,
@@ -13647,6 +14285,27 @@ impl DaemonState {
                 "canonicalize language-server enrichment transition: {error}"
             )))
         })?;
+        // The external symbols and proof contexts the published edges and
+        // ledgers name go in with them, the ledgers with them, and the symbols
+        // and contexts nothing names any longer go out.
+        let (reference_deltas, record_deltas) =
+            resolution_node_deltas(live, authority, desired.values(), ledgers);
+        if reference_deltas.is_empty() && record_deltas.is_empty() {
+            return Ok((delta, unpublishable));
+        }
+        let canonicalize = |error: kin_model::ModelError| {
+            DaemonError::Graph(kin_db::KinDbError::StorageError(format!(
+                "canonicalize language-server enrichment transition: {error}"
+            )))
+        };
+        let delta = kin_model::WorkspaceSemanticDelta::new_with_external_references(
+            delta.entity_deltas().to_vec(),
+            delta.relation_deltas().to_vec(),
+            reference_deltas,
+        )
+        .map_err(canonicalize)?
+        .with_resolution_records(record_deltas)
+        .map_err(canonicalize)?;
         Ok((delta, unpublishable))
     }
 
@@ -14649,6 +15308,7 @@ mod tests {
             evidence: vec![],
             risk_summary: None,
             external_reference_deltas: vec![],
+            resolution_record_deltas: Vec::new(),
         };
         let change = kin_model::SemanticChange {
             id: kin_core::compute_semantic_change_id(&change).unwrap(),
@@ -16159,6 +16819,7 @@ mod tests {
             evidence: vec![],
             risk_summary: None,
             external_reference_deltas: vec![],
+            resolution_record_deltas: Vec::new(),
         };
         let change = kin_model::SemanticChange {
             id: kin_core::compute_semantic_change_id(&change).unwrap(),
@@ -16254,6 +16915,7 @@ mod tests {
             evidence: vec![],
             risk_summary: None,
             external_reference_deltas: vec![],
+            resolution_record_deltas: Vec::new(),
         };
         let change = kin_model::SemanticChange {
             id: kin_core::compute_semantic_change_id(&change).unwrap(),
@@ -16976,6 +17638,7 @@ mod tests {
             evidence: vec![],
             risk_summary: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         };
         change.id = kin_core::compute_semantic_change_id(&change).unwrap();
         change
@@ -17353,6 +18016,7 @@ mod tests {
             tree_deltas: Vec::new(),
             admission_policy_delta: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         };
 
         let events = relation_change_events(&delta, Some("src/net.c"));
@@ -17403,6 +18067,7 @@ mod tests {
             tree_deltas: Vec::new(),
             admission_policy_delta: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         };
 
         assert!(
@@ -18527,6 +19192,7 @@ mod tests {
                 }],
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             })
             .unwrap();
         sibling_graph.batch_upsert_entities(entities).unwrap();
@@ -18589,6 +19255,7 @@ mod tests {
                 }],
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             })
             .unwrap();
         sibling_graph
@@ -19200,6 +19867,7 @@ mod tests {
                 }],
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             })
             .unwrap();
         sibling_graph
@@ -23102,8 +23770,13 @@ mod tests {
                 .as_slice(),
         );
 
-        let (delta, unpublishable) =
-            DaemonState::language_server_enrichment_delta(&live, &authority).unwrap();
+        let (delta, unpublishable) = DaemonState::language_server_enrichment_delta(
+            &live,
+            &authority,
+            &Default::default(),
+            &[],
+        )
+        .unwrap();
 
         assert_eq!(unpublishable, 0);
         let published = delta
@@ -23122,6 +23795,340 @@ mod tests {
         );
     }
 
+    fn external_proof(
+        caller: &Entity,
+    ) -> (
+        kin_model::ExternalReference,
+        kin_model::ResolutionRecord,
+        kin_model::Relation,
+    ) {
+        let symbol = kin_model::ExternalSymbol::new(
+            kin_model::ScipPackage::new("cargo", "std", "1.90.0").unwrap(),
+            vec![
+                kin_model::ScipDescriptor::namespace("fs"),
+                kin_model::ScipDescriptor::method("read_to_string"),
+            ],
+        )
+        .unwrap();
+        let reference = symbol.to_reference().unwrap();
+        let context = kin_model::ResolutionRecord::ProofContext(kin_model::ProofContext {
+            language: kin_model::LanguageId::Rust,
+            resolver: "lsp:rust-analyzer".to_string(),
+            resolver_version: "0.3.2600".to_string(),
+            configuration_hash: Hash256::from_bytes([1; 32]),
+            environment_hash: Hash256::from_bytes([2; 32]),
+            environment_summary: "rust 1.90.0".to_string(),
+        });
+        let relation = kin_lsp::call_sites::proven_external_call(
+            caller.id,
+            reference.id,
+            vec![kin_model::RelationEvidence {
+                parser_rule: Some(kin_lsp::call_sites::DEFINITION_RULE.to_string()),
+                token: Some(context.id().context_token()),
+                ..Default::default()
+            }],
+        );
+        (reference, context, relation)
+    }
+
+    fn with_nodes(
+        snapshot: kin_db::GraphSnapshot,
+        reference: &kin_model::ExternalReference,
+        context: &kin_model::ResolutionRecord,
+        relations: &[kin_model::Relation],
+    ) -> kin_db::GraphSnapshot {
+        let graph = kin_db::InMemoryGraph::from_snapshot(snapshot).unwrap();
+        graph
+            .apply_transaction_delta(&kin_model::TransactionDelta {
+                external_reference_deltas: vec![kin_model::ExternalReferenceDelta::Added {
+                    new: reference.clone(),
+                }],
+                resolution_record_deltas: vec![kin_model::ResolutionRecordDelta::Added {
+                    new: context.clone(),
+                }],
+                ..Default::default()
+            })
+            .unwrap();
+        for relation in relations {
+            graph.upsert_relation(relation).unwrap();
+        }
+        graph.to_snapshot()
+    }
+
+    /// A proven call into a symbol outside the repository is published with
+    /// the symbol's node and the proof context it names, in one delta, and a
+    /// symbol and context nothing names any longer are collected in the next.
+    #[test]
+    fn enrichment_publishes_an_external_proof_with_its_symbol_and_context() {
+        let caller = test_entity("load", "src/config.rs");
+        let (reference, context, relation) = external_proof(&caller);
+        let authority = snapshot_of(std::slice::from_ref(&caller), &[]);
+        let live = with_nodes(
+            snapshot_of(std::slice::from_ref(&caller), &[]),
+            &reference,
+            &context,
+            std::slice::from_ref(&relation),
+        );
+
+        let (delta, unpublishable) = DaemonState::language_server_enrichment_delta(
+            &live,
+            &authority,
+            &Default::default(),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(unpublishable, 0);
+        assert_eq!(
+            delta.relation_deltas(),
+            &[kin_model::RelationDelta::Added {
+                new: relation.clone()
+            }]
+        );
+        assert_eq!(
+            delta.external_reference_deltas(),
+            &[kin_model::ExternalReferenceDelta::Added {
+                new: reference.clone()
+            }]
+        );
+        assert_eq!(
+            delta.resolution_record_deltas(),
+            &[kin_model::ResolutionRecordDelta::Added {
+                new: context.clone()
+            }]
+        );
+        assert!(
+            kin_model::WorkspaceSemanticOverlay::new_with_external_references(
+                Vec::new(),
+                delta.relation_deltas().to_vec(),
+                delta.external_reference_deltas().to_vec(),
+            )
+            .unwrap()
+            .with_resolution_records(delta.resolution_record_deltas().to_vec())
+            .unwrap()
+            .is_language_server_enrichment_only(),
+            "a workspace holding only this is not dirty"
+        );
+
+        // Authority holds a symbol and a context that no relation names: the
+        // next publication collects both.
+        let orphaned = with_nodes(
+            snapshot_of(std::slice::from_ref(&caller), &[]),
+            &reference,
+            &context,
+            &[],
+        );
+        let live = snapshot_of(std::slice::from_ref(&caller), &[]);
+        let (delta, _) = DaemonState::language_server_enrichment_delta(
+            &live,
+            &orphaned,
+            &Default::default(),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            delta.external_reference_deltas(),
+            &[kin_model::ExternalReferenceDelta::Removed { old: reference }]
+        );
+        assert_eq!(
+            delta.resolution_record_deltas(),
+            &[kin_model::ResolutionRecordDelta::Removed { old: context }]
+        );
+    }
+
+    /// A caller in `file` with source text, and a ledger for it proving one
+    /// call into `callee` under `context`, with the edge that carries it.
+    fn ledgered_call(
+        file: &str,
+        callee: &Entity,
+    ) -> (
+        Entity,
+        kin_model::ResolutionRecord,
+        kin_model::ResolutionRecord,
+        kin_model::Relation,
+    ) {
+        let mut caller = test_entity("send", file);
+        caller.span = Some(kin_model::SourceSpan {
+            file: FilePathId::new(file),
+            start_byte: 100,
+            end_byte: 200,
+            start_line: 4,
+            start_col: 0,
+            end_line: 9,
+            end_col: 0,
+        });
+        let context = kin_model::ResolutionRecord::ProofContext(kin_model::ProofContext {
+            language: LanguageId::Rust,
+            resolver: "lsp:rust-analyzer".to_string(),
+            resolver_version: "1".to_string(),
+            configuration_hash: Hash256::from_bytes([1; 32]),
+            environment_hash: Hash256::from_bytes([2; 32]),
+            environment_summary: String::new(),
+        });
+        let ledger = kin_model::ResolutionRecord::CallSites(kin_model::CallSiteLedger {
+            caller: caller.id,
+            behavior_hash: caller.fingerprint.behavior_hash,
+            body_hash: Hash256::from_bytes([7; 32]),
+            context: context.id(),
+            census: 1,
+            sites: vec![kin_model::CallSite {
+                offset: 10,
+                length: 4,
+                state: kin_model::CallSiteState::ProvenTarget { target: callee.id },
+            }],
+        });
+        let edge = kin_lsp::call_sites::proven_call(
+            caller.id,
+            callee.id,
+            vec![kin_model::RelationEvidence {
+                token: Some(context.id().context_token()),
+                ..kin_lsp::call_sites::site_evidence(
+                    kin_lsp::call_sites::DEFINITION_RULE,
+                    kin_model::SourceSpan {
+                        file: FilePathId::new(file),
+                        start_byte: 110,
+                        end_byte: 114,
+                        start_line: 5,
+                        start_col: 4,
+                        end_line: 5,
+                        end_col: 8,
+                    },
+                )
+            }],
+        );
+        (caller, context, ledger, edge)
+    }
+
+    fn with_records(
+        snapshot: kin_db::GraphSnapshot,
+        records: &[kin_model::ResolutionRecord],
+    ) -> kin_db::GraphSnapshot {
+        let graph = kin_db::InMemoryGraph::from_snapshot(snapshot).unwrap();
+        for record in records {
+            graph
+                .apply_transaction_delta(&kin_model::TransactionDelta {
+                    resolution_record_deltas: vec![kin_model::ResolutionRecordDelta::Added {
+                        new: record.clone(),
+                    }],
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        graph.to_snapshot()
+    }
+
+    /// A file is marked only once every caller it declares has a call-site
+    /// ledger, and the ledgers go into authority in the same delta as the
+    /// proofs and the proof context they name.
+    #[test]
+    fn enrichment_publishes_ledgers_and_marks_a_file_only_when_every_caller_has_one() {
+        let callee = test_entity("adapter_send", "src/adapters.rs");
+        let (caller, context, ledger, edge) = ledgered_call("src/sessions.rs", &callee);
+        let authority = snapshot_of(&[caller.clone(), callee.clone()], &[]);
+        let live = with_records(
+            snapshot_of(
+                &[caller.clone(), callee.clone()],
+                std::slice::from_ref(&edge),
+            ),
+            &[context.clone(), ledger.clone()],
+        );
+        let tree = ResolvedTree::default()
+            .apply(&[TreeDelta::Added {
+                artifact_id: ArtifactId::new(),
+                new: LocatedEntry::new(
+                    RepoPath::from_utf8("src/sessions.rs").unwrap(),
+                    TreeEntry::blob(Hash256::from_bytes([7; 32]), false),
+                ),
+            }])
+            .unwrap();
+        let pending = std::collections::BTreeMap::from([(
+            "src/sessions.rs".to_string(),
+            Hash256::from_bytes([7; 32]),
+        )]);
+
+        let ledgers = publishable_ledgers(&live, &authority);
+        assert_eq!(ledgers, std::slice::from_ref(&ledger));
+        let (delta, _) = DaemonState::language_server_enrichment_delta(
+            &live,
+            &authority,
+            &Default::default(),
+            &ledgers,
+        )
+        .unwrap();
+        let records: Vec<_> = delta
+            .resolution_record_deltas()
+            .iter()
+            .map(|record| (record.target_id(), record.new_state().is_some()))
+            .collect();
+        assert!(records.contains(&(ledger.id(), true)), "{records:?}");
+        assert!(records.contains(&(context.id(), true)), "{records:?}");
+
+        let (marks, unmarkable) = DaemonState::enrichment_marks_to_commit(
+            &pending,
+            &tree,
+            &live,
+            &authority,
+            &Default::default(),
+            &ledgers,
+        );
+        assert!(unmarkable.is_empty());
+        assert_eq!(
+            marks[0].relations,
+            kin_model::enrichment_relations_digest(
+                "src/sessions.rs",
+                [&edge],
+                |id: &kin_model::EntityId| (*id == caller.id)
+                    .then_some("src/sessions.rs")
+                    .or((*id == callee.id).then_some("src/adapters.rs")),
+                [ledger.id()],
+            ),
+            "the mark digests the file's ledgers with its proofs"
+        );
+
+        let (marks, unmarkable) = DaemonState::enrichment_marks_to_commit(
+            &pending,
+            &tree,
+            &live,
+            &authority,
+            &Default::default(),
+            &[],
+        );
+        assert!(
+            marks.is_empty(),
+            "a caller without a ledger leaves its file owed"
+        );
+        assert_eq!(unmarkable, ["src/sessions.rs"]);
+
+        // A ledger of another body, or naming an entity authority does not
+        // hold, is not carried.
+        let mut moved = caller.clone();
+        moved.fingerprint.behavior_hash = Hash256::from_bytes([8; 32]);
+        let other_body = snapshot_of(&[moved, callee.clone()], &[]);
+        assert!(publishable_ledgers(&live, &other_body).is_empty());
+        let without_callee = snapshot_of(std::slice::from_ref(&caller), &[]);
+        assert!(publishable_ledgers(&live, &without_callee).is_empty());
+    }
+
+    /// A proof a file's sweep retracted is carried out of authority by the
+    /// next publication, as a settled guess is.
+    #[test]
+    fn enrichment_retires_a_proof_the_live_graph_retracted() {
+        let callee = test_entity("adapter_send", "src/adapters.rs");
+        let (caller, _, _, edge) = ledgered_call("src/sessions.rs", &callee);
+        let authority = snapshot_of(
+            &[caller.clone(), callee.clone()],
+            std::slice::from_ref(&edge),
+        );
+        let live = snapshot_of(&[caller, callee], &[]);
+        let settled = std::collections::BTreeSet::from([edge.id]);
+        let (delta, _) =
+            DaemonState::language_server_enrichment_delta(&live, &authority, &settled, &[])
+                .unwrap();
+        assert_eq!(
+            delta.relation_deltas(),
+            &[kin_model::RelationDelta::Removed { old: edge }]
+        );
+    }
+
     #[test]
     fn enrichment_never_retracts_a_relation_authority_holds() {
         // A language server that is absent this run, or slower than the last
@@ -23136,7 +24143,13 @@ mod tests {
         );
         let live = snapshot_of(&[caller, callee], &[]);
 
-        let (delta, _) = DaemonState::language_server_enrichment_delta(&live, &authority).unwrap();
+        let (delta, _) = DaemonState::language_server_enrichment_delta(
+            &live,
+            &authority,
+            &Default::default(),
+            &[],
+        )
+        .unwrap();
 
         assert!(
             delta.is_empty(),
@@ -23155,8 +24168,13 @@ mod tests {
         let authority = snapshot_of(std::slice::from_ref(&caller), &[]);
         let live = snapshot_of(&[caller, stranger], std::slice::from_ref(&dangling));
 
-        let (delta, unpublishable) =
-            DaemonState::language_server_enrichment_delta(&live, &authority).unwrap();
+        let (delta, unpublishable) = DaemonState::language_server_enrichment_delta(
+            &live,
+            &authority,
+            &Default::default(),
+            &[],
+        )
+        .unwrap();
 
         assert!(delta.is_empty(), "a dangling edge is not published");
         assert_eq!(
@@ -23276,6 +24294,768 @@ mod tests {
                 ..Default::default()
             })
             .unwrap();
+    }
+
+    /// The body the workspace tree holds at `path`.
+    fn tree_body(state: &DaemonState, path: &str) -> Hash256 {
+        match state
+            .graph
+            .resolved_tree()
+            .artifact_at_path(&RepoPath::from_utf8(path).unwrap())
+            .map(|artifact| artifact.entry.clone())
+        {
+            Some(TreeEntry::Blob { hash, .. }) => hash,
+            other => panic!("the fixture tree holds no blob at {path}: {other:?}"),
+        }
+    }
+
+    /// A language-server relation whose evidence names `file`, the way the
+    /// sweep records one.
+    fn lsp_relation_from(src: &Entity, dst: &Entity, file: &str) -> kin_model::Relation {
+        let mut relation = language_server_relation(src, dst, kin_model::RelationOrigin::Lsp);
+        relation.evidence = vec![kin_model::RelationEvidence {
+            source_span: Some(kin_model::SourceSpan {
+                file: FilePathId::new(file),
+                start_byte: 0,
+                end_byte: 1,
+                start_line: 0,
+                start_col: 0,
+                end_line: 0,
+                end_col: 1,
+            }),
+            ..Default::default()
+        }];
+        relation
+    }
+
+    /// Replace the body authority holds at `path`, the way an edit reaches it.
+    fn rewrite_authority_file(state: &DaemonState, path: &str) {
+        let binding = state.local_repository_authority_binding().unwrap();
+        let authority = binding.open_manager().unwrap();
+        let workspace_id = binding.workspace_id();
+        let lease = authority.read_authority();
+        let roots = lease.roots().clone();
+        let workspace = lease
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == workspace_id)
+            .cloned()
+            .unwrap();
+        drop(lease);
+        let repo_path = RepoPath::from_utf8(path).unwrap();
+        let old = workspace.tree.artifact_at_path(&repo_path).unwrap().clone();
+        let body = format!("// {path}, edited\n").into_bytes();
+        let hash = Hash256::from_bytes(kin_blobs::digest_bytes(&body));
+        authority.save_source_blob(hash, &body).unwrap();
+        state.blobs.write(&body).unwrap();
+        let tree_deltas = vec![TreeDelta::Updated {
+            artifact_id: old.artifact_id,
+            old: LocatedEntry::new(repo_path.clone(), old.entry.clone()),
+            new: LocatedEntry::new(repo_path, TreeEntry::blob(hash, false)),
+        }];
+        let next_tree = workspace.tree.apply(&tree_deltas).unwrap();
+        let transaction = kin_model::RepositoryTransaction {
+            schema_version: kin_model::REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+            operation_id: OperationId::new(),
+            repository_id: binding.repository_id().clone(),
+            expected_generation: roots.generation,
+            expected_roots: roots,
+            actor: kin_model::AuthorId::new("kin"),
+            reason: "edit a fixture file".to_string(),
+            external_objects: Vec::new(),
+            changes: Vec::new(),
+            aliases: Vec::new(),
+            git_authority_delta: None,
+            ref_mutations: Vec::new(),
+            default_ref_mutation: None,
+            workspace_mutation: Some(kin_model::WorkspaceMutation {
+                workspace_id,
+                expected: kin_model::WorkspaceExpectation::MustEqual {
+                    generation: workspace.generation,
+                    head: workspace.head.clone(),
+                    base_target: workspace.base_target.clone(),
+                    base_tree_hash: workspace.base_tree_hash,
+                    tree_hash: workspace.tree_hash,
+                    semantic_overlay_hash: workspace.semantic_overlay_hash,
+                    admission_policy: workspace.admission_policy,
+                },
+                new_generation: workspace.generation + 1,
+                new_head: workspace.head.clone(),
+                new_base_target: workspace.base_target.clone(),
+                new_base_tree_hash: workspace.base_tree_hash,
+                tree_deltas,
+                new_tree_hash: kin_model::compute_resolved_tree_hash(&next_tree).unwrap(),
+                semantic_delta: kin_model::WorkspaceSemanticDelta::default(),
+                new_shared_admission_policy: workspace.shared_admission_policy.clone(),
+                new_admission_policy: workspace.admission_policy,
+            }),
+            local_overlay_delta: None,
+            merge_transaction_delta: None,
+            sealed_observation: None,
+            collaboration_delta: None,
+        };
+        let receipt = authority
+            .commit_repository_transaction(transaction)
+            .expect("the fixture edit commits");
+        state
+            .record_repository_authority_commit(receipt.generation)
+            .unwrap();
+    }
+
+    /// The workspace's enrichment marks as authority holds them.
+    fn authority_marks(state: &DaemonState) -> Vec<kin_model::EnrichmentMark> {
+        let binding = state.local_repository_authority_binding().unwrap();
+        let authority = binding.open_manager().unwrap();
+        let lease = authority.read_authority();
+        lease
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == binding.workspace_id())
+            .map(|workspace| workspace.enrichment_marks.clone())
+            .unwrap_or_default()
+    }
+
+    /// The resume, end to end through repository authority. A sweep finishes
+    /// two files, one with a relation and one without, and its publication
+    /// commits both marks with the relation. The daemon then stops, and the
+    /// next one skips exactly those files, from authority alone: the
+    /// accepted-evidence record and the completion marker are deleted first,
+    /// so neither can be what it read.
+    ///
+    /// Measured before this, on a 3,590-file TypeScript repository: every stop
+    /// started the 47-minute sweep over from its first file.
+    #[test]
+    fn a_sweeps_finished_files_resume_from_repository_authority() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let layout = init.layout.clone();
+        let caller = test_entity("send", "src/sessions.rs");
+        let callee = test_entity("adapter_send", "src/adapters.rs");
+        let unfinished = test_entity("pending", "src/unfinished.rs");
+        let enriched = lsp_relation_from(&caller, &callee, "src/sessions.rs");
+
+        {
+            let state = test_state(layout.clone(), repo_dir.path());
+            publish_authority_entities(&state, &[caller.clone(), callee.clone(), unfinished]);
+            state.graph.upsert_relation(&enriched).unwrap();
+            let epoch = crate::daemon::current_marker_epoch(&state);
+            for file in ["src/sessions.rs", "src/adapters.rs"] {
+                let body = tree_body(&state, file);
+                assert!(crate::daemon::record_sweep_file_completed(
+                    &state, file, body, epoch
+                ));
+            }
+            state
+                .save_snapshot()
+                .expect("a publication that carries marks succeeds");
+            assert!(
+                state.lsp_pending_marks.lock().unwrap().is_empty(),
+                "the publication commits every pending mark"
+            );
+            let marks = authority_marks(&state);
+            assert_eq!(
+                marks
+                    .iter()
+                    .map(|mark| mark.path.as_str())
+                    .collect::<Vec<_>>(),
+                ["src/adapters.rs", "src/sessions.rs"]
+            );
+        }
+
+        for sidecar in ["lsp-accepted-evidence.jsonl", "lsp-enriched-files.json"] {
+            let _ = std::fs::remove_file(layout.root().join(sidecar));
+        }
+        let reopened = test_state(layout, repo_dir.path());
+        assert_eq!(
+            reopened
+                .lsp_resumed_files
+                .lock()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            ["src/adapters.rs", "src/sessions.rs"],
+            "the next daemon skips exactly the files authority records as finished"
+        );
+        assert!(reopened
+            .graph
+            .to_snapshot()
+            .relations
+            .contains_key(&enriched.id));
+    }
+
+    /// A mark vouches for exact bytes. An edit that reaches authority retires
+    /// it in the same transaction, so the next daemon asks about the file
+    /// again, and a file whose relations the publication could not carry is
+    /// never marked at all.
+    #[test]
+    fn a_mark_does_not_outlive_the_bytes_it_describes() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let layout = init.layout.clone();
+        let caller = test_entity("send", "src/sessions.rs");
+        let callee = test_entity("adapter_send", "src/adapters.rs");
+        let outside = test_entity("vendored", "src/vendored.rs");
+        let enriched = lsp_relation_from(&caller, &callee, "src/sessions.rs");
+        let dangling = lsp_relation_from(&callee, &outside, "src/adapters.rs");
+
+        {
+            let state = test_state(layout.clone(), repo_dir.path());
+            publish_authority_entities(&state, &[caller.clone(), callee.clone()]);
+            state.graph.upsert_entity(&outside).unwrap();
+            state.graph.upsert_relation(&enriched).unwrap();
+            state.graph.upsert_relation(&dangling).unwrap();
+            let epoch = crate::daemon::current_marker_epoch(&state);
+            for file in ["src/sessions.rs", "src/adapters.rs"] {
+                let body = tree_body(&state, file);
+                assert!(crate::daemon::record_sweep_file_completed(
+                    &state, file, body, epoch
+                ));
+            }
+            state.save_snapshot().unwrap();
+            assert_eq!(
+                authority_marks(&state)
+                    .iter()
+                    .map(|mark| mark.path.as_str())
+                    .collect::<Vec<_>>(),
+                ["src/sessions.rs"],
+                "a file with a relation authority cannot hold is not finished"
+            );
+
+            rewrite_authority_file(&state, "src/sessions.rs");
+            assert!(
+                authority_marks(&state).is_empty(),
+                "the edit retires the mark in its own transaction"
+            );
+        }
+
+        let reopened = test_state(layout, repo_dir.path());
+        assert!(reopened.lsp_resumed_files.lock().unwrap().is_empty());
+    }
+
+    /// Commit relation changes to the workspace authority and nothing else, the
+    /// way a re-derivation that binds a file's calls again reaches it.
+    fn commit_authority_relations(state: &DaemonState, changes: Vec<kin_model::RelationDelta>) {
+        let binding = state.local_repository_authority_binding().unwrap();
+        let authority = binding.open_manager().unwrap();
+        let workspace_id = binding.workspace_id();
+        let lease = authority.read_authority();
+        let roots = lease.roots().clone();
+        let workspace = lease
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == workspace_id)
+            .cloned()
+            .unwrap();
+        drop(lease);
+        let transaction = kin_model::RepositoryTransaction {
+            schema_version: kin_model::REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+            operation_id: OperationId::new(),
+            repository_id: binding.repository_id().clone(),
+            expected_generation: roots.generation,
+            expected_roots: roots,
+            actor: kin_model::AuthorId::new("kin"),
+            reason: "bind a fixture call again".to_string(),
+            external_objects: Vec::new(),
+            changes: Vec::new(),
+            aliases: Vec::new(),
+            git_authority_delta: None,
+            ref_mutations: Vec::new(),
+            default_ref_mutation: None,
+            workspace_mutation: Some(kin_model::WorkspaceMutation {
+                workspace_id,
+                expected: kin_model::WorkspaceExpectation::MustEqual {
+                    generation: workspace.generation,
+                    head: workspace.head.clone(),
+                    base_target: workspace.base_target.clone(),
+                    base_tree_hash: workspace.base_tree_hash,
+                    tree_hash: workspace.tree_hash,
+                    semantic_overlay_hash: workspace.semantic_overlay_hash,
+                    admission_policy: workspace.admission_policy,
+                },
+                new_generation: workspace.generation + 1,
+                new_head: workspace.head.clone(),
+                new_base_target: workspace.base_target.clone(),
+                new_base_tree_hash: workspace.base_tree_hash,
+                tree_deltas: Vec::new(),
+                new_tree_hash: workspace.tree_hash,
+                semantic_delta: kin_model::WorkspaceSemanticDelta::new(Vec::new(), changes)
+                    .unwrap(),
+                new_shared_admission_policy: workspace.shared_admission_policy.clone(),
+                new_admission_policy: workspace.admission_policy,
+            }),
+            local_overlay_delta: None,
+            merge_transaction_delta: None,
+            sealed_observation: None,
+            collaboration_delta: None,
+        };
+        let receipt = authority
+            .commit_repository_transaction(transaction)
+            .expect("the fixture relation change commits");
+        state
+            .record_repository_authority_commit(receipt.generation)
+            .unwrap();
+    }
+
+    /// Whether the workspace authority's graph holds a relation.
+    fn authority_holds_relation(state: &DaemonState, id: &kin_model::RelationId) -> bool {
+        let binding = state.local_repository_authority_binding().unwrap();
+        let authority = binding.open_manager().unwrap();
+        let lease = authority.read_authority();
+        lease
+            .workspace_graph_snapshot(&binding.workspace_id())
+            .unwrap()
+            .is_some_and(|graph| graph.relations.contains_key(id))
+    }
+
+    /// A mark vouches for the calls its file settled, not only for the
+    /// language-server relations. The publication that retires a name-only
+    /// guess a language server contradicted commits the file's mark over the
+    /// settled calls, and the next daemon resumes past the file. A later
+    /// mutation that binds the guess again, with the file's bytes and its
+    /// language-server relations unchanged, retires the mark in its own
+    /// transaction, so the next daemon asks about the file and settles it again
+    /// instead of resuming past a guess the server refuted.
+    #[test]
+    fn a_mark_does_not_outlive_the_call_guesses_its_file_settled() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let layout = init.layout.clone();
+        let caller = test_entity("send", "src/sessions.rs");
+        let guessed = test_entity("adapter_send", "src/adapters.rs");
+        let proven = test_entity("transport_send", "src/transport.rs");
+        let mut guess =
+            language_server_relation(&caller, &guessed, kin_model::RelationOrigin::Parsed);
+        guess.confidence = 0.5;
+        guess.evidence = lsp_relation_from(&caller, &guessed, "src/sessions.rs").evidence;
+        let proof = lsp_relation_from(&caller, &proven, "src/sessions.rs");
+
+        {
+            let state = test_state(layout.clone(), repo_dir.path());
+            publish_authority_entities(&state, &[caller.clone(), guessed.clone(), proven.clone()]);
+            commit_authority_relations(
+                &state,
+                vec![kin_model::RelationDelta::Added { new: guess.clone() }],
+            );
+            assert!(authority_holds_relation(&state, &guess.id));
+            // The settlement as the sweep leaves it: the guess is gone from the
+            // live graph, the proof is in, and the file is finished.
+            let _ = state.graph.remove_relation(&guess.id);
+            state.graph.upsert_relation(&proof).unwrap();
+            state.lsp_settled_guesses.lock().unwrap().insert(guess.id);
+            let epoch = crate::daemon::current_marker_epoch(&state);
+            let body = tree_body(&state, "src/sessions.rs");
+            assert!(crate::daemon::record_sweep_file_completed(
+                &state,
+                "src/sessions.rs",
+                body,
+                epoch
+            ));
+            state.save_snapshot().unwrap();
+            assert!(!authority_holds_relation(&state, &guess.id));
+            assert!(authority_holds_relation(&state, &proof.id));
+            assert_eq!(
+                authority_marks(&state)
+                    .iter()
+                    .map(|mark| mark.path.as_str())
+                    .collect::<Vec<_>>(),
+                ["src/sessions.rs"],
+                "the mark describes the file as settled, in the commit that settles it"
+            );
+        }
+
+        {
+            let state = test_state(layout.clone(), repo_dir.path());
+            assert_eq!(
+                state
+                    .lsp_resumed_files
+                    .lock()
+                    .unwrap()
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                ["src/sessions.rs"],
+                "control: a settled file is resumed past"
+            );
+            commit_authority_relations(
+                &state,
+                vec![kin_model::RelationDelta::Added { new: guess.clone() }],
+            );
+            assert!(
+                authority_marks(&state).is_empty(),
+                "binding the refuted guess again retires the mark in the same transaction"
+            );
+        }
+
+        let reopened = test_state(layout, repo_dir.path());
+        assert!(
+            reopened.lsp_resumed_files.lock().unwrap().is_empty(),
+            "the next daemon asks about the file again"
+        );
+    }
+
+    /// A Python file's mark resumes only once the workspace scope upgrade is
+    /// recorded, the gate the completion marker applies to Python files; every
+    /// other file's mark resumes either way.
+    #[test]
+    fn a_python_marks_resume_waits_for_the_workspace_scope_upgrade() {
+        let tree = ResolvedTree::default()
+            .apply(&[
+                TreeDelta::Added {
+                    artifact_id: ArtifactId::new(),
+                    new: LocatedEntry::new(
+                        RepoPath::from_utf8("app/run.py").unwrap(),
+                        TreeEntry::blob(Hash256::from_bytes([1; 32]), false),
+                    ),
+                },
+                TreeDelta::Added {
+                    artifact_id: ArtifactId::new(),
+                    new: LocatedEntry::new(
+                        RepoPath::from_utf8("src/lib.rs").unwrap(),
+                        TreeEntry::blob(Hash256::from_bytes([2; 32]), false),
+                    ),
+                },
+            ])
+            .unwrap();
+        let entities = std::collections::HashMap::new();
+        let mark = |path: &str, byte: u8| kin_model::EnrichmentMark {
+            path: path.to_string(),
+            body: Hash256::from_bytes([byte; 32]),
+            version: crate::daemon::LSP_ENRICHMENT_MARKER_VERSION,
+            relations: kin_model::enrichment_relations_digest(path, [], |_| None, []),
+        };
+        let marks = [mark("app/run.py", 1), mark("src/lib.rs", 2)];
+        let resumed = |scope_current| {
+            resumable_enrichment_files(&marks, &tree, &entities, [], [], scope_current)
+                .into_keys()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(resumed(true), ["app/run.py", "src/lib.rs"]);
+        assert_eq!(resumed(false), ["src/lib.rs"]);
+    }
+
+    /// A relation whose evidence names `file` under one evidence rule, the way
+    /// a pass records a site it proved.
+    fn lsp_relation_with_rule(
+        kind: kin_model::RelationKind,
+        src: &Entity,
+        dst: &Entity,
+        file: &str,
+        rule: &str,
+    ) -> kin_model::Relation {
+        let mut relation = lsp_relation_from(src, dst, file);
+        relation.kind = kind;
+        relation.evidence[0].parser_rule = Some(rule.to_string());
+        relation
+    }
+
+    /// A mark vouches for what its own file's passes produced and settled, not
+    /// for what a later file's passes add. The sweep finishes `sessions.rs`
+    /// and commits its mark; a later file's reference query then finds a site
+    /// inside `sessions.rs` that the file's own passes never asked about, and
+    /// publishes that edge beside the later file's own mark. Both marks hold,
+    /// and the next daemon resumes past both files.
+    ///
+    /// Measured before this, on a 3,590-file TypeScript repository: 618 of the
+    /// 1,456 marks a sweep committed were dropped later in the same sweep,
+    /// because later files' reference queries added edges into files already
+    /// marked and the mark's digest counted them.
+    #[test]
+    fn a_later_files_reference_pass_leaves_an_earlier_files_mark_holding() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let layout = init.layout.clone();
+        let send = test_entity("send", "src/sessions.rs");
+        let close = test_entity("close", "src/sessions.rs");
+        let adapter_send = test_entity("adapter_send", "src/adapters.rs");
+        // What `sessions.rs`'s own definitions pass proved at its call site.
+        let own = lsp_relation_with_rule(
+            kin_model::RelationKind::References,
+            &send,
+            &adapter_send,
+            "src/sessions.rs",
+            "lsp_definition",
+        );
+        // What `adapters.rs`'s reference query about `adapter_send` found
+        // later: a site inside `close`, which `sessions.rs`'s own pass left
+        // undecided.
+        let found_later = lsp_relation_with_rule(
+            kin_model::RelationKind::References,
+            &close,
+            &adapter_send,
+            "src/sessions.rs",
+            kin_model::LSP_REFERENCES_RULE,
+        );
+        // What `adapters.rs`'s uses-type arm found at a position in its own
+        // entity: a type `sessions.rs` declares. The arm records under the
+        // references rule too, at the asking position.
+        let used_later = lsp_relation_with_rule(
+            kin_model::RelationKind::UsesType,
+            &adapter_send,
+            &send,
+            "src/adapters.rs",
+            kin_model::LSP_REFERENCES_RULE,
+        );
+
+        {
+            let state = test_state(layout.clone(), repo_dir.path());
+            publish_authority_entities(
+                &state,
+                &[send.clone(), close.clone(), adapter_send.clone()],
+            );
+            state.graph.upsert_relation(&own).unwrap();
+            let epoch = crate::daemon::current_marker_epoch(&state);
+            let body = tree_body(&state, "src/sessions.rs");
+            assert!(crate::daemon::record_sweep_file_completed(
+                &state,
+                "src/sessions.rs",
+                body,
+                epoch
+            ));
+            state.save_snapshot().unwrap();
+            assert_eq!(
+                authority_marks(&state)
+                    .iter()
+                    .map(|mark| mark.path.as_str())
+                    .collect::<Vec<_>>(),
+                ["src/sessions.rs"],
+                "control: the first checkpoint commits the finished file's mark"
+            );
+
+            // The later file finishes and its checkpoint publishes the edges
+            // its queries found: a site inside the earlier file, and a type
+            // the earlier file declares.
+            state.graph.upsert_relation(&found_later).unwrap();
+            state.graph.upsert_relation(&used_later).unwrap();
+            let body = tree_body(&state, "src/adapters.rs");
+            assert!(crate::daemon::record_sweep_file_completed(
+                &state,
+                "src/adapters.rs",
+                body,
+                epoch
+            ));
+            state.save_snapshot().unwrap();
+            assert!(authority_holds_relation(&state, &found_later.id));
+            assert!(authority_holds_relation(&state, &used_later.id));
+            assert_eq!(
+                authority_marks(&state)
+                    .iter()
+                    .map(|mark| mark.path.as_str())
+                    .collect::<Vec<_>>(),
+                ["src/adapters.rs", "src/sessions.rs"],
+                "an edge another file's pass adds does not retire the earlier file's mark"
+            );
+        }
+
+        let reopened = test_state(layout, repo_dir.path());
+        assert_eq!(
+            reopened
+                .lsp_resumed_files
+                .lock()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            ["src/adapters.rs", "src/sessions.rs"],
+            "the next daemon resumes past both files"
+        );
+    }
+
+    /// A running sweep's checkpoints publish what it finished without paying
+    /// for the store twice more: the daemon keeps the authority its own commit
+    /// just wrote instead of reopening it, and the read index waits for the
+    /// save that ends the sweep. Until then the stale index is gone and the
+    /// marker names the committed generation, the state a crash may safely
+    /// leave, and the save that ends the sweep rebuilds the index.
+    ///
+    /// Measured before this, on a 3,590-file TypeScript repository: each
+    /// checkpoint reopened authority, re-verifying every body, and rebuilt the
+    /// read index from a fresh materialization of the whole workspace graph,
+    /// about a quarter of every checkpoint and growing with the store.
+    #[tokio::test]
+    async fn a_sweep_checkpoint_reopens_nothing_and_leaves_the_read_index_to_the_sweeps_end() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let layout = init.layout.clone();
+        let caller = test_entity("send", "src/sessions.rs");
+        let callee = test_entity("adapter_send", "src/adapters.rs");
+        let state = Arc::new(test_state(layout.clone(), repo_dir.path()));
+        publish_authority_entities(&state, &[caller.clone(), callee.clone()]);
+        state.save_snapshot().unwrap();
+        let index_path = layout.kindb_snapshot_path().with_extension("kidx");
+        let loads_before = state.projection_authority.loads();
+
+        for file in ["src/sessions.rs", "src/adapters.rs"] {
+            let (src, dst) = if file == "src/sessions.rs" {
+                (&caller, &callee)
+            } else {
+                (&callee, &caller)
+            };
+            state
+                .graph
+                .upsert_relation(&lsp_relation_from(src, dst, file))
+                .unwrap();
+            let epoch = crate::daemon::current_marker_epoch(&state);
+            let body = tree_body(&state, file);
+            assert!(crate::daemon::record_sweep_file_completed(
+                &state, file, body, epoch
+            ));
+            assert_eq!(crate::daemon::sweep_checkpoint(&state).await, 1);
+            let generation = state.snapshot_generation.load(Ordering::SeqCst);
+            assert_eq!(
+                DaemonState::read_generation_marker(&layout),
+                generation,
+                "the marker names the generation the checkpoint committed"
+            );
+            assert!(
+                !index_path.exists(),
+                "the read index the commit made stale is retired, not rebuilt"
+            );
+            assert!(state
+                .post_commit_finalization_pending
+                .load(Ordering::SeqCst));
+        }
+        assert_eq!(
+            state.projection_authority.loads(),
+            loads_before,
+            "a checkpoint reuses the authority its own commit wrote"
+        );
+        assert_eq!(authority_marks(&state).len(), 2);
+
+        // The save that ends the sweep finalizes in full.
+        state.save_snapshot().unwrap();
+        assert!(
+            index_path.exists(),
+            "the sweep's end rebuilds the read index"
+        );
+        assert!(!state
+            .post_commit_finalization_pending
+            .load(Ordering::SeqCst));
+        assert!(DaemonState::durable_read_index_matches_generation(
+            &layout,
+            state.snapshot_generation.load(Ordering::SeqCst)
+        ));
+    }
+
+    /// The authority a sweep's saves keep is the one their own commits
+    /// installed, and only that one. Two enrichment saves reopen nothing, and a
+    /// record someone else wrote over the same head before the save relabels
+    /// is loaded and judged: refused when an open refuses it, reloaded when an
+    /// open accepts it, and never served from what the daemon held.
+    ///
+    /// The relabel used to compare the head a record names, parsed with none
+    /// of the checks an open makes, so a same-head record from a newer Kin was
+    /// kept as current although a reopen would refuse it.
+    #[tokio::test]
+    async fn enrichment_saves_keep_only_the_record_their_own_commit_installed() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let layout = init.layout.clone();
+        let caller = test_entity("send", "src/sessions.rs");
+        let callee = test_entity("adapter_send", "src/adapters.rs");
+        let state = Arc::new(test_state(layout.clone(), repo_dir.path()));
+        publish_authority_entities(&state, &[caller.clone(), callee.clone()]);
+        state.save_snapshot().unwrap();
+        let record_path = layout
+            .kindb_namespace_path(&state.cached_repo_id)
+            .join("authority.json");
+        let loads_before = state.projection_authority.loads();
+
+        for (src, dst, file) in [
+            (&caller, &callee, "src/sessions.rs"),
+            (&callee, &caller, "src/adapters.rs"),
+        ] {
+            state
+                .graph
+                .upsert_relation(&lsp_relation_from(src, dst, file))
+                .unwrap();
+            let epoch = crate::daemon::current_marker_epoch(&state);
+            let body = tree_body(&state, file);
+            assert!(crate::daemon::record_sweep_file_completed(
+                &state, file, body, epoch
+            ));
+            assert_eq!(crate::daemon::sweep_checkpoint(&state).await, 1);
+            crate::api::held_repository_authority(&state).unwrap();
+        }
+        assert_eq!(authority_marks(&state).len(), 2, "both saves published");
+        assert_eq!(
+            state.projection_authority.loads(),
+            loads_before,
+            "two enrichment saves keep the authority their own commits installed"
+        );
+
+        // Same head, version from a newer Kin, landing between a save's commit
+        // and its relabel.
+        let own = std::fs::read(&record_path).unwrap();
+        let mut newer: serde_json::Value = serde_json::from_slice(&own).unwrap();
+        newer["version"] = serde_json::json!(6);
+        std::fs::write(&record_path, serde_json::to_vec(&newer).unwrap()).unwrap();
+        crate::api::relabel_held_authority_after_own_commit(&state);
+        let refused = crate::api::held_repository_authority(&state);
+        assert!(
+            refused.is_err(),
+            "a record an open refuses is loaded and refused, never served from the held authority"
+        );
+
+        // Same head, a record an open accepts: it is loaded rather than kept.
+        let mut unproven: serde_json::Value = serde_json::from_slice(&own).unwrap();
+        unproven
+            .as_object_mut()
+            .unwrap()
+            .remove("history_validation");
+        std::fs::write(&record_path, serde_json::to_vec(&unproven).unwrap()).unwrap();
+        crate::api::relabel_held_authority_after_own_commit(&state);
+        crate::api::held_repository_authority(&state).unwrap();
+        assert_eq!(
+            state.projection_authority.loads(),
+            loads_before + 1,
+            "a record this daemon did not install is loaded, even over the head it holds"
+        );
+    }
+
+    /// A checkpoint commits what the sweep finished while it runs, and one that
+    /// committed a mark shows the store can sweep, so it resets the count of
+    /// fruitless interruptions the circuit reads.
+    #[tokio::test]
+    async fn a_checkpoint_commits_finished_files_and_resets_the_interruption_count() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let layout = init.layout.clone();
+        let caller = test_entity("send", "src/sessions.rs");
+        let callee = test_entity("adapter_send", "src/adapters.rs");
+        let state = Arc::new(test_state(layout.clone(), repo_dir.path()));
+        publish_authority_entities(&state, &[caller.clone(), callee.clone()]);
+        state
+            .graph
+            .upsert_relation(&lsp_relation_from(&caller, &callee, "src/sessions.rs"))
+            .unwrap();
+        kin_daemon_spawn::write_sweep_interruptions(layout.root(), 2);
+
+        assert_eq!(
+            crate::daemon::sweep_checkpoint(&state).await,
+            0,
+            "control: nothing finished, nothing committed"
+        );
+        assert_eq!(kin_daemon_spawn::read_sweep_interruptions(layout.root()), 2);
+
+        let body = tree_body(&state, "src/sessions.rs");
+        let epoch = crate::daemon::current_marker_epoch(&state);
+        assert!(crate::daemon::record_sweep_file_completed(
+            &state,
+            "src/sessions.rs",
+            body,
+            epoch
+        ));
+        assert_eq!(crate::daemon::sweep_checkpoint(&state).await, 1);
+        assert_eq!(
+            kin_daemon_spawn::read_sweep_interruptions(layout.root()),
+            0,
+            "durable progress resets the circuit's count"
+        );
+        assert_eq!(authority_marks(&state).len(), 1);
     }
 
     #[test]

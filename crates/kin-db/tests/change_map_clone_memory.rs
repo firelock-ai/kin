@@ -119,6 +119,7 @@ fn snapshot_with_history() -> GraphSnapshot {
             origin: ChangeOrigin::Native,
             admission_policy_delta: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         };
         change.id = compute_semantic_change_id(&change).expect("change id computes");
         parent = Some(change.id);

@@ -82,6 +82,28 @@ impl QueryInputs {
         })
     }
 
+    /// Whether `other` captured the same entities and the same tree as this
+    /// capture, so an answer proven against one is proven against the other.
+    ///
+    /// Their authority epochs may differ. Every graph write moves the epoch,
+    /// including a reconcile of a watcher event that changed nothing, and an
+    /// epoch alone cannot tell that from a write that moved these inputs.
+    pub(crate) fn describes_same_graph(&self, other: &QueryInputs) -> bool {
+        if self.tree != other.tree || self.ids != other.ids {
+            return false;
+        }
+        let held: std::collections::HashMap<kin_model::EntityId, &Entity> = self
+            .entities
+            .iter()
+            .map(|entity| (entity.id, entity))
+            .collect();
+        held.len() == other.entities.len()
+            && other
+                .entities
+                .iter()
+                .all(|entity| held.get(&entity.id) == Some(&entity))
+    }
+
     /// The blob this pass's captured tree holds at `path`, which is what an
     /// owed file's backoff is keyed to.
     pub(crate) fn blob(&self, path: &str) -> Option<String> {
@@ -145,6 +167,37 @@ impl QueryInputs {
         ))
     }
 
+    /// Record that the sweep finished `file`, under the same coordination and
+    /// freshness proof the completion marker is written under, bound to the
+    /// body this pass asked about. `Ok(false)` when it was declined, which
+    /// costs a later resume one question.
+    pub(crate) async fn record_file_completed(
+        &self,
+        state: &DaemonState,
+        file: &str,
+    ) -> Result<bool, Refused> {
+        let _coordinated = state.coordination_gate.lock().await;
+        self.validate(state)?;
+        let Some(body) = self.blob_hash(file) else {
+            return Ok(false);
+        };
+        Ok(super::record_sweep_file_completed(
+            state,
+            file,
+            body,
+            self.marker_epoch,
+        ))
+    }
+
+    /// The body this pass's captured tree holds at `path`.
+    fn blob_hash(&self, path: &str) -> Option<kin_model::Hash256> {
+        let path_id = RepoPath::from_utf8(path.to_string()).ok()?;
+        match &self.tree.artifact_at_path(&path_id)?.entry {
+            TreeEntry::Blob { hash, .. } => Some(*hash),
+            _ => None,
+        }
+    }
+
     pub(crate) async fn absorb(
         &self,
         state: &DaemonState,
@@ -186,6 +239,109 @@ impl QueryInputs {
         Ok(written)
     }
 
+    /// Settle the linker's name-only call guesses in `file` against what the
+    /// server answered at their call sites, once the file's relations are in.
+    ///
+    /// `text` is the admitted source these answers were asked against, the
+    /// same bytes the guesses' sites were parsed from while this capture's
+    /// epoch holds.
+    ///
+    /// `names` are the external symbols the server's outside answers were
+    /// named as, and `context` the proof context it answered under; with both,
+    /// a call into a named symbol is proven as well as refuting guesses.
+    pub(crate) async fn settle(
+        &self,
+        state: &DaemonState,
+        file: &str,
+        text: &str,
+        answers: &[kin_lsp::call_sites::SiteAnswer],
+        names: &kin_lsp::call_sites::ExternalNames,
+        context: Option<&kin_model::ProofContext>,
+    ) -> Result<EnrichmentWrite, Refused> {
+        let _coordinated = state.coordination_gate.lock().await;
+        self.validate(state)?;
+        // Every endpoint an answer names came from this capture's index.
+        for answer in answers {
+            if !self.ids.contains(&answer.source) {
+                return Err(Refused::UnprovenSource);
+            }
+            if let kin_lsp::call_sites::SiteTarget::Entity(target) = answer.target {
+                if !self.ids.contains(&target) {
+                    return Err(Refused::UnprovenSource);
+                }
+            }
+        }
+        let written = super::settle_call_sites_locked(state, file, text, answers, names, context);
+        self.accept_own_write(state)?;
+        Ok(written)
+    }
+
+    /// [`Self::settle`] for a file a sweep finished asking about, then give
+    /// every caller in the file its call-site ledger and make the file's
+    /// proofs agree with the ledgers (see
+    /// [`super::install_call_site_ledgers_locked`]), under the same
+    /// coordination and freshness proof.
+    ///
+    /// `ledger` carries what the passes left beyond their answers: the
+    /// questions that proved nothing, how the passes ended, and whether the
+    /// file is in any build. With `retract`, every pass over the file
+    /// finished, so a proof its ledgers do not hold is retracted.
+    pub(crate) async fn settle_file(
+        &self,
+        state: &DaemonState,
+        text: &str,
+        answers: &[kin_lsp::call_sites::SiteAnswer],
+        names: &kin_lsp::call_sites::ExternalNames,
+        context: &kin_model::ProofContext,
+        ledger: LedgerRequest<'_>,
+    ) -> Result<(EnrichmentWrite, super::LedgerWrite), Refused> {
+        let _coordinated = state.coordination_gate.lock().await;
+        self.validate(state)?;
+        for answer in answers {
+            if !self.ids.contains(&answer.source) {
+                return Err(Refused::UnprovenSource);
+            }
+            if let kin_lsp::call_sites::SiteTarget::Entity(target) = answer.target {
+                if !self.ids.contains(&target) {
+                    return Err(Refused::UnprovenSource);
+                }
+            }
+        }
+        let written = super::settle_call_sites_locked(
+            state,
+            ledger.file,
+            text,
+            answers,
+            names,
+            Some(context),
+        );
+        self.accept_own_write(state)?;
+        let Some(body) = self.blob_hash(ledger.file) else {
+            return Ok((written, super::LedgerWrite::default()));
+        };
+        let context_id = kin_model::ResolutionRecord::ProofContext(context.clone()).id();
+        let pass = crate::call_site_ledger::FilePass {
+            file: ledger.file,
+            text,
+            uri: ledger.uri,
+            index: ledger.index,
+            entities: ledger.entities,
+            answers,
+            names,
+            unproven: ledger.unproven,
+            recorded: &[],
+            produced_references: ledger.produced_references,
+            ending: ledger.ending,
+            not_in_build: ledger.not_in_build,
+            context: context_id,
+            body,
+        };
+        let ledgers =
+            super::install_call_site_ledgers_locked(state, &pass, context, ledger.retract);
+        self.accept_own_write(state)?;
+        Ok((written, ledgers))
+    }
+
     fn accept_own_write(&self, state: &DaemonState) -> Result<(), Refused> {
         // Still under coordination. Only our synchronous relation installer
         // could have advanced the epoch here; never refresh after waiting on a
@@ -194,6 +350,28 @@ impl QueryInputs {
         self.epoch.store(epoch, Ordering::SeqCst);
         Ok(())
     }
+}
+
+/// What a sweep's passes over one file left for its call-site ledgers, beyond
+/// their answers.
+pub(crate) struct LedgerRequest<'a> {
+    pub(crate) file: &'a str,
+    /// The file's URI as `index` knows it.
+    pub(crate) uri: &'a str,
+    pub(crate) index: &'a kin_lsp::EntityIndex,
+    /// The entities the file declares.
+    pub(crate) entities: &'a [&'a Entity],
+    /// Every identifier the definitions pass asked about and could not prove.
+    pub(crate) unproven: &'a [kin_lsp::call_sites::UnprovenSite],
+    /// The language-server `References` relations the passes over the file
+    /// produced, which a retraction keeps.
+    pub(crate) produced_references: &'a std::collections::HashSet<kin_model::RelationId>,
+    pub(crate) ending: crate::call_site_ledger::PassEnding,
+    /// Whether no build of the repository compiles the file.
+    pub(crate) not_in_build: bool,
+    /// Whether every pass over the file finished, so a proof its ledgers do
+    /// not hold may be retracted.
+    pub(crate) retract: bool,
 }
 
 pub(crate) fn request_fresh_sweep(state: &DaemonState) {

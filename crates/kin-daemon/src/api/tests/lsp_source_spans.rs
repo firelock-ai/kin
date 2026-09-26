@@ -107,7 +107,8 @@ async fn fresh_lsp_source_spans_preserve_prior_call_through_removal_and_cold_sta
         Some(&|path| inputs.document(path)),
     )
     .await
-    .unwrap();
+    .unwrap()
+    .relations;
     server.shutdown().await.unwrap();
     assert_eq!(generated.len(), 1);
     let prior = generated[0].clone();

@@ -348,6 +348,12 @@ pub(crate) struct EncodedChanges {
     /// `None` describes every encoded change map that could never go stale
     /// this way: a test fixture, or history admitted without a backend at all.
     stale_handle_recovery: Option<StaleHandleRecovery>,
+    /// Whether any change in these bytes moves resolution records, observed
+    /// by the open that streamed every change once.
+    carries_resolution_records: bool,
+    /// Whether any change in these bytes moves a call-site ledger, observed
+    /// the same way.
+    carries_call_site_ledgers: bool,
 }
 
 impl fmt::Debug for EncodedChanges {
@@ -386,6 +392,10 @@ pub(crate) struct HistoryRecord {
 struct ChangeOverlay {
     records: HashMap<SemanticChangeId, HistoryRecord>,
     spool: Option<Arc<Mutex<File>>>,
+    /// Whether any appended change moves resolution records.
+    carries_resolution_records: bool,
+    /// Whether any appended change moves a call-site ledger.
+    carries_call_site_ledgers: bool,
 }
 
 impl Deref for ChangeOverlay {
@@ -475,6 +485,9 @@ impl ChangeOverlay {
                 leaf_digest,
             },
         );
+        self.carries_resolution_records |= !change.resolution_record_deltas.is_empty();
+        self.carries_call_site_ledgers = self.carries_call_site_ledgers
+            || super::format::moves_call_site_ledgers(&change.resolution_record_deltas);
         Ok(())
     }
 }
@@ -495,11 +508,25 @@ impl EncodedChanges {
             body_checksum,
             index: None,
             stale_handle_recovery: None,
+            carries_resolution_records: false,
+            carries_call_site_ledgers: false,
         }
     }
 
     pub(crate) fn with_index(mut self, index: HashMap<SemanticChangeId, HistoryRecord>) -> Self {
         self.index = Some(index);
+        self
+    }
+
+    /// Record whether any change in these bytes moves resolution records.
+    pub(crate) fn with_resolution_records(mut self, carries: bool) -> Self {
+        self.carries_resolution_records = carries;
+        self
+    }
+
+    /// Record whether any change in these bytes moves a call-site ledger.
+    pub(crate) fn with_call_site_ledgers(mut self, carries: bool) -> Self {
+        self.carries_call_site_ledgers = carries;
         self
     }
 
@@ -1005,6 +1032,48 @@ impl ChangeMap {
         Self::from(ChangeMapInner::new())
     }
 
+    /// Whether any change in this history moves resolution records, which a
+    /// reader older than them cannot decode.
+    ///
+    /// Exact for decoded history and for appended changes, and exact for
+    /// history still on disk because the open that streamed it saw every
+    /// change once. Never decodes anything.
+    pub fn may_carry_resolution_records(&self) -> bool {
+        if self.overlay.carries_resolution_records {
+            return true;
+        }
+        if let Some(decoded) = self.body.decoded.get() {
+            return decoded
+                .values()
+                .any(|change| !change.resolution_record_deltas.is_empty());
+        }
+        self.body
+            .encoded
+            .as_ref()
+            .is_some_and(|encoded| encoded.carries_resolution_records)
+    }
+
+    /// Whether any change in this history moves a call-site ledger, which a
+    /// reader older than ledgers decodes and then mishandles.
+    ///
+    /// Exact in the same three cases [`Self::may_carry_resolution_records`]
+    /// is: decoded history, appended changes, and history still on disk,
+    /// whose open saw every change once. Never decodes anything.
+    pub fn may_carry_call_site_ledgers(&self) -> bool {
+        if self.overlay.carries_call_site_ledgers {
+            return true;
+        }
+        if let Some(decoded) = self.body.decoded.get() {
+            return decoded.values().any(|change| {
+                super::format::moves_call_site_ledgers(&change.resolution_record_deltas)
+            });
+        }
+        self.body
+            .encoded
+            .as_ref()
+            .is_some_and(|encoded| encoded.carries_call_site_ledgers)
+    }
+
     /// A map that stays on disk until a reader asks for an entry.
     pub(crate) fn encoded(encoded: EncodedChanges) -> Self {
         Self {
@@ -1415,6 +1484,7 @@ mod tests {
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         };
         change.id = kin_model::compute_semantic_change_id(&change).unwrap();
         change

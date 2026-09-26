@@ -9,7 +9,8 @@ use super::{binding_history::BindingHistoryWitness, GraphSnapshot};
 use crate::KinDbError;
 use kin_model::{
     Entity, EntityId, ExternalReference, ExternalReferenceId, Hash256, OperationId, Relation,
-    RelationId, RepositoryCommitReceipt, RepositoryTransaction, ResolvedTree, WorkspaceId,
+    RelationId, RepositoryCommitReceipt, RepositoryTransaction, ResolutionRecord,
+    ResolutionRecordId, ResolvedTree, WorkspaceId,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -110,6 +111,10 @@ pub(super) struct CapturedSessionGraph {
     relations: BTreeMap<RelationId, Relation>,
     external_references: BTreeMap<ExternalReferenceId, ExternalReference>,
     tree: ResolvedTree,
+    /// Appended last and omitted when empty, so a captured graph without
+    /// resolution records keeps the bytes it always had.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    resolution_records: BTreeMap<ResolutionRecordId, ResolutionRecord>,
 }
 
 impl CapturedSessionGraph {
@@ -131,6 +136,11 @@ impl CapturedSessionGraph {
                 .map(|(k, v)| (*k, v.clone()))
                 .collect(),
             tree: source.resolved_tree.clone(),
+            resolution_records: source
+                .resolution_records
+                .iter()
+                .map(|(k, v)| (*k, v.clone()))
+                .collect(),
         }
     }
     pub(super) fn graph(&self) -> GraphSnapshot {
@@ -147,6 +157,14 @@ impl CapturedSessionGraph {
             .map(|(k, v)| (*k, v.clone()))
             .collect();
         graph.resolved_tree = self.tree.clone();
+        if !self.resolution_records.is_empty() {
+            graph.resolution_records = self
+                .resolution_records
+                .iter()
+                .map(|(k, v)| (*k, v.clone()))
+                .collect();
+            graph.version = GraphSnapshot::graph_only_version(graph.resolution_records.values());
+        }
         graph
     }
 }

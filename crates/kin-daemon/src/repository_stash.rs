@@ -60,10 +60,36 @@ struct ReturnToBase {
     base_relations: std::collections::HashMap<kin_model::RelationId, kin_model::Relation>,
     sealed_entities: std::collections::HashMap<kin_model::EntityId, kin_model::Entity>,
     sealed_relations: std::collections::HashMap<kin_model::RelationId, kin_model::Relation>,
+    base_nodes: GraphNodes,
+    sealed_nodes: GraphNodes,
     base_policy: SharedAdmissionPolicy,
     actor: AuthorId,
     stash_ref: RefName,
     entry: StashEntryReport,
+}
+
+/// The external symbols and resolution records one side of a stash holds.
+#[derive(Default)]
+struct GraphNodes {
+    external_references:
+        std::collections::HashMap<kin_model::ExternalReferenceId, kin_model::ExternalReference>,
+    resolution_records:
+        std::collections::HashMap<kin_model::ResolutionRecordId, kin_model::ResolutionRecord>,
+}
+
+impl GraphNodes {
+    fn target<'a>(
+        &'a self,
+        entities: &'a std::collections::HashMap<kin_model::EntityId, kin_model::Entity>,
+        relations: &'a std::collections::HashMap<kin_model::RelationId, kin_model::Relation>,
+    ) -> crate::local_repository_authority::TargetGraph<'a> {
+        crate::local_repository_authority::TargetGraph {
+            entities,
+            relations,
+            external_references: &self.external_references,
+            resolution_records: &self.resolution_records,
+        }
+    }
 }
 
 struct StashExecution {
@@ -309,6 +335,10 @@ fn push(
     let daemon_snapshot = state.graph.to_snapshot();
     let daemon_entities = daemon_snapshot.entities;
     let daemon_relations = daemon_snapshot.relations;
+    let daemon_nodes = GraphNodes {
+        external_references: daemon_snapshot.external_references,
+        resolution_records: daemon_snapshot.resolution_records,
+    };
     let ordinal = next_stash_ordinal(metadata)?;
     let stash_ref = stash_ref_name(ordinal)?;
     if lease
@@ -325,7 +355,7 @@ fn push(
         Some(parent) => Some(resolved_admission_policy(metadata, parent)?),
         None => None,
     };
-    let (parent_tree, parent_entities, parent_relations) = match parent {
+    let (parent_tree, parent_entities, parent_relations, parent_nodes) = match parent {
         Some(parent) => {
             let mut snapshot = lease.snapshot().clone();
             snapshot.repository_authority = None;
@@ -334,12 +364,21 @@ fn push(
             let state = graph
                 .resolve_graph_at(&parent)
                 .with_context(|| format!("resolve exact graph at stash parent {parent}"))?;
-            (state.tree.clone(), state.entities, state.relations)
+            (
+                state.tree.clone(),
+                state.entities,
+                state.relations,
+                GraphNodes {
+                    external_references: state.external_references,
+                    resolution_records: state.resolution_records,
+                },
+            )
         }
         None => (
             ResolvedTree::default(),
             std::collections::HashMap::new(),
             std::collections::HashMap::new(),
+            GraphNodes::default(),
         ),
     };
     // The sealed content is built exactly the way a native commit builds its
@@ -352,13 +391,12 @@ fn push(
         parent.as_ref(),
     )
     .context("plan the exact sealed change against the authority target")?;
-    let workspace_semantic_delta = kin_core::diff_workspace_semantics(
-        &workspace_graph.entities,
-        &workspace_graph.relations,
-        &daemon_entities,
-        &daemon_relations,
-    )
-    .context("plan the exact sealed workspace semantic transition")?;
+    let workspace_semantic_delta =
+        crate::local_repository_authority::plan_workspace_graph_transition(
+            crate::local_repository_authority::TargetGraph::of_snapshot(&workspace_graph),
+            daemon_nodes.target(&daemon_entities, &daemon_relations),
+        )
+        .context("plan the exact sealed workspace semantic transition")?;
     let (sealed_policy, admission_policy_delta) =
         SharedAdmissionPolicy::derive_from_tree_with_allowances(
             parent_policy.as_ref(),
@@ -388,7 +426,8 @@ fn push(
         spec_link: None,
         evidence: Vec::new(),
         risk_summary: None,
-        external_reference_deltas: Vec::new(),
+        external_reference_deltas: sealed.external_reference_deltas,
+        resolution_record_deltas: sealed.resolution_record_deltas,
     };
     change.id = compute_semantic_change_id(&change).context("identify the exact sealed change")?;
     let sealed_change_id = change.id;
@@ -545,6 +584,8 @@ fn push(
             base_relations: parent_relations,
             sealed_entities: daemon_entities,
             sealed_relations: daemon_relations,
+            base_nodes: parent_nodes,
+            sealed_nodes: daemon_nodes,
             base_policy,
             actor: actor.clone(),
             stash_ref,
@@ -570,32 +611,22 @@ fn return_to_base(
         .context("hash the exact authority base tree")?;
     let tree_deltas = kin_core::exact_tree_correction(&plan.sealed_workspace.tree, &plan.base_tree)
         .context("plan the exact workspace return tree transition")?;
-    let semantic_delta = kin_core::diff_workspace_semantics(
-        &plan.sealed_entities,
-        &plan.sealed_relations,
-        &plan.base_entities,
-        &plan.base_relations,
+    let base_graph = plan
+        .base_nodes
+        .target(&plan.base_entities, &plan.base_relations);
+    let semantic_delta = crate::local_repository_authority::plan_workspace_graph_transition(
+        plan.sealed_nodes
+            .target(&plan.sealed_entities, &plan.sealed_relations),
+        base_graph,
     )
     .context("plan the exact workspace return semantic transition")?;
-    let daemon_snapshot = state.graph.to_snapshot();
-    let daemon_semantic_delta = kin_core::diff_workspace_semantics(
-        &daemon_snapshot.entities,
-        &daemon_snapshot.relations,
-        &plan.base_entities,
-        &plan.base_relations,
-    )
-    .context("plan the exact workspace return transition for the daemon view")?;
-    let daemon_delta = TransactionDelta {
-        entity_deltas: daemon_semantic_delta.entity_deltas().to_vec(),
-        relation_deltas: daemon_semantic_delta.relation_deltas().to_vec(),
-        tree_deltas: kin_core::exact_tree_correction(
-            &daemon_snapshot.resolved_tree,
-            &plan.base_tree,
+    let (mut daemon_delta, daemon_tree) =
+        crate::local_repository_authority::plan_daemon_graph_transition_from_tree(
+            state, base_graph,
         )
-        .context("plan the exact workspace return tree transition for the daemon view")?,
-        admission_policy_delta: None,
-        external_reference_deltas: Vec::new(),
-    };
+        .context("plan the exact workspace return transition for the daemon view")?;
+    daemon_delta.tree_deltas = kin_core::exact_tree_correction(&daemon_tree, &plan.base_tree)
+        .context("plan the exact workspace return tree transition for the daemon view")?;
     let transaction =
         RepositoryTransaction {
             schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
@@ -784,29 +815,19 @@ fn pop(
     };
     let tree_deltas = kin_core::exact_tree_correction(&workspace.tree, &sealed_tree)
         .context("plan the exact stash restore tree transition")?;
-    let semantic_delta = kin_core::diff_workspace_semantics(
-        &workspace_graph.entities,
-        &workspace_graph.relations,
-        &sealed_state.entities,
-        &sealed_state.relations,
+    let semantic_delta = crate::local_repository_authority::plan_workspace_graph_transition(
+        crate::local_repository_authority::TargetGraph::of_snapshot(&workspace_graph),
+        crate::local_repository_authority::TargetGraph::of_state(&sealed_state),
     )
     .context("plan the exact stash restore semantic transition")?;
-    let daemon_snapshot = state.graph.to_snapshot();
-    let daemon_semantic_delta = kin_core::diff_workspace_semantics(
-        &daemon_snapshot.entities,
-        &daemon_snapshot.relations,
-        &sealed_state.entities,
-        &sealed_state.relations,
-    )
-    .context("plan the exact stash restore transition for the daemon view")?;
-    let daemon_delta = TransactionDelta {
-        entity_deltas: daemon_semantic_delta.entity_deltas().to_vec(),
-        relation_deltas: daemon_semantic_delta.relation_deltas().to_vec(),
-        tree_deltas: kin_core::exact_tree_correction(&daemon_snapshot.resolved_tree, &sealed_tree)
-            .context("plan the exact stash restore tree transition for the daemon view")?,
-        admission_policy_delta: None,
-        external_reference_deltas: Vec::new(),
-    };
+    let (mut daemon_delta, daemon_tree) =
+        crate::local_repository_authority::plan_daemon_graph_transition_from_tree(
+            state,
+            crate::local_repository_authority::TargetGraph::of_state(&sealed_state),
+        )
+        .context("plan the exact stash restore transition for the daemon view")?;
+    daemon_delta.tree_deltas = kin_core::exact_tree_correction(&daemon_tree, &sealed_tree)
+        .context("plan the exact stash restore tree transition for the daemon view")?;
     let transaction = RepositoryTransaction {
         schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
         operation_id,

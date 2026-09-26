@@ -3,7 +3,7 @@
 
 # Kin environment variables
 
-This is the authoritative list of supported `KIN_*` environment variables (554 total, 365 correctness-relevant), generated from the central registry in `kin-core`.
+This is the authoritative list of supported `KIN_*` environment variables (556 total, 365 correctness-relevant), generated from the central registry in `kin-core`.
 
 At CLI and daemon startup Kin validates this surface (`KIN_ENV_VALIDATION`, default `warn`):
 
@@ -63,6 +63,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_ALLOW_MASS_DELETION` | bool | false | correctness | permit reconcile to apply mass deletions (data-destructive) |
 | `KIN_ALLOW_OFFLINE_RESTORE` | bool | false | operational | allow restoring a backup without remote verification |
 | `KIN_ALLOW_PARENT_STORE` | bool | false | operational | allow discovering a store in a parent directory |
+| `KIN_ANALYSIS_ENVIRONMENTS` | bool | true | operational | fetch the dependencies a repository's lockfile pins, hash-verified and never run, into a shared store under KIN_HOME/cache so language servers can resolve calls into them; falsy turns analysis environments off, and a repository without a matching environment of its own then reports its environment missing |
 | `KIN_API_URL` | url | *(unset)* | operational | hosted API base URL (release/pipeline commands) |
 | `KIN_BUILD_GRAPH_TIMEOUT_SECS` | seconds>=0 | 60 | operational | timeout for building a historical ref-view graph |
 | `KIN_BYPASS_EMBEDDING_COVERAGE_CHECK` | bool | false | correctness | bypass the embedding-coverage correctness gate |
@@ -104,6 +105,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_STRICT_BEHAVIOR_ENV` | bool | false | operational | escalate a CLI/daemon behavior-env divergence from a warning to a hard error |
 | `KIN_STRICT_BUILD_MATCH` | bool | false | correctness | require a strict historical build match when resolving a ref view |
 | `KIN_TRANSFER_MAX_DECODED_BODY_BYTES` | usize | 67108864 | operational | kin-daemon receive ceiling for one transfer pack's decoded body closure, in bytes; unset, zero or unparseable keeps the compiled 64 MiB, and the effective bound is always the smaller of this and what the sending peer advertised, so raising it never overrides a peer. It is a transport bound, not the product's answer to repository size, and it is held in memory per concurrent receive |
+| `KIN_TSSERVER_MAX_MEMORY_MB` | usize | a quarter of RAM, 3072 to 16384 | operational | tsserver heap ceiling in MB for the TypeScript language server; values below 1024 are ignored |
 | `KIN_VECTOR_SIMD` | bool | true | correctness | kin-vector NEON SIMD cosine-distance kernel on aarch64, on by default; only 0/false/no/off select the scalar reduction, and the two reduction orders differ in the last ULPs so distances and therefore ranking order can shift |
 | `KIN_VFS_BIN` | path | *(unset)* | operational | pin the `kin-vfs` projection driver Kin probes and runs, instead of searching beside the `kin` binary, in `~/.kin/bin`, and on PATH. When set it is the only candidate, so a pin naming a file that is not there reports an absent driver rather than resolving to another one. Use it to run a driver built with a mount feature without reordering PATH |
 | `KIN_VFS_DISABLE` | bool | false | correctness | kin-vfs interception kill switch: the literal 1 disables every projected read and write, default off |

@@ -25,6 +25,17 @@ pub fn handle_verify_entity<G: GraphStore>(
     store: &G,
 ) -> Result<ToolCallResult> {
     let id_str = get_string_param(args, "entity_id")?;
+    // Tests link to repository entities, so a symbol outside the repository
+    // has none here, and `covered: false` would read as an untested entity.
+    if let Some(refusal) = super::external_symbols::external_id_refusal(
+        store,
+        &id_str,
+        "kin_verify_entity",
+        "entity_id",
+        "has no tests linked to it here, since tests link to repository entities",
+    )? {
+        return Ok(refusal);
+    }
     let entity_id = parse_entity_id(&id_str)?;
     let runner_filter = args
         .get("runner")

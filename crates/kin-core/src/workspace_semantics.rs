@@ -10,7 +10,9 @@
 use std::collections::{BTreeSet, HashMap};
 
 use kin_model::{
-    Entity, EntityDelta, EntityId, Relation, RelationDelta, RelationId, WorkspaceSemanticDelta,
+    Entity, EntityDelta, EntityId, ExternalReference, ExternalReferenceDelta, ExternalReferenceId,
+    GraphNodeId, Relation, RelationDelta, RelationId, ResolutionRecord, ResolutionRecordDelta,
+    ResolutionRecordId, WorkspaceSemanticDelta,
 };
 
 /// Whether two versions of one entity hold the same CONTENT.
@@ -221,4 +223,100 @@ mod tests {
         assert!(!entity_sides_agree(Some(&before), None));
         assert!(!entity_sides_agree(None, Some(&before)));
     }
+}
+
+/// The external symbols and resolution records a graph holds once it moves to
+/// a target whose relations are `desired_relations`.
+///
+/// Every symbol and record the target holds, and every one the current graph
+/// holds that a desired relation names, by an end or by a proof context in its
+/// evidence, so a relation the transition carries over keeps its endpoint and
+/// the context it was proven under.
+pub fn desired_resolution_nodes<'a>(
+    target_references: &HashMap<ExternalReferenceId, ExternalReference>,
+    target_records: &HashMap<ResolutionRecordId, ResolutionRecord>,
+    current_references: &HashMap<ExternalReferenceId, ExternalReference>,
+    current_records: &HashMap<ResolutionRecordId, ResolutionRecord>,
+    desired_relations: impl IntoIterator<Item = &'a Relation>,
+) -> (
+    HashMap<ExternalReferenceId, ExternalReference>,
+    HashMap<ResolutionRecordId, ResolutionRecord>,
+) {
+    let mut references = target_references.clone();
+    let mut records = target_records.clone();
+    for relation in desired_relations {
+        for node in [relation.src, relation.dst] {
+            if let GraphNodeId::ExternalReference(id) = node {
+                if let Some(reference) = current_references.get(&id) {
+                    references.entry(id).or_insert_with(|| reference.clone());
+                }
+            }
+        }
+        for evidence in &relation.evidence {
+            let Some(id) = evidence
+                .token
+                .as_deref()
+                .and_then(ResolutionRecordId::from_context_token)
+            else {
+                continue;
+            };
+            if let Some(record) = current_records.get(&id) {
+                records.entry(id).or_insert_with(|| record.clone());
+            }
+        }
+    }
+    (references, records)
+}
+
+/// `delta`, also moving the external symbols and resolution records from the
+/// current graph's to the desired ones.
+pub fn with_resolution_node_transition(
+    delta: WorkspaceSemanticDelta,
+    current_references: &HashMap<ExternalReferenceId, ExternalReference>,
+    current_records: &HashMap<ResolutionRecordId, ResolutionRecord>,
+    desired_references: &HashMap<ExternalReferenceId, ExternalReference>,
+    desired_records: &HashMap<ResolutionRecordId, ResolutionRecord>,
+) -> kin_model::Result<WorkspaceSemanticDelta> {
+    let reference_deltas: Vec<ExternalReferenceDelta> = current_references
+        .keys()
+        .chain(desired_references.keys())
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter_map(|id| {
+            match (current_references.get(&id), desired_references.get(&id)) {
+                (None, Some(new)) => Some(ExternalReferenceDelta::Added { new: new.clone() }),
+                (Some(old), None) => Some(ExternalReferenceDelta::Removed { old: old.clone() }),
+                // One identity is one immutable coordinate.
+                (Some(_), Some(_)) | (None, None) => None,
+            }
+        })
+        .collect();
+    let record_deltas: Vec<ResolutionRecordDelta> = current_records
+        .keys()
+        .chain(desired_records.keys())
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter_map(
+            |id| match (current_records.get(&id), desired_records.get(&id)) {
+                (None, Some(new)) => Some(ResolutionRecordDelta::Added { new: new.clone() }),
+                (Some(old), Some(new)) if old != new => Some(ResolutionRecordDelta::Modified {
+                    old: old.clone(),
+                    new: new.clone(),
+                }),
+                (Some(old), None) => Some(ResolutionRecordDelta::Removed { old: old.clone() }),
+                (Some(_), Some(_)) | (None, None) => None,
+            },
+        )
+        .collect();
+    if reference_deltas.is_empty() && record_deltas.is_empty() {
+        return Ok(delta);
+    }
+    WorkspaceSemanticDelta::new_with_external_references(
+        delta.entity_deltas().to_vec(),
+        delta.relation_deltas().to_vec(),
+        reference_deltas,
+    )?
+    .with_resolution_records(record_deltas)
 }

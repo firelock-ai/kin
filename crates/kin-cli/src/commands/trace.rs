@@ -480,8 +480,25 @@ fn build_trace_lines_with_graph(
         ));
     }
 
-    if let Some(content) =
-        render_entity_source(binding, graph, target, focal_max_lines, snippet_max_chars)?
+    // Read once: printed below, and the text an external call's site quotes.
+    let focal_body = read_entity_body(binding, graph, target)?;
+    // The calls the focal makes into symbols outside the repository, in the
+    // rows `trace_data_flow` reaches as leaf steps, each site's text cut from
+    // the focal's own body.
+    let external_calls = {
+        let text = crate::commands::external_symbols::BodySiteText::new(|caller: &Entity| {
+            if caller.id == target.id {
+                focal_body.clone()
+            } else {
+                None
+            }
+        });
+        kin_mcp::handlers::external_symbols::external_call_rows(graph, target, &text)
+            .map_err(|error| anyhow::anyhow!("read external calls: {error}"))?
+    };
+    if let Some(content) = focal_body
+        .as_deref()
+        .and_then(|body| format_entity_source(target, body, focal_max_lines, snippet_max_chars))
     {
         if !compact {
             lines.push("\n--- Focal ---".to_string());
@@ -523,7 +540,13 @@ fn build_trace_lines_with_graph(
     // Hoisted above the compact split on purpose. Both renderings key on the
     // same two groups, and leaving this inside the compact arm left the DEFAULT
     // invocation, the one a person types, as the only surface still silent.
-    if pack.dependency_signatures.is_empty() && pack.transitive_deps.is_empty() {
+    //
+    // A focal whose calls all leave the repository reaches something, as its
+    // leaf steps do in `trace_data_flow`, so it claims no absence.
+    if pack.dependency_signatures.is_empty()
+        && pack.transitive_deps.is_empty()
+        && external_calls.0.is_empty()
+    {
         lines.extend(trace_absence_qualifier(graph, target, envelope));
     }
 
@@ -536,7 +559,7 @@ fn build_trace_lines_with_graph(
             .chain(pack.transitive_deps.iter())
             .map(|e| &e.entity_id)
             .collect();
-        if !all_dep_ids.is_empty() {
+        if !all_dep_ids.is_empty() || !external_calls.0.is_empty() {
             lines.push("\n--- Deps ---".to_string());
             // Every call the focal makes is printed. The eight-row cap and the
             // same-file skip below bound the rows that answer a different
@@ -578,6 +601,17 @@ fn build_trace_lines_with_graph(
                     "  ({} further non-call rows not shown)",
                     other_withheld
                 ));
+            }
+            // Every call is printed, and these are calls: never capped here.
+            for row in &external_calls.0 {
+                lines.push(format!(
+                    "  {}",
+                    crate::commands::external_symbols::leaf_line(row)
+                ));
+            }
+            lines.extend(external_withheld_line(&external_calls));
+            if !external_calls.0.is_empty() {
+                lines.push(crate::commands::external_symbols::SITE_OFFSET_NOTE.to_string());
             }
         }
     } else {
@@ -655,6 +689,15 @@ fn build_trace_lines_with_graph(
                 ));
             }
         }
+
+        if !external_calls.0.is_empty() {
+            lines.push("\n--- External calls ---".to_string());
+            for row in &external_calls.0 {
+                lines.push(crate::commands::external_symbols::leaf_line(row));
+            }
+            lines.extend(external_withheld_line(&external_calls));
+            lines.push(crate::commands::external_symbols::SITE_OFFSET_NOTE.to_string());
+        }
     }
 
     if !compact {
@@ -677,6 +720,17 @@ fn build_trace_lines_with_graph(
     }
 
     Ok(lines)
+}
+
+/// The line a trace prints when the per-list cap withheld external calls.
+fn external_withheld_line(external_calls: &(Vec<serde_json::Value>, usize)) -> Option<String> {
+    let withheld = external_calls.1.saturating_sub(external_calls.0.len());
+    (withheld > 0).then(|| {
+        format!(
+            "({withheld} more external calls past the {}-row cap are not listed)",
+            kin_mcp::handlers::external_symbols::EXTERNAL_CALLS_MAX
+        )
+    })
 }
 
 fn parse_budget(s: &str) -> Result<TokenBudget> {
@@ -847,6 +901,42 @@ fn render_entity_source(
     max_lines: usize,
     max_chars: usize,
 ) -> Result<Option<String>> {
+    let Some(body) = read_entity_body(binding, graph, entity)? else {
+        return Ok(None);
+    };
+    Ok(format_entity_source(entity, &body, max_lines, max_chars))
+}
+
+/// An entity's body as the rendering prints it: a header naming it, then its
+/// source clipped to the caps, or `None` when nothing is left to print.
+fn format_entity_source(
+    entity: &Entity,
+    body: &str,
+    max_lines: usize,
+    max_chars: usize,
+) -> Option<String> {
+    let snippet = clip_rendered_text_with_cap(body.trim(), max_lines, max_chars);
+    if snippet.is_empty() {
+        return None;
+    }
+    let file = entity
+        .file_origin
+        .as_ref()
+        .map(|file| file.0.as_str())
+        .unwrap_or_default();
+    Some(format!(
+        "// {} ({:?}, {})\n{}",
+        entity.name, file, entity.language, snippet
+    ))
+}
+
+/// The exact bytes of an entity's span, read from the graph-owned tree, or
+/// `None` when the graph holds no independent source for it.
+fn read_entity_body(
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
+    graph: &impl GraphStore,
+    entity: &Entity,
+) -> Result<Option<String>> {
     if kin_model::is_derived_member(entity) {
         return Ok(None);
     }
@@ -884,15 +974,7 @@ fn render_entity_source(
             entity.name, start, end, file_origin.0
         )
     })?;
-    let snippet = clip_rendered_text_with_cap(source.trim(), max_lines, max_chars);
-    if snippet.is_empty() {
-        return Ok(None);
-    }
-
-    Ok(Some(format!(
-        "// {} ({:?}, {})\n{}",
-        entity.name, file_origin.0, entity.language, snippet
-    )))
+    Ok(Some(source.to_string()))
 }
 
 fn display_read_path(_layout: &kin_core::KinLayout, rel_path: &str) -> String {
@@ -1077,6 +1159,17 @@ fn resolve_trace_target(
 ) -> Result<TraceResolution> {
     let entity = request.entity.trim();
     let qualifiers = request.qualifiers();
+
+    // A symbol outside the repository has no body or dependencies here to
+    // trace, so it is refused by what it is, with the command that lists its
+    // callers, before the id branch below reports it absent.
+    if let Some(lines) = crate::commands::external_symbols::entity_argument_refusal(
+        graph,
+        entity,
+        "`kin trace` has no body or dependencies of its own here to trace",
+    )? {
+        return Err(anyhow::Error::new(TraceMiss { lines }));
+    }
 
     if let Ok(uuid) = uuid::Uuid::parse_str(entity) {
         let Some(found) = graph.get_entity(&kin_model::EntityId(uuid))? else {
@@ -1791,6 +1884,119 @@ issues.map((iss) => util.finalizeItem(iss, ctx, core.config()));
             response.error.as_deref(),
             Some(joined.as_str()),
             "a miss must carry the discriminator, not just the prose"
+        );
+    }
+
+    // ---- calls into symbols outside the repository ----------------------
+
+    use crate::commands::external_symbols::fixture;
+
+    fn trace_of(
+        store: &fixture::ExternalStore,
+        entity: &str,
+        compact: bool,
+    ) -> super::TraceResponse {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
+        let binding = absent_binding(&layout);
+        let mut request = trace_request(entity);
+        request.compact = compact;
+        super::build_trace_response(
+            &layout,
+            &binding,
+            &store.graph,
+            &request,
+            &healthy_trace_envelope(),
+        )
+        .expect("a trace response")
+    }
+
+    /// A call the focal makes into a package outside the repository is a leaf
+    /// row, as it is a leaf step in `trace_data_flow`: the symbol by name,
+    /// package and version, the proof, the sites inside the focal and the id
+    /// `kin refs` takes, in both renderings.
+    #[test]
+    fn trace_shows_a_focals_external_call_as_a_leaf() {
+        let store = fixture::external_store(false);
+        for compact in [false, true] {
+            let response = trace_of(&store, "render", compact);
+            assert!(response.error.is_none(), "{:?}", response.error);
+            let text = response.lines.join("\n");
+            let line = response
+                .lines
+                .iter()
+                .find(|line| line.contains("Array.map"))
+                .unwrap_or_else(|| panic!("compact={compact}: no external row: {text}"));
+            assert_eq!(
+                line.trim(),
+                format!(
+                    "[Calls ->] Array.map (external symbol, npm typescript 5.6.3, standard \
+                     library) proven_external by lsp:tsserver 5.6.3 (lsp_definition), sites +2, \
+                     +5, id {}, leaf",
+                    store.address()
+                ),
+                "compact={compact}: {text}"
+            );
+            assert!(text.contains("helper"), "the entity callee stays: {text}");
+        }
+    }
+
+    /// A focal whose every call leaves the repository reaches something, so the
+    /// trace does not print the absence qualifier an empty walk earns.
+    #[test]
+    fn a_focal_whose_calls_all_leave_the_repository_is_not_an_absence() {
+        let store = fixture::external_only_store(false);
+        let qualifier =
+            super::trace_absence_qualifier(&store.graph, &store.caller, &healthy_trace_envelope());
+        assert!(
+            !qualifier.is_empty(),
+            "the fixture must earn a qualifier, or this test asserts nothing"
+        );
+        for compact in [false, true] {
+            let response = trace_of(&store, "render", compact);
+            let text = response.lines.join("\n");
+            assert!(text.contains("Array.map"), "{text}");
+            for line in &qualifier {
+                assert!(
+                    !response.lines.contains(line),
+                    "compact={compact}: {line:?} in {text}"
+                );
+            }
+        }
+    }
+
+    /// A symbol outside the repository has no body to trace. Both renderings
+    /// refuse it by its address or its bare id, naming the symbol and the
+    /// command that lists its callers, never as a miss.
+    #[test]
+    fn trace_refuses_an_external_symbol_and_names_kin_refs() {
+        let store = fixture::external_store(false);
+        let hint = format!("kin refs {}", store.address());
+        let dir = tempfile::tempdir().unwrap();
+        let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
+        for entity in [store.address(), store.node.id.to_string()] {
+            let response = trace_of(&store, &entity, false);
+            let error = response.error.expect("a refusal");
+            assert!(error.contains("Array.map"), "{error}");
+            assert!(error.contains(&hint), "{error}");
+            assert!(!error.contains("not in this repo's graph"), "{error}");
+
+            let json =
+                super::build_trace_json_response(&layout, &store.graph, &trace_request(&entity))
+                    .unwrap();
+            let error = json.error.expect("a refusal");
+            assert!(error.contains(&hint), "{error}");
+            assert!(json.entities.is_empty());
+        }
+        let unknown = trace_of(
+            &store,
+            "external_reference:00000000-0000-8000-8000-000000000000",
+            false,
+        );
+        let error = unknown.error.expect("a refusal");
+        assert!(
+            error.contains("names no symbol outside the repository"),
+            "{error}"
         );
     }
 }

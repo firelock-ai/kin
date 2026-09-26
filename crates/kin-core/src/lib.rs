@@ -122,7 +122,9 @@ pub use workspace_carry::{
     plan_workspace_carry, WorkspaceCarry, WorkspaceCarryConflict, WorkspaceCarryConflictKind,
     WorkspaceCarryPlan, WorkspaceSemanticCarryRefusal,
 };
-pub use workspace_semantics::diff_workspace_semantics;
+pub use workspace_semantics::{
+    desired_resolution_nodes, diff_workspace_semantics, with_resolution_node_transition,
+};
 
 pub use diff::{compute_semantic_change_id, content_identity_from_deltas};
 pub use disambiguation::{

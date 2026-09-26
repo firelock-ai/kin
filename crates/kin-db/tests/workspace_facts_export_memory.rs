@@ -185,6 +185,7 @@ fn change(index: usize) -> (SemanticChangeId, SemanticChange) {
         spec_link: None,
         evidence: Vec::new(),
         risk_summary: None,
+        resolution_record_deltas: Vec::new(),
     };
     change.id = compute_semantic_change_id(&change).expect("synthetic change identifies");
     (change.id, change)

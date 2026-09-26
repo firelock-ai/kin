@@ -7,6 +7,7 @@ use crate::error::ModelError;
 use crate::external_reference::{ExternalReference, ExternalReferenceId};
 use crate::ids::*;
 use crate::relation::{GraphNodeId, Relation, RelationKind};
+use crate::resolution::{ResolutionRecord, ResolutionRecordId};
 use crate::review::{
     Review, ReviewAssignment, ReviewComment, ReviewDecision, ReviewDecisionState, ReviewDiscussion,
     ReviewDiscussionId, ReviewDiscussionState, ReviewFilter, ReviewId, ReviewNote, ReviewNoteId,
@@ -73,6 +74,41 @@ pub trait EntityStore: Send + Sync {
         &self,
         id: &EntityId,
     ) -> std::result::Result<Vec<Relation>, Self::Error>;
+    /// A symbol outside the repository, by its identity. A store that holds
+    /// no external symbols answers `None`.
+    fn lookup_external_reference(
+        &self,
+        _id: &ExternalReferenceId,
+    ) -> std::result::Result<Option<ExternalReference>, Self::Error> {
+        Ok(None)
+    }
+    /// Every relation from the entity `id` to a symbol outside the
+    /// repository, in identity order. [`Self::get_all_relations_for_entity`]
+    /// answers only relations between two entities; this is the rest of an
+    /// entity's outgoing edges. A store that holds no external symbols
+    /// answers none.
+    fn get_external_relations_for_entity(
+        &self,
+        _id: &EntityId,
+    ) -> std::result::Result<Vec<Relation>, Self::Error> {
+        Ok(Vec::new())
+    }
+    /// Every relation with an external symbol at either end, in identity
+    /// order. A store that holds no external symbols answers none.
+    fn relations_of_external_reference(
+        &self,
+        _id: &ExternalReferenceId,
+    ) -> std::result::Result<Vec<Relation>, Self::Error> {
+        Ok(Vec::new())
+    }
+    /// One resolution record, by its identity. A store that holds none
+    /// answers `None`.
+    fn lookup_resolution_record(
+        &self,
+        _id: &ResolutionRecordId,
+    ) -> std::result::Result<Option<ResolutionRecord>, Self::Error> {
+        Ok(None)
+    }
     fn get_downstream_impact(
         &self,
         id: &EntityId,
@@ -855,7 +891,7 @@ pub struct SubGraph {
 ///
 /// Persisted positionally, so the crate-level positional-wire rule applies: a
 /// new field goes last, and only a trailing field may skip serialization.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct ResolvedGraphState {
     pub entities: HashMap<EntityId, Entity>,
     pub relations: HashMap<RelationId, Relation>,
@@ -870,9 +906,53 @@ pub struct ResolvedGraphState {
     pub relation_tombstones: HashMap<RelationId, (Relation, SemanticChangeId)>,
     /// First-class endpoints for symbols owned outside this repository.
     ///
-    /// Deliberately last for additive positional-wire compatibility.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    /// Additive for positional-wire compatibility, and written even empty
+    /// whenever resolution records follow it; see the `Serialize` below.
+    #[serde(default)]
     pub external_references: HashMap<ExternalReferenceId, ExternalReference>,
+    /// Resolution records: proof contexts, call-site ledgers and dispatch
+    /// sets.
+    ///
+    /// Deliberately last and omitted when empty, so a state without any keeps
+    /// its exact bytes.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub resolution_records: HashMap<ResolutionRecordId, ResolutionRecord>,
+}
+
+/// Positional-wire serialization: a trailing field is omitted only when every
+/// field after it is omitted too. A name-keyed format omits each empty trailing
+/// field on its own, as the derive this replaced did.
+impl Serialize for ResolvedGraphState {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let has_records = !self.resolution_records.is_empty();
+        let has_external = !self.external_references.is_empty()
+            || (has_records && !serializer.is_human_readable());
+        let mut out = serializer.serialize_struct(
+            "ResolvedGraphState",
+            6 + usize::from(has_external) + usize::from(has_records),
+        )?;
+        out.serialize_field("entities", &self.entities)?;
+        out.serialize_field("relations", &self.relations)?;
+        out.serialize_field("entity_revisions", &self.entity_revisions)?;
+        out.serialize_field("tree", &self.tree)?;
+        out.serialize_field("entity_tombstones", &self.entity_tombstones)?;
+        out.serialize_field("relation_tombstones", &self.relation_tombstones)?;
+        if has_external {
+            out.serialize_field("external_references", &self.external_references)?;
+        } else {
+            out.skip_field("external_references")?;
+        }
+        if has_records {
+            out.serialize_field("resolution_records", &self.resolution_records)?;
+        } else {
+            out.skip_field("resolution_records")?;
+        }
+        out.end()
+    }
 }
 
 /// Filter for querying entities.
@@ -1180,9 +1260,29 @@ where
     I: IntoIterator<Item = SemanticChange>,
 {
     let mut state = ResolvedGraphState::default();
+    let mut records = crate::resolution::ResolutionRecordSet::default();
 
     for change in changes {
         let change_id = change.id;
+        let record_plan = records
+            .plan_parts(
+                &change.entity_deltas,
+                &change.external_reference_deltas,
+                &change.resolution_record_deltas,
+            )
+            .map_err(|error| {
+                ModelError::Conflict(format!(
+                    "change {change_id} moves resolution records it cannot: {error}"
+                ))
+            })?;
+        // History carries every record transition explicitly, so a replay
+        // never infers a removal.
+        if let Some(retired) = record_plan.retired.first() {
+            return Err(ModelError::Conflict(format!(
+                "change {change_id} leaves resolution record {retired} describing a node it \
+                 changed or removed; history carries record removals explicitly"
+            )));
+        }
         for delta in change.entity_deltas {
             match delta {
                 crate::change::EntityDelta::Added { new: entity } => {
@@ -1311,6 +1411,20 @@ where
             }
         }
 
+        records
+            .check_references(&record_plan, |node| match node {
+                GraphNodeId::Entity(id) => state.entities.contains_key(id),
+                GraphNodeId::ExternalReference(id) => state.external_references.contains_key(id),
+                _ => false,
+            })
+            .map_err(|error| {
+                ModelError::Conflict(format!(
+                    "change {change_id} leaves resolution records naming what it does not hold: \
+                     {error}"
+                ))
+            })?;
+        records.apply(&record_plan);
+
         for relation in state.relations.values() {
             for node in [relation.src, relation.dst] {
                 if let GraphNodeId::Entity(entity_id) = node {
@@ -1335,6 +1449,7 @@ where
         }
     }
 
+    state.resolution_records = records.into_records();
     Ok(state)
 }
 
@@ -1939,6 +2054,30 @@ impl<G: EntityStore> EntityStore for &G {
         id: &EntityId,
     ) -> std::result::Result<Vec<Relation>, Self::Error> {
         (**self).get_all_relations_for_entity(id)
+    }
+    fn lookup_external_reference(
+        &self,
+        id: &ExternalReferenceId,
+    ) -> std::result::Result<Option<ExternalReference>, Self::Error> {
+        (**self).lookup_external_reference(id)
+    }
+    fn get_external_relations_for_entity(
+        &self,
+        id: &EntityId,
+    ) -> std::result::Result<Vec<Relation>, Self::Error> {
+        (**self).get_external_relations_for_entity(id)
+    }
+    fn relations_of_external_reference(
+        &self,
+        id: &ExternalReferenceId,
+    ) -> std::result::Result<Vec<Relation>, Self::Error> {
+        (**self).relations_of_external_reference(id)
+    }
+    fn lookup_resolution_record(
+        &self,
+        id: &ResolutionRecordId,
+    ) -> std::result::Result<Option<ResolutionRecord>, Self::Error> {
+        (**self).lookup_resolution_record(id)
     }
     fn get_downstream_impact(
         &self,
@@ -2732,6 +2871,7 @@ mod tests {
             evidence: vec![],
             risk_summary: None,
             external_reference_deltas: vec![],
+            resolution_record_deltas: Vec::new(),
         }
     }
 
@@ -4161,6 +4301,97 @@ mod tests {
         assert!(!state.relations.contains_key(&relation.id));
     }
 
+    /// History carries resolution records like it carries entities: a change
+    /// that records a ledger replays into the state, and a change that
+    /// modifies the ledger's caller must remove or rewrite the ledger itself.
+    #[test]
+    fn resolution_records_replay_and_history_names_every_retirement() {
+        let c1 = make_change_id(41);
+        let c2 = make_change_id(42);
+        let caller = make_entity(EntityId::new(), "caller");
+        let context = crate::ResolutionRecord::ProofContext(crate::ProofContext {
+            language: crate::LanguageId::Rust,
+            resolver: "lsp:rust-analyzer".to_string(),
+            resolver_version: "0.3.2000".to_string(),
+            configuration_hash: crate::Hash256::from_bytes([1; 32]),
+            environment_hash: crate::Hash256::from_bytes([2; 32]),
+            environment_summary: String::new(),
+        });
+        let ledger = crate::ResolutionRecord::CallSites(crate::CallSiteLedger {
+            caller: caller.id,
+            behavior_hash: crate::Hash256::from_bytes([3; 32]),
+            body_hash: crate::Hash256::from_bytes([4; 32]),
+            context: context.id(),
+            census: 1,
+            sites: vec![crate::CallSite {
+                offset: 4,
+                length: 2,
+                state: crate::CallSiteState::ProvenOutside,
+            }],
+        });
+        let mut introduction = make_semantic_change(
+            c1,
+            Vec::new(),
+            vec![EntityDelta::Added {
+                new: caller.clone(),
+            }],
+            Vec::new(),
+        );
+        introduction.resolution_record_deltas = vec![
+            crate::ResolutionRecordDelta::Added {
+                new: context.clone(),
+            },
+            crate::ResolutionRecordDelta::Added {
+                new: ledger.clone(),
+            },
+        ];
+        let state = replay_graph_state(vec![introduction.clone()]).unwrap();
+        assert_eq!(state.resolution_records.get(&ledger.id()), Some(&ledger));
+        assert_eq!(state.resolution_records.len(), 2);
+
+        let mut edited = caller.clone();
+        edited.signature = "fn caller(x: u8)".to_string();
+        let implicit = make_semantic_change(
+            c2,
+            vec![c1],
+            vec![EntityDelta::Modified {
+                old: caller.clone(),
+                new: edited.clone(),
+            }],
+            Vec::new(),
+        );
+        let error = replay_graph_state(vec![introduction.clone(), implicit]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("history carries record removals explicitly"),
+            "{error}"
+        );
+
+        let mut explicit = make_semantic_change(
+            c2,
+            vec![c1],
+            vec![EntityDelta::Modified {
+                old: caller,
+                new: edited,
+            }],
+            Vec::new(),
+        );
+        explicit.resolution_record_deltas = vec![crate::ResolutionRecordDelta::Removed {
+            old: ledger.clone(),
+        }];
+        let state = replay_graph_state(vec![introduction.clone(), explicit]).unwrap();
+        assert!(!state.resolution_records.contains_key(&ledger.id()));
+        assert!(state.resolution_records.contains_key(&context.id()));
+
+        let mut orphan = make_semantic_change(c1, Vec::new(), Vec::new(), Vec::new());
+        orphan.resolution_record_deltas = vec![crate::ResolutionRecordDelta::Added { new: ledger }];
+        assert!(
+            replay_graph_state(vec![orphan]).is_err(),
+            "a ledger of a caller and a context the graph does not hold"
+        );
+    }
+
     #[test]
     fn a_relation_cannot_name_an_external_reference_the_change_did_not_persist() {
         let source = make_entity(EntityId::new(), "caller");
@@ -4261,6 +4492,7 @@ mod tests {
             }],
             admission_policy_delta: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         };
 
         crate::validate_transaction_delta(&delta).unwrap();

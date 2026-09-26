@@ -24,6 +24,7 @@ mod coverage;
 pub mod cross_file;
 pub mod error;
 mod external;
+mod linker_surface;
 pub mod lkg;
 mod move_bindings;
 mod named_imports;

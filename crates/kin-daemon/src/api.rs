@@ -181,6 +181,20 @@ pub(crate) fn read_local_publication_identity(
     backend: &LocalFileBackend,
     repository_id: &RepositoryId,
 ) -> Result<LocalPublicationIdentity, (StatusCode, String)> {
+    Ok(
+        match read_local_publication_record(backend, repository_id)? {
+            Some(bytes) => LocalPublicationIdentity::Published(Sha256::digest(&bytes).into()),
+            None => LocalPublicationIdentity::Unpublished,
+        },
+    )
+}
+
+/// The exact bytes of a repository's local publication record, or `None`
+/// when it has published nothing yet.
+fn read_local_publication_record(
+    backend: &LocalFileBackend,
+    repository_id: &RepositoryId,
+) -> Result<Option<Vec<u8>>, (StatusCode, String)> {
     use std::io::Read as _;
 
     let record = kin_core::kindb_namespace_in(backend.base_path(), repository_id.as_str())
@@ -199,7 +213,7 @@ pub(crate) fn read_local_publication_identity(
     let file = match std::fs::File::open(&record) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(LocalPublicationIdentity::Unpublished);
+            return Ok(None);
         }
         Err(error) => return Err(record_error(error)),
     };
@@ -213,9 +227,61 @@ pub(crate) fn read_local_publication_identity(
             record.display()
         )));
     }
-    Ok(LocalPublicationIdentity::Published(
-        Sha256::digest(&bytes).into(),
-    ))
+    Ok(Some(bytes))
+}
+
+/// Keep the daemon's held authority across a publication it made itself.
+///
+/// The held authority is reused only while `authority.json` reads as it did
+/// before the authority was loaded, and this daemon's own commits rewrite that
+/// record. So every enrichment publication the daemon made through its held
+/// authority left the next reader reopening the store (decoding it and
+/// re-verifying every body in repository CAS, seconds on a converted
+/// TypeScript repository) to load the very state the held manager had just
+/// written. A running sweep publishes every minute or so, and each checkpoint
+/// paid that reopen.
+///
+/// Relabeled only when the record's bytes, read once, are exactly the bytes
+/// the held manager's own commit installed for the state it now publishes,
+/// compared against the digest that commit's write computed under the
+/// repository lock. Any other record reloads, including one that names this
+/// same head: a history-validation proof another process recorded, a prepared
+/// session, or a record from a newer Kin that an open would refuse. Those
+/// carry what an open must judge, so the next reader opens and judges them.
+///
+/// Never waits on the load gate. A reader already loading under it installs
+/// its own label, so a save that finds the gate taken leaves the label to that
+/// reader rather than stalling behind a full reopen.
+pub(crate) fn relabel_held_authority_after_own_commit(state: &DaemonState) {
+    let Some(backend) = state.local_repository_backend() else {
+        return;
+    };
+    let Ok(binding) = state.local_repository_authority_binding() else {
+        return;
+    };
+    let repository_id = binding.repository_id().clone();
+    let _load = match state.projection_authority.load_gate.try_lock() {
+        Ok(gate) => gate,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return,
+    };
+    let Some(held) = lock_recover(&state.projection_authority.held).clone() else {
+        return;
+    };
+    let Ok(Some(record)) = read_local_publication_record(&backend, &repository_id) else {
+        return;
+    };
+    if !held
+        .authority
+        .manager
+        .publication_record_is_own_commit(&record)
+    {
+        return;
+    }
+    state.projection_authority.install(
+        LocalPublicationIdentity::Published(Sha256::digest(&record).into()),
+        held.authority,
+    );
 }
 
 /// One repository-v6 authority per durable publication, shared across the
@@ -7149,6 +7215,22 @@ async fn command_trace_data_flow(
 
     let session_id = extract_session_id_from_headers(&headers)?;
     let graph = resolve_session_graph(&state, session_id.as_ref()).await;
+    // A focal naming a symbol outside the repository is one the graph holds
+    // and the walk does not serve, never a focal it lacks.
+    if let Some(node) =
+        kin_mcp::handlers::external_symbols::lookup_external_symbol(graph.as_ref(), &request.focal)
+            .map_err(internal_error)?
+    {
+        let refusal = kin_mcp::handlers::external_symbols::external_not_served_text(
+            graph.as_ref(),
+            &node,
+            "trace_data_flow",
+            "focal",
+            kin_mcp::handlers::entities::TRACE_EXTERNAL_WHY,
+        )
+        .map_err(internal_error)?;
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, refusal));
+    }
     // A focal or a target that resolved to nothing, and a walk with no step,
     // is served only from a read no writer spanned, for the reason
     // `NameReadWait` gives. A walk with steps toward a resolved target is
@@ -18800,6 +18882,24 @@ async fn mcp_tools_call_selected(
             include_type_edges,
             target,
         };
+        // A focal naming a symbol outside the repository is one the graph
+        // holds and the walk does not serve, never a focal it lacks.
+        match kin_mcp::handlers::external_symbols::lookup_external_symbol(graph.as_ref(), &focal) {
+            Ok(Some(node)) => {
+                return Ok(Json(
+                    kin_mcp::handlers::external_symbols::external_not_served(
+                        graph.as_ref(),
+                        &node,
+                        "trace_data_flow",
+                        "focal",
+                        kin_mcp::handlers::entities::TRACE_EXTERNAL_WHY,
+                    )
+                    .unwrap_or_else(|error| kin_mcp::ToolCallResult::error(error.to_string())),
+                ));
+            }
+            Ok(None) => {}
+            Err(error) => return Ok(Json(kin_mcp::ToolCallResult::error(error.to_string()))),
+        }
         // A focal or a target that resolved to nothing, and a walk with no
         // step, is served only from a read no writer spanned, for the reason
         // `NameReadWait` gives.
@@ -19328,7 +19428,12 @@ async fn mcp_tools_call_selected(
                 graph_authority,
                 scope,
             )
-            .await;
+            .await
+            // Every call site's state across the graph this status reads, by
+            // the one reading every surface shares.
+            .map(|result| {
+                kin_mcp::handlers::entities::with_call_site_status(result, graph.as_ref())
+            });
             if scope == kin_mcp::handlers::entities::GraphStatusScope::Head {
                 // Status is where a caller reads the base for its next
                 // unit-addressed write; a session-scoped graph is not HEAD.
@@ -23062,6 +23167,22 @@ async fn lsp_sweep_status(State(state): State<Arc<DaemonState>>) -> impl IntoRes
                 .collect()
         })
         .unwrap_or_default();
+    let unprovable_files: Vec<serde_json::Value> = state
+        .lsp_unprovable
+        .lock()
+        .map(|unprovable| {
+            unprovable
+                .iter()
+                .map(|(file, queries)| {
+                    json!({
+                        "file": file,
+                        "queries": queries.len(),
+                        "first": queries.first(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let pending = state.lsp_work.pending.load(Ordering::SeqCst);
     let total = state.lsp_sweep_files_total.load(Ordering::SeqCst);
     let done = state.lsp_sweep_files_done.load(Ordering::SeqCst);
@@ -23103,6 +23224,15 @@ async fn lsp_sweep_status(State(state): State<Arc<DaemonState>>) -> impl IntoRes
         // no considered answer, so its enrichment is not durable yet.
         "files_owed": owed_files.len(),
         "owed_files": owed_files,
+        // Files whose latest sweep the language server answered in ways this
+        // build cannot prove, with how many questions and the first answer.
+        // Settled, not owed: each file is finished, and asking again returns
+        // the same answers.
+        "unprovable_queries": unprovable_files
+            .iter()
+            .map(|file| file["queries"].as_u64().unwrap_or(0))
+            .sum::<u64>(),
+        "unprovable_files": unprovable_files,
         // Files whose accepted evidence the crash record could not keep since
         // the last authority commit. Live, published at the next commit, and
         // lost by a crash before it.
@@ -28778,6 +28908,7 @@ pub(crate) mod tests {
             evidence: Vec::new(),
             risk_summary: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         };
         change.id = compute_semantic_change_id(&change).unwrap();
 
@@ -28880,6 +29011,7 @@ pub(crate) mod tests {
             evidence: Vec::new(),
             risk_summary: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         };
         change.id = compute_semantic_change_id(&change).unwrap();
 
@@ -29046,6 +29178,7 @@ pub(crate) mod tests {
             evidence: Vec::new(),
             risk_summary: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         };
         change.id = compute_semantic_change_id(&change).unwrap();
         let main = kin_model::RefName::branch(b"main").unwrap();
@@ -38468,6 +38601,7 @@ pub(crate) mod tests {
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         };
         // The id is the change's computed identity, not a chosen constant: the
         // graph recomputes it on admission and refuses a mismatch. Naming a
@@ -38665,6 +38799,7 @@ pub(crate) mod tests {
                 }],
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             })
             .unwrap();
         // The admission that puts a source file's bytes in the tree derives its
@@ -38777,6 +38912,7 @@ pub(crate) mod tests {
             evidence: Vec::new(),
             risk_summary: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         };
         change.id = kin_core::compute_semantic_change_id(&change).unwrap();
         let target_ref = kin_model::RefName::branch(b"semantic-target").unwrap();
@@ -41425,6 +41561,27 @@ pub(crate) mod tests {
             .unwrap();
         let repeated_digest: [u8; 32] = Sha256::digest(&repeated).into();
         assert_eq!(repeated_digest, first_digest);
+    }
+
+    /// A save that finds a full load under way leaves the label to that load
+    /// rather than waiting behind it. The relabel runs inside the save, after
+    /// its commit, so waiting on the load gate held the save for a whole
+    /// reopen, only to find afterwards that the load had installed its own.
+    #[test]
+    fn a_save_never_waits_on_a_load_in_progress_to_relabel() {
+        let state = test_state();
+        held_repository_authority(&state).unwrap();
+        let _loading = lock_recover(&state.projection_authority.load_gate);
+        let (done, finished) = std::sync::mpsc::channel();
+        let saving = Arc::clone(&state);
+        std::thread::spawn(move || {
+            relabel_held_authority_after_own_commit(&saving);
+            let _ = done.send(());
+        });
+        assert!(
+            finished.recv_timeout(Duration::from_secs(10)).is_ok(),
+            "the relabel waited on a load in progress instead of leaving the label to it"
+        );
     }
 
     /// `/health` answers while another caller holds the admission-pair load.
@@ -56773,6 +56930,7 @@ pub(crate) mod tests {
             evidence: vec![],
             risk_summary: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         };
         change.id = kin_core::compute_semantic_change_id(&change).unwrap();
         state.graph.create_change(&change).unwrap();
@@ -56864,6 +57022,7 @@ pub(crate) mod tests {
             evidence: vec![],
             risk_summary: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         };
         change.id = kin_core::compute_semantic_change_id(&change).unwrap();
         state.graph.create_change(&change).unwrap();
@@ -63116,6 +63275,7 @@ pub(crate) mod tests {
             evidence: Vec::new(),
             risk_summary: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         };
         change.id = kin_model::compute_semantic_change_id(&change).unwrap();
         change
@@ -64674,7 +64834,53 @@ pub(crate) mod tests {
         let target = install_trace_fixture_file(&state, "sweep_target", "src/target.py");
         let caller = install_trace_fixture_file(&state, "sweep_caller", "src/caller.py");
         link_every_class(&state, &caller, &target);
+        settle_every_caller(&state);
         (state, target)
+    }
+
+    /// Give every entity with source text a call-site ledger that records no
+    /// call, under one proof context, as a sweep that found none would, so a
+    /// fixture's call sites read as settled and nothing but the behavior under
+    /// test qualifies an answer.
+    pub(crate) fn settle_every_caller(state: &DaemonState) {
+        use kin_model::EntityStore as _;
+        let context = kin_model::ResolutionRecord::ProofContext(kin_model::ProofContext {
+            language: kin_model::LanguageId::Python,
+            resolver: "lsp:fixture".to_string(),
+            resolver_version: "1".to_string(),
+            configuration_hash: kin_model::Hash256::from_bytes([1; 32]),
+            environment_hash: kin_model::Hash256::from_bytes([2; 32]),
+            environment_summary: String::new(),
+        });
+        let mut deltas = Vec::new();
+        if state.graph.get_resolution_record(&context.id()).is_none() {
+            deltas.push(kin_model::ResolutionRecordDelta::Added {
+                new: context.clone(),
+            });
+        }
+        for entity in state.graph.list_all_entities().unwrap() {
+            if entity.span.is_none() {
+                continue;
+            }
+            let new = kin_model::ResolutionRecord::CallSites(kin_model::CallSiteLedger {
+                caller: entity.id,
+                behavior_hash: entity.fingerprint.behavior_hash,
+                body_hash: kin_model::Hash256::from_bytes([3; 32]),
+                context: context.id(),
+                census: 0,
+                sites: Vec::new(),
+            });
+            if state.graph.get_resolution_record(&new.id()).is_none() {
+                deltas.push(kin_model::ResolutionRecordDelta::Added { new });
+            }
+        }
+        state
+            .graph
+            .apply_transaction_delta(&kin_model::TransactionDelta {
+                resolution_record_deltas: deltas,
+                ..Default::default()
+            })
+            .unwrap();
     }
 
     fn find_references_arguments(target: &Entity) -> HashMap<String, serde_json::Value> {

@@ -10,6 +10,7 @@ use crate::entity::Entity;
 use crate::external_reference::ExternalReferenceDelta;
 use crate::ids::*;
 use crate::relation::Relation;
+use crate::resolution::ResolutionRecordDelta;
 use crate::retrieval::ArtifactId;
 use crate::review::RiskSummary;
 use crate::timestamp::Timestamp;
@@ -19,7 +20,7 @@ use crate::timestamp::Timestamp;
 /// Persisted positionally in every snapshot that carries history, so the
 /// crate-level positional-wire rule applies: a new field goes last, and only a
 /// trailing field may skip serialization.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SemanticChange {
     /// Content-addressed hash.
@@ -47,11 +48,67 @@ pub struct SemanticChange {
     pub risk_summary: Option<RiskSummary>,
     /// Exact transitions of first-class external-symbol endpoints.
     ///
-    /// Deliberately last: persisted positional encodings treat an appended,
-    /// omitted-empty field as additive, while inserting one earlier would
-    /// reassign every field after it.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Additive for positional-wire compatibility: the hand-written
+    /// `Serialize` below omits it when it is empty and nothing after it is
+    /// present, and writes it, even empty, whenever resolution records follow.
+    /// It declares no serde skip of its own because it is not the last field.
+    #[serde(default)]
     pub external_reference_deltas: Vec<ExternalReferenceDelta>,
+    /// Exact transitions of resolution records: proof contexts, call-site
+    /// ledgers and dispatch sets.
+    ///
+    /// Deliberately last and omitted when empty, so every change written
+    /// before it keeps its exact bytes and its identity.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resolution_record_deltas: Vec<ResolutionRecordDelta>,
+}
+
+/// Positional-wire serialization. Changes persist inside a MessagePack
+/// snapshot, where a struct is an array and position decides the mapping, so
+/// a trailing field may be omitted only when every field after it is omitted
+/// too. `external_reference_deltas` is written, even empty, whenever
+/// resolution records follow it; a change carrying neither serializes to the
+/// bytes it always did. A name-keyed format omits each empty field on its own,
+/// so the JSON a change's identity is computed over is unchanged too.
+impl Serialize for SemanticChange {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let has_records = !self.resolution_record_deltas.is_empty();
+        // Name-keyed formats address a field by name, so each empty field is
+        // omitted on its own, exactly as the derive this replaced wrote them.
+        // A positional format writes a field whenever a later one follows.
+        let has_external = !self.external_reference_deltas.is_empty()
+            || (has_records && !serializer.is_human_readable());
+        let mut out = serializer.serialize_struct(
+            "SemanticChange",
+            14 + usize::from(has_external) + usize::from(has_records),
+        )?;
+        out.serialize_field("id", &self.id)?;
+        out.serialize_field("origin", &self.origin)?;
+        out.serialize_field("parents", &self.parents)?;
+        out.serialize_field("timestamp", &self.timestamp)?;
+        out.serialize_field("author", &self.author)?;
+        out.serialize_field("message", &self.message)?;
+        out.serialize_field("entity_deltas", &self.entity_deltas)?;
+        out.serialize_field("relation_deltas", &self.relation_deltas)?;
+        out.serialize_field("tree_deltas", &self.tree_deltas)?;
+        out.serialize_field("admission_policy_delta", &self.admission_policy_delta)?;
+        out.serialize_field("projected_files", &self.projected_files)?;
+        out.serialize_field("spec_link", &self.spec_link)?;
+        out.serialize_field("evidence", &self.evidence)?;
+        out.serialize_field("risk_summary", &self.risk_summary)?;
+        if has_external {
+            out.serialize_field("external_reference_deltas", &self.external_reference_deltas)?;
+        } else {
+            out.skip_field("external_reference_deltas")?;
+        }
+        if has_records {
+            out.serialize_field("resolution_record_deltas", &self.resolution_record_deltas)?;
+        } else {
+            out.skip_field("resolution_record_deltas")?;
+        }
+        out.end()
+    }
 }
 
 /// Immutable provenance that participates in semantic-change identity.
@@ -85,6 +142,7 @@ pub struct EntityHistoryEntry {
     pub relation_delta_count: usize,
     pub tree_delta_count: usize,
     pub external_reference_delta_count: usize,
+    pub resolution_record_delta_count: usize,
     pub admission_policy_changed: bool,
     pub projected_file_count: usize,
     pub evidence_count: usize,
@@ -166,6 +224,7 @@ impl EntityHistoryEntry {
             relation_delta_count: change.relation_deltas.len(),
             tree_delta_count: change.tree_deltas.len(),
             external_reference_delta_count: change.external_reference_deltas.len(),
+            resolution_record_delta_count: change.resolution_record_deltas.len(),
             admission_policy_changed: change.admission_policy_delta.is_some(),
             projected_file_count: change.projected_files.len(),
             evidence_count: change.evidence.len(),
@@ -183,6 +242,7 @@ impl SemanticChange {
             tree_deltas: self.tree_deltas.clone(),
             admission_policy_delta: self.admission_policy_delta.clone(),
             external_reference_deltas: self.external_reference_deltas.clone(),
+            resolution_record_deltas: self.resolution_record_deltas.clone(),
         }
     }
 }
@@ -278,16 +338,54 @@ impl RelationDelta {
 ///
 /// Persisted positionally, so the crate-level positional-wire rule applies: a
 /// new field goes last, and only a trailing field may skip serialization.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TransactionDelta {
     pub entity_deltas: Vec<EntityDelta>,
     pub relation_deltas: Vec<RelationDelta>,
     pub tree_deltas: Vec<TreeDelta>,
     pub admission_policy_delta: Option<AdmissionPolicyDelta>,
-    /// Deliberately last for additive positional-wire compatibility.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Additive for positional-wire compatibility, and written even empty
+    /// whenever resolution records follow it; see the `Serialize` below.
+    #[serde(default)]
     pub external_reference_deltas: Vec<ExternalReferenceDelta>,
+    /// Exact transitions of resolution records. Deliberately last and omitted
+    /// when empty, so a delta without any keeps its exact bytes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resolution_record_deltas: Vec<ResolutionRecordDelta>,
+}
+
+/// Positional-wire serialization, by the rule [`SemanticChange`]'s follows: a
+/// trailing field is omitted only when every field after it is omitted too.
+impl Serialize for TransactionDelta {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let has_records = !self.resolution_record_deltas.is_empty();
+        // Name-keyed formats address a field by name, so each empty field is
+        // omitted on its own, exactly as the derive this replaced wrote them.
+        // A positional format writes a field whenever a later one follows.
+        let has_external = !self.external_reference_deltas.is_empty()
+            || (has_records && !serializer.is_human_readable());
+        let mut out = serializer.serialize_struct(
+            "TransactionDelta",
+            4 + usize::from(has_external) + usize::from(has_records),
+        )?;
+        out.serialize_field("entity_deltas", &self.entity_deltas)?;
+        out.serialize_field("relation_deltas", &self.relation_deltas)?;
+        out.serialize_field("tree_deltas", &self.tree_deltas)?;
+        out.serialize_field("admission_policy_delta", &self.admission_policy_delta)?;
+        if has_external {
+            out.serialize_field("external_reference_deltas", &self.external_reference_deltas)?;
+        } else {
+            out.skip_field("external_reference_deltas")?;
+        }
+        if has_records {
+            out.serialize_field("resolution_record_deltas", &self.resolution_record_deltas)?;
+        } else {
+            out.skip_field("resolution_record_deltas")?;
+        }
+        out.end()
+    }
 }
 
 impl TransactionDelta {
@@ -312,6 +410,11 @@ impl TransactionDelta {
                 .external_reference_deltas
                 .iter()
                 .map(ExternalReferenceDelta::inverse)
+                .collect(),
+            resolution_record_deltas: self
+                .resolution_record_deltas
+                .iter()
+                .map(ResolutionRecordDelta::inverse)
                 .collect(),
         }
     }

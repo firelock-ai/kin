@@ -62,6 +62,21 @@ pub async fn build_xref_response(
     graph_root: &str,
     spine_backend: Option<&dyn kin_spine::SpineBackend>,
 ) -> Result<XrefResponse> {
+    // A symbol outside every repository is no local anchor, and calling it
+    // missing would send the caller to run xref from a repository that does
+    // not exist. Its callers here are what `kin refs` lists.
+    if let Some(lines) = crate::commands::external_symbols::entity_argument_refusal(
+        graph,
+        &request.entity,
+        "`kin xref` has no entity in this repository to anchor a cross-repo lookup on",
+    )? {
+        return Ok(XrefResponse {
+            error: Some(lines.join("\n")),
+            lines,
+            spine: None,
+        });
+    }
+
     // Find the entity by name
     let filter = EntityFilter {
         name_pattern: Some(request.entity.clone()),
@@ -501,5 +516,34 @@ mod tests {
             "daemon-X"
         );
         assert!(payload.authority_complete_for("daemon-X", &target.id));
+    }
+
+    /// A symbol outside every repository has no local anchor, and saying the
+    /// entity is missing would send the caller to run xref from a repository
+    /// that does not exist. The refusal names it and the command that lists
+    /// its callers here.
+    #[tokio::test]
+    async fn xref_refuses_an_external_symbol_and_names_kin_refs() {
+        let store = crate::commands::external_symbols::fixture::external_store(false);
+        for entity in [store.address(), store.node.id.to_string()] {
+            let response = build_xref_response(
+                &store.graph,
+                &XrefRequest {
+                    entity: entity.clone(),
+                },
+                "repo",
+                "root",
+                None,
+            )
+            .await
+            .expect("xref response");
+            let error = response.error.expect("a refusal");
+            assert!(error.contains("Array.map"), "{error}");
+            assert!(
+                error.contains(&format!("kin refs {}", store.address())),
+                "{error}"
+            );
+            assert!(!error.contains("not found"), "{error}");
+        }
     }
 }

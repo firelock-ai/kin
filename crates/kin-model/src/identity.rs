@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use crate::admission::AdmissionPolicyDelta;
 use crate::{
     Entity, EntityDelta, ExternalReferenceDelta, Hash256, ModelError, Relation, RelationDelta,
-    Result, SemanticChange, SemanticChangeId, TransactionDelta, TreeDelta,
+    ResolutionRecordDelta, Result, SemanticChange, SemanticChangeId, TransactionDelta, TreeDelta,
 };
 
 /// Domain separator hashed ahead of a semantic change's canonical preimage.
@@ -79,8 +79,9 @@ pub fn compute_semantic_change_id(change: &SemanticChange) -> Result<SemanticCha
 /// the change carries.
 ///
 /// Every field but `id`, which the preimage derives, and
-/// `external_reference_deltas`, which the derive skips when empty and the
-/// walk below therefore skips too. Hoisted so the count the object header
+/// `external_reference_deltas` and `resolution_record_deltas`, which the
+/// name-keyed serialization skips when empty and the walk below therefore
+/// skips too. Hoisted so the count the object header
 /// carries and the fields the walk writes come from one constant rather than
 /// from a copy that can drift.
 const CHANGE_IDENTITY_FIELD_COUNT: usize = 13;
@@ -111,6 +112,7 @@ struct CanonicalChangeIdentity<'a> {
     relation_deltas: Vec<&'a RelationDelta>,
     tree_deltas: Vec<&'a TreeDelta>,
     external_reference_deltas: Vec<&'a ExternalReferenceDelta>,
+    resolution_record_deltas: Vec<&'a ResolutionRecordDelta>,
 }
 
 impl<'a> CanonicalChangeIdentity<'a> {
@@ -128,12 +130,17 @@ impl<'a> CanonicalChangeIdentity<'a> {
             source.external_reference_deltas.iter().collect();
         external_reference_deltas.sort_by_key(|delta| ExternalReferenceDelta::target_id(delta));
 
+        let mut resolution_record_deltas: Vec<&'a ResolutionRecordDelta> =
+            source.resolution_record_deltas.iter().collect();
+        resolution_record_deltas.sort_by_key(|delta| ResolutionRecordDelta::target_id(delta));
+
         Self {
             source,
             entity_deltas,
             relation_deltas,
             tree_deltas,
             external_reference_deltas,
+            resolution_record_deltas,
         }
     }
 
@@ -147,8 +154,9 @@ impl<'a> CanonicalChangeIdentity<'a> {
     /// say what follows.
     fn write_canonical_preimage<S: CanonicalSink>(&self, out: &mut S) -> Result<()> {
         let source = self.source;
-        let field_count =
-            CHANGE_IDENTITY_FIELD_COUNT + usize::from(!self.external_reference_deltas.is_empty());
+        let field_count = CHANGE_IDENTITY_FIELD_COUNT
+            + usize::from(!self.external_reference_deltas.is_empty())
+            + usize::from(!self.resolution_record_deltas.is_empty());
 
         append_canonical_object_header(out, field_count)?;
 
@@ -174,6 +182,10 @@ impl<'a> CanonicalChangeIdentity<'a> {
         append_canonical_value(out, &source.projected_files)?;
         append_canonical_key(out, "relation_deltas")?;
         append_canonical_seq(out, &self.relation_deltas)?;
+        if !self.resolution_record_deltas.is_empty() {
+            append_canonical_key(out, "resolution_record_deltas")?;
+            append_canonical_seq(out, &self.resolution_record_deltas)?;
+        }
         append_canonical_key(out, "risk_summary")?;
         append_canonical_value(out, &source.risk_summary)?;
         append_canonical_key(out, "spec_link")?;
@@ -226,6 +238,9 @@ pub(crate) fn change_identity_preimage_via_tree(change: &SemanticChange) -> Resu
     canonical_change
         .external_reference_deltas
         .sort_by_key(ExternalReferenceDelta::target_id);
+    canonical_change
+        .resolution_record_deltas
+        .sort_by_key(ResolutionRecordDelta::target_id);
 
     let mut payload = serde_json::to_value(&canonical_change).map_err(serialization)?;
     let fields = payload.as_object_mut().ok_or_else(|| {
@@ -290,6 +305,7 @@ pub fn validate_transaction_delta(delta: &TransactionDelta) -> Result<()> {
         &delta.tree_deltas,
         delta.admission_policy_delta.as_ref(),
         &delta.external_reference_deltas,
+        &delta.resolution_record_deltas,
     )
 }
 
@@ -306,6 +322,7 @@ fn validate_change_deltas(change: &SemanticChange) -> Result<()> {
         &change.tree_deltas,
         change.admission_policy_delta.as_ref(),
         &change.external_reference_deltas,
+        &change.resolution_record_deltas,
     )
 }
 
@@ -315,6 +332,7 @@ fn validate_deltas(
     tree_deltas: &[TreeDelta],
     admission_policy_delta: Option<&AdmissionPolicyDelta>,
     external_reference_deltas: &[ExternalReferenceDelta],
+    resolution_record_deltas: &[ResolutionRecordDelta],
 ) -> Result<()> {
     let mut entity_targets = BTreeSet::new();
     for entity_delta in entity_deltas {
@@ -390,6 +408,17 @@ fn validate_deltas(
         }
     }
 
+    let mut resolution_record_targets = BTreeSet::new();
+    for record_delta in resolution_record_deltas {
+        let target = record_delta.target_id();
+        if !resolution_record_targets.insert(target) {
+            return Err(ModelError::InvalidOperation(format!(
+                "transaction contains more than one delta for resolution record {target}"
+            )));
+        }
+        record_delta.validate()?;
+    }
+
     let mut tree_targets = BTreeSet::new();
     for tree_delta in tree_deltas {
         let target = tree_delta.artifact_id();
@@ -426,6 +455,9 @@ pub fn content_identity_from_deltas(delta: &TransactionDelta) -> Result<[u8; 32]
     canonical
         .external_reference_deltas
         .sort_by_key(ExternalReferenceDelta::target_id);
+    canonical
+        .resolution_record_deltas
+        .sort_by_key(ResolutionRecordDelta::target_id);
 
     let encoded = canonical_json_bytes(&canonical)?;
 
@@ -858,6 +890,7 @@ mod tests {
             evidence: Vec::new(),
             risk_summary: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         }
     }
 
@@ -1419,6 +1452,28 @@ mod tests {
         shapes.push((
             "wide change without external references".to_string(),
             without_references,
+        ));
+        let record = |resolver: &str| crate::ResolutionRecordDelta::Added {
+            new: crate::ResolutionRecord::ProofContext(crate::ProofContext {
+                language: LanguageId::Go,
+                resolver: resolver.to_string(),
+                resolver_version: "v0.17.1".to_string(),
+                configuration_hash: Hash256::from_bytes([0x21; 32]),
+                environment_hash: Hash256::from_bytes([0x22; 32]),
+                environment_summary: "go 1.23.4".to_string(),
+            }),
+        };
+        let mut with_records = wide_change(9);
+        with_records.resolution_record_deltas = vec![record("lsp:gopls"), record("go-vta")];
+        shapes.push((
+            "wide change with resolution records".to_string(),
+            with_records,
+        ));
+        let mut only_records = empty_change();
+        only_records.resolution_record_deltas = vec![record("lsp:gopls")];
+        shapes.push((
+            "resolution records without external references".to_string(),
+            only_records,
         ));
 
         for (name, change) in &shapes {

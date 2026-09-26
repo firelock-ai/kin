@@ -152,17 +152,54 @@ pub struct GraphSnapshotDelta {
     pub entity_revisions: CollectionDelta<EntityId, Vec<EntityRevision>>,
 
     /// Immutable resolved symbols owned outside this repository.
-    ///
-    /// Deliberately last for additive positional-wire compatibility.
     pub external_references: CollectionDelta<ExternalReferenceId, ExternalReference>,
+
+    /// Resolution records: proof contexts, call-site ledgers and dispatch
+    /// sets.
+    ///
+    /// Deliberately last and omitted when empty, so a delta without records
+    /// keeps its exact v5 bytes. A delta that moves records is written at v6,
+    /// or at v7 when it adds or rewrites a call-site ledger.
+    #[serde(default, skip_serializing_if = "CollectionDelta::is_empty")]
+    pub resolution_records: CollectionDelta<ResolutionRecordId, ResolutionRecord>,
 }
 
 impl GraphSnapshotDelta {
     /// Magic bytes for the delta file header: "KNDD"
     pub const MAGIC: [u8; 4] = *b"KNDD";
 
-    /// Current delta format version.
+    /// The format version of a delta that moves no resolution record.
     pub const CURRENT_VERSION: u32 = 5;
+
+    /// The format version of a delta that moves resolution records, which a
+    /// reader of v5 cannot decode.
+    pub const RESOLUTION_RECORDS_VERSION: u32 = 6;
+
+    /// The format version of a delta that adds or rewrites a call-site
+    /// ledger. The layout is v6's. A reader of at most v6 was built before
+    /// anything wrote a ledger, and it would decode one and then mishandle it,
+    /// so it refuses the delta at its header instead.
+    pub const CALL_SITE_LEDGERS_VERSION: u32 = 7;
+
+    /// The version these contents are written at.
+    ///
+    /// A removed record is written as its identity alone, so only an added or
+    /// rewritten ledger makes a delta carry one.
+    pub fn wire_version(&self) -> u32 {
+        if self.resolution_records.is_empty() {
+            Self::CURRENT_VERSION
+        } else if self
+            .resolution_records
+            .added
+            .iter()
+            .chain(&self.resolution_records.modified)
+            .any(|(_, record)| super::format::is_call_site_ledger(record))
+        {
+            Self::CALL_SITE_LEDGERS_VERSION
+        } else {
+            Self::RESOLUTION_RECORDS_VERSION
+        }
+    }
 
     /// Size of the SHA-256 checksum appended to the wire format.
     pub const CHECKSUM_LEN: usize = 32;
@@ -204,6 +241,7 @@ impl GraphSnapshotDelta {
             downstream_warnings: VecDelta::default(),
             entity_revisions: CollectionDelta::default(),
             external_references: CollectionDelta::default(),
+            resolution_records: CollectionDelta::default(),
         }
     }
 
@@ -242,6 +280,7 @@ impl GraphSnapshotDelta {
             && self.downstream_warnings.is_empty()
             && self.entity_revisions.is_empty()
             && self.external_references.is_empty()
+            && self.resolution_records.is_empty()
     }
 
     /// Total number of individual changes across all collections.
@@ -264,6 +303,7 @@ impl GraphSnapshotDelta {
             + self.sessions.change_count()
             + self.intents.change_count()
             + self.external_references.change_count()
+            + self.resolution_records.change_count()
     }
 
     fn validate_semantic_changes(&self) -> Result<(), KinDbError> {
@@ -275,6 +315,32 @@ impl GraphSnapshotDelta {
                 .map(|(key, change)| (key, change)),
             "snapshot delta",
         )
+    }
+
+    fn validate_resolution_records(&self) -> Result<(), KinDbError> {
+        let mut seen = HashSet::with_capacity(self.resolution_records.change_count());
+        for (id, record) in self
+            .resolution_records
+            .added
+            .iter()
+            .chain(&self.resolution_records.modified)
+        {
+            if !seen.insert(*id) {
+                return Err(KinDbError::StorageError(format!(
+                    "snapshot delta repeats resolution record {id}"
+                )));
+            }
+            kin_model::validate_keyed_record(id, record)
+                .map_err(|error| KinDbError::StorageError(format!("snapshot delta {error}")))?;
+        }
+        for id in &self.resolution_records.removed {
+            if !seen.insert(*id) {
+                return Err(KinDbError::StorageError(format!(
+                    "snapshot delta repeats resolution record {id}"
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn validate_external_references(&self) -> Result<(), KinDbError> {
@@ -318,9 +384,10 @@ impl GraphSnapshotDelta {
     pub fn to_bytes(&self) -> Result<Vec<u8>, KinDbError> {
         self.validate_semantic_changes()?;
         self.validate_external_references()?;
+        self.validate_resolution_records()?;
         let mut buf = Vec::new();
         buf.extend_from_slice(&Self::MAGIC);
-        buf.extend_from_slice(&Self::CURRENT_VERSION.to_le_bytes());
+        buf.extend_from_slice(&self.wire_version().to_le_bytes());
         let body = rmp_serde::to_vec(self)
             .map_err(|e| KinDbError::StorageError(format!("delta serialization failed: {e}")))?;
         buf.extend_from_slice(&(body.len() as u64).to_le_bytes());
@@ -333,6 +400,25 @@ impl GraphSnapshotDelta {
     }
 
     /// Deserialize a delta from bytes (with header and checksum validation).
+    /// Refuse a header version that a reader whose newest readable version is
+    /// `newest_readable` does not open, naming the version and the range.
+    ///
+    /// Every read checks with the newest version this binary writes. Checking
+    /// with an older binary's newest version instead shows what that binary
+    /// does with the deltas this one writes.
+    pub(crate) fn check_readable_version(
+        version: u32,
+        newest_readable: u32,
+    ) -> Result<(), KinDbError> {
+        if !(Self::CURRENT_VERSION..=newest_readable).contains(&version) {
+            return Err(KinDbError::StorageError(format!(
+                "unsupported delta version: {version} (expected {} to {newest_readable})",
+                Self::CURRENT_VERSION
+            )));
+        }
+        Ok(())
+    }
+
     pub fn from_bytes(data: &[u8]) -> Result<Self, KinDbError> {
         if data.len() < 16 {
             return Err(KinDbError::StorageError(
@@ -353,12 +439,7 @@ impl GraphSnapshotDelta {
                 .try_into()
                 .map_err(|_| KinDbError::SliceConversionError("version bytes".to_string()))?,
         );
-        if version != Self::CURRENT_VERSION {
-            return Err(KinDbError::StorageError(format!(
-                "unsupported delta version: {version} (expected {})",
-                Self::CURRENT_VERSION
-            )));
-        }
+        Self::check_readable_version(version, Self::CALL_SITE_LEDGERS_VERSION)?;
 
         let body_len = u64::from_le_bytes(
             data[8..16]
@@ -391,8 +472,15 @@ impl GraphSnapshotDelta {
 
         let delta: Self = rmp_serde::from_slice(body)
             .map_err(|e| KinDbError::StorageError(format!("delta deserialization failed: {e}")))?;
+        if delta.wire_version() != version {
+            return Err(KinDbError::StorageError(format!(
+                "delta declares version {version} but its contents are written at version {}",
+                delta.wire_version()
+            )));
+        }
         delta.validate_semantic_changes()?;
         delta.validate_external_references()?;
+        delta.validate_resolution_records()?;
         Ok(delta)
     }
 }
@@ -570,6 +658,7 @@ pub fn compute_graph_delta(
         downstream_warnings: diff_vecs(&old.downstream_warnings, &new.downstream_warnings),
         entity_revisions: diff_maps(&old.entity_revisions, &new.entity_revisions),
         external_references: diff_maps_eq(&old.external_references, &new.external_references),
+        resolution_records: diff_maps_eq(&old.resolution_records, &new.resolution_records),
     }
 }
 
@@ -671,6 +760,7 @@ pub fn apply_graph_delta(
     }
     delta.validate_semantic_changes()?;
     delta.validate_external_references()?;
+    delta.validate_resolution_records()?;
     for (id, _) in &delta.external_references.added {
         if snapshot.external_references.contains_key(id) {
             return Err(KinDbError::StorageError(format!(
@@ -698,6 +788,7 @@ pub fn apply_graph_delta(
     apply_map_delta(&mut staged.outgoing, &delta.outgoing);
     apply_map_delta(&mut staged.incoming, &delta.incoming);
     apply_map_delta(&mut staged.external_references, &delta.external_references);
+    apply_map_delta(&mut staged.resolution_records, &delta.resolution_records);
 
     // Change history
     apply_map_delta(&mut staged.changes, &delta.changes);
@@ -745,6 +836,9 @@ pub fn apply_graph_delta(
     apply_vec_delta(&mut staged.downstream_warnings, &delta.downstream_warnings);
     apply_map_delta(&mut staged.entity_revisions, &delta.entity_revisions);
 
+    // A graph-only snapshot's version follows its contents: v13, v23 once it
+    // holds resolution records, or v25 once one of them is a call-site ledger.
+    staged.version = staged.wire_version();
     staged.validate_storage_admission()?;
     *snapshot = staged;
     Ok(())
@@ -868,6 +962,7 @@ mod tests {
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         });
         change.message.push_str(" after id was sealed");
         let mut delta = GraphSnapshotDelta::empty(0);
@@ -896,7 +991,158 @@ mod tests {
 
         assert!(error
             .to_string()
-            .contains("unsupported delta version: 2 (expected 5)"));
+            .contains("unsupported delta version: 2 (expected 5 to 7)"));
+    }
+
+    /// A delta that moves resolution records is written at v6, which a v5
+    /// reader refuses at its header; one that moves none keeps its v5 bytes,
+    /// and a header that disagrees with its contents is refused.
+    #[test]
+    fn a_delta_moving_resolution_records_is_written_at_v6() {
+        let plain = GraphSnapshotDelta::empty(0);
+        let plain_bytes = plain.to_bytes().unwrap();
+        assert_eq!(u32::from_le_bytes(plain_bytes[4..8].try_into().unwrap()), 5);
+
+        let context = kin_model::ResolutionRecord::ProofContext(kin_model::ProofContext {
+            language: LanguageId::Rust,
+            resolver: "lsp:rust-analyzer".to_string(),
+            resolver_version: "0.3.2600".to_string(),
+            configuration_hash: Hash256::from_bytes([1; 32]),
+            environment_hash: Hash256::from_bytes([2; 32]),
+            environment_summary: String::new(),
+        });
+        let mut recorded = GraphSnapshotDelta::empty(0);
+        recorded
+            .resolution_records
+            .added
+            .push((context.id(), context.clone()));
+        let bytes = recorded.to_bytes().unwrap();
+        assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 6);
+        let decoded = GraphSnapshotDelta::from_bytes(&bytes).unwrap();
+        assert_eq!(
+            decoded.resolution_records.added,
+            vec![(context.id(), context.clone())]
+        );
+
+        let mut relabeled = bytes.clone();
+        relabeled[4..8].copy_from_slice(&5u32.to_le_bytes());
+        let error = GraphSnapshotDelta::from_bytes(&relabeled).unwrap_err();
+        assert!(error.to_string().contains("declares version 5"), "{error}");
+
+        let mut snapshot = GraphSnapshot::empty();
+        apply_graph_delta(&mut snapshot, &decoded).unwrap();
+        assert_eq!(snapshot.version, GraphSnapshot::RESOLUTION_RECORDS_VERSION);
+        assert_eq!(
+            snapshot.resolution_records.get(&context.id()),
+            Some(&context)
+        );
+    }
+
+    /// A delta that adds or rewrites a call-site ledger is written at v7,
+    /// which a reader of at most v6 refuses at its header by name. The same
+    /// delta holding only its proof context keeps v6, which that reader opens;
+    /// a removal names only an identity, so it carries no ledger; a header
+    /// that understates a ledger is refused; and applying the delta makes the
+    /// snapshot a ledger store.
+    #[test]
+    fn a_delta_moving_a_call_site_ledger_is_written_at_v7() {
+        let (caller_id, mut caller) = make_entity("caller");
+        caller.file_origin = None;
+        let context = kin_model::ResolutionRecord::ProofContext(kin_model::ProofContext {
+            language: LanguageId::Rust,
+            resolver: "lsp:rust-analyzer".to_string(),
+            resolver_version: "0.3.2600".to_string(),
+            configuration_hash: Hash256::from_bytes([1; 32]),
+            environment_hash: Hash256::from_bytes([2; 32]),
+            environment_summary: String::new(),
+        });
+        let ledger = kin_model::ResolutionRecord::CallSites(kin_model::CallSiteLedger {
+            caller: caller_id,
+            behavior_hash: Hash256::from_bytes([0; 32]),
+            body_hash: Hash256::from_bytes([3; 32]),
+            context: context.id(),
+            census: 1,
+            sites: vec![kin_model::CallSite {
+                offset: 3,
+                length: 5,
+                state: kin_model::CallSiteState::ProvenOutside,
+            }],
+        });
+        let header = |bytes: &[u8]| u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+
+        let mut delta = GraphSnapshotDelta::empty(0);
+        delta.entities.added.push((caller_id, caller));
+        delta
+            .resolution_records
+            .added
+            .push((context.id(), context.clone()));
+        let records_bytes = delta.to_bytes().unwrap();
+        assert_eq!(
+            header(&records_bytes),
+            GraphSnapshotDelta::RESOLUTION_RECORDS_VERSION
+        );
+        GraphSnapshotDelta::check_readable_version(
+            header(&records_bytes),
+            GraphSnapshotDelta::RESOLUTION_RECORDS_VERSION,
+        )
+        .expect("a reader older than ledgers opens a records-only delta");
+
+        delta
+            .resolution_records
+            .added
+            .push((ledger.id(), ledger.clone()));
+        let bytes = delta.to_bytes().unwrap();
+        assert_eq!(
+            header(&bytes),
+            GraphSnapshotDelta::CALL_SITE_LEDGERS_VERSION
+        );
+        let error = GraphSnapshotDelta::check_readable_version(
+            header(&bytes),
+            GraphSnapshotDelta::RESOLUTION_RECORDS_VERSION,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("unsupported delta version: 7 (expected 5 to 6)"),
+            "{error}"
+        );
+        let decoded = GraphSnapshotDelta::from_bytes(&bytes).unwrap();
+        assert_eq!(
+            decoded.resolution_records.added,
+            delta.resolution_records.added
+        );
+        assert_eq!(decoded.to_bytes().unwrap(), bytes);
+
+        let mut relabeled = bytes.clone();
+        relabeled[4..8].copy_from_slice(&6u32.to_le_bytes());
+        let error = GraphSnapshotDelta::from_bytes(&relabeled).unwrap_err();
+        assert!(error.to_string().contains("declares version 6"), "{error}");
+
+        let mut rewritten = GraphSnapshotDelta::empty(0);
+        rewritten
+            .resolution_records
+            .modified
+            .push((ledger.id(), ledger.clone()));
+        assert_eq!(
+            rewritten.wire_version(),
+            GraphSnapshotDelta::CALL_SITE_LEDGERS_VERSION
+        );
+        let mut removed = GraphSnapshotDelta::empty(0);
+        removed.resolution_records.removed.push(ledger.id());
+        assert_eq!(
+            removed.wire_version(),
+            GraphSnapshotDelta::RESOLUTION_RECORDS_VERSION
+        );
+
+        let mut snapshot = GraphSnapshot::empty();
+        apply_graph_delta(&mut snapshot, &decoded).unwrap();
+        assert_eq!(snapshot.version, GraphSnapshot::CALL_SITE_LEDGERS_VERSION);
+        assert_eq!(snapshot.resolution_records.get(&ledger.id()), Some(&ledger));
+        let snapshot_bytes = snapshot.to_bytes().unwrap();
+        assert_eq!(
+            header(&snapshot_bytes),
+            GraphSnapshot::CALL_SITE_LEDGERS_VERSION
+        );
     }
 
     // -- Helpers -----------------------------------------------------------
