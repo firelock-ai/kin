@@ -7,8 +7,310 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking for MCP clients:** every whole-entity replacement now carries the
+  `source_base` of the version it replaces. A `kin_mutate`,
+  `kin_transaction_stage` or `kin_transaction_commit` operation that sends
+  `update` or `modify` with a `body` and no payload, or an explicit `Entity`
+  payload with a `body`, is refused as `source_base_required` before anything
+  is begun or applied. The fix is one step: call `get_entity_source`, then
+  resend with the entity's UUID as `target` and
+  `payload.EntitySourceBase` set to the `source_base` it returned, unchanged,
+  or send an anchored `EntitySourcePatch`. A current read of an entity whose
+  span has no recorded source digest answers `source_base_unavailable`
+  instead. An older repository may need `kin upgrade`; the caller must reread
+  and obtain a source base before editing, or report the verification gap.
+- `kin agent run` no longer carries `edit_file` or `write_file`. The agent
+  changes code only through `kin_mutate`, naming the entity it changes, and
+  `KIN_AGENT_PURE_KIN` set to a false value, which used to add the two file
+  tools back, now makes the run refuse to start. Exit code `6`
+  (`changes_unpublished`) is retired with them, along with the `local_calls`,
+  `unpublished_changes` and `files_changed` fields of the result record.
+  `entities_changed` still names every entity a run changed.
+- `entity_history` answers a bounded page: `offset` from 0, `limit` 20 by
+  default and 100 at most, with `change_count`, `latest_change_id`,
+  `returned` and `next_offset` beside `result[]`. Each row is the change's
+  projection onto that one entity, with its original `id`, `origin` and
+  `parents` and exact counts for the sections it leaves out. `max_chars`
+  bounds the reply from 2,000 to 60,000 UTF-8 bytes. An out-of-range or
+  non-integer `offset`, `limit` or `max_chars` is refused with a structured
+  error instead of clamped. The daemon's raw route returns the same paging
+  object, so a client of it reads `result[]` rather than a bare array.
+
+### Thanks
+
+- Thanks to Emre K. (@kocaemre) for the fix that lets top-level `kin --help`,
+  `kin -h`, `kin --version` and `kin -V` print without a nested-repository
+  parent-store warning (#1778), and to Vikas (@vikas-kushwaha-dev) for an
+  independent fix of the same bug (#1779).
+
+### Added
+
+- `lexical_lookup` finds exact literals, including punctuation, in stored
+  graph fields: names, signatures, summaries, body previews and file context.
+  It reports the matching field and verified source line when available.
+  Stable content-bound pagination retains hits withheld by response limits.
+  Each page scans the scoped graph; previews can be bounded, so a miss does
+  not prove repository absence. Literal hits are distinct from resolved calls
+  and references.
+
 ### Fixed
 
+- `find_references` and `kin refs` confirm a caller's site only when an edge
+  they count recorded it. A caller's row summarized every edge behind it, so
+  one proven edge confirmed every site that caller's other edges recorded:
+  on the gh CLI, `RepoOwner()` calls on a `ghrepo.Interface` value, recorded
+  only by the parser's receiver fan-out, read as `type_resolved` calls of
+  `Repository.RepoOwner` because the same callers also call it directly. The
+  sites only a held edge recorded now travel as that caller's row in
+  `candidates`, under the resolution those edges earned, and the counted row
+  reads `reference_lines_partial_reason: unconfirmed_sites_in_candidates`.
+  `kin refs` prints them under the candidate headings, marked as belonging to
+  a caller counted above.
+- A store enriched before a Go method's reference sites were proven no longer
+  confirms the sites that answer widened. Released builds recorded an
+  interface method's gopls answer as it came, so every direct call of a
+  concrete method read as a reference to the interface method it implements,
+  and no later sweep removed those records. They are now read as no evidence,
+  the proven sites are recorded under their own evidence rule, and a Go file
+  an earlier build enriched is swept again to record them, while every other
+  language's files stay enriched.
+- A Go method's confirmed references are the sites gopls resolves to that
+  method. gopls answers a method's references with those of every method
+  related to it through interface satisfaction, and a site from that answer
+  is now recorded only when gopls's definition there is the method asked
+  about. A call through an interface stays a caller of the interface method
+  and an interface-dispatch candidate of each concrete method behind it, and
+  a direct call of a concrete method is no longer a reference to the
+  interface method it implements.
+- The language-server sweep records a Go file as enriched once its queries
+  are answered. gopls answers a request that does not apply where it was asked,
+  such as a type definition at a keyword or a call hierarchy at a package
+  clause, with an error, and those were counted as failed queries, so every Go
+  file was held back and every daemon start queried the whole repository again.
+  Those answers are now recognized by method and message, never by error code
+  alone. A file whose queries got no answer is recorded as owed with the
+  reason and asked again after a backoff, or sooner when its bytes change or a
+  sweep is requested, and `/lsp/sweep/status` lists every owed file. The
+  completion marker now carries a version, so a store enriched by an earlier
+  build is swept once more.
+- Accepted language-server evidence is recorded in full. The crash record of
+  evidence not yet published refused new entries past 16 MiB, which one cold
+  sweep of a mid-size Go repository crosses, so evidence accepted after that
+  point did not survive a crash before the sweep's publication.
+- The language-server sweep keeps a Python file's proven references when one
+  declaration in it cannot be asked about. A decorated method's name query ran
+  past the end of its decorator line, and a module surface's past the end of a
+  short first line, and either failure discarded the whole file's definitions
+  pass. A failed declaration query could therefore discard references proved
+  by other declarations in the file. Each declaration is now
+  asked at the token its declaration line spells its name with, a module
+  surface is not asked about its own name at all, and a query that fails still
+  keeps the file from being recorded as enriched without costing it the
+  relations other queries proved. That includes a member expression whose
+  candidate export cannot be located.
+- An imported value read as a receiver, such as `current_app` in
+  `current_app.config[...]`, is a reference to that value when the language
+  server resolves it to the value's own declaration. It was read as a module
+  and recorded as nothing.
+- A Python definition or type answer counts only on the line that declares
+  what it names. An answer inside a property setter's body made the
+  attribute's own line a reference to the setter, and an import of a module
+  was read as a reference to whatever class the module's first line declares.
+- A call to a function defined in the caller's own file no longer also links
+  every same-named function in other files as a callee. Without a language
+  server, that linked each copy of a helper defined in several files to the
+  callers of every copy, so `kin refs` and impact answers listed callers from
+  files that call their own copy. Only a C or C++ prototype, or a local
+  definition whose parameter count cannot take the call, still hands the call
+  to same-named definitions elsewhere, and those stay `name_only` candidates.
+- `impact_analysis` no longer certifies a zero consumer count when a file that
+  can reach the entity holds call sites that became no edge. Each entity it
+  reports with no consumers now carries the `caller_arrival` reading
+  `find_references` uses, and when that reading is incomplete the verdict is
+  inconclusive and names the files. `kin impact` reads the same block for an
+  empty answer.
+- A tracked file edited or deleted while no daemon ran is now admitted when the
+  next daemon starts, the way a watched edit is. Before, the startup catch-up
+  left tracked paths alone, so after an idle daemon exited the graph kept
+  answering from the old bytes: a renamed function was found only under its old
+  name, the new name was certified absent, and a deleted file stayed a top hit.
+  The daemon now plans the catch-up before it publishes its endpoint, reading
+  only tracked files whose modification or change time falls after the last
+  admission, and every answer reads `inconclusive` under
+  `tracked_changes_unadmitted` until they land. A command that starts the
+  daemon waits up to 30 s for that catch-up. `kin status` with no daemon
+  running names those files on a new `Tracked changes since the last
+  admission` line, and `kin graph status` withholds its all-clear while any are
+  owed. Divergence that predates the last admission is still projection drift
+  for `kin doctor --drift` and `--heal`.
+- CLI data-flow traces apply `max_response_chars` to the final serialized
+  UTF-8 bytes, including required resolution, terminal and clipping disclosures.
+  Bodies and branches are trimmed before emission; a response whose required
+  identity and disclosures still cannot fit is explicitly refused instead of
+  returning an oversized or misleading empty answer. The refusal no longer
+  suggests reducing depth or fan-out after the smallest retained walk fails,
+  and only suggests a larger budget below the 60,000-byte maximum.
+- The MCP `trace_data_flow` tool answers the same walk instead of refusing it.
+  Every MCP reply carries an envelope the walk's budget does not count, so a
+  refusal there shipped over the budget too, only without the chain. Below its
+  floor the tool now returns the smallest retained walk, cut and disclosed the
+  way a walk that fit would be, with a `response_over_budget` degradation
+  naming the budget it missed. The tool's schema and the MCP tool reference now
+  describe `max_chars` as a target rather than a hard ceiling. A focal or
+  `target` that several owners share is still held to the budget and refused
+  when it cannot fit.
+- Ambiguous data-flow focals and targets also obey the requested response-byte
+  limit, including the final MCP envelope. Candidate lists retain whole entity
+  identities in order and exact omitted counts instead of selecting a candidate
+  or overrunning the budget. Shared targets carry a structured `target_ambiguity`
+  listing alongside their synchronized explanation; focal refusals never imply
+  a source read or a completed empty walk.
+- The same source-derived query over an unchanged graph now discloses the same
+  verdict every time. The source inspection behind `derived_source_unproven`
+  ran under a 25 ms clock and refused outright when a writer held the graph
+  lock, so on a loaded host one answer in a repeated run could pick up the
+  clause while the answer itself stayed the same. It now waits for a write in
+  flight and has no clock. It refuses only when the inventory passes a fixed
+  record or byte cap, which the graph alone decides.
+- A Python class base written `module.Class` resolves through the declaring
+  file's import graph before any leaf-name tier. A class merely sharing the
+  base's leaf name in the same file no longer outranks the module the import
+  named, so the `Overrides` edge stops disagreeing with the `Extends` edge for
+  the same declaration and stops minting the wrong base at full parser
+  confidence. A self-call to a method that the real base's subclass replaces
+  therefore keeps its dispatch qualification instead of being published as a
+  uniquely resolved destination.
+- A class base a module outside the repository owns now mints an `Overrides`
+  edge against the linker's existing external-import placeholder, carrying the
+  module coordinate the declaring file named and the member's owner-qualified
+  name inside it. The edge classifies `name_only` and never satisfies the
+  proven predicate: it records that the subclass declares the member and that
+  its base is external, not that the external base declares that member. Batch
+  linking binds the placeholder target in the same transaction; the live
+  reconcile path withholds the edge rather than publishing an endpoint the
+  graph does not hold, as it already does for an external call or reference.
+- A declared base that binds to nothing at all — a builtin, a name a
+  star-import brought in, a name ambiguous across the repository — is disclosed
+  by a new `base_resolution_coverage_v1` half of the file's coverage
+  certificate, counting bases declared against bases bound, rather than leaving
+  the graph in a silence that reads like a class with no base. The certificate
+  is emitted where the caller supplies parse completeness, as the import half
+  already is.
+- Named Go struct fields are addressable as `Owner.Field`. Read and write
+  selectors retain their receiver and source sites. Without receiver-type
+  evidence, same-file and cross-file field matches remain disclosed
+  `name_only` candidates; they cannot bind unrelated free globals. Imported
+  package selectors remain unresolved when their namespace is not established.
+  Embedded fields retain their existing Extends relation. Existing compact
+  index entity-kind codes remain unchanged.
+- `kin rollback` now requires `--discard-later` before restoring an earlier
+  change's complete content, including targets outside its bounded
+  first-parent preview. The daemon checks the preview's exact repository,
+  workspace and tip under the mutation lock, then publishes against those
+  expectations; a concurrent change requires a fresh preview. Rollback
+  publishes a new restoring change and keeps all immutable history. Help and
+  recovery instructions now describe that operation, and the misleading
+  `revert` alias is replaced by a refusal explaining that Kin has no
+  single-change revert.
+- Retained snapshot history reads can recover from positional I/O failures by
+  reopening current durable history. Recovery refuses promptly if an authority
+  freeze holds the required lock, so a stale read cannot deadlock its own
+  caller; retrying after release can succeed. Indexed readers share a verified
+  replacement while preserving the original change membership and content.
+  Corruption, missing changes and changed content still refuse. Recovery and
+  refusal diagnostics name the relevant path and generations. This is a
+  defensive correction: the originally reported post-idle HTTP 409 trigger
+  remains unproven, while the freeze/recovery lock cycle has a deterministic
+  real-backend regression test.
+- Incremental linking retains the import aliases that give recorded class bases
+  meaning. Editing a base file alone, or restoring a linker checkpoint before
+  that edit, no longer upgrades an overridden self-call to `type_resolved`
+  because its unchanged subclass imported the base under another name. Import
+  changes and removals replace the prior binding context.
+
+- Python `self`/`cls` calls to a definition with a known override now retain
+  dispatch qualification at confidence 0.86 (`import_scoped`), including after
+  a persisted graph reopen and a base-only edit. Batch linking derives this
+  knowledge from parsed hierarchy; live reconcile also consults persisted
+  `Overrides` edges at current entity identities. Fresh source slices replace
+  obsolete override facts. The classification survives reconcile's same-edge
+  fold while preserving the relation ID and fresh per-site spans, shapes and
+  occurrence counts. Graph-read errors are surfaced instead of publishing an
+  intra-file guess. Ordinary calls without known overrides keep their tier.
+  This does not reconstruct the complete class hierarchy or establish the
+  runtime destination: `import_scoped` still passes the existing `is_proven`
+  predicate, and consumers do not yet enumerate all override candidates. The
+  `overriding_methods` graph helper is available for that follow-up. Explicit
+  Python `Base.send(self, ...)` resolution remains incomplete; its missing
+  call-shape coverage remains disclosed.
+- Go calls on a method's declared receiver now resolve to that type's method
+  within the same declared package, including methods defined in another
+  file and methods on named scalar types. A local binding that shadows the
+  receiver stays a candidate instead of borrowing the receiver's type or a
+  same-named import. Package identity survives incremental linker checkpoints;
+  missing, conflicting or removed targets do not resolve to another package.
+- A Go call on a method's declared receiver that the receiver's own type does
+  not declare now resolves through the type's embedding, so a method promoted
+  onto the receiver by an embedded type is reached again. Qualifying the call
+  with the receiver's type had taken those edges away: no entity carries the
+  qualified name, and the bare leaf that used to resolve them cross-file was
+  gone. The walk is breadth first, so the shallowest embedding wins as Go's
+  selector rule says, and two types embedded at one depth that both promote
+  the method leave the call unresolved rather than guessed. A method the
+  embedder declares itself still answers first, and no call falls back to a
+  free function of the same name.
+- `kin agent run`'s final answer now always carries the literal `ANSWER`
+  marker a caller parses for, and now always names every reference row
+  `find_references` resolved with confidence, even when the model's own
+  prose did not. A study task found Kin resolving six rows for one symbol,
+  all with equal confidence, and the model's own answer keeping four while
+  dropping exactly the two aliased-import lines. Another task found Kin's
+  retrieval exactly right while the model's own answer was a bare fenced
+  block with no `ANSWER` token anywhere in it, so a caller parsing for the
+  marker got nothing under it. Neither repair rewrites what the model
+  wrote: an answer that already carries the marker and already names every
+  resolved row is untouched, and an ordinary prose answer with no reference
+  rows and no position-shaped line is never forced into a fence it does not
+  need.
+- `list_file_entities` on a JavaScript file no longer certifies its listing as
+  complete when a loop bulk-assigns computed members it cannot read the names
+  of, such as Express's own `methods.forEach(function (method) { app[method]
+  = ...; })`. The extractor now recognizes that shape across `forEach`, `map`,
+  `for...of`, and a plain counting `for` over a list, checking whether the
+  iterated list is statically knowable: an array literal
+  at the loop site, a `const` bound to one elsewhere in the file, or a
+  `require`/`import` of the `methods` package, whose HTTP-method table is
+  carried as a small versioned constant rather than read from the dependency.
+  When it is, every member is minted as a real, owner-qualified entity (such
+  as `app.get`) with a signature and a note explaining where it came from, so
+  `find_references` and `list_file_entities` both see it. When it is not, or
+  when only part of a file's sites resolve, nothing is fabricated: the file's
+  listing is reported as a floor, `_kin.verdict` reads inconclusive for
+  completeness instead of certified, and the disclosure names the loop's own
+  iterated expression rather than a generic warning.
+- Computed assignments inside `for...in` retain an unresolved-member disclosure,
+  including nested and conditional assignments. This loop visits enumerable
+  property keys, including inherited keys, rather than array values; Kin no
+  longer invents `app.get` from `for (key in ['get'])`. Ordinary static methods
+  remain available with their original source spans.
+- `find_references` asked for a bare name that several owner-qualified
+  entities share, such as `Blueprint.register_blueprint` and
+  `App.register_blueprint` in a Flask-shaped Python store, now answers a
+  full, labelled section for every one of them, under `candidates_by_owner`,
+  instead of silently ranking one and dropping the rest from the answer. The
+  resolver still has to pick a single winner for every other caller that asks
+  it to resolve a name, which is the right contract for them. `find_references`
+  itself already knows each candidate's whole reference list, and answering
+  for one while discarding what it knows about a sibling is what this closes.
+  Sectioning only fires on a real owner-qualified collision: two bare,
+  unrelated same-named declarations with no owner segment to relabel by keep
+  the existing single-answer-with-a-count behavior, because there is no
+  owner-qualified name a caller could retype to pin one instead. The answer
+  carries an `ambiguous_name` degradation naming how many candidates were
+  sectioned and how to address one directly, and it folds into `_kin.verdict`
+  through the same path any other degradation does.
 - A top-level TypeScript `const`, `let`, or `var` bound to an empty array or
   object literal, such as `export const globalContexts: Context<unknown>[] =
   []` in `honojs/hono`'s `src/jsx/context.ts`, now gets its own `constant`
@@ -32,6 +334,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   itself is unchanged. Measured on a corpus checkout nine hundred forty-two
   commits ahead of its store, roughly twenty-six percent of its files were in
   this previously unreported state.
+- Building on the entry above: the directory a large pull leaves this graph
+  having never met is now admitted by startup catch-up, instead of being left
+  to `waiting_deferred` and a manual `kin admit`. A directory arriving whole
+  still cannot be told from a clone or a move by its modification time. The
+  sweep that admits it does not use that modification-time window at all: it
+  asks only whether graph truth has ever met the directory, a question with
+  no window to be wrong about. The admission is recorded under its own
+  provenance, `arrived`, so this bulk sweep-in stays distinguishable from an
+  ordinary watched edit or an explicit admission, neither of which minted a
+  record like it before. Content the daemon cannot read still defers exactly
+  as before. Only the directory-unknown decline is lifted, and reconciliation
+  now reaches `idle` on its own after a pull that adds a directory, with no
+  operator action required.
 - `kin agent run`'s result record now carries every row a `find_references`
   call returned, under `kin_agent.reference_rows`, independent of what the
   model's own final answer text kept. A study task found Kin's
@@ -42,18 +357,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   else: the drop was the model's own composition, not the belt's. A belt
   cannot make a model's free text complete, so this record does not try to;
   instead it holds the full, deduplicated row set the run actually saw, so a
-  consumer reading the structured result depends on zero percent prose and
-  gets one hundred percent of the resolved rows.
+  consumer reads the retained structured rows without depending on the
+  model's prose.
 - `find_references` held `name_only` rows, a bare same-name match with nothing
   at the reference site proving it, out of `total_upstream` by description but
   not by code: the headline partitioned on a single receiver-guess tier, so
-  the other guess tiers still counted as fact. Measured on the frozen gh CLI
-  corpus against compiler-produced gold: on the small callers gold, F1 score
-  rose from 49 percent to 85 percent, precision from 35 percent to 89 percent,
-  with recall unchanged at 81 percent. Across the full resolvable set, F1
-  score rose from 83 percent to 95 percent and precision from 76 percent to
-  99 percent, with recall unchanged at 92 percent. No true site was lost. The
-  tool now takes `min_resolution`, defaulting to `import_scoped`. Setting
+  the other guess tiers still counted as fact. The tool now takes
+  `min_resolution`, defaulting to `import_scoped`. Setting
   `min_resolution: "name_only"` returns the old headline. `counts` reports
   `receiver_name_candidates` and `unresolved_name_candidates` apart.
 - `find_references`'s resolution floor no longer withholds every row for a
@@ -79,6 +389,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   focal's `name_only` rows exactly as it would for any other, and the
   disclosure now names the store rather than the focal as the reason a row
   was kept.
+
+## [0.8.0]
+
+Release preparation. Final archive, upgrade, install and client qualification is
+pending; this entry does not announce publication.
+
+### Fixed
+
+- Rust import edges use the declaring file's module coordinate, including after
+  incremental indexing and checkpoint reopen. A child module or same-named
+  function no longer replaces that file module as the import owner.
+- Rust macro declaration names, including interpolated `quote!` names and
+  `macro_rules!` metavariables, are excluded from call extraction. Calls in
+  macro bodies remain eligible for extraction.
+
+### Changed
+
+- Advance hydration semantics so stored derived graphs are re-evaluated using
+  the corrected Rust import and call extraction rules.
 
 ## [0.7.21] - 2026-09-18
 

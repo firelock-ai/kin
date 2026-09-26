@@ -419,7 +419,7 @@ fn render_bootstrap_section(target_path: &str) -> String {
         "copilot-instructions.md" => {
             out.push_str("- Keep instructions short and tool-oriented.\n");
             out.push_str("- Prefer `kin search`, `kin context`, and `kin review` for precise semantic lookup.\n");
-            out.push_str("- Avoid broad file dumps when Kin can provide targeted context.\n");
+            out.push_str("- Use Kin's targeted context, not file dumps.\n");
         }
         _ => {
             out.push_str("Key commands:\n");
@@ -454,7 +454,7 @@ pub(crate) fn render_comparison_tables() -> String {
     out.push_str("| Instead of | Use | Why |\n");
     out.push_str("|------------|-----|-----|\n");
     out.push_str("| Reading 5 files to find callers | `kin context <entity>` | Token-budgeted pack: focal entity + callers + dependencies |\n");
-    out.push_str("| `cat src/foo.rs` (whole file) | `kin search foo` then read only the pointed-to file | Surfaces the exact definition, so you read one location instead of the whole file |\n");
+    out.push_str("| `cat src/foo.rs` (whole file) | `kin search foo`, then `kin context` on the entity | Returns the exact definition and its neighbourhood, never the whole file |\n");
     out.push_str("| Guessing which files matter | `kin support` | Coverage report showing all indexed entities, languages, relations |\n");
     out.push('\n');
 
@@ -531,7 +531,7 @@ fn render_kin_first_section(target_path: &str) -> String {
     out.push_str("source of authority; ordinary files are the projection and execution\n");
     out.push_str("surface for tools that still expect a filesystem. Kin indexes every\n");
     out.push_str("function, class, type, and trait into a graph with cross-file relations.\n");
-    out.push_str("**Use Kin tools instead of raw file operations whenever possible.**\n\n");
+    out.push_str("**Read and change code through Kin tools, by entity, not through raw file reads or writes.**\n\n");
 
     out.push_str("### Agent Coding Workflow\n\n");
     out.push_str(
@@ -539,6 +539,7 @@ fn render_kin_first_section(target_path: &str) -> String {
     );
     out.push_str("- For direct commands, prefer `kin exec -- <command>` so execution is tied to the Kin repo context\n");
     out.push_str("- Discover with Kin first: `semantic_locate`, `get_context_pack`, then `trace_data_flow`\n");
+    out.push_str("- Change code through `kin_mutate` on entity ids, after `kin_session_start`; the shell is for building and running tests\n");
     out.push_str("- Record changes with `kin commit -m \"message\"` after verification passes\n");
     out.push_str("- Export only when an external Git consumer needs it: `kin git export --output <path>` or `kin git export --in-place`\n");
     out.push('\n');
@@ -555,11 +556,10 @@ fn render_kin_first_section(target_path: &str) -> String {
     }
 
     out.push_str("### Key Principle\n\n");
-    out.push_str("**Ask the graph first, read projected files second.** Kin search returns\n");
-    out.push_str("ranked entity definitions with file:line instead of raw text matches, and\n");
-    out.push_str("context packs assemble a focal entity with its callers and dependencies\n");
-    out.push_str("instead of reading whole files. Only fall back to raw file reads when Kin\n");
-    out.push_str("doesn't have what you need.\n");
+    out.push_str("**Ask the graph, by entity.** Kin search returns ranked entity definitions\n");
+    out.push_str("instead of raw text matches, and context packs assemble an entity's exact\n");
+    out.push_str("code with its callers and dependencies instead of whole files. When Kin has\n");
+    out.push_str("no answer it says so; report that gap rather than reading raw files.\n");
     out.push('\n');
 
     out

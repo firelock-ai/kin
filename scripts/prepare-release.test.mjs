@@ -11,6 +11,7 @@ import { fileURLToPath } from 'node:url';
 
 import {
   removeChangelogSection,
+  stampServerVersion,
   updateWorkspaceLock,
   upsertChangelogSection,
 } from './prepare-release.mjs';
@@ -188,4 +189,42 @@ test('the generator runs from a copy reached through a symlinked directory', () 
     output = `${error.stdout ?? ''}${error.stderr ?? ''}`;
   }
   assert.notEqual(output, '', 'the generator produced no output, so it never ran');
+});
+
+test('the MCP Registry entry moves with the release', () => {
+  const server = {
+    name: 'ai.kinlab/kin',
+    version: '0.7.21',
+    packages: [{ identifier: '@kinlab/kin', version: '0.7.21', transport: { type: 'stdio' } }],
+  };
+  const stamped = stampServerVersion(server, '0.7.21', '0.8.0');
+  assert.equal(stamped.version, '0.8.0');
+  assert.equal(stamped.packages[0].version, '0.8.0');
+  assert.equal(stamped.packages[0].identifier, '@kinlab/kin');
+  assert.equal(stampServerVersion(stamped, '0.7.21', '0.8.0'), stamped, 'already stamped is left alone');
+  assert.throws(
+    () => stampServerVersion({ ...server, version: '0.5.27' }, '0.7.21', '0.8.0'),
+    /server.json names 0.5.27, 0.7.21/,
+  );
+});
+
+test('the checked-in MCP Registry entry names the workspace version', () => {
+  const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+  const cargo = fs.readFileSync(path.join(root, 'Cargo.toml'), 'utf8');
+  const workspace = /\[workspace\.package\][^[]*?\nversion = "([^"]+)"/.exec(cargo)?.[1];
+  const server = JSON.parse(fs.readFileSync(path.join(root, 'server.json'), 'utf8'));
+  assert.ok(workspace, 'Cargo.toml names no workspace version');
+  assert.equal(server.version, workspace);
+  for (const pkg of server.packages) {
+    assert.equal(pkg.version, workspace, pkg.identifier);
+  }
+  // The entry installs the canonical package and runs its MCP server, and that
+  // package carries the registry name the registry validates it against.
+  const canonical = JSON.parse(fs.readFileSync(path.join(root, 'packages/kin/package.json'), 'utf8'));
+  assert.equal(server.packages[0].identifier, canonical.name);
+  assert.equal(canonical.mcpName, server.name);
+  assert.deepEqual(
+    server.packages[0].packageArguments.map((argument) => argument.value),
+    ['mcp', 'start'],
+  );
 });

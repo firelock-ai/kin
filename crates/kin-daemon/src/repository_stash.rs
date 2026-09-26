@@ -487,9 +487,17 @@ fn push(
     drop(lease);
 
     require_sealed_sources_in_repository_cas(&authority.manager, &sealed_policy, &seal)?;
+    // Checked like the workspace return and the restore after it. An unchecked
+    // commit ends the workspace's binding-history lineage whatever it seals, so
+    // a stash round trip left every later answer unproven until `kin upgrade`
+    // re-qualified the store. A seal the verifier does not qualify is left
+    // unproven, exactly as an unchecked one was.
     let (sealed_receipt, sealed_freeze) = authority
         .manager
-        .commit_repository_transaction_and_freeze(seal)
+        .commit_repository_transaction_with_binding_history_and_freeze(
+            seal,
+            &kin_index::binding_history::LocalBindingHistoryVerifier,
+        )
         .context("seal a repository stash")?;
     sealed_receipt
         .validate()
@@ -865,6 +873,9 @@ fn pop(
         .into());
     }
     let previous_tree = workspace.tree.clone();
+    // A stash sealed before the store's last `kin upgrade` restores state an
+    // older build derived.
+    crate::hydration_requalify::before_restoring(state, &graph, sealed_change_id, "stash restore")?;
     let (materialized, receipt, authority_freeze) =
         kin_core::tree::transition_repository_workspace_tree_and_commit_repository_transaction(
             state.layout.working_dir(),

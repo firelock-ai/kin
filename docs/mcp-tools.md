@@ -1,6 +1,6 @@
 # Model Context Protocol (MCP) Tool Surface Reference
 
-The Kin MCP server exposes 74 semantic tools to AI assistants (Claude, Cursor, Gemini,
+The Kin MCP server exposes 75 semantic tools to AI assistants (Claude, Cursor, Gemini,
 Codex, etc.). These tools bridge the gap between traditional file-first navigation and
 Kin's graph-first semantic substrate: instead of issuing raw shell commands or reading raw
 files, an assistant interacts with the codebase through entity-level primitives.
@@ -36,6 +36,18 @@ and what each code means is written here, once. `kin status`, `kin graph status`
 
 The envelope's fields:
 
+- `advice`: the plain sentences a reader acts on first, present only when one holds, and
+  the first key of every envelope, which is the first key of every answer. Two sentences
+  can ride it. When the answer came from a Kin repository that is not the client's own
+  folder, it says so. When a missing language server leaves cross-file references out of
+  the answer, it names what is missing and the command that adds it, spelled `kin ...` on a
+  host with `kin` on the server's PATH and as the `npx -y @kinlab/kin@<version>` form of
+  the same release on one without, which is every MCP registry install.
+- `repository`: which Kin repository answered, on every answer a repository daemon gave:
+  `root`, and, when the client works in another folder, `client_root` and a `warning`.
+  The client's folder is its first workspace root, or the server's launch directory when
+  the client names none. A folder with no repository of its own inside another Kin
+  repository is answered from that one, and this is where the answer says so.
 - `runtime`: `repo-daemon` (live, graph-owned truth) or `offline-in-process` (an
   in-process store, explicitly a fallback surface and labeled as one).
 - `graph_as_of` and `graph_state`: the snapshot generation that answered, plus
@@ -53,7 +65,13 @@ The envelope's fields:
   durable authority directly.
 - `behind`: present when the working copy holds content graph truth never took, or when
   nothing has measured it (`measured: false`). Answers cover admitted content only;
-  `kin admit` takes the paths now, and a commit takes them anyway.
+  `kin admit` takes the paths now, and a commit takes them anyway. `changed_paths` and
+  `changed_sample` count tracked files the working copy edited or removed while no daemon
+  was watching and the daemon's startup catch-up has not admitted yet, and
+  `changed_unchecked` is `true` when that check could not run. Either one makes every
+  answer `inconclusive`, a populated one included, because until those files land the
+  graph answers from their old bytes. The daemon names them before it publishes its
+  endpoint and admits them on its own; `kin admit` takes them now.
 - `freshness`: whether this daemon recorded a complete admission (`recorded` or
   `no_admission_recorded`), or `stale` when a status sample replays an earlier
   observation.
@@ -61,13 +79,20 @@ The envelope's fields:
   covered or its durable loss record is unreadable. `reason` retains the backend's
   cause; `read_error` retains a record read failure, whose counters are unknown.
   `kin admit` on the repository clears the gap after a complete admission.
-- `hydration_semantics`: the store's replay-semantics `standing`. For `behind`, re-ingest
-  the repository with `kin init` into a fresh store recorded under this build's replay
-  semantics. For `ahead`, upgrade this Kin build to at least the one that created the
-  store, rather than re-ingesting with the older replay version. For `unstamped` or
-  `unreadable`, upgrade Kin to the newest build first, because a record this build cannot
-  read can belong to a store a newer build created. An `unreadable` record keeps
-  its concrete read failure in `reason`, also shown by `kin doctor`.
+- `hydration_semantics`: the store's replay-semantics `standing`. For `behind`, run
+  `kin upgrade` in the repository (`npx -y @kinlab/kin@<version> upgrade` when Kin runs
+  through npm, with the version the answering build reports): it re-derives the state the
+  store serves under this build and keeps every native commit, branch, review and history
+  record. For `ahead`, upgrade this Kin build to at least the one that recorded the store's
+  semantics. For `unstamped`, upgrade Kin to the newest build first, because a store a
+  newer build created can have lost its record, then run `kin upgrade`. For `unreadable`,
+  upgrade Kin to the newest build first; if it still cannot read the record, the record is
+  damaged: remove `.kin/kindb/hydration-semantics` and run `kin upgrade`. An `unreadable`
+  record keeps its concrete read failure in `reason`, also shown by `kin doctor`.
+  `upgraded_under` is present once `kin upgrade` has run: the standing compares that
+  version, `created_under` still names the version the store was created under, and
+  answers that read history from before the upgrade stay qualified with
+  `history_predates_upgrade`.
 - `degraded`: honest flags (`daemon_unreachable`, `no_repository`, `embed_worker_failed`,
   `mass_deletion_blocked`, `offline_fallback`, `workspace_mismatch`,
   `daemon_killed_by_memory`, `sweep_suspended`, `memory_pressure`), each present only
@@ -101,6 +126,19 @@ all, and the source carries sites of it that the linker resolved, so the gap is 
 the build rather than in the code. A verdict that certifies over a recorded limit
 was the shipped 0.5.52 behaviour (FIR-2672) and is now a contract violation the
 tests scan for.
+
+An entity-level `Imports` edge, the class that answers "who imports this" at entity
+level, is minted for TypeScript, JavaScript, Python, C++, HCL, Go, Java, Kotlin, PHP,
+Rust and Swift. Go, Java, Kotlin, PHP, Rust and Swift reach it at the `import_scoped`
+tier: a Go or Swift import names a package directory whose representative file this
+build chooses, and a Java, Kotlin or PHP one names a type through a source root the
+repository never writes down, so the module is settled and the name is selected
+inside it rather than proven outright. C is the one language named as unable to mint
+the class at all, because its adapter emits no module entity for the edge to be
+sourced at and its `#include` directives are `Includes` edges. An import naming a
+module this repository does not hold mints no edge in any language; it is disclosed
+by the per-file import-resolution certificate, which carries how many import
+statements the file wrote and how many of them reached this repository.
 
 `limiting_factor` is `null` on a certified answer. Otherwise it is the code of every
 input that refused, in the order the verdict weighs them (the absence gate's own
@@ -144,6 +182,46 @@ Every code `limiting_factor` carries is below, and so is every label that leads 
 in `negative.trust_reason`. The list is closed: a code not in it is never sent, and
 `unlisted_clause` in its place is a Kin defect worth reporting.
 
+Live source-derived daemon queries add `source_derivation`, also carried under
+`_kin` by stdio. It compares persisted parser evidence with admitted source bodies
+for graph-owned full-adapter source files. File enumeration checks its exact path;
+repository queries check the admitted inventory. A changed body, unavailable
+selected authority, or an inventory past the inspection's fixed record and byte
+caps makes current source binding unproven or stale and can only downgrade the
+answer. The inspection waits for a graph write in flight and has no time budget,
+so a graph that did not change discloses the same observation on every call.
+Known live admission failures are disclosed separately. Older useful rows remain
+available. Reopening the store does not clear a persisted body mismatch.
+
+`body_binding: current` does **not** certify parsing, extraction, dependency
+resolution, dispatch, or answer completeness. Those observations and each tool's
+existing qualifications remain separate. Excluded source classes are outside this
+inventory. The existing call-shape parse predicate is parser-only; it does not
+prove all imports or dynamic dispatch resolved. The observation samples the
+selected graph after the query, not every earlier payload read atomically. A
+historical selected graph is not compared with live HEAD, and history-only
+`semantic_diff` modes receive no unrelated live warning. Admission timestamps
+continue to describe previous success, not current semantic completeness.
+
+`prior_local_binding` reports `no_recorded_debt`, `outstanding`, or `unproven`
+separately from parse and import coverage. It checks the exact reserved record
+and source-owned claims; malformed, stale, unavailable or uninspected records
+cannot become absence. Its obligation count is null when the binding inspection
+is incomplete, and zero only after checked absence. An explicit no-debt status
+with a missing or nonzero count is unproven. The count measures prior relation
+obligations, not missing modules: a call and an import can contribute two
+obligations for one module. An ordinary external import has no prior-local obligation. No recorded debt does not prove all imports or
+legacy bindings resolved. Live impact requires this independent prerequisite
+before reporting all consumers as shaped calls. Historical and custom impact
+adapters without a binding proof keep their rows but cannot certify that combined
+prerequisite. Older metadata missing this axis is unproven.
+
+The inspection refuses on contention and on record, logical-copy-byte or
+cooperative time limits. Its reason is reported as unproven, never as current.
+Source and excluded-artifact counts are null when inspection did not complete;
+a completed measured empty inventory reports zero. Paths and error samples are
+bounded. No raw filesystem search or epoch cache supplies missing evidence.
+
 <!-- clause-codes:begin -->
 | Code | Meaning |
 |---|---|
@@ -174,6 +252,8 @@ in `negative.trust_reason`. The list is closed: a code not in it is never sent, 
 | `dependency_scan_incomplete` | The scan of unadmitted imports hit its budget before it checked all of them. |
 | `dependency_scan_unavailable` | The store could not say which of its imports are unadmitted. |
 | `depth_zero` | The walk expanded no edges, so an empty neighbourhood is not evidence of isolation. |
+| `derived_source_stale` | Derived source evidence differs from admitted bytes; useful last-good rows do not establish current completeness. |
+| `derived_source_unproven` | Bounded graph evidence did not establish source binding in the selected scope. |
 | `edge_coverage_budget_exhausted` | The coverage scan for the language stopped before it could establish what the graph holds. |
 | `edge_coverage_unknown` | Whether the graph holds cross-file edges of a requested class for the language could not be established. |
 | `edge_coverage_unreported` | The answer did not report whether the graph holds the cross-file edges it depends on. |
@@ -192,11 +272,15 @@ in `negative.trust_reason`. The list is closed: a code not in it is never sent, 
 | `focal_resolution_ambiguous` | The focal name resolved to several entities and only one was answered for. |
 | `focal_resolution_unreported` | The answer did not report how many entities the focal could have resolved to, so it may describe a same-named sibling. |
 | `graph_admission_unrecorded` | The daemon reports no complete admission of the repository into graph truth, so how far the graph is behind is unmeasured. |
-| `graph_behind_working_tree` | Host paths on disk have never been admitted; `_kin.behind` counts them. |
+| `graph_behind_working_tree` | Host paths on disk have never been admitted, or admitted paths are still owed their parse; `_kin.behind` counts each separately. |
 | `graph_empty` | The graph that answered holds no entities, so it cannot speak for the repository yet; ask again once its graph is loaded. |
 | `graph_not_loaded` | The daemon reports no graph loaded, so an empty structural result is not authoritative. |
 | `graph_uninitialized` | The daemon has not confirmed its first reconciliation or snapshot load. |
+| `history_predates_upgrade` | The answer reads the store's history, and history recorded before its last `kin upgrade` keeps the replay version that authored it and carries no checked binding history. |
 | `lexical_fallback_matched_nothing` | A phrase query matched no name, and the per-token fallback ranks by word overlap rather than meaning. |
+| `lexical_lookup_not_structural` | This is lexical evidence over stored graph fields, not a resolved call or reference edge; a hit or a miss here is not proof the identifier is or is not used. |
+| `local_binding_outstanding` | Previously local source bindings remain unresolved; current source and parse evidence do not establish complete dependency knowledge. |
+| `local_binding_unproven` | Prior-local binding evidence could not be validated for the checked scope; complete dependency knowledge is unproven. |
 | `method_call_resolution_incomplete` | Receiver-method calls are linked by bare name and may be unresolved, so an empty result is not authoritative for a method. |
 | `name_filter_narrowed_to_zero` | The name pattern selects declarations and the query's other filters removed every one of them. |
 | `offline_fallback` | The in-process fallback graph answered, not the daemon's graph truth. |
@@ -209,13 +293,21 @@ in `negative.trust_reason`. The list is closed: a code not in it is never sent, 
 | `retrieval_degraded` | The query reported degradations; the payload's `degradations` names them. |
 | `selected_graph_sample_stale` | The selected graph could not be sampled live, so the counters replay an earlier observation; `_kin.freshness` has its age. |
 | `semantic_authoritative` | Certifying: daemon-owned truth with complete embedding coverage. Appears only when trust is authoritative. |
+| `semantic_readmission_failed` | Semantic readmission failed for admitted source; current semantic completeness is not established. |
+| `spine_candidate_representation_gap` | The daemon's cross-repo spine refused this repository's graph because it holds an inferred member whose candidate authority the spine format cannot carry, so no cross-repo authority stands behind the answer for as long as the graph holds it. |
+| `spine_initialization_deferred` | The daemon's cross-repo spine was not built yet, because its initialization stepped aside while a writer held graph authority, so no cross-repo authority stands behind the answer; a read after the writer finishes builds it. |
 | `spine_root_stale` | The cross-repo spine's recorded root for this repository is stale. |
+| `store_semantics_ahead` | A newer Kin build recorded this store's replay semantics; upgrade Kin rather than re-deriving the store with this older build. |
+| `store_semantics_behind` | This store serves state an older Kin build derived; run `kin upgrade` in this repository (`npx -y @kinlab/kin@<version> upgrade` through npm) to re-derive it under this build, keeping every native commit, branch and review. |
+| `store_semantics_unknown` | This store's replay-semantics record is missing or unreadable; upgrade Kin to the newest build, then run `kin upgrade` in this repository. |
 | `structural_authoritative` | Certifying: the daemon's graph is initialized and loaded. Appears only when trust is authoritative. |
 | `substrate_partial` | A coverage class the answer depended on was observed short of whole; `_kin.completeness.classes` names it and says whether it was `partial`, `absent` or `unproduced`. |
 | `substrate_unknown` | The coverage classes the answer depended on were not all observed present; `_kin.completeness.classes` names them. |
 | `trace_spine_clipped` | The per-step cap cut the walk's fan-out, so the chain is one route among those the cap kept and a missing hop was not looked for. |
 | `trace_walk_degraded` | The walk reported degradations, so it did not complete under its own work bounds. |
 | `trace_walk_truncated` | The walk hit a per-step or total cap before examining everything an empty chain would have to rule out. |
+| `tracked_changes_unadmitted` | Tracked files changed or removed while no daemon was watching are not admitted yet, so the answer may describe bytes the working copy no longer holds; the daemon's catch-up takes them on its own, and `kin admit` takes them now. |
+| `tracked_changes_unchecked` | The daemon could not check whether tracked files changed while no daemon was watching, so the answer may describe bytes the working copy no longer holds; `kin admit` settles it. |
 | `unlisted_clause` | A reason this build carries no code for. The blocks the verdict's `inputs` name hold its facts. Seeing it is a Kin defect. |
 | `walk_bounded` | The walk stopped at a work bound before its frontier emptied, so a route may exist beyond what was explored. |
 | `walk_depth_bounded` | The walk stopped at max_depth before its frontier emptied; raise max_depth. |
@@ -243,7 +335,7 @@ CLI) with the curated tool profile, and
 adds a Kin-first discovery reminder to your agent instruction files. `kin setup status`
 then verifies each client config.
 
-The wizard writes this entry, stating the profile explicitly:
+For Claude Code the wizard writes this entry, stating the profile explicitly:
 
 ```json
 {
@@ -256,6 +348,10 @@ The wizard writes this entry, stating the profile explicitly:
   }
 }
 ```
+
+Cursor, Gemini CLI, Windsurf and LM Studio get it with `agent-routed` as the profile. Codex
+CLI and Antigravity get that `agent-routed` entry, and the Grok CLI this one, bound to one
+repository with `--repo`.
 
 The wizard substitutes the installation's exact absolute launcher path. A bare `kin`
 command is not a supported manual shortcut because agent clients do not reliably inherit
@@ -328,7 +424,9 @@ command line (the flag wins):
 | -- | -- |
 | `agent-default` | the curated agent belt, **the default** |
 | `agent-query` | the same belt with no session and no transaction tools, for a client that only queries |
-| `agent-search` | the measured always-on set, with every other tool reached through `kin_tool_search` |
+| `agent-search` | the measured always-on set, with hidden operations discovered through `kin_tool_search` and read-only matches invoked through `kin_tool_call` |
+| `agent-routed` | one tool, `kin`, whose commands reach the agent belt, writes included, and through `describe` and `call` every other tool, for a client that sends every tool with every request; `kin setup` writes it for those clients |
+| `agent-routed-query` | the same one tool without a write path: no `session`, no `mutate`, and `call` reaches read-only tools only. It limits what that tool reaches, not what a shell runs: `kin call` in a shell answers as `agent-routed` does |
 | `full` | every tool this reference documents |
 | `benchmark` | the retrieval belt the benchmark arm drives |
 | `context-bench` | read-only graph-native retrieval, no write-side session or transaction tools |
@@ -341,10 +439,26 @@ it does not constrain a local process that already holds your repo daemon's cred
 Reach for it to keep an agent's belt focused and its context small, not as a capability
 boundary you can rely on.
 
+Every profile serves each tool's input schema as a plain `type: object` with its properties,
+and the same schema to every client. A model provider's tool API refuses a schema that opens
+with `anyOf`, `oneOf`, `allOf`, `not` or `if`, and a client loading tools for one drops that
+tool without saying so: Claude Code listed 19 of `agent-default`'s 22 tools while
+`semantic_locate`, `get_context_pack` and `lexical_lookup` opened with `anyOf`. The rules those
+combinators carried are the server's to enforce. A call to `semantic_locate` needs `query` or
+`cursor`, `get_context_pack` needs `entity_id`, `entities` or `question`, `lexical_lookup` needs
+`literal` or `cursor`, `kin_review_create` needs `base` and `head`, `scope_type` and
+`entity_ids`, or `scopes`, and `kin_review_assign` needs `reviewer` or `reviewers`. Any
+combination of them is accepted, a null value supplies nothing, and a call supplying none is
+refused before anything runs, with the rule and one call that works. A `kin_mutate` call that
+carries `request_id` is held to the keyed rules as before: it names its session, takes `scope`
+`repository` only, and accepts no other field. A `kin_review_create` call naming only a title,
+or a `kin_review_assign` call naming only `requested_reviewers`, was always outside the
+advertised schema and is now refused.
+
 #### `agent-default` serves short descriptions
 
-`agent-default` does not serve the long descriptions on this page. Each tool gets one or two
-sentences saying when to call it and what comes back, and an input schema trimmed to the
+`agent-default` does not serve the long descriptions on this page. Each tool gets one short
+sentence saying when to call it and what comes back, and an input schema trimmed to the
 properties that change which entities come back rather than how the response is shaped
 (`max_chars`, `compact`, `explain`, `snippet_alias` and `pipeline` are not advertised there).
 Trimming hides a property; it does not remove it. No tool sets `additionalProperties: false`,
@@ -356,7 +470,30 @@ over 20 tools, 47,739 of it descriptions and 30,456 input schemas, spent before 
 asked anything. `full`, `benchmark` and `context-bench` keep the long forms: the last two
 because their `tools/list` bytes are an input to a citable benchmark result.
 
+On 2026-09-22 every served description on `agent-default` and `agent-query`, tool and
+parameter, was cut to at most half its bytes, with no parameter dropped. `agent-query`'s
+`tools/list` went from 14,610 bytes to 11,079, and `agent-default`'s from 35,118 to 26,420.
+`kin_init` joined `agent-default` the same day, so a folder with no repository can be set up
+from the client, and costs 366 bytes there: 26,786. Setting a folder up is a write, so
+`agent-query` does not serve it.
+
+On 2026-09-25 `kin_session_exec` joined `agent-default`, so an agent Kin sets up, Claude Code
+among them, can build, test and run the code it writes without a shell. Measured off a real
+`kin mcp start` the way the MCP surface contract grades it, compact JSON as a client reads it,
+`agent-default`'s `tools/list` went from 34,119 bytes over 21 tools to 35,183 over 22: the tool
+costs 1,064 bytes, and the profile's descriptions total 1,455 of their 1,617-character budget. It
+runs the project's code and writes what the toolchain hands back, so `agent-query` does not serve
+it.
+
 #### `agent-query` is that belt without its write half
+
+On the agent profiles, `find_references` defaults to `answer_only: true`: the same
+reference rows, focal identity, counts, withheld-row disclosures and verdict, with
+the graph generation, freshness, hydration, durability and degraded-state observations
+preserved. Detailed coverage and candidate blocks are available with `answer_only: false`.
+An explicit `explain: true` or `compact: false` also requests the detailed response unless
+`answer_only` itself is set. Errors retain their original message. The full and benchmark
+profiles keep the detailed default and advertise the same optional parameter.
 
 Native tool calling re-sends the whole `tools` array on every turn, so the served list is a
 per-turn cost, not a per-session one. Measured on 2026-09-02 against a real `kin mcp start`,
@@ -366,7 +503,8 @@ bought two tool calls. `kin_transaction_stage` and `kin_transaction_commit` alon
 of those bytes, and across six runs the model never reached for a session or a transaction
 tool (FIR-3107).
 
-`agent-query` is `agent-default` minus the three session tools and the four transaction tools.
+`agent-query` is `agent-default` minus its write tools: the three session tools, the four
+transaction tools, `kin_mutate`, `kin_init` and `kin_session_exec`.
 Same served names, same short descriptions, same trimmed schemas, so nothing an agent learned
 on one profile is wrong on the other. Point a query-only client at it:
 
@@ -383,19 +521,29 @@ applies: a local process holding your daemon's credentials can still write.
 #### `agent-search` is the always-on set, and the rest is found on demand
 
 Every profile above trades bytes. This one changes where the tools live. `agent-search` serves
-five tools, and everything else is reached by asking `kin_tool_search` for it in plain language.
-A match comes back as the whole tool definition, exactly as `full` serves it, so a tool found on
-one turn is callable on the next with nothing withheld.
+six tools, including discovery and invocation. Ask `kin_tool_search` for an operation in plain
+language, then pass its exact name and input object to `kin_tool_call`:
+
+```json
+{"tool":"find_references","arguments":{"query":"handleRequest"}}
+```
+
+The discovered definition is the full registered schema. Invocation uses the same handler,
+repository and session checks, validation, response limits and persistence as a direct call.
+The tool list stays fixed; clients do not need dynamic tool registration. `kin_tool_call`
+accepts only registered read-only operations. Mutations require direct calls through a profile
+that serves them, preserving client permission granularity. `agent-query` keeps its existing
+served set; it does not gain this dispatcher.
 
 ```sh
 KIN_MCP_TOOL_PROFILE=agent-search kin mcp start --repo /path/to/repo
 ```
 
 The always-on set is `semantic_locate`, `trace_data_flow`, `get_context_pack`,
-`kin_graph_status` and `kin_tool_search`. The first three are there because they were measured.
+`kin_graph_status`, `kin_tool_search` and `kin_tool_call`. The first three are there because they were measured.
 Across 40 agentic runs on 2026-09-03, over four questions on three repositories with one local
 model, those three took 96 of the 103 tool calls made, `impact_analysis` was offered 24 times and
-called none, and nine of the fourteen tools `agent-query` serves were never called once. A
+called none, and nine of the fourteen tools `agent-query` served in that study were never called once. A
 four-tool arm answered every question the fourteen-tool control answered, in fewer calls, for 36
 percent fewer tokens, and cited fewer symbols that failed to resolve.
 
@@ -411,9 +559,130 @@ that reading on a healthy answer: `_kin.verdict` is computed from seven inputs a
 freshness one is silent by construction. Until a stale graph reaches an agent through the
 envelope, this is the tool that says so, and it costs about 610 bytes.
 
-An agent that never searches gets a narrower answer, never a wrong one. No served description
-points at a withheld tool in silence: on this profile the note names `kin_tool_search` as the way
-to reach it, rather than telling an agent mid-session to restart the server on `full`.
+An agent that never searches sees only the always-on tools. No served description
+points at a withheld tool in silence: the note names `kin_tool_search` for its schema and
+`kin_tool_call` for invocation. The historical four-tool result above did not evaluate this
+invocation path; completed-task efficiency for this revised profile still requires measurement.
+
+#### `agent-routed` is one tool for a client that sends every tool
+
+A client that loads every tool it is handed re-sends every definition with every request.
+Codex CLI, Cursor, Gemini CLI, Windsurf, Antigravity and LM Studio work this way. In the
+corrected rerun pilot of 2026-09-22, Codex CLI 0.153.4 carried `agent-query`'s fifteen schemas
+as one 14,096-byte namespace tool, about 3,500 tokens on every request against about 1,100 for
+the raw arm's four tools, and its model never called a Kin tool.
+
+`agent-routed` serves one tool, `kin`, in 1,699 bytes of `tools/list` against a 3,200-byte
+budget; `agent-routed-query` serves it in 1,392. Adding the write path and `exec` needed no
+larger budget. The tool takes a `command` and that command's `args`:
+
+```json
+{"command":"locate","args":{"query":"where failed requests are retried"}}
+```
+
+One vocabulary runs across the three surfaces. Each routed command runs one named tool, and
+where the `kin` CLI has a subcommand for the same capability it is listed beside it:
+
+| command | named tool | `kin` CLI | for |
+| -- | -- | -- | -- |
+| `locate` | `semantic_locate` | `kin locate` | code by what it does |
+| `search` | `semantic_search`, or `lexical_lookup` when `args` name a `literal` or `cursor` | `kin search` | declarations by name, kind or language, or exact text |
+| `context` | `get_context_pack` | `kin context` | code and routes around entities |
+| `refs` | `find_references` | `kin refs` | callers, importers and references |
+| `trace` | `trace_data_flow` | `kin trace-data-flow` | the call chain out from one entity |
+| `path` | `trace_path` | `kin path` | how one entity reaches another |
+| `impact` | `impact_analysis` | `kin impact` | what a change could affect |
+| `source` | `get_entity_source` | `kin source` | one entity's code |
+| `status` | `kin_graph_status` | `kin graph status` | graph counts and freshness |
+| `init` | `kin_init` | `kin init` | set the client's folder up as a Kin repository, when it is not one; `agent-routed` only |
+| `session` | `kin_session_start` | none | the write session `mutate` needs; `agent-routed` only |
+| `mutate` | `kin_mutate` | none | entity and relationship changes in one atomic commit; `agent-routed` only |
+| `exec` | `kin_session_exec` | none | build, test or run the project's toolchain in a session workspace; `agent-routed` only |
+| `describe` | none | `kin describe` | a command's or tool's `args` schema and an example; with no command, every command and every other tool this connection reaches |
+| `call` | any other tool | `kin call` | runs a tool by its registered name |
+
+Any name in the table works as the command: the named tool, and the CLI spelling with or
+without its leading `kin`, so `get_entity_source`, `kin source`, `kin graph source` and
+`kin trace-data-flow` all run. The name of any other registered tool works too, and runs
+that tool the way `call` does. Two CLI names mean something else in a shell: `kin trace` is
+a one-shot composite that resolves an entity and summarizes what is around it, and
+`kin status` is the workspace's status. The command `trace` is `trace_data_flow`, which the
+CLI spells `kin trace-data-flow`, and `status` is `kin graph status`.
+
+A routed call is answered as the named tool it runs: the same belt defaults, the same payload
+and the same `_kin` envelope, the write path included, so `mutate` is `kin_mutate` with its
+own refusals. The `args` are checked against the named tool's schema before anything runs, and
+a field the tool does not declare is refused rather than ignored; a refusal names the fields
+and carries one call that works. Where an answer's hints name a tool, they name it by a
+spelling that runs both here and in a shell: the CLI spelling of the command that reaches it,
+`kin source` for `get_entity_source` and `kin graph status` for `kin_graph_status`, or
+`kin call` with the tool's name where that command has no CLI spelling or no command reaches
+the tool, `kin call kin_session_start` and `kin call graph_neighborhood`. `kin_tool_search`
+and `kin_tool_call` are named `kin describe` and `kin call`, the commands that do their job
+here. A hint keeps the tool's own name where its spelling would push the answer past its
+budget. The `_kin` envelope is never rewritten. A named tool called directly on a routed
+connection is refused with the command that runs it there. On `agent-routed-query` every
+write is refused before anything runs, and the refusal names `agent-routed` as the profile
+that carries it.
+
+The same words run in a shell. `kin source` is `kin graph source`, and
+`kin describe [command]` prints what `describe` answers. `kin call <tool> [arguments]`
+sends `call` through the server path `kin mcp start` answers it on, against the repository's
+daemon, so the answer is the one this tool gives, `_kin` envelope and hints included. Its
+arguments are one JSON object, `-` reads that object from stdin, and it exits 1 when the tool
+answers with an error. Both answer as `agent-routed` does, writes included: a read-only
+profile limits what its one MCP tool reaches, and a shell on the same machine already writes
+through `kin commit` and the rest. `kin call` refuses a name a shell runs another way and
+says what works there: `kin init` for `kin_init`, `kin describe` and `kin call` for
+`kin_tool_search` and `kin_tool_call`, and for a command's name, the command's CLI spelling
+or `kin call` with the tool it runs.
+
+`kin setup` writes `agent-routed` for Codex CLI, Cursor, Gemini CLI, Windsurf, Antigravity and
+LM Studio, and `agent-default` for Claude Code, which defers schemas behind its own tool
+search, and the Grok CLI, which never sends them.
+
+#### Which profile a client keeps
+
+`kin setup` and `kin update` decide each client's profile the same way, in this order:
+
+1. `kin setup --tool-profile <profile>` writes that profile into every client the run
+   configures, and pins it with `KIN_MCP_TOOL_PROFILE_PINNED=1` beside it.
+2. A pinned entry keeps its profile.
+3. A profile a person set is kept, and pinned so later runs keep it too. The install ledger
+   tells it apart from Kin's own write: the entry is the one Kin last wrote with only the
+   profile changed. With no ledger record to say, a profile no Kin has written as a default
+   counts as chosen.
+4. Everything else gets the client's default: a new entry, one exactly as Kin last wrote it,
+   and one still carrying a default an earlier Kin wrote. That is how an existing Codex CLI
+   entry moves from `agent-default` to `agent-routed`.
+
+`kin doctor` shows each client's profile and says when it is pinned.
+
+Setup also writes a Kin-first discovery block into `~/.claude/CLAUDE.md` and
+`~/.codex/AGENTS.md` for a client it registered. The block is the server's operating
+procedure worded for that client's profile, `kin locate` and `kin refs` for a routed client
+and `semantic_locate` and `find_references` for a named one, and Kin owns only the text
+between its `kin-managed:discovery` markers. `kin setup` and `kin update` rewrite it when the
+profile changes, and replace the block an earlier Kin appended without markers. A copy of
+that older block a person edited is left alone. `kin doctor` flags a block that names a
+command or tool its client's profile does not carry.
+
+#### Entity bodies with line offsets
+
+On the profiles with no Kin write path, `agent-query`, `agent-search` and
+`agent-routed-query`, an entity's body from `get_entity_source` comes back with each line
+starting with `+N` and a tab, where `N` is the line's offset from the entity's first line, and
+an `about_body` note directly before it saying so. The plus sign keeps an offset from being
+read as a file line. Where the answer carries the graph's own span, as a daemon-served record
+does, the note adds `File line = start_line + N`. The entity's file location, `file_path`,
+`start_line` and `end_line`, is unchanged, and the listing's description of the source tool
+says the lines come as `+N`.
+
+Every surface that restates a body is served the exact bytes: a profile that serves Kin's
+write tools, the citable `benchmark` and `context-bench` profiles, and any client that sends
+`"capabilities": {"experimental": {"kin": {"exactEntityBodies": true}}}` at `initialize`, which
+`kin agent run` always does, because it copies a body byte for byte into the text an edit must
+match. Only targeted entity source is exposed.
 
 #### A client that hides the tool schemas
 
@@ -426,12 +695,22 @@ tools instead, and only three ever called `search_tool` at all.
 
 Two things follow, and both are now Kin's side of the contract rather than the client's.
 
-The `instructions` string is a discovery surface. It names `semantic_locate`,
-`semantic_search`, `get_context_pack`, `find_references`, `trace_data_flow`, `trace_path`,
-`impact_analysis` and `list_file_entities` with one line each, because a name a model has read
-is a name it can search for, and it tells a model whose client lists tools by search to search
-for `kin` before its first file read. It stays under 1,200 bytes, since a client spends it once
-per session on the model's context. `kin agent run` builds its own prompt and never reads it.
+The `instructions` string is an operating procedure in five numbered steps: find things with
+`semantic_locate` or `semantic_search` first and do not grep or list files to explore; use
+`find_references` and `get_context_pack` before `get_entity_source`; read code with
+`get_entity_source` by entity id; use the shell only to build and run tests; read
+`_kin.verdict` first, where inconclusive means the counts are a lower bound. Each profile is
+served the wording for what it has. On the routed profiles the same steps name the routed
+commands, `kin locate`, `kin search`, `kin refs`, `kin context` and `kin source`, and end by
+saying that `kin describe` lists every other Kin tool and `kin call` runs it; on
+`agent-routed-query` that sentence says every other read-only tool. Each of those words is also
+a `kin` command a shell runs. On `agent-search` the
+steps name only what that profile serves and say that `kin_tool_search` finds the rest and
+`kin_tool_call` runs it. Every wording tells a model whose client lists tools by search to
+search for `kin` before its first file read, and each stays under 1,200 bytes, since a client
+spends it once per session on the model's context. The citable `benchmark` and `context-bench`
+profiles keep, byte for byte, the tool-list wording their published numbers were measured
+under. `kin agent run` builds its own prompt and never reads any of them.
 
 The session and transaction descriptions carry no code vocabulary. A client that ranks tools by
 retrieval scores them against the question, and on one real locate question Grok's ranked top
@@ -457,15 +736,16 @@ move those proofs too. Both names dispatch to the same handler on every profile.
 ---
 
 ## 1. Retrieval & Codebase Exploration
-*Tools:* `semantic_search`, `semantic_locate`, `list_file_entities`, `get_entity`, `get_entity_source`, `get_entity_body`, `get_entity_sources`, `get_context_pack`, `explore_codebase`, `graph_neighborhood`
+*Tools:* `semantic_search`, `semantic_locate`, `lexical_lookup`, `get_entity`, `get_entity_source`, `get_entity_body`, `get_entity_sources`, `get_context_pack`, `explore_codebase`, `graph_neighborhood`
 
 - **`semantic_search`** (`agent-default` also accepts the name **`find_declarations`** on a call): Find declarations by **name, kind, or language** (functions, classes, structs, traits, enums, interfaces, types, constants). This matches real parsed declarations rather than raw string occurrences like grep, and returns each match's file path, line range, signature, and stable entity ID. Note: despite the name, this is a metadata matcher; it does **not** rank by vector similarity. Use it as your first step to find "the thing called X."
-- **`semantic_locate`**: Rank the code most relevant to a **natural-language** query using Kin's vector index, the same embedding-backed retrieval that powers `kin locate`. Use it when you only have a description of the behavior, not an exact symbol name. Supports `granularity` of `entity` (default) or `file`, reports `semantic_coverage` as the counter object, and requires the running daemon. Each hit carries its inline source once: on `body` for the fused pipeline (the default, `routing: "fused-v1"`) and on `snippet` for the cosine pipeline. Multi-query fan-out echoes the variants once under `queries`, and a hit names the ones that surfaced it by position in `matched_variant_indexes`. **The `agent-default` belt asks for a compact response shape** at entity granularity: per hit `id`, `name`, `kind`, `file`, `line`, `signature` and `score`, plus the ranked file paths, `total_ranked`, `next_cursor`, `all_fallback`, a `ranked_by` clause, and the `semantic_coverage` object the `_kin` envelope carries. The shared `kin locate --json` schema described above stays the default on the wire and on every other profile, because this payload deserializes straight back into that type and a consumer needs one parser across all three locate surfaces. Pass `surface: "compact"` to ask for the small shape yourself, or `surface: "full"` on the belt to opt back out. Two arguments force the shared schema whatever else is set: `explain: true`, since every field an explanation adds lives on it, and an explicit `include_snippet: true`, since that asks for source text per hit and the compact shape carries none. File granularity is always full, because there the file roll-up is the answer. The compact default exists because the full shape spends most of its bytes on the back-compat `files[].symbols` roll-up of entities `entities` already carries: on a 730-entity store a twelve-hit page is 38,819 bytes full and 3,472 compact.
-- **`list_file_entities`**: Enumerate every entity the graph holds for one repository-relative file. This is the enumeration surface, and it is the one to reach for when the question is "what is in this file" rather than "what is most relevant to this query". `semantic_search` and `semantic_locate` both return a bounded set they cannot certify, so a short answer and a whole one read identically; this one reports `total_in_file` on every page and says whether the set is complete. Completeness rests on the file's own parse record rather than on store-wide health: `file_coverage.parsed` is `full` only when a language adapter parsed the file completely, and `_kin.completeness` and `negative.safe_to_conclude_absent` follow that fact. A path the graph does not track is refused by name instead of answered with an empty list, because a caller cannot tell those two answers apart and only one of them means the file holds no entities. Large files page through `next_cursor`.
+- **`semantic_locate`**: Rank the code most relevant to a **natural-language** query using Kin's vector index, the same embedding-backed retrieval that powers `kin locate`. Use it when you only have a description of the behavior, not an exact symbol name. Supports only `granularity: "entity"`, reports `semantic_coverage` as the counter object, and requires the running daemon. Each hit carries its inline source once: on `body` for the fused pipeline (the default, `routing: "fused-v1"`) and on `snippet` for the cosine pipeline. Multi-query fan-out echoes the variants once under `queries`, and a hit names the ones that surfaced it by position in `matched_variant_indexes`. **The `agent-default` belt asks for a compact response shape** at entity granularity: per hit the entity `id`, `name`, `kind`, `file`, `line`, `signature`, `score` and `matched` (`name`, `semantic` or `text_fallback`), plus `collapsed_rows` on a Go package's module row when the ranking folded that package's other files into it (at least that many rows were folded; every Go file declares its package, so a word the package is named after would otherwise bring one row per file), plus the ranked file paths, `total_ranked`, `next_cursor`, `all_fallback`, a `ranked_by` clause, and the `semantic_coverage` object the `_kin` envelope carries. The shared `kin locate --json` schema described above stays the default on the wire and on every other profile, because this payload deserializes straight back into that type and a consumer needs one parser across all three locate surfaces. Pass `surface: "compact"` to ask for the small shape yourself, or `surface: "full"` on the belt to opt back out. Two arguments force the shared schema whatever else is set: `explain: true`, since every field an explanation adds lives on it, and an explicit `include_snippet: true`, since that asks for source text per hit and the compact shape carries none. Non-entity candidates are omitted with a conversion coverage gap; file-granularity requests are refused. The compact default exists because the full shape spends most of its bytes on the back-compat `files[].symbols` roll-up of entities `entities` already carries: on a 730-entity store a twelve-hit page is 38,819 bytes full and 3,472 compact.
+- **`lexical_lookup`**: Find a bare literal, including punctuation, in stored graph fields: entity name, signature, doc summary, body preview and file import/surface context. Matching folds ASCII case only; it does not use the ranked text index. Each hit names its matched field and excerpt; an exact source line requires verified source/span coherence. Results use entity-ID order with `score: null`. `total_matching` counts the matching entities in the requested kind scope, and content-bound cursors reject changed matches. Following `next_cursor` preserves hits withheld by the response budget. Each page scans and materializes the scoped graph, regardless of `limit`. Body previews may be sampled or truncated, and unadmitted source and paths are outside this lookup, so a miss cannot establish repository absence. Its disclosure and `lexical_lookup_not_structural` clause distinguish literal occurrences from resolved relationships; use `find_references` and `trace_data_flow` for those.
+
 - **`get_entity`**: Fetch metadata about a specific entity (kind, language, path, line range, signature) without its source body.
-- **`get_entity_source` / `get_entity_body`**: Retrieve the implementation source of an entity, served from the graph.
+- **`get_entity_source` / `get_entity_body`**: Retrieve the implementation source of an entity, served from the graph. The id is the exact address, and a name is accepted in its place. A name returns a body only when it names one entity: one exact whole name, or, when nothing is named it exactly, one owner's member (a method, field or enum variant) that carries it as its member name, such as `get` for `Scaffold.get`. Any other name returns `ambiguous_focal` and no body or edit base, with `resolution` saying why (`same_name`, `shared_member_name` or `partial_name`) and every candidate's `entity_id`, `name`, `member_name`, `owner`, kind, file and signature under `candidates`. Past 25 candidates the rest are listed by id under `more_candidates`, and past 200 `omitted_candidates` says how many were left out. `get_entity_sources` gives such a name a row with `reason: "ambiguous_name"` and the same candidates, never `not_found`. `trace_data_flow`, `trace_computation`, `trace_path` and `get_context_pack` answer a member name several owners share the same way, and `find_references` answers each candidate in its own section under `candidates_by_owner`, listing any past its first 10 sections by id under `unsectioned_candidates`.
 - **`get_entity_sources`**: The batch form of `get_entity_source`. Hand it up to 50 entity IDs in priority order and it returns each entity's metadata plus its body in one budgeted call, which replaces the N separate round-trips and N response envelopes those reads would otherwise cost. Bodies fill in the order you list the IDs until the shared `token_budget` is reached, and entities past that point come back signature-only with `omitted=true`.
-- **`get_context_pack`**: Package a target entity alongside its caller/import neighborhood into a single prompt-friendly bundle. The two directions come back as separate named groups: `dependencies` is what the focal needs to run, `dependents` is what breaks if you change it, and every row carries a `relation` saying which way its edge points. A question that names several things takes several focals: pass `entities` with their names or ids (a name with twins can pin the one it means, `Name@file`, `Name@file:line`, `Name#Kind`), or pass `question` and let Kin's ranking pick them, which needs the running daemon because that is where the ranking lives. That shape carries every focal, the graph route between connected focals before either focal's neighborhood, and each neighborhood water-filled into what remains, and it returns `method` (one sentence naming each focal, how it resolved and what it contributed), `routes`, `route_search.bounded` (true when a search stopped at its bound, so an absent route is not evidence there is none), and `measured_tokens`, which is never above `token_budget` because rows are dropped until it is not.
+- **`get_context_pack`**: Package a target entity alongside its caller/import neighborhood into a single prompt-friendly bundle. The two directions come back as separate named groups: `dependencies` is what the focal needs to run, `dependents` is what breaks if you change it, and every row carries a `relation` saying which way its edge points. The focal comes back with its exact body; dependencies and dependents come back as signatures (`projection: "SignatureOnly"`) unless you pass `neighbor_bodies: true`, which adds their exact bodies within the budget. Pass `focal_body: false` when you already hold the focal's body and want its neighborhood alone; the focal then comes back as its signature with `body_omitted: "focal_body:false"`. Both controls apply to a single `entity_id` pack, and passing either with `entities` or `question` is refused. A pack carries no `source_base`: to change an entity, read it with `get_entity_source`, whose `source_base` the guarded full-body and anchored-patch `kin_mutate` forms require. A pack replaces `get_entity_source` for reading, not for editing. A question that names several things takes several focals: pass `entities` with their names or ids (a name with twins can pin the one it means, `Name@file`, `Name@file:line`, `Name#Kind`), or pass `question` and let Kin's ranking pick them, which needs the running daemon because that is where the ranking lives. That shape carries every focal, the graph route between connected focals before either focal's neighborhood, and each neighborhood water-filled into what remains, and it returns `method` (one sentence naming each focal, how it resolved and what it contributed), `routes`, `route_search.bounded` (true when a search stopped at its bound, so an absent route is not evidence there is none), and `measured_tokens`, which is never above `token_budget` because rows are dropped until it is not.
 - **`explore_codebase`**: Get a one-shot map of the codebase via a selectable strategy (e.g. `overview`: entity counts by kind and language, plus the top public declarations).
 - **`graph_neighborhood`**: Return the dependency neighborhood of an entity, traversed to a given depth. The neighborhood covers what it depends on and what depends on it. `direction` selects which side to walk: `out` for dependencies, `in` for dependents (blast radius), `both` (default) for the merged neighborhood; every returned edge is tagged with the direction it was traversed in.
 
@@ -483,11 +763,11 @@ reported rather than served as a confident answer.
 *Tools:* `trace_computation`, `trace_data_flow`, `trace_path`, `find_references`, `bulk_check_references`, `entity_history`
 
 - **`trace_computation`**: Get a focal entity together with its control-/data-flow neighborhood in one structured response (a flat snapshot, not an ordered walk). The response carries its body plus callers, callees, and imports.
-- **`trace_data_flow`**: Walk the directional call/data-flow chain rooted at a focal entity and return it as an ordered list of steps (the path-walk counterpart to `trace_computation`'s flat neighborhood).
+- **`trace_data_flow`**: Walk the directional call/data-flow chain rooted at a focal entity and return it as an ordered list of steps (the path-walk counterpart to `trace_computation`'s flat neighborhood). `max_chars`, or its older spelling `max_response_chars`, is the size in UTF-8 bytes the walk cuts its reply toward. It accepts 2,000 to 60,000, serves a smaller value as 2,000 and a larger one as 60,000, and defaults to 45,000 on `full` and 24,576 on `agent-default`. It is a target, not a hard ceiling. The walk drops bodies before edges and then whole branches, least relevant first, and a cut chain always keeps at least one step. Read the cut from `elisions.chain`, which accounts for every step the walk reached. Whichever pass made the cut, `total_steps` is the number of steps `chain` carries and `steps_omitted` equals `elisions.chain.elided`; `chain_withheld` is the share the MCP envelope pass withheld after the walk, and `degradations` names each cut (`steps_omitted` for the walk's, `response_bounded` for the envelope pass's). `spine_clipped_steps`, `spine_dropped_crossing_file`, each clip's `continued_below` and the `fanout_cap` / `spine_clipped` disclosure likewise describe only the clipped nodes that chain still continues beneath, and name none the cut removed. A spine count a cut took to zero does not mean every missing hop was looked for, because `truncated` and `steps_omitted` still report that cut. When `spine_dropped_crossing_file_is_floor` is true, `spine_dropped_crossing_file` counts only the spine nodes whose clip records reached the envelope pass, so it is a floor. When the walk itself made a cut, `chars_before_budget` on the reply gives the size the walk measured before it, and `_kin.response` reports the reply as bounded, with a `chars_before_budget` no smaller than that, whether or not the reply then fits. The reply also carries parts the budget never trims: the focal's identity, the disclosures a cut requires, the `_kin` envelope and the `negative` object. When those and the smallest retained walk still exceed the budget, the tool answers with that walk anyway and adds a `response_over_budget` degradation naming the budget it missed, and `_kin.response.chars_after_budget` gives the size that shipped. A smaller budget cannot make that reply smaller. The exception is a focal or `target` that several owners share as a member name: its candidate listing is held to the budget, and a reply that cannot fit the listing's shortest form, beside the walk for a `target`, is refused with a count-only error (`isError: true`, `ambiguous_focal` or `ambiguous_target`, `candidate_count`) instead of shipped over. `kin trace-data-flow --max-response-chars` treats the budget as a hard limit and refuses a walk whose smallest retained form does not fit.
 - **`trace_path`**: The route between two named entities, for the question "how does A reach B" that no single-rooted walk answers. It resolves both ends (by exact name, entity id, or `name@file` to pin a twin; a qualified name that matches nothing takes its bare leaf when that is unique and is refused with the candidates listed when it is not), searches breadth-first over call, instantiation, reference, import and include edges, and returns up to `limit` shortest routes, every hop carrying its kind, file, line, the relation into the next hop and the syntax lines that produced it. A class stands for its members, so a route between two classes runs through the methods that carry it, and those containment hops are shown. `direction` defaults to `either`: forward (A reaches B) is tried first and the answer says which sense held. No route is explicit rather than plausible: `found: false`, `routes: []`, a `gap` naming what stopped the walk and how much of the graph it explored, and the same-name twin count on each end; the `negative` and `_kin.verdict` beside it say whether the absence can be trusted. In the `agent-default` profile.
 - **`find_references`**: Find all entities that import, call, or reference a target symbol. One row is one referencing entity, so two callers in one file are two rows, and `total_upstream` counts those entities, the same unit `kin refs` prints. The `counts` object names the unit and adds the file and reference-site totals beside it. A row's `reference_lines` gives the lines inside that caller which reference the target, and names why under `reference_lines_absent_reason` when the graph does not carry them. Rows omit the caller's body by default; pass `include_snippets=true` for it.
 - **`bulk_check_references`**: Classify many entities by reachability in one call.
-- **`entity_history`**: Retrieve version changes scoped to a specific entity.
+- **`entity_history`**: Read a bounded chronological page of recorded changes to one entity, including a retired entity. `offset` defaults to 0, and `limit` defaults to 20 with a maximum of 100. The reply keeps `result[]` and adds `change_count`, `latest_change_id`, `returned` and `next_offset`. Follow `next_offset`, and compare `change_count` and `latest_change_id` between calls before combining pages; a partial page or one past the end certifies neither the complete history nor its absence. Each entry is a focal projection of a change, not a replayable commit: `id`, `origin` and `parents` keep their original values, and the printable `change_id` is the native semantic ID `semantic_diff` takes. Sections about other entities are replaced by exact omitted counts, and oversized focal details and optional metadata by explicit summaries. A focal detail past 12,000 bytes is not available from history at any budget; its summary names the largest view of that row, a one-row page at `max_chars` 60,000, and its operations and original counts stay exact. `max_chars` bounds the final JSON payload in UTF-8 bytes, the MCP envelope included, and not the escaped size on the JSON-RPC wire (default 45,000, accepted from 2,000 to 60,000). A value outside those bounds, a `limit` outside 1 to 100, a negative `offset`, or any of the three not an integer, is refused with a structured `history_parameters_out_of_range` error rather than clamped. A budget too small to keep exact ancestry and the required qualifications returns a structured error. A change with more parents than history can carry exactly refuses its page with `history_ancestry_exceeds_limit`, and names that change's offset and the pages that read every other row. The page bounds the reply, not the read: a store read from disk may still decode each whole change while building it. The raw daemon route now returns the same paging object instead of a bare array, so a client of that route reads `result[]`.
 
 ---
 
@@ -495,16 +775,31 @@ reported rather than served as a confident answer.
 *Tools:* `impact_analysis`, `semantic_diff`, `semantic_review`, `shadow_gate_report`
 
 - **`semantic_diff`**: Compute an entity-level diff of which declarations were added, removed, or changed, rather than a line-by-line text diff. Target it by base/head change IDs, entity IDs, or a list of change IDs (file paths still answer through 0.7.16 and are deprecated in favour of entity IDs).
-- **`impact_analysis`**: Walk the relation graph from what changed to find the downstream entities that could be affected ("if I change this, what else might break?").
+- **`impact_analysis`**: Walk the relation graph from what changed to find the downstream entities that could be affected ("if I change this, what else might break?"). Each changed entity reported with `consumer_count: 0` is also read by the `caller_arrival` reading `find_references` publishes, in a top-level `caller_arrival` block. When a file that can reach the entity holds call sites that became no edge, or the reading could not be taken, the verdict is `inconclusive` and names the files rather than certifying the zero. The block's `scope` says what the reading can see: it counts a call site as arrived when the graph holds any call edge from it, including a call bound to a same-named definition in the caller's own file, and it reads only files that hold an import edge into the entity's file, so a caller that reaches the entity without one is not read. A zero certified over the reading says both in `negative.trust_reason`, and `_kin.verdict.inputs.caller_arrival` names the reading as one of the inputs the verdict was computed from, on `find_references` and `get_context_pack` absences as well.
 - **`semantic_review`**: Produce a complete review of a change in one call. It covers entity-level diff, downstream impact, and an overall risk assessment, in `text` or `json` form.
 - **`shadow_gate_report`**: Run the shadow-mode merge gate over a PR-shaped change (`base` ref to `head` ref) and return one report covering changed entities, graph-proven blast radius, the verdict the gate would have issued, the repair context needed to fix findings, explicit evidence gaps, and audit evidence. Shadow mode is report-only and never blocks. Refs accept branch names and semantic change IDs, and imported Git commit SHAs resolve once their history is in the graph. Where the graph cannot prove something, the report says so in `evidence_gaps` rather than passing silently.
 
 ---
 
 ## 4. Collaborative Sessions & Intent
-*Tools:* `register_session`, `kin_session_start`, `kin_session_heartbeat`, `kin_session_end`, `kin_register_intent`, `kin_release_intent`, `kin_check_traffic`
+*Tools:* `register_session`, `kin_session_start`, `kin_session_heartbeat`, `kin_session_end`, `kin_session_exec`, `kin_register_intent`, `kin_release_intent`, `kin_check_traffic`
 
 - **`kin_session_start` / `kin_session_heartbeat` / `kin_session_end`**: Manage developer/agent working sessions.
+- **`kin_session_exec`**: Run the project's toolchain for a session, so an agent that reaches Kin alone can build, test and run the code it wrote. It takes `session_id`, `argv` (the command as separate words), and optionally `env` (plain application variables, passed exactly as given and never expanded), `timeout_secs` (default 50, at most 600), `max_output_bytes` (default 6,000 per stream, at most 16,000) and `summary`. The session must declare `can_execute`. The command runs directly, never through a shell, in a session workspace materialized from the session's current graph head, which includes every change the session already committed, and the answer carries `exit_code`, `elapsed_ms`, and `stdout` and `stderr` with `bytes`, `truncated` and, when cut, `omitted_bytes`: the first and last halves of the bound are kept and a marker shows where the middle was cut. A command still running at its timeout is stopped with every process it started and answered as `timed_out`. Every answer for a command that ran carries `ran_on`: the `change_id` the workspace was materialized from (`null` on a branch with no change yet), the workspace `tree_hash` and `workspace_generation`, the change's own `change_tree_hash`, and `uncommitted`, true when the workspace held content no change records yet. It is read from the workspace's base record before the command starts.
+
+  Only the project's toolchain entry points run. The defaults follow the languages Kin detects in the workspace: for Go `go build`, `go test`, `go vet`, `go run`, `go list`, `go version`, `go env`, `go mod init` and `go mod tidy`; for Node `npm test`, `npm run <script>`, `npm install`, `npm ci` and `node <entry>`; for Python `python -m pytest`, `python -m unittest`, `python -m <project module>` and `pytest`; for Rust `cargo build`, `cargo test`, `cargo run` and `cargo check`. `go version` runs by itself, with no flag and no binary to read, and `go env` only reads: with nothing after it, with variable names such as `GOPATH`, or with `-json` before them. A workspace with no detected language allows all four. The repository adds commands, or fixes the languages, under `[execution.agent]` in `.kin/config.toml`:
+
+  ```toml
+  [execution.agent]
+  allow = ["make test"]
+  languages = ["go"]
+  ```
+
+  Shells, command runners such as `env` and `xargs`, inline code such as `python -c` and `node -e`, file utilities such as `cat`, `head`, `sed`, `cp` and `tee`, and paths outside the workspace are refused before anything runs, whatever the configuration says. So are the toolchain routes to another program: every word of a Go command is read against its subcommand's flag grammar, so `-exec`, `-toolexec`, `-vettool`, `-overlay` and `-modfile`, an `-ldflags` or `-gcflags` value naming an external linker, and any flag the grammar does not know are refused wherever they appear; npm's `--script-shell`, `--global` and `--prefix`, a node option before the entry point, cargo's `--config` and `-Z`, and Python modules that print or serve files such as `base64`, `json.tool` and `http.server` are refused too. `go version` with anything after it is refused, and so is every `go env` word but a leading `-json` and variable names, `--` included: `go env -w` and `-u` write the user's Go environment file outside the workspace, where a `GOFLAGS` would reach every later go command. A configured prefix adds commands and never lifts these. An `env` name that changes how a program is found, loaded, built or fetched is refused: `PATH`, `HOME`, `SHELL`, `IFS`, `BASH_ENV`, `ENV`, the Go toolchain's own variables such as `GOFLAGS`, `GOTOOLCHAIN`, `GOPROXY` and `GOPATH`, `NODE_OPTIONS`, `PYTHONPATH`, `RUSTFLAGS`, anything starting `LD_`, `DYLD_`, `CGO_`, `CARGO_`, `RUSTUP_`, `NPM_CONFIG_`, `GIT_`, `SSH_` or `KIN_`, and anything ending `_PROXY`. Every refusal says why, lists what the project allows, and carries one call that works.
+
+  When the command succeeds, what it wrote is handed back through the session reconcile boundary under the agent write-back policy: the manifests and lockfiles of the toolchain that ran are admitted, `go.mod`, `go.sum`, `go.work` and `go.work.sum` for Go; `package.json`, `package-lock.json`, `npm-shrinkwrap.json`, `yarn.lock` and `pnpm-lock.yaml` for Node; `Cargo.toml` and `Cargo.lock` for Rust; `pyproject.toml`, `requirements.txt`, `poetry.lock`, `uv.lock`, `Pipfile`, `Pipfile.lock` and `pdm.lock` for Python, and any of them for a configured command. They are recorded as one change attributed to the session, exactly as its `kin_mutate` commits are, and only while the workspace still holds exactly the tree that admission published. Source code it created, changed or removed is refused and reported, because code is written through entity operations; every other file, an application's own data files included, is refused too; and build outputs are never admitted. `write_back` names each admitted and withheld path with its reason, and the `change_id` and `tree_hash` of the new head, which the session's next command runs on. A command that fails or times out keeps nothing it wrote. The session needs `can_write` and `can_commit` for its manifests to be kept.
+
+  The command itself runs the project's own code, which can do anything that code can do, and `npm run` runs the scripts `package.json` names. What the policy governs is what an agent can run directly and what comes back into the graph. `kin_session_exec` is served by name on `agent-default` and `full`, and as `exec` on `agent-routed`; a refusal's example call is written in the form the caller holds, `{"name":"kin_session_exec","arguments":{...}}` by name and `{"command":"exec","args":{...}}` routed.
 - **`kin_register_intent` / `kin_release_intent`**: Register or release intent to modify a specific entity or path, surfacing conflicts before code is edited.
 - **`kin_check_traffic`**: Query concurrent work on target entities or paths.
 
@@ -514,18 +809,40 @@ reported rather than served as a confident answer.
 *Tools:* `kin_transaction_begin`, `kin_transaction_stage`, `kin_transaction_validate`, `kin_transaction_commit`, `kin_transaction_abort`, `kin_mutate`
 
 - **`kin_transaction_begin`**: Start a transaction context.
-- **`kin_transaction_stage`**: Stage changes to the transaction. Each staged operation is one of six disjoint shapes, and the verb decides which:
-  - `create` (or `add`/`insert`) with `target` set to a repository-relative path and `body` set to the file's complete source text admits a file the graph has never seen. It is the only operation that introduces a new file, and it refuses a path repository authority already tracks.
-  - `replace` (or `overwrite`) with `target` set to a repository-relative path and `body` set to the file's complete new source text rewrites a file the graph already tracks. This is the shape for what a local edit or write leaves you holding, a path and the file's new contents, and it needs no entity: Kin reparses the body, so entities the new text adds enter the graph, entities it drops leave it, and the rest keep their ids and their incoming edges. It refuses a path repository authority does not track, and it refuses a body byte-identical to the contents already tracked.
-  - `update` (or `modify`) with `target` set to an entity uuid or an unambiguous exact entity name, and `body` set to that entity's complete new source text, edits one entity in place. Prefer it when you are changing one function or class and you know which.
-  - `delete` (or `remove`) with `target` set to a repository-relative path and no body retires a tracked file, along with every entity derived from it and every edge incident to those entities.
-  - `rename` (or `move`) with `target` and `destination` both repository-relative paths relocates a tracked file. Entity ids, history, and incoming references survive the move.
-  - A structured entity or relation mutation carries an explicit `payload`, for callers that already hold Kin's own entity and relation objects.
+- **`kin_transaction_stage`**: Stage changes to the transaction. Staged work targets entities and relationships:
+  - `patch` with the exact entity UUID as `target` and `payload.EntitySourcePatch` containing the unchanged `source_base` from `get_entity_source` plus `edits: [{old_text, new_text}]` changes unique literal anchors within that original entity body. Omit `body` and `destination`. All anchors address the original body and must be nonempty, unique and nonoverlapping. Stale, missing, ambiguous or no-op edits refuse without partial publication. Use one operation per entity. This avoids resending a large body for a small edit; a guarded full-body update may be smaller for tiny entities. See [guarded source edits](mcp-source-bases.md).
+  - `update` (or `modify`) with the exact entity UUID as `target`, `payload.EntitySourceBase` set to the unchanged `source_base` from `get_entity_source`, and `body` set to that entity's complete new source text, replaces one entity's body in place. The payload is required: an update with no payload, or an explicit `Entity` payload with a body, is refused as `source_base_required`, and one fresh `get_entity_source` read and a resend is the fix. When `get_entity_source` answers `source_base_unavailable` instead of a `source_base`, stop and report the verification gap. An older repository may need `kin upgrade`; reread afterward and proceed only if Kin issues a source base. If the repository is already current or no base is issued, report the unresolved gap. See [guarded source edits](mcp-source-bases.md).
+  - `create` with the declared name as `target` and `payload.EntityCreate: {repository_base, unit, name, kind, body, imports}` creates one declaration in a source unit named by language identity. It is the form for an empty repository and for every Go declaration kind. See [creating declarations in a unit](#creating-declarations-in-a-unit). Omit outer `body` and `destination`.
+  - `create` with an anchor function UUID as `target` and `payload.EntityCreate: {source_base, name, kind: "function", body, placement}` creates exactly one top-level leaf function beside an existing one. Use the unchanged source base of the anchor and the new function's complete declaration. `placement` is `sibling_after` or `new_source_unit`; the daemon derives projection placement from the anchor, with no caller path or offset. Omit outer `body` and `destination`.
+  - `update` with the unit's package name as `target` and `payload.UnitImports: {repository_base, unit, add, remove}` adds and removes imports on one unit. Omit `body` and `destination`.
+  - `remove` with the function UUID as `target` and `payload.EntityRemove: {source_base}` removes only that declaration. Its source unit and siblings remain. Omit `body` and `destination`.
+  - A structured relation mutation carries an explicit `Relation` payload and adds or removes one edge. A structured `Entity` payload is Kin's own internal record for callers that already hold one; it never creates source, and a create-verb operation carrying one is refused as `entity_create_required` with the `EntityCreate` call to send instead. Neither carries a `body`: a change to an entity's source is a guarded patch or a guarded update.
+
+Anchored function creation supports Rust, Python and Go. Separate new source units from an anchor support Python and Go only; Go anchors require plain filenames without underscores or a leading dot, and no build directives. Missing or stale anchors, occupied placement and ambiguous ownership refuse without publication.
+
+#### Creating declarations in a unit
+
+A unit-addressed `EntityCreate` names its source unit the way the language does, never by path. For Go, `unit` is `{"language": "go", "package": <import path relative to the module root, "." for the root package>, "name": <package clause name>, "role": "source" | "test"}`. The module root is the directory of the repository's one `go.mod`, or the repository root when there is none. Kin derives the unit's file by convention (`<package>/<name>.go`, and `<name>_test.go` for the test role), writes its package clause, and places the declaration: a method directly after its receiver type or that type's last method in the unit, anything else at the end. `imports` lists the import paths the declaration needs; Kin merges them into the unit's one import block, standard library first and each group sorted.
+
+`kind` is `function`, `method`, `struct`, `interface`, `type`, `const` or `var`; the graph's own kind names `class`, `type_alias`, `constant` and `static_var` are accepted as synonyms. `name` is the declared name as the graph names it: `Name`, `Receiver.Method` for a method, or the first name of a grouped `const ( ... )` or `var ( ... )`. `body` is exactly the declaration, optionally led by its doc comment, with no package clause, imports or sibling declarations.
+
+A blank var or const, such as the interface assertion `var _ Getter = (*Store)(nil)`, is created with `name` `_`. Go lets the blank identifier repeat, so its entity is named after the assertion itself, `_ Getter = (*Store)(nil)` with whitespace collapsed, and `created_entities` reports that name. A grouped `type ( ... )` is refused with the one-step alternative, one `EntityCreate` per type in the same call, and a spec declaring several names (`const A, B = 1, 2`) with the one-name-per-spec form.
+
+`repository_base` is the workspace instant you last observed, returned unchanged from `session`, `status` or the last `mutate` reply. A successful commit's reply carries the next `repository_base` and `created_entities` (each `entity_id`, `name` and `kind`), so a caller can chain creations and read or patch what it created without a search. A keyed `kin_mutate` receipt keeps its fixed `kin.mutate.receipt.v1` shape, because a retry replays it after the base has moved, so a keyed caller reads the next base with `status`. A stale base is refused as `repository_base_conflict` carrying the base authority holds now as `current_repository_base` and a `next_step`: unit-addressed operations resend with that base in one step, and any operation carrying a `source_base` is listed in `source_reads_required` for a fresh `get_entity_source` read first. A generation that advanced over the same head and tree, such as a toolchain run that published nothing, is not a conflict. See [repository bases](mcp-source-bases.md#repository-bases).
+
+`UnitImports` adds and removes imports on one unit. Adding an import the unit already holds and removing one it does not are no-ops, and a transaction whose every import change is already in place publishes nothing and answers `unit_imports_unchanged`. An import already held under another name is refused. A guarded patch and the `UnitImports` it needs may share one transaction and publish together.
+
+Changing a type's members is an edit of the type. A guarded patch or update of a struct, interface, trait or enum may add, remove or rename the members nested inside it (fields, interface methods, enum variants); new members become entities, and untouched members keep their ids and bytes. An edit that adds or drops a declaration beside the entity it names is still refused.
+
+Every existing declaration in the unit keeps its exact bytes, and the only new entities are the requested declarations and the members nested inside them; anything else refuses without publication. A name the package already declares, a unit whose directory holds another package, a method whose receiver type the package does not declare, and two creations of one name are refused. Python and TypeScript units are not supported yet; their creation is anchored only.
+
+Whole-file creation, replacement, retirement and relocation are refused by the semantic agent surface, including direct calls and previously staged unpublished work. Conversion and materialization remain separate boundaries. Already-published receipts remain recoverable.
+
 - **`kin_transaction_validate`**: Run constraints and validation against staged changes.
 - **`kin_transaction_commit` / `kin_transaction_abort`**: Commit changes to the branch head or discard them. An optional `message` on the commit becomes the change's subject in history; without one the change records only `MCP transaction <id>`, which names the call and not the work.
 - **`kin_mutate`**: Atomically validate and commit a batch of graph mutations in a single call, the one-shot front for an agent that already knows what it is changing. It begins, stages and commits in one round trip, aborts cleanly on a refusal, and takes the change message as `summary`. Every refusal is a structured tool error the caller can retry from.
 
-A body that came back marked `... [truncated]` is refused by both `kin_transaction_stage` and `kin_mutate` rather than committed. Bodies rendered inside search results, context packs and trace steps are capped at 40 lines or 2400 characters, and committing one of those would replace the entity's whole span with the part that fit. `get_entity_source` serves an entity's complete span and applies no line or character cap of its own; read the body there.
+A body that came back marked `... [truncated]` is refused by `kin_transaction_stage`, `kin_mutate`, and the inline `operations` form of `kin_transaction_commit` before staging or committing it. Bodies rendered inside search results, context packs and trace steps are capped at 40 lines or 2400 characters, and committing one of those would replace the entity's whole span with the part that fit. `get_entity_source` serves an entity's complete span and applies no line or character cap of its own; read the body there.
 
 ---
 
@@ -572,24 +889,25 @@ A body that came back marked `... [truncated]` is refused by both `kin_transacti
 ---
 
 ## 10. Utility & Health
-*Tools:* `dead_code`, `find_dead_code_seeded`, `benchmark`, `kin_graph_status`, `kin_tool_search`
+*Tools:* `dead_code`, `find_dead_code_seeded`, `benchmark`, `kin_graph_status`, `kin_tool_search`, `kin_tool_call`, `kin_init`
 
 - **`dead_code` / `find_dead_code_seeded`**: Identify unreachable or orphaned entities (whole-repo or seeded by a semantic query).
 - **`benchmark`**: Run Kin's retrieval/locate benchmarks.
 - **`kin_graph_status`**: Report one schema-bound, point-in-time status view of the exact daemon graph selected for the call, covering entity and relation counts, selected-graph embedding coverage (indexed / total / pending), temporal-session versus HEAD scope, a process-local authority epoch, and backing authority. The daemon holds its normal embedding-work fence while reading internally synchronized coverage counters, then revalidates graph/scope authority before publishing; observed counts still do not attest enrichment completeness.
-- **`kin_tool_search`**: Find the tools this server registers but the current profile does not serve, by describing the need in plain language. Each match comes back as the complete tool definition, exactly as the `full` profile serves it, so a tool found here is callable on the next turn with nothing withheld. `matched_names` lists every match and `matches` carries the full definitions for the first `limit` of them, so a bounded answer reports what it did not carry. Omit `need` to enumerate the whole registry. It answers from the registry compiled into the server rather than from the graph, so it needs no daemon.
+- **`kin_init`**: Set a folder up as a Kin repository from inside the MCP client, for the first answer that says the folder is not one. With no `path` it sets up the client's workspace folder, or the server's working directory when the client names none; a relative `path` is taken from that folder. It runs `kin init <folder> --json --no-enrich`, which writes a `.kin` store into the folder and reads its Git history into a graph, so the folder must be a Git repository or empty; cross-file enrichment continues in the daemon that serves it next. In a Git repository it also appends `/.kin/` to `.git/info/exclude`, Git's local ignore file that is never committed, unless a rule there already covers the store. A call waits about 40 seconds and then answers that the setup is still running, which the next `kin_init` call reports on, and graph calls answer once it finishes. A folder that already is a Kin repository is answered as one and nothing is rewritten. The home directory and the filesystem root are refused, and so is a folder inside another Kin repository that is not a Git repository of its own, since that repository already answers for it. It is a write: it creates a store and the repository's canonical state. So only the profiles that write serve it, `agent-default` and `full` by name and `agent-routed` as `init`, and it runs only when called. `agent-query`, `agent-search`, `agent-routed-query`, `benchmark` and `context-bench` never list it or run it by any name, a `kin_tool_call` or a routed `call` included, and on those profiles an answer that finds no repository names the `kin init .` command to run instead.
+- **`kin_tool_search`**: Find the tools this server registers but the current profile does not serve, by describing the need in plain language. Each match comes back as the complete tool definition, exactly as the `full` profile serves it, so the input contract is available. `invocation.profile_enabled` reports direct eligibility; when `invocation.callable_via_dispatcher` is true for the match, call `kin_tool_call` with the discovered name and input object. Discovery never changes the connection’s tool list. `matched_names` lists every match and `matches` carries the full definitions for the first `limit` of them, so a bounded answer reports what it did not carry. Omit `need` to enumerate the whole registry. It answers from the registry compiled into the server rather than from the graph, so it needs no daemon.
 
 ---
 
-## 11. Repository Artifacts
-*Tools:* `kin_artifact_list`, `kin_artifact_read`
+## 11. Semantic Discovery Boundary
 
-Both tools ship in the `agent-default` profile, so an agent configured with
-`kin setup --intent agent` already has them.
-
-- **`kin_artifact_list`**: List the exact graph-owned repository artifacts at one semantic change. This is the repository-membership surface, so it covers code and every non-code tracked object, including Docker Compose files, Dockerfiles, lockfiles, configuration, binary assets, unsupported languages, symlinks, executable files, and gitlinks. Identity comes from `artifact_id` and never from a path, and a listed artifact is read by passing its `artifact_id` to `kin_artifact_read`. Each row names its path once: `path_label` is the exact path whenever `path_label_lossy` is false, and only a path whose bytes are not valid UTF-8 also carries the byte-exact `path` as a lowercase `bytes_hex` object. Omit `source_change_id` to read the exact current workspace tree.
-- **`kin_artifact_read`**: Read one exact graph-owned repository artifact by stable `artifact_id` or by `path`: the repository-relative string `kin_artifact_list` prints as `path_label` (a leading `/` is tolerated), or the byte-exact `{"bytes_hex": ...}` object for a path whose bytes are not valid UTF-8. A blob or symlink body comes back as `text_utf8` when its bytes are valid UTF-8 and as base64 in `content_base64` when they are not, and `include_bytes: true` adds the base64 for a UTF-8 body too. Gitlinks return their external object identity and have no repository-owned body. The read is bound to the resolved tree entry and fails loudly when the tree, identity, or content-addressed blob is missing. It never reads the working directory.
-
+Agent discovery targets entities through `semantic_search` and `semantic_locate`,
+then follows relationships with `graph_neighborhood` and `find_references`.
+File catalogs, whole-artifact reads and routed `read` are not served or callable,
+including direct tool names and discovery dispatch. Repository membership and
+materialization remain internal conversion diagnostics. Import-created file-module
+nodes retain graph relationships but expose no whole-file bodies or edit bases.
+Missing parsed coverage is a gap, not permission to fall back to a file catalog.
 
 ## 12. Durable Entity Drafts
 *Tools:* `kin_draft_capabilities`, `kin_draft_create`, `kin_draft_save`, `kin_draft_read`, `kin_draft_list`, `kin_draft_apply`
@@ -602,3 +920,5 @@ older receipt never marks newer draft text applied. These tools are in the full
 profile, keeping the default 22-tool agent belt unchanged. See the
 [durable draft contract](mcp-entity-drafts.md) for schemas, revision CAS, recovery,
 quota configuration and the explicit initial non-Unix write refusal.
+
+- **`kin_tool_call`**: Invoke a registered read-only operation discovered with `kin_tool_search`, using `tool` for its exact name and `arguments` for its input object. Available in `agent-search` and `full`; other profiles keep their existing dispatch restrictions. Recursive dispatch, mutating operations and unknown tool names refuse before execution. All normal repository authority, session, mutation and response checks still apply.

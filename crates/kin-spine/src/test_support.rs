@@ -30,10 +30,15 @@ use crate::publication::{
     SpineRolloutRepositoryFence,
 };
 use crate::store::{
-    LoadedRepo, LoadedRepoPublication, LoadedSpineRolloutFence, PreparedStorePublication,
-    RepoPublicationCleanupProgress, SpineStore, StoreHeadPrecondition, StorePublicationStageGuard,
-    StoreRepoHeadGuard,
+    DurableReadMeter, DurableReadStats, LoadedRepo, LoadedRepoPublication, LoadedSpineRolloutFence,
+    PreparedStorePublication, RepoPublicationCleanupProgress, SpineStore, StoreHeadPrecondition,
+    StorePublicationStageGuard, StoreRepoHeadGuard,
 };
+
+/// Firestore returns at most this many documents per list page, because
+/// `FirestoreStore` asks for `pageSize=300`. The fake pages its head listing
+/// the same way so it bills the same number of requests.
+const FIRESTORE_LIST_PAGE_SIZE: usize = 300;
 
 pub fn test_rollout_fence(rollout_fence: u64, token: &str, repo_ids: &[&str]) -> SpineRolloutFence {
     let expected = repo_ids
@@ -162,6 +167,15 @@ pub struct FakeSpineStore {
     /// time a real Firestore staging costs, so a lease that has to outlive a
     /// whole fleet's publication can be proved to, without sleeping for it.
     pub prepare_hook: Mutex<Option<Box<dyn Fn(&str) + Send + Sync>>>,
+    /// The reads a `FirestoreStore` would have been billed for, on the paths a
+    /// hosted READER takes: the active fence, the committed-head listing, the
+    /// full hydration, the single-repository load a commit reconciles through,
+    /// and the legacy seal check. Each is charged the requests `FirestoreStore`
+    /// sends for it, one read per document returned and at least one per
+    /// request. Publication staging, the head compare-and-swap, cleanup and
+    /// legacy seal completion are not metered here, so a count taken across
+    /// one of those is a floor for it, not a measurement.
+    pub read_meter: DurableReadMeter,
 }
 
 #[derive(Default)]
@@ -258,6 +272,7 @@ impl Default for FakeSpineStore {
             cleanup_calls: AtomicUsize::new(0),
             legacy_migration_seal: Mutex::new(None),
             prepare_hook: Mutex::new(None),
+            read_meter: DurableReadMeter::default(),
         }
     }
 }
@@ -322,6 +337,118 @@ impl FakeSpineStore {
         *revision += 1;
     }
 
+    /// The active fence without charging a read: for the fake's own internal
+    /// checks, which `FirestoreStore` makes as part of requests metered
+    /// elsewhere or not at all.
+    fn fence_unmetered(&self) -> Option<LoadedSpineRolloutFence> {
+        self.rollout_fence_state
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|(revision, fence)| LoadedSpineRolloutFence {
+                fence: fence.clone(),
+                update_time: revision.to_string(),
+            })
+    }
+
+    /// Charge one listing of `spine_repo_heads_v2` holding `heads` documents,
+    /// paged the way `FirestoreStore::list_all_documents` pages it.
+    fn charge_head_listing(&self, heads: usize) {
+        if heads == 0 {
+            self.read_meter.record(0);
+            return;
+        }
+        let mut remaining = heads;
+        while remaining > 0 {
+            let page = remaining.min(FIRESTORE_LIST_PAGE_SIZE);
+            self.read_meter.record(page);
+            remaining -= page;
+        }
+    }
+
+    /// Every committed publication, through the head, rows, head sequence
+    /// `FirestoreStore::load_repo_publications` runs, charged to the read
+    /// meter only when `metered`.
+    fn load_committed_publications(
+        &self,
+        metered: bool,
+    ) -> Result<Vec<LoadedRepoPublication>, SpineError> {
+        if !self.atomicity_available.load(Ordering::SeqCst) {
+            return Err(SpineError::Backend(
+                "injected atomic publication unavailable".to_string(),
+            ));
+        }
+        for _ in 0..3 {
+            let selected_heads = self.publication_state.lock().unwrap().heads.clone();
+            // `FirestoreStore::load_repo_publications`: list the heads, read
+            // each head's manifest and query its entity and edge rows, then
+            // list the heads again to prove they did not move.
+            if metered {
+                self.charge_head_listing(selected_heads.len());
+            }
+            // Same guard-lifetime rule as the cleanup rendezvous below.
+            let rendezvous = self.load_snapshot_barrier.lock().unwrap().take();
+            if let Some(barrier) = rendezvous {
+                barrier.wait("fake store hydration snapshot");
+                barrier.wait("fake store hydration snapshot");
+            }
+            let loaded = {
+                let state = self.publication_state.lock().unwrap();
+                selected_heads
+                    .values()
+                    .map(|(_, head)| {
+                        if metered {
+                            self.read_meter.record(1);
+                        }
+                        let manifest =
+                            state.manifests.get(&head.publication_id).ok_or_else(|| {
+                                SpineError::Serialization(format!(
+                                    "missing fake manifest {}",
+                                    head.publication_id
+                                ))
+                            })?;
+                        if manifest != head {
+                            return Err(SpineError::Serialization(
+                                "fake head and manifest disagree".to_string(),
+                            ));
+                        }
+                        let entries = state
+                            .entity_rows
+                            .get(&head.publication_id)
+                            .cloned()
+                            .unwrap_or_default();
+                        if metered {
+                            self.read_meter.record(entries.len());
+                        }
+                        let outgoing_edges = state
+                            .edge_rows
+                            .get(&head.publication_id)
+                            .cloned()
+                            .unwrap_or_default();
+                        if metered {
+                            self.read_meter.record(outgoing_edges.len());
+                        }
+                        Ok(LoadedRepoPublication {
+                            head: head.clone(),
+                            entries,
+                            outgoing_edges,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, SpineError>>()
+            };
+            let observed_heads = self.publication_state.lock().unwrap().heads.clone();
+            if metered {
+                self.charge_head_listing(observed_heads.len());
+            }
+            if observed_heads == selected_heads {
+                return loaded;
+            }
+        }
+        Err(SpineError::Backend(
+            "fake durable spine heads did not stabilize after three attempts".to_string(),
+        ))
+    }
+
     pub fn age_stage(&self, publication_id: &str, by: std::time::Duration) {
         let mut state = self.publication_state.lock().unwrap();
         assert!(
@@ -337,16 +464,14 @@ impl FakeSpineStore {
 }
 
 impl SpineStore for FakeSpineStore {
+    fn read_stats(&self) -> Option<DurableReadStats> {
+        Some(self.read_meter.snapshot())
+    }
+
     fn load_rollout_fence(&self) -> Result<Option<LoadedSpineRolloutFence>, SpineError> {
-        Ok(self
-            .rollout_fence_state
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|(revision, fence)| LoadedSpineRolloutFence {
-                fence: fence.clone(),
-                update_time: revision.to_string(),
-            }))
+        // One document get, found or not.
+        self.read_meter.record(1);
+        Ok(self.fence_unmetered())
     }
 
     fn advance_rollout_fence(
@@ -424,11 +549,16 @@ impl SpineStore for FakeSpineStore {
 
     fn legacy_migration_complete(&self) -> Result<bool, SpineError> {
         let seal = self.legacy_migration_seal.lock().unwrap();
+        // `FirestoreStore` gets the active fence, then the seal document, and
+        // only when the seal is absent the older marker document too.
+        self.read_meter.record(1);
+        self.read_meter.record(usize::from(seal.is_some()));
         let Some((sealed_fence, writer_drain, sealed_heads)) = seal.as_ref() else {
+            self.read_meter.record(0);
             return Ok(false);
         };
         writer_drain.validate()?;
-        let current = self.load_rollout_fence()?.ok_or_else(|| {
+        let current = self.fence_unmetered().ok_or_else(|| {
             SpineError::Backend(
                 "fake legacy migration seal has no active rollout fence".to_string(),
             )
@@ -521,7 +651,7 @@ impl SpineStore for FakeSpineStore {
         if let Some(hook) = self.prepare_hook.lock().unwrap().as_ref() {
             hook(&publication.repo_id);
         }
-        let rollout_fence = self.load_rollout_fence()?.ok_or_else(|| {
+        let rollout_fence = self.fence_unmetered().ok_or_else(|| {
             SpineError::Backend("fake active rollout fence is missing".to_string())
         })?;
         let mut state = self.publication_state.lock().unwrap();
@@ -701,7 +831,7 @@ impl SpineStore for FakeSpineStore {
         publication: RepoSpinePublication,
         expected_rollout_fence: &SpineRolloutFenceEvidence,
     ) -> Result<PreparedStorePublication, SpineError> {
-        let active = self.load_rollout_fence()?.ok_or_else(|| {
+        let active = self.fence_unmetered().ok_or_else(|| {
             SpineError::Backend("fake active rollout fence is missing".to_string())
         })?;
         if active.evidence() != *expected_rollout_fence {
@@ -912,7 +1042,7 @@ impl SpineStore for FakeSpineStore {
                 "injected atomic publication unavailable".to_string(),
             ));
         }
-        Ok(self
+        let heads = self
             .publication_state
             .lock()
             .unwrap()
@@ -921,63 +1051,37 @@ impl SpineStore for FakeSpineStore {
             .map(|(repo_id, (revision, head))| {
                 (repo_id.clone(), (head.clone(), revision.to_string()))
             })
-            .collect())
+            .collect::<BTreeMap<_, _>>();
+        self.charge_head_listing(heads.len());
+        Ok(heads)
     }
 
     fn load_repo_publications(&self) -> Result<Vec<LoadedRepoPublication>, SpineError> {
-        if !self.atomicity_available.load(Ordering::SeqCst) {
-            return Err(SpineError::Backend(
-                "injected atomic publication unavailable".to_string(),
-            ));
+        self.load_committed_publications(true)
+    }
+
+    /// The same data the trait default hands back, which filters the full
+    /// committed load, billed as `FirestoreStore` bills this call: the head,
+    /// the manifest, the entity and edge rows, and the head again. Metering
+    /// it as a whole-fleet hydration, as the default would, charges a commit
+    /// for every row in every repository.
+    fn load_repo_publication(
+        &self,
+        repo_id: &str,
+    ) -> Result<Option<LoadedRepoPublication>, SpineError> {
+        let loaded = self
+            .load_committed_publications(false)?
+            .into_iter()
+            .find(|publication| publication.head.repo_id == repo_id);
+        // The head get, found or not.
+        self.read_meter.record(1);
+        if let Some(publication) = &loaded {
+            self.read_meter.record(1);
+            self.read_meter.record(publication.entries.len());
+            self.read_meter.record(publication.outgoing_edges.len());
+            self.read_meter.record(1);
         }
-        for _ in 0..3 {
-            let selected_heads = self.publication_state.lock().unwrap().heads.clone();
-            // Same guard-lifetime rule as the cleanup rendezvous below.
-            let rendezvous = self.load_snapshot_barrier.lock().unwrap().take();
-            if let Some(barrier) = rendezvous {
-                barrier.wait("fake store hydration snapshot");
-                barrier.wait("fake store hydration snapshot");
-            }
-            let loaded = {
-                let state = self.publication_state.lock().unwrap();
-                selected_heads
-                    .values()
-                    .map(|(_, head)| {
-                        let manifest =
-                            state.manifests.get(&head.publication_id).ok_or_else(|| {
-                                SpineError::Serialization(format!(
-                                    "missing fake manifest {}",
-                                    head.publication_id
-                                ))
-                            })?;
-                        if manifest != head {
-                            return Err(SpineError::Serialization(
-                                "fake head and manifest disagree".to_string(),
-                            ));
-                        }
-                        Ok(LoadedRepoPublication {
-                            head: head.clone(),
-                            entries: state
-                                .entity_rows
-                                .get(&head.publication_id)
-                                .cloned()
-                                .unwrap_or_default(),
-                            outgoing_edges: state
-                                .edge_rows
-                                .get(&head.publication_id)
-                                .cloned()
-                                .unwrap_or_default(),
-                        })
-                    })
-                    .collect::<Result<Vec<_>, SpineError>>()
-            };
-            if self.publication_state.lock().unwrap().heads == selected_heads {
-                return loaded;
-            }
-        }
-        Err(SpineError::Backend(
-            "fake durable spine heads did not stabilize after three attempts".to_string(),
-        ))
+        Ok(loaded)
     }
 
     fn cleanup_repo_publications(

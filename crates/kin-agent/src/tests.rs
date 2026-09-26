@@ -1,16 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-//! Unit tests for the parsers, the router, the envelope reading and path safety.
+//! Unit tests for the parsers, the router, the envelope reading and the Kin-only belt.
 
-use crate::belt::{self, Belt, LocalTool, Route};
+use crate::belt::{self, Belt, Route};
 use crate::mcp::unwrap_tool_result;
 use crate::parse::{self, CallShape, Turn};
 use serde_json::json;
 use std::collections::BTreeSet;
 
 fn belt_names() -> BTreeSet<String> {
-    ["mcp__kin__semantic_locate", "edit_file", "write_file"]
+    ["mcp__kin__semantic_locate"]
         .into_iter()
         .map(ToString::to_string)
         .collect()
@@ -201,7 +201,7 @@ fn well_formed_arguments_are_not_reported_as_malformed() {
 }
 
 fn test_belt() -> Belt {
-    Belt::with_file_tools(vec![kin_tool(0, "semantic_locate", None)])
+    Belt::new(vec![kin_tool(0, "semantic_locate", None)])
 }
 
 /// One belt entry as a run would build it: bare name from the server, exposed name from
@@ -258,8 +258,6 @@ fn the_router_routes_what_is_on_the_belt() {
             tool: "semantic_locate".into()
         }
     );
-    assert_eq!(belt.route("edit_file"), Route::Local(LocalTool::Edit));
-    assert_eq!(belt.route("write_file"), Route::Local(LocalTool::Write));
 }
 
 #[test]
@@ -297,7 +295,7 @@ fn harness_owned_tools_never_reach_the_model() {
 }
 
 #[test]
-fn pure_kin_belt_has_no_file_tools_and_refuses_them_with_mutate_hint() {
+fn the_belt_has_no_file_tools_and_refuses_them_with_a_mutate_hint() {
     let tool = crate::belt::KinTool {
         folded: false,
         server: 0,
@@ -306,34 +304,35 @@ fn pure_kin_belt_has_no_file_tools_and_refuses_them_with_mutate_hint() {
         description: "Atomically mutate graph".into(),
         schema: json!({ "type": "object" }),
     };
-    let belt = Belt::pure_kin(vec![tool]);
-    assert!(!belt.has_file_tools());
+    let belt = Belt::new(vec![tool]);
     assert_eq!(belt.names().len(), 1);
     assert!(belt.names().contains("mcp__kin__kin_mutate"));
     assert!(!belt.names().contains("edit_file"));
     assert!(!belt.names().contains("write_file"));
 
-    let Route::Refused(refusal) = belt.route("edit_file") else {
-        panic!("edit_file must be refused on pure kin belt");
-    };
-    assert!(
-        refusal.contains("kin_mutate"),
-        "refusal should point to kin_mutate: {refusal}"
-    );
-
-    let Route::Refused(refusal_write) = belt.route("write_file") else {
-        panic!("write_file must be refused on pure kin belt");
-    };
-    assert!(
-        refusal_write.contains("kin_mutate"),
-        "refusal should point to kin_mutate: {refusal_write}"
-    );
+    for name in ["edit_file", "write_file"] {
+        let Route::Refused(refusal) = belt.route(name) else {
+            panic!("{name} must be refused: the file tools are retired");
+        };
+        assert!(
+            refusal.contains("`mcp__kin__kin_mutate`"),
+            "the refusal should point to kin_mutate: {refusal}"
+        );
+        assert!(
+            refusal.contains("file tools are retired"),
+            "the refusal should say the file tools are gone, not missing: {refusal}"
+        );
+        assert!(
+            refusal.contains("There is no file creation"),
+            "the refusal should not imply a way to create a file: {refusal}"
+        );
+    }
 
     // What the model is actually shown. `names` and `route` are the harness's
     // own view; `to_specs` is the tools array that goes out on every turn, and a
     // tool absent from the first two but present in the third is a tool the
     // model will call.
-    let specs = belt.to_specs(None);
+    let specs = belt.to_specs();
     let served: Vec<&str> = specs
         .iter()
         .filter_map(|spec| spec["function"]["name"].as_str())
@@ -341,92 +340,199 @@ fn pure_kin_belt_has_no_file_tools_and_refuses_them_with_mutate_hint() {
     assert_eq!(
         served,
         vec!["mcp__kin__kin_mutate"],
-        "a pure Kin belt serves the Kin tools and nothing else"
+        "the belt serves the Kin tools and nothing else"
     );
     assert!(belt.schema_for("edit_file").is_none());
     assert!(belt.schema_for("write_file").is_none());
+}
 
-    // The control: the same tools on the belt that keeps them. Without this the
-    // assertions above would pass just as well against a belt that lost its
-    // file tools by accident, or against a `to_specs` that stopped emitting
-    // anything at all.
-    let tool = crate::belt::KinTool {
-        folded: false,
-        server: 0,
-        bare: "kin_mutate".into(),
-        exposed: "mcp__kin__kin_mutate".into(),
-        description: "Atomically mutate graph".into(),
-        schema: json!({ "type": "object" }),
+/// A belt that carries no `kin_mutate` must not point the model at it: a refusal
+/// naming a tool the belt lacks sends the model into a second refusal.
+#[test]
+fn a_file_tool_refusal_on_a_read_only_belt_names_no_write_tool() {
+    let belt = Belt::new(vec![kin_tool(0, "semantic_locate", None)]);
+    let Route::Refused(refusal) = belt.route("edit_file") else {
+        panic!("edit_file must be refused");
     };
-    let with_files = Belt::with_file_tools(vec![tool]);
-    assert!(with_files.has_file_tools());
-    assert!(with_files.names().contains("edit_file"));
-    assert!(with_files.names().contains("write_file"));
-    assert!(matches!(
-        with_files.route("edit_file"),
-        Route::Local(crate::belt::LocalTool::Edit)
-    ));
-    let with_file_specs = with_files.to_specs(None);
-    let served: Vec<&str> = with_file_specs
-        .iter()
-        .filter_map(|spec| spec["function"]["name"].as_str())
-        .collect();
-    assert_eq!(
-        served,
-        vec!["mcp__kin__kin_mutate", "edit_file", "write_file"]
+    assert!(!refusal.contains("kin_mutate"), "{refusal}");
+    assert!(
+        refusal.contains("no tool that changes code"),
+        "the refusal must say the run is read-only: {refusal}"
     );
 }
 
-/// `KIN_AGENT_PURE_KIN` means what kin-core's env registry says a boolean means,
-/// and the belt is Kin tools only unless it says false.
+/// `KIN_AGENT_PURE_KIN` means what kin-core's env registry says a boolean means.
+/// A false value asked for the file tools, which are retired, so it is refused by
+/// name; every other value, and no value, runs the one belt there is.
 ///
-/// Read through the pure function rather than the process environment, because
+/// Read through the pure functions rather than the process environment, because
 /// tests share one process and a test that sets an environment variable races
-/// every other test that reads it.
+/// every other test that reads it. The run's own refusal is proven in a child
+/// process below.
 #[test]
 fn the_pure_kin_switch_reads_booleans_the_way_the_env_registry_does() {
     for on in ["1", "true", "yes", "on", "TRUE", " On "] {
         assert!(
             belt::pure_kin_requested(Some(on)),
-            "{on:?} should lock the belt"
+            "{on:?} asks for the Kin-only belt"
         );
+        assert_eq!(belt::refuse_file_tools(Some(on)), Ok(()), "{on:?}");
     }
     for off in ["0", "false", "no", "off", "OFF", " Off "] {
         assert!(
             !belt::pure_kin_requested(Some(off)),
-            "{off:?} should add the two file tools"
+            "{off:?} asked for the file tools"
+        );
+        let refusal = belt::refuse_file_tools(Some(off)).expect_err("a false value is refused");
+        assert_eq!(
+            refusal,
+            format!(
+                "KIN_AGENT_PURE_KIN={} no longer adds file tools: Kin agents change code \
+                 through entities, and the local file tools are retired. Unset \
+                 KIN_AGENT_PURE_KIN, or set it to true, to run.",
+                off.trim()
+            )
         );
     }
-    // Unset is the locked belt, and so is a value the registry cannot read:
+    // Unset is the Kin-only belt, and so is a value the registry cannot read:
     // startup validation reports the typo, the default is not guessed away.
     assert!(belt::pure_kin_requested(None), "unset is the Kin-only belt");
+    assert_eq!(belt::refuse_file_tools(None), Ok(()));
     for unread in ["", "maybe"] {
         assert!(
             belt::pure_kin_requested(Some(unread)),
             "{unread:?} leaves the Kin-only belt"
         );
+        assert_eq!(belt::refuse_file_tools(Some(unread)), Ok(()), "{unread:?}");
     }
 }
 
-/// The built-in prompt describes only the write tools the belt actually carries.
+/// Marks a child process running one run-refusal test on its own.
+const PURE_KIN_CHILD: &str = "KIN_AGENT_PURE_KIN_TEST_CHILD";
+
+/// Whether this process is the child running `test` on its own.
+fn in_pure_kin_child(test: &str) -> bool {
+    std::env::var(PURE_KIN_CHILD).as_deref() == Ok(test)
+}
+
+/// Run `test` again in a child process with `KIN_AGENT_PURE_KIN` set to `value`,
+/// or removed for `None`, and fail unless the child ran it and it passed.
+///
+/// The variable is process-wide and every run reads it, so it is set only in a
+/// child that runs this one test, never under tests running concurrently here.
+fn run_in_pure_kin_child(test: &str, value: Option<&str>) {
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+    child
+        .args(["--exact", &format!("tests::{test}"), "--nocapture"])
+        .env(PURE_KIN_CHILD, test);
+    match value {
+        Some(value) => child.env("KIN_AGENT_PURE_KIN", value),
+        None => child.env_remove("KIN_AGENT_PURE_KIN"),
+    };
+    let output = child.output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("1 passed"),
+        "child for {value:?} failed or ran nothing: {stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// A run config that would fail loudly if it got far enough to use anything: the
+/// graph server is a binary that does not exist and the endpoint is a closed port.
+fn unreachable_config(dir: &std::path::Path) -> crate::AgentConfig {
+    crate::AgentConfig {
+        task: "Rename greet.".into(),
+        system_prompt: None,
+        repo: dir.to_path_buf(),
+        out_dir: dir.join("out"),
+        provider: crate::ProviderConfig {
+            base_url: crate::ProviderConfig::normalize_base_url("http://127.0.0.1:9"),
+            model: "fixture-model".into(),
+            api_key: None,
+            temperature: None,
+            request_timeout: std::time::Duration::from_secs(1),
+        },
+        mcp_command: vec!["kin-agent-no-such-binary".into()],
+        extra_servers: Vec::new(),
+        mcp_timeout: std::time::Duration::from_secs(1),
+        max_tool_calls: 1,
+        deadline: std::time::Duration::from_secs(5),
+        context: crate::ContextWindow {
+            tokens: 32_768,
+            source: crate::ContextSource::Flag,
+        },
+        max_result_bytes: None,
+        tool_profile: None,
+    }
+}
+
+/// A false `KIN_AGENT_PURE_KIN` used to put `edit_file` and `write_file` on the
+/// belt. Now the run refuses to start and says why, through the same entry
+/// point `kin agent run` calls, before it writes a transcript, starts a graph
+/// server or contacts the model.
+#[test]
+fn the_run_refuses_to_start_on_a_false_pure_kin_value() {
+    const TEST: &str = "the_run_refuses_to_start_on_a_false_pure_kin_value";
+    if !in_pure_kin_child(TEST) {
+        for value in ["false", "0", " Off "] {
+            run_in_pure_kin_child(TEST, Some(value));
+        }
+        return;
+    }
+    let raw = std::env::var("KIN_AGENT_PURE_KIN").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let config = unreachable_config(dir.path());
+    let out = config.out_dir.clone();
+    let refusal = crate::run(config).expect_err("a false value must not start a run");
+    assert_eq!(
+        refusal.to_string(),
+        format!(
+            "KIN_AGENT_PURE_KIN={} no longer adds file tools: Kin agents change code through \
+             entities, and the local file tools are retired. Unset KIN_AGENT_PURE_KIN, or set \
+             it to true, to run.",
+            raw.trim()
+        )
+    );
+    // The transcript is the run's first write, ahead of the graph server and the
+    // model, so its absence proves the refusal came before all three.
+    assert!(!out.exists(), "a refused run must write nothing");
+}
+
+/// The control for the refusal above: a true value and no value at all both get
+/// past it, so the run goes on to fail for the reason this config sets up, the
+/// graph server that is not there, and records that failure in its transcript.
+#[test]
+fn a_true_or_unset_pure_kin_value_runs() {
+    const TEST: &str = "a_true_or_unset_pure_kin_value_runs";
+    if !in_pure_kin_child(TEST) {
+        for value in [Some("true"), Some("1"), None] {
+            run_in_pure_kin_child(TEST, value);
+        }
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let config = unreachable_config(dir.path());
+    let out = config.out_dir.clone();
+    let outcome = crate::run(config).expect("the run starts and reports its own failure");
+    assert_eq!(outcome.status, crate::ExitStatus::McpError);
+    assert!(out.join("transcript.jsonl").exists());
+}
+
+/// The built-in prompt describes only the write tool the belt actually carries.
 ///
 /// A prompt naming a tool the belt lacks is a false instruction: under
 /// `--tool-profile agent-query` no `kin_mutate` is served, and a model told to
 /// call it spends its turns being refused.
 #[test]
-fn the_system_prompt_names_only_the_write_tools_the_belt_carries() {
+fn the_system_prompt_names_only_the_write_tool_the_belt_carries() {
     let mutate = kin_tool(0, "kin_mutate", None);
     let locate = kin_tool(0, "semantic_locate", None);
 
-    let entity =
-        crate::run::system_prompt_for(&Belt::pure_kin(vec![mutate.clone(), locate.clone()]));
+    let entity = crate::run::system_prompt_for(&Belt::new(vec![mutate.clone(), locate.clone()]));
     assert!(entity.contains("mcp__kin__kin_mutate") && entity.contains("name the entity"));
 
-    let files = crate::run::system_prompt_for(&Belt::with_file_tools(vec![locate.clone()]));
-    assert!(files.contains("edit_file") && files.contains("write_file"));
-    assert!(!files.contains("kin_mutate"), "{files}");
-
-    let read_only = crate::run::system_prompt_for(&Belt::pure_kin(vec![locate.clone()]));
+    let read_only = crate::run::system_prompt_for(&Belt::new(vec![locate.clone()]));
     assert!(
         read_only.contains("no tool that changes code"),
         "{read_only}"
@@ -437,10 +543,90 @@ fn the_system_prompt_names_only_the_write_tools_the_belt_carries() {
     );
 
     // Every shape keeps the shared head and tail, so only the one paragraph moved.
-    for prompt in [&entity, &files, &read_only] {
+    for prompt in [&entity, &read_only] {
         assert!(prompt.contains("Kin is your only way to look at the repository"));
         assert!(prompt.contains("Work in small steps"));
     }
+}
+
+/// The default prompt teaches one way to change code: `kin_mutate`, naming an entity.
+/// It offers no file verb and no file tool, and it says plainly that there is no file
+/// creation, so a model that needs something `kin_mutate` cannot make stops instead of
+/// hunting for a way around the gap.
+///
+/// An entity-level verb may appear here as `kin_mutate` grows one. What must not come
+/// back is the file-level shape: a path as the target, a whole file rewritten, or a
+/// local file tool.
+#[test]
+fn the_default_prompt_teaches_entity_changes_and_offers_no_file_verb() {
+    let prompt = crate::DEFAULT_SYSTEM_PROMPT;
+    for gone in [
+        "edit_file",
+        "write_file",
+        "'replace'",
+        "repository-relative path",
+        "A file the graph has never seen",
+        "rewriting whole",
+    ] {
+        assert!(!prompt.contains(gone), "the prompt still mentions {gone}");
+    }
+    // As a word, too. `replaces` in the update instruction is a different word and
+    // stays: the body replaces the entity's whole span.
+    let words: BTreeSet<String> = prompt
+        .split(|character: char| !character.is_alphanumeric())
+        .map(str::to_ascii_lowercase)
+        .collect();
+    assert!(
+        !words.contains("replace"),
+        "the prompt still offers the replace verb"
+    );
+    assert!(prompt.contains("verb 'update'"));
+    assert!(prompt.contains("send the whole body back, not a fragment"));
+    assert!(
+        prompt.contains(
+            "Your tools are the ones on your belt and no others: this repository is a graph, \
+             and a change to it is a change to an entity. Every change goes through \
+             mcp__kin__kin_mutate, including a new entity if its operations offer one; there \
+             is no file creation. If the change needs something kin_mutate cannot make, stop \
+             and say so."
+        ),
+        "the prompt must state that there is no file creation: {prompt}"
+    );
+}
+
+/// The routing rule for the literal-lookup tool: named in the prompt, on the
+/// default belt (never withheld behind `KIN_AGENT_BELT=wide`), and routed by
+/// bare name like any other Kin tool, with no fold and no special case needed.
+#[test]
+fn lexical_lookup_is_on_the_default_belt_and_named_in_its_routing_rule() {
+    let locate = kin_tool(0, "semantic_locate", None);
+    let lexical_lookup = kin_tool(0, "lexical_lookup", None);
+
+    let prompt =
+        crate::run::system_prompt_for(&Belt::new(vec![locate.clone(), lexical_lookup.clone()]));
+    assert!(
+        prompt.contains("mcp__kin__lexical_lookup"),
+        "the routing rule must name the tool: {prompt}"
+    );
+    assert!(
+        prompt.contains("inconclusive verdict"),
+        "the routing rule must name the second trigger (an inconclusive structural verdict): {prompt}"
+    );
+
+    assert!(
+        !belt::is_opt_in("lexical_lookup"),
+        "lexical_lookup must ride the default belt, not KIN_AGENT_BELT=wide"
+    );
+
+    let belt = Belt::new(vec![locate, lexical_lookup]);
+    assert_eq!(
+        belt.route("mcp__kin__lexical_lookup"),
+        Route::Kin {
+            server: 0,
+            tool: "lexical_lookup".to_string(),
+        },
+        "an ordinary declared Kin tool routes by its bare name with no fold"
+    );
 }
 
 /// The harness supplies the session `kin_mutate` needs and the model cannot see.
@@ -595,7 +781,7 @@ fn naming_both_ends_routes_the_folded_call_to_the_two_ended_tool() {
         traversal_tool(0, belt::TRACE_TWO_ENDPOINT, None),
     ];
     belt::fold_traversal(&mut tools);
-    let belt = Belt::with_file_tools(tools);
+    let belt = Belt::new(tools);
 
     let two_ended = belt.route_call(
         "mcp__kin__trace",
@@ -639,7 +825,7 @@ fn an_empty_to_is_read_as_one_ended_rather_than_refused() {
         traversal_tool(0, belt::TRACE_TWO_ENDPOINT, None),
     ];
     belt::fold_traversal(&mut tools);
-    let belt = Belt::with_file_tools(tools);
+    let belt = Belt::new(tools);
     let routed = belt.route_call("mcp__kin__trace", &json!({ "from": "apiRun", "to": "  " }));
     assert_eq!(
         routed.route,
@@ -681,12 +867,7 @@ fn the_default_belt_withholds_the_opt_in_tools_and_the_wide_one_does_not() {
         belt::BeltProfile::Default,
         "an unreadable value must not quietly widen the belt"
     );
-    for withheld in [
-        "kin_artifact_list",
-        "kin_artifact_read",
-        "graph_neighborhood",
-        "kin_provenance_query",
-    ] {
+    for withheld in ["graph_neighborhood", "kin_provenance_query"] {
         assert!(belt::is_opt_in(withheld), "{withheld} should be opt-in");
     }
     // The capabilities an agent needs to answer, edit and publish stay on the
@@ -698,7 +879,6 @@ fn the_default_belt_withholds_the_opt_in_tools_and_the_wide_one_does_not() {
         "get_context_pack",
         "get_entity_source",
         "find_references",
-        "list_file_entities",
         "impact_analysis",
         "kin_mutate",
         "trace_data_flow",
@@ -712,12 +892,7 @@ fn the_default_belt_withholds_the_opt_in_tools_and_the_wide_one_does_not() {
     }
     // And nothing the harness owns is listed here, or it would be withheld twice
     // and the reason a reader finds would be the wrong one.
-    for withheld in [
-        "kin_artifact_list",
-        "kin_artifact_read",
-        "graph_neighborhood",
-        "kin_provenance_query",
-    ] {
+    for withheld in ["graph_neighborhood", "kin_provenance_query"] {
         assert!(
             !belt::is_harness_owned(withheld),
             "{withheld} is already withheld as harness-owned"
@@ -727,7 +902,7 @@ fn the_default_belt_withholds_the_opt_in_tools_and_the_wide_one_does_not() {
 
 #[test]
 fn tool_prefixes_separate_two_servers_and_a_bare_name_names_both() {
-    let belt = Belt::with_file_tools(vec![
+    let belt = Belt::new(vec![
         kin_tool(0, "semantic_locate", Some("alpha")),
         kin_tool(1, "semantic_locate", Some("beta")),
     ]);
@@ -754,39 +929,6 @@ fn tool_prefixes_separate_two_servers_and_a_bare_name_names_both() {
         message.contains("mcp__kin_alpha__semantic_locate")
             && message.contains("mcp__kin_beta__semantic_locate"),
         "the refusal must name both prefixed forms: {message}"
-    );
-}
-
-#[test]
-fn a_relative_path_means_the_primary_and_an_absolute_path_finds_its_own_repository() {
-    let repos = vec![
-        std::path::PathBuf::from("/work/alpha"),
-        std::path::PathBuf::from("/work/beta"),
-    ];
-    let (index, path) = belt::resolve_across_repos(&repos, "src/main.rs").unwrap();
-    assert_eq!(index, 0);
-    assert_eq!(path, std::path::PathBuf::from("/work/alpha/src/main.rs"));
-
-    let (index, path) = belt::resolve_across_repos(&repos, "/work/beta/src/main.rs").unwrap();
-    assert_eq!(index, 1);
-    assert_eq!(path, std::path::PathBuf::from("/work/beta/src/main.rs"));
-
-    // A checkout inside another checkout resolves to the innermost one, which is the
-    // containment rule; the outer repository would otherwise swallow every path.
-    let nested = vec![
-        std::path::PathBuf::from("/work/alpha"),
-        std::path::PathBuf::from("/work/alpha/vendor/beta"),
-    ];
-    let (index, _) =
-        belt::resolve_across_repos(&nested, "/work/alpha/vendor/beta/src/main.rs").unwrap();
-    assert_eq!(index, 1);
-
-    let problem = belt::resolve_across_repos(&repos, "/elsewhere/main.rs").unwrap_err();
-    assert!(
-        problem.contains("outside every repository")
-            && problem.contains("/work/alpha")
-            && problem.contains("/work/beta"),
-        "the refusal must name every root: {problem}"
     );
 }
 
@@ -920,369 +1062,48 @@ fn degraded_flags_are_read_in_every_shape_the_envelope_uses() {
 }
 
 #[test]
-fn a_path_cannot_escape_the_repository() {
-    let repo = std::path::Path::new("/tmp/kin-agent-fixture");
-    for raw in ["../outside.txt", "a/../../outside.txt", "/etc/passwd", "/"] {
-        assert!(
-            belt::resolve_in_repo(repo, raw).is_err(),
-            "`{raw}` must be refused"
-        );
-    }
-    // The control: an ordinary relative path resolves, and so does an absolute path that
-    // is genuinely inside the repository.
-    assert_eq!(
-        belt::resolve_in_repo(repo, "src/main.rs").unwrap(),
-        repo.join("src/main.rs")
-    );
-    assert_eq!(
-        belt::resolve_in_repo(repo, "/tmp/kin-agent-fixture/src/lib.rs").unwrap(),
-        repo.join("src/lib.rs")
-    );
-}
-
-#[test]
-fn edit_file_refuses_an_ambiguous_find() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("a.txt"), "x\nx\n").unwrap();
-    let outcome = belt::run_edit(
-        dir.path(),
-        &json!({ "path": "a.txt", "find": "x", "replace": "y" }),
-    );
-    assert!(outcome.is_error);
-    assert!(outcome.text.contains("2 times"), "{}", outcome.text);
-    // The file is untouched, so an ambiguous edit cannot half-apply.
-    assert_eq!(
-        std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
-        "x\nx\n"
-    );
-    // The control: a unique find lands.
-    std::fs::write(dir.path().join("b.txt"), "hello world\n").unwrap();
-    let ok = belt::run_edit(
-        dir.path(),
-        &json!({ "path": "b.txt", "find": "world", "replace": "kin" }),
-    );
-    assert!(!ok.is_error, "{}", ok.text);
-    assert_eq!(
-        std::fs::read_to_string(dir.path().join("b.txt")).unwrap(),
-        "hello kin\n"
-    );
-    assert_eq!(ok.changed.as_deref(), Some("b.txt"));
-}
-
-#[test]
-fn edit_file_refuses_a_find_that_is_not_present() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("a.txt"), "hello\n").unwrap();
-    let outcome = belt::run_edit(
-        dir.path(),
-        &json!({ "path": "a.txt", "find": "goodbye", "replace": "y" }),
-    );
-    assert!(outcome.is_error);
-    assert!(outcome.text.contains("does not appear"), "{}", outcome.text);
-    // The refusal the model can act on is the one the guard counts.
-    assert!(outcome.retry_with_bytes, "{}", outcome.text);
-}
-
-#[test]
-fn a_labelled_belt_names_its_own_mutate_prefix_in_the_hint_and_the_tool_text() {
+fn a_labelled_belt_names_its_own_mutate_prefix_in_the_refusal() {
     // With several repositories attached each server's tools carry a label, so
     // `mcp__kin__kin_mutate` is a name nothing on this belt answers to. A hint that used
     // it, or dropped the prefix entirely, would send the model at a tool that does not
     // exist, which is the same dead end as no hint at all.
-    let belt = Belt::with_file_tools(vec![kin_tool(0, "kin_mutate", Some("cli90"))]);
+    let belt = Belt::new(vec![kin_tool(0, "kin_mutate", Some("cli90"))]);
     let Route::Refused(_) = belt.route("bash") else {
         panic!("an off-belt tool is refused");
     };
-    let pure = Belt::pure_kin(vec![kin_tool(0, "kin_mutate", Some("cli90"))]);
-    let Route::Refused(refusal) = pure.route("edit_file") else {
-        panic!("edit_file must be refused on a pure Kin belt");
+    let Route::Refused(refusal) = belt.route("edit_file") else {
+        panic!("edit_file must be refused");
     };
     assert!(
         refusal.contains("`mcp__kin_cli90__kin_mutate`"),
         "the hint must name a tool this belt actually carries: {refusal}"
     );
-
-    let served = belt.to_specs(None);
-    let edit = served
-        .iter()
-        .find(|spec| spec["function"]["name"] == "edit_file")
-        .expect("the belt carries the local replacement tool");
-    let description = edit["function"]["description"].as_str().unwrap();
-    assert!(
-        description.contains("`mcp__kin_cli90__kin_mutate`"),
-        "the tool text must steer at a tool this belt carries: {description}"
-    );
-    assert!(
-        description.contains("\"verb\": \"update\""),
-        "the tool text must show the operation shape: {description}"
-    );
-}
-
-/// The bytes between the refusal's markers, which is what a model re-issues with.
-fn quoted_bytes(refusal: &str) -> &str {
-    let (_, after) = refusal
-        .split_once("<<<KIN-EXACT\n")
-        .unwrap_or_else(|| panic!("the refusal quotes the file's bytes: {refusal}"));
-    let (bytes, _) = after
-        .split_once("\n>>>KIN-EXACT")
-        .unwrap_or_else(|| panic!("the quote is closed: {refusal}"));
-    bytes
 }
 
 #[test]
-fn an_unmatched_find_is_answered_with_the_file_s_exact_bytes_and_the_reason() {
-    // The measured failure, byte for byte. `qwen/qwen3-coder-next` read this function
-    // through get_entity_source, which returns source inside a JSON result, and sent the
-    // escaped form straight back as `find`: 26 bytes opening with a literal backslash and
-    // a `t` where the file holds one tab.
-    let dir = tempfile::tempdir().unwrap();
-    let file = "func remoteURL(repo *api.Repository, protocol string) (string, error) {\n\
-                \tif protocol != \"ssh\" {\n\
-                \t\treturn ghrepo.FormatRemoteURL(repo, protocol), nil\n\
-                \t}\n";
-    std::fs::write(dir.path().join("clone.go"), file).unwrap();
-    let sent = "\\tif protocol != \\\"ssh\\\" {";
-    assert_eq!(sent.len(), 26, "the measured call carried 26 bytes");
-
-    let outcome = belt::run_edit(
-        dir.path(),
-        &json!({
-            "path": "clone.go",
-            "find": sent,
-            "replace": "\\tif strings.ToLower(protocol) != \\\"ssh\\\" {",
-        }),
-    );
-    assert!(outcome.is_error);
-    assert!(outcome.retry_with_bytes);
-
-    // It names the cause rather than only the failure.
-    assert!(
-        outcome.text.contains("escape sequences literal"),
-        "{}",
-        outcome.text
-    );
-    // It names where, so the model can join this to the source it already read.
-    assert!(outcome.text.contains("at line 2 "), "{}", outcome.text);
-    // It carries the file's exact current bytes, tab and plain quotes included.
-    assert_eq!(quoted_bytes(&outcome.text), "\tif protocol != \"ssh\" {");
-    // It says what to do with them, in one line.
-    assert!(
-        outcome
-            .text
-            .contains("Re-issue this call with `find` set to exactly those bytes"),
-        "{}",
-        outcome.text
-    );
-    // It names the route that needs no old bytes at all.
-    assert!(
-        outcome.text.contains("mcp__kin__kin_mutate")
-            && outcome.text.contains("\"verb\": \"update\""),
-        "{}",
-        outcome.text
-    );
-
-    // The proof that the quoted bytes are usable: re-issuing with exactly them lands.
-    let second = belt::run_edit(
-        dir.path(),
-        &json!({
-            "path": "clone.go",
-            "find": quoted_bytes(&outcome.text),
-            "replace": "\tif !strings.EqualFold(protocol, \"ssh\") {",
-        }),
-    );
-    assert!(!second.is_error, "{}", second.text);
-    let after = std::fs::read_to_string(dir.path().join("clone.go")).unwrap();
-    assert!(
-        after.contains("\tif !strings.EqualFold(protocol, \"ssh\") {"),
-        "{after}"
-    );
-    // Nothing else moved.
-    assert!(
-        after.contains("\t\treturn ghrepo.FormatRemoteURL(repo, protocol), nil"),
-        "{after}"
-    );
-}
-
-#[test]
-fn an_indentation_miss_is_answered_with_the_file_s_own_whitespace() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("greet.py"),
-        "def greet(name):\n    return f\"hello {name}\"\n",
-    )
-    .unwrap();
-    // The right line, re-indented with a tab the file does not use.
-    let outcome = belt::run_edit(
-        dir.path(),
-        &json!({
-            "path": "greet.py",
-            "find": "\treturn f\"hello {name}\"",
-            "replace": "\treturn f\"hi {name}\"",
-        }),
-    );
-    assert!(outcome.is_error);
-    assert!(
-        outcome.text.contains("Indentation is part of the bytes"),
-        "{}",
-        outcome.text
-    );
-    assert_eq!(quoted_bytes(&outcome.text), "    return f\"hello {name}\"");
-}
-
-#[test]
-fn a_find_that_matches_nothing_gets_the_nearest_line_and_is_told_it_is_not_a_substitute() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("greet.py"),
-        "def greet(name):\n    return f\"hello {name}\"\n",
-    )
-    .unwrap();
-    // A stale read: the file never held this line.
-    let outcome = belt::run_edit(
-        dir.path(),
-        &json!({
-            "path": "greet.py",
-            "find": "    return \"hello \" + name.upper()",
-            "replace": "    return name",
-        }),
-    );
-    assert!(outcome.is_error);
-    assert!(
-        outcome.text.contains("the read it came from is stale"),
-        "{}",
-        outcome.text
-    );
-    // The nearest line is handed back, and the refusal does not pretend it is a swap.
-    assert_eq!(quoted_bytes(&outcome.text), "    return f\"hello {name}\"");
-    assert!(
-        outcome.text.contains("not a substitute for what was sent"),
-        "{}",
-        outcome.text
-    );
-    assert!(
-        !outcome
-            .text
-            .contains("Re-issue this call with `find` set to exactly those bytes"),
-        "a nearest-line quote must not be presented as a proven match: {}",
-        outcome.text
-    );
-}
-
-#[test]
-fn a_span_closing_on_a_multibyte_character_is_reported_not_panicked_on() {
-    // The span's last byte is inside a character, so a line number looked up at
-    // `end - 1` slices mid-character and panics. Source carries non-ASCII in strings
-    // and comments constantly, so this is the ordinary case and not an exotic one.
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("greet.py"),
-        "def greet(name):\n    return f\"héllo {name} \u{2192}\"\n",
-    )
-    .unwrap();
-    // The escaped form, cut so the span the decoder matches CLOSES on the arrow. That
-    // is the shape that breaks: the matched span carries no trailing newline, so its
-    // last byte sits inside a three-byte character.
-    let outcome = belt::run_edit(
-        dir.path(),
-        &json!({
-            "path": "greet.py",
-            "find": "f\\\"héllo {name} \u{2192}",
-            "replace": "f\"hi {name}",
-        }),
-    );
-    assert!(outcome.is_error);
-    assert!(
-        outcome.text.contains("escape sequences literal"),
-        "{}",
-        outcome.text
-    );
-    assert_eq!(
-        quoted_bytes(&outcome.text),
-        "f\"héllo {name} \u{2192}",
-        "the quoted span must close on the arrow"
-    );
-    assert!(outcome.text.contains("at line 2 "), "{}", outcome.text);
-}
-
-#[test]
-fn a_multiline_span_names_the_lines_it_covers() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("greet.py"),
-        "import sys\ndef greet(name):\n    return name\n",
-    )
-    .unwrap();
-    // Two lines, sent escaped, so the span the refusal quotes covers lines 2 and 3.
-    let outcome = belt::run_edit(
-        dir.path(),
-        &json!({
-            "path": "greet.py",
-            "find": "def greet(name):\\n    return name",
-            "replace": "x",
-        }),
-    );
-    assert!(outcome.is_error);
-    assert!(outcome.text.contains("at lines 2 to 3"), "{}", outcome.text);
-    assert_eq!(
-        quoted_bytes(&outcome.text),
-        "def greet(name):\n    return name"
-    );
-}
-
-#[test]
-fn the_refusal_quote_is_bounded_even_when_the_span_is_not() {
-    let dir = tempfile::tempdir().unwrap();
-    let long: String = (0..40).map(|n| format!("    line {n}\n")).collect();
-    std::fs::write(dir.path().join("long.txt"), &long).unwrap();
-    // The whole file, re-indented, so the whitespace rule matches a 40-line span.
-    let sent: String = (0..40).map(|n| format!("\tline {n}\n")).collect();
-    let outcome = belt::run_edit(
-        dir.path(),
-        &json!({ "path": "long.txt", "find": sent, "replace": "x" }),
-    );
-    assert!(outcome.is_error);
-    let quoted = quoted_bytes(&outcome.text);
-    assert!(
-        quoted.lines().count() <= 6 && quoted.len() <= 400,
-        "the quote stays bounded, got {} lines / {} bytes",
-        quoted.lines().count(),
-        quoted.len()
-    );
-    assert!(
-        outcome.text.contains("cut to a few lines"),
-        "{}",
-        outcome.text
-    );
-}
-
-#[test]
-fn write_file_creates_parents_and_reports_which_path_changed() {
-    let dir = tempfile::tempdir().unwrap();
-    let outcome = belt::run_write(
-        dir.path(),
-        &json!({ "path": "docs/new.md", "content": "# hi\n" }),
-    );
-    assert!(!outcome.is_error, "{}", outcome.text);
-    assert_eq!(outcome.changed.as_deref(), Some("docs/new.md"));
-    assert_eq!(
-        std::fs::read_to_string(dir.path().join("docs/new.md")).unwrap(),
-        "# hi\n"
-    );
-}
-
-#[test]
-fn the_belt_exposes_only_kin_tools_plus_the_two_local_ones() {
+fn the_belt_exposes_only_kin_tools() {
     let belt = test_belt();
     let names: Vec<&str> = belt.names().iter().map(String::as_str).collect();
-    assert_eq!(
-        names,
-        vec!["edit_file", "mcp__kin__semantic_locate", "write_file"]
-    );
-    // No shell, search or read tool exists to be routed, which is the policy.
-    for absent in ["bash", "shell", "grep", "rg", "find", "read_file", "cat"] {
+    assert_eq!(names, vec!["mcp__kin__semantic_locate"]);
+    // No shell, search, read or write tool exists to be routed, which is the policy.
+    for absent in [
+        "bash",
+        "shell",
+        "grep",
+        "rg",
+        "find",
+        "read_file",
+        "cat",
+        "edit_file",
+        "write_file",
+    ] {
         assert!(
             !belt.names().contains(absent),
             "`{absent}` must not be in the belt"
+        );
+        assert!(
+            matches!(belt.route(absent), Route::Refused(_)),
+            "`{absent}` must be refused"
         );
     }
 }
@@ -1486,4 +1307,81 @@ fn limiting_factor_ignores_keys_the_server_never_sends() {
         1,
     );
     assert_eq!(outcome.limiting_factor(), None);
+}
+
+#[test]
+fn retired_whole_artifact_read_never_enters_any_belt() {
+    for label in [None, Some("legacy")] {
+        let belt = Belt::new(vec![
+            kin_tool(0, "kin_artifact_read", label),
+            kin_tool(0, "get_entity_source", label),
+        ]);
+        assert!(!belt.has_kin_tool("kin_artifact_read"));
+        let name = format!("{}kin_artifact_read", belt::tool_prefix(label));
+        assert!(matches!(belt.route(&name), Route::Refused(_)));
+        assert!(belt.schema_for(&name).is_none());
+        assert!(!serde_json::to_string(&belt.to_specs())
+            .unwrap()
+            .contains("kin_artifact_read"));
+        assert!(belt.has_kin_tool("get_entity_source"));
+    }
+}
+
+#[test]
+fn retired_file_catalogs_never_enter_a_belt_or_escape_through_dispatchers() {
+    for label in [None, Some("legacy")] {
+        let tools = [
+            "kin_artifact_list",
+            "list_file_entities",
+            "kin_tool_call",
+            "kin",
+            "get_entity_source",
+        ]
+        .into_iter()
+        .map(|name| kin_tool(0, name, label))
+        .collect();
+        let belt = Belt::new(tools);
+        for retired in ["kin_artifact_list", "list_file_entities"] {
+            assert!(!belt.has_kin_tool(retired));
+            let exposed = format!("{}{retired}", belt::tool_prefix(label));
+            assert!(!belt.names().contains(&exposed));
+            assert!(belt.schema_for(&exposed).is_none());
+            assert!(matches!(belt.route(&exposed), Route::Refused(_)));
+            assert!(matches!(belt.route(retired), Route::Refused(_)));
+            for (dispatcher, arguments) in [
+                ("kin_tool_call", json!({"tool":retired,"arguments":{}})),
+                ("kin", json!({"command":retired,"args":{}})),
+                ("kin", json!({"command":format!("kin {retired}"),"args":{}})),
+                (
+                    "kin",
+                    json!({"command":"call","args":{"tool":retired,"arguments":{}}}),
+                ),
+                (
+                    "kin",
+                    json!({"command":format!(" KIN {} ", retired.to_uppercase().replace('_', "-")),"args":{}}),
+                ),
+                (
+                    "kin",
+                    json!({"command":"KIN CALL","args":{"tool":format!("kin {}", retired.replace('_', "   ")),"arguments":{}}}),
+                ),
+                (
+                    "kin",
+                    json!({"command":"describe","args":{"command":retired}}),
+                ),
+            ] {
+                let result = belt.route_call(
+                    &format!("{}{dispatcher}", belt::tool_prefix(label)),
+                    &arguments,
+                );
+                assert!(matches!(result.route, Route::Refused(_)), "{result:?}");
+                assert_eq!(result.arguments, arguments);
+            }
+        }
+        assert!(belt.has_kin_tool("get_entity_source"));
+        let result = belt.route_call(
+            &format!("{}kin_tool_call", belt::tool_prefix(label)),
+            &json!({"tool":"get_entity_source","arguments":{"entity_id":"e1"}}),
+        );
+        assert!(matches!(result.route, Route::Kin { .. }));
+    }
 }

@@ -8,7 +8,7 @@ Kin is pre-1.0 and the command surface moves. Where this page and your build dis
 
 Descriptions are the command's own help text. A `--json` flag switches that command to machine-readable output. Angle brackets mark a required argument, square brackets an optional one, and a trailing `...` an argument that takes the rest of the line.
 
-84 commands are documented below. 4 further commands (`bench-meta`, `contextbench-locate`, `prepared-state`, `semantic-only-guard`) are hidden from `kin --help` because they exist for benchmark and internal orchestration, and they are not part of the supported surface.
+87 commands are documented below. 5 further commands (`bench-meta`, `contextbench-locate`, `prepared-state`, `revert`, `semantic-only-guard`) are hidden from `kin --help` because they are not part of the supported surface. `revert` specifically refuses on purpose and names `rollback` instead, so typing it out of Git habit gets that explanation rather than a real command.
 
 `kin capabilities` prints the readiness matrix for the Git-replacement command set, and `kin capabilities --json` gives the same inventory to a machine. Reach for it before scripting against a command you have not used.
 
@@ -30,14 +30,14 @@ Every command also shares one rule for a reader that goes away. When the process
 ## Contents
 
 - [Start here](#start-here): `init`, `clone`, `status`, `commit`, `log`, `diff`
-- [Ask the graph](#ask-the-graph): `locate`, `search`, `trace`, `path`, `impact`, `refs`, `context`
+- [Ask the graph](#ask-the-graph): `locate`, `search`, `trace`, `path`, `impact`, `refs`, `context`, `source`
 - [More graph queries](#more-graph-queries): `history`, `blame`, `overview`, `deps`, `xref`, `dead-code`, `trace-data-flow`, `security`, `languages`, `scope`, `locate-debug`
 - [Branches, merges, and exact trees](#branches-merges-and-exact-trees): `branch`, `checkout`, `merge`, `conflicts`, `resolve`, `stash`, `rollback`, `tag`, `semver`, `purge-ignored`, `admit`, `reconcile`, `migrate`, `eject`, `git`
 - [Review and verification](#review-and-verification): `review`, `approvals`, `verify`, `spec`, `audit`, `rename`
-- [Sessions and agents](#sessions-and-agents): `agent`, `exec`, `shell`, `open`, `with`, `mcp`, `assistant`, `intent`, `traffic`, `work`, `note`, `todo`, `feature`
+- [Sessions and agents](#sessions-and-agents): `agent`, `exec`, `shell`, `open`, `with`, `mcp`, `describe`, `call`, `assistant`, `intent`, `traffic`, `work`, `note`, `todo`, `feature`
 - [Remotes and publishing](#remotes-and-publishing): `auth`, `remote`, `push`, `pull`, `publish`, `release`, `hosted-release`, `pipeline`, `secret`
 - [Graph, store, and daemon operations](#graph-store-and-daemon-operations): `graph`, `embed`, `cache`, `backup`, `resources`, `support`, `daemon`, `registry`, `telemetry`, `notify`, `bench`
-- [Install and health](#install-and-health): `capabilities`, `setup`, `doctor`, `vfs`, `update`, `completions`
+- [Install and health](#install-and-health): `capabilities`, `setup`, `doctor`, `vfs`, `update`, `upgrade`, `completions`
 
 ## Start here
 
@@ -58,6 +58,12 @@ kin init [path] [options]
 | Flag | Default | Description |
 | --- | --- | --- |
 | `--json` |  | Output machine-readable JSON status instead of human text |
+| `--no-enrich` |  | Skip the cross-file enrichment phase |
+
+`kin init` stages its conversion beside the repository and publishes `.kin` into the repository
+root, so it first checks that it can create entries in both. When either directory is not writable
+by the current user, as with `/workspaces` or `/app` in many containers, it refuses before any work
+and names the directory.
 
 Before it captures anything, `kin init` counts the repository's commits and tracked files,
 forecasts what converting that much history holds in memory, and compares the forecast to the
@@ -68,16 +74,63 @@ hold and carries on; comfortably inside it and it says nothing. The forecast is 
 measured conversions, so it understates rather than overstates, and it is a statement about memory
 and never about time.
 
+That forecast counts the history HEAD reaches, and a conversion captures every branch, tag and
+other ref under `refs/`. So once it has planned what it captured, and before it derives any
+semantic history, `kin init` projects that plan against the memory still free and refuses when the
+projection is larger. The capture is removed as it stops and nothing is written. A clone carrying
+many refs is the usual cause, and one made with `git clone --single-branch --no-tags` carries only
+the history you need.
+
 Set `KIN_INIT_MEMORY_CEILING_BYTES` to a byte count when Kin reads your machine's ceiling wrongly,
-or when you have judged the forecast wrong for your repository and want to convert anyway. A value
-that is not a positive whole number is refused rather than ignored, because a ceiling nobody set is
-how a conversion gets killed with no warning.
+or when you have judged the forecast wrong for your repository and want to convert anyway. It
+moves both checks, and the one after planning judges the ceiling less the memory already in use. A
+value that is not a positive whole number is refused rather than ignored, because a ceiling nobody
+set is how a conversion gets killed with no warning.
+
+It checks disk the same way. A conversion holds every file version reachable from HEAD twice while
+it runs, uncompressed, so `kin init` refuses before any work when the filesystem it stages on has
+less free than that. When free space clears that and is still under what stores measured on current
+releases came to, it says so in one line and carries on (`docs/store-size.md` records those
+measurements). Set `KIN_INIT_DISK_FREE_BYTES` to judge against a different free-space figure, for
+example on a filesystem that compresses what it stores.
 
 Exit codes: `0` when the conversion finished and nothing died, and `7` when it produced a store but
 a daemon serving that store was killed during the run, which leaves the semantic enrichment
 unattested. `7` is not a failure. The store is real and answers questions; what nobody can attest is
 that its enrichment finished, and the summary says the same thing in words. A scripted or
 agent-driven setup should branch on it rather than treating the run as done.
+
+After admission, `kin init` runs a cross-file enrichment phase: a daemon asks a language server for
+the reference, override and type-use edges a single-file parse cannot derive. `kin init --json`
+reports what that phase did under `cross_file_enrichment`, and the exit code does not change with
+it:
+
+- `state`: `produced` when a sweep finished, enriched files and owes none, `owed` when the graph
+  handed over lacks some or all of those edges, and `unknown` when the run could not read what its
+  sweep did.
+- `reason`: why, as one of the stable codes below. Absent when `state` is `produced`.
+- `detail`: the sentence the human summary prints, naming what is missing and what supplies it.
+- `cause`: the error or observation behind `reason`, when there was one.
+- `elapsed_ms`: how long the phase took.
+
+| `reason` | What happened |
+| --- | --- |
+| `not_requested` | `--no-enrich` skipped the sweep. |
+| `daemon_spawn_disabled` | `KIN_NO_DAEMON` is set, so no daemon could be started to run the sweep. |
+| `loopback_blocked` | The operating system refuses this process every loopback connection, as a sandbox or seccomp filter that denies `connect()` does, so no daemon it started could be reached. |
+| `daemon_unavailable` | No daemon could be started or reached for another reason. `cause` says which. |
+| `store_unreadable` | The store `kin init` wrote could not be opened as a Kin layout. |
+| `sweep_not_started` | A daemon answered and would not queue the sweep. |
+| `language_server_unavailable` | The daemon has no usable language server for this repository. |
+| `sweep_enriched_nothing` | The sweep walked files and enriched none of them. |
+| `sweep_languages_unserved` | The sweep could not serve at least one language. `cause` names each one. |
+| `sweep_files_owed` | The language server left questions about some files unanswered, for example because it stopped partway through. Those files are owed: the next sweep after a backoff asks again, and `kin daemon sweep` asks at once. `cause` names the first one and why. |
+| `sweep_budget_spent` | The sweep did not finish within 900 seconds. It resumes on the next daemon start. |
+| `sweep_outcome_unreadable` | The run could not read what its sweep did (`state` is `unknown`). |
+
+`daemon_spawn_disabled` and `loopback_blocked` are decided before anything is started, so the phase
+returns at once instead of waiting on a daemon that cannot run the sweep. In every `owed` case
+`detail` names what supplies the missing edges, and `kin daemon sweep` runs the sweep on demand.
 
 ### `kin clone`
 
@@ -198,7 +251,7 @@ kin locate [text] [options]
 | `--cursor <cursor>` |  | Fetch a specific entity page using an explicit cursor token (from a prior result's `next_cursor`). Lower-level alternative to `--next`. |
 | `--page-size <page-size>` |  | Entities per page for the graph-native `entities` surface (`KIN_LOCATE_ENTITY_CAP` otherwise). |
 | `--include-tests` | off | Rank test-role entities alongside source. Off by default: locate demotes tests unless the query text itself reads as being about them. The response says how many test paths a default run withheld. |
-| `--surface <shape>` | `full` | Which JSON shape `--json` emits. `full` is every field, the schema `POST /locate` and the MCP `semantic_locate` tool share. `compact` is the agent surface: per hit `id`, `name`, `kind`, `file`, `line`, `signature` and `score`, plus the ranked file paths, `total_ranked`, `next_cursor`, `all_fallback`, a `ranked_by` clause and a `_kin` object carrying `embedding_state` with its counts. Refused with `--diagnose`, which needs the full payload. |
+| `--surface <shape>` | `full` | Which JSON shape `--json` emits. `full` is every field, the schema `POST /locate` and the MCP `semantic_locate` tool share. `compact` is the agent surface: per hit `id` (or `artifact`, its repo-relative path, on a hit for a tracked file the parsers produced no entities for), `name`, `kind`, `file`, `line`, `signature`, `score` and `matched`, plus `collapsed_rows` on a Go package's module row when the ranking folded that package's other files into it (at least that many rows were folded), plus the ranked file paths, `total_ranked`, `next_cursor`, `all_fallback`, a `ranked_by` clause and a `_kin` object carrying `embedding_state` with its counts. Refused with `--diagnose`, which needs the full payload. |
 
 `--surface compact` is for a tool loop with a token budget. The full shape spends most of its bytes
 on the back-compat `files[].symbols` roll-up of entities the `entities` block already carries, and
@@ -259,6 +312,24 @@ kin trace <entity> [options]
 The argument takes either form. An entity id, exactly as `kin search --json` prints it, names one
 entity and needs no qualifier. A name may reach several: a C function declared in a header and
 defined in a source file is two entities under one name, and so is an overload set.
+
+A name resolves in tiers. An exact whole name comes first and is never pooled with anything else:
+`get` means a function named `get` when one exists. Only when no entity is named it exactly does a
+bare member name reach the members that carry it. The graph names a member by its owner,
+`Scaffold.get` in Python and `Router::route` in Rust, and the member kinds are methods, fields and
+enum variants, so `get` reaches the method `Scaffold.get` but not `get_json`, `__get__`, or a
+module named `app.get`. When one owner carries the member, the name answers for it. When several
+do, the command lists every candidate with its owner-qualified name, file and id, never a line
+number, and answers about none of them, so you choose. `kin refs` answers for each of them in turn
+instead, the way `find_references` does over MCP. The rule is the same one `get_entity_source`,
+`trace_data_flow`, `trace_path` and `get_context_pack` apply, so the CLI and MCP reach the same
+candidates for the same name.
+
+`kin graph source` reads a body, so it answers only a name that names one entity: one exact name,
+or one owner's member when nothing is named exactly. Several same-named entities, several owners'
+members and a partial name each list their candidates and read nothing, exactly as
+`get_entity_source` does over MCP. A long list names every candidate past the first 25 by id, and
+past 200 says how many it left out.
 
 When a name reaches several and nothing pins one, `kin trace` prefers the definition over the
 declaration, then the earlier file path, then the earlier line, then the id. Every one of those is
@@ -343,7 +414,7 @@ kin refs [entity] [options]
 | `--entity-kind <kind>` |  | Exact entity kind (for example: function or method), when its name has twins. `--kind` filters relation kinds here, so the entity's own kind takes this flag |
 | `--bulk-json` |  | Bulk mode: classify many entities by reachability in one daemon call. Outputs JSON to stdout. Requires --entities. |
 | `--entities <entities>` |  | Comma-separated entity UUIDs for --bulk-json. Required when --bulk-json is set. |
-| `--compact` |  | If true (default) emit compact bulk-mode rows ({entity_id, has_references, reference_count}). Set --no-compact for verbose rows with name/kind/file_path/matched_kinds. |
+| `--compact` |  | If true (default) emit compact bulk-mode rows ({entity_id, has_references, reference_count, receiver_name_candidate_count, unconfirmed_candidate_count}). A row holding an unconfirmed candidate caller reads `reference_count` null beside `known_reference_count`, and `has_references` null unless a caller is confirmed. Set --no-compact for verbose rows with name/kind/file_path/matched_kinds. |
 | `--no-compact` |  | Force verbose bulk-mode rows (overrides --compact). Required for clap to accept `--no-compact`. |
 
 A bare name that several entities share resolves through the ranking every read
@@ -437,6 +508,29 @@ is what the bytes actually cost.
 unrelated. It is true when a route search stopped at its own bound, in which
 case an absent route says nobody looked far enough rather than that the graph
 joins nothing.
+
+### `kin source`
+
+Print the exact implementation body for an entity
+
+```
+kin source <entity> [options]
+```
+
+| Argument | Required | Description |
+| --- | --- | --- |
+| `<entity>` | yes | Entity name or ID. A name with twins can carry its pin: `Name@file`, `Name@file:line`, `Name#kind` |
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--file <file>` |  | Exact repo-relative file of the entity, when its name has twins |
+| `--kind <kind>` |  | Exact entity kind (for example: function), when its name has twins |
+| `--json` |  | Output machine-readable JSON |
+
+The same command as [`kin graph source`](#kin-graph-source), with the same arguments and
+answer, at the top level so that `kin source`, the word the routed MCP tool teaches for
+reading one entity's code, runs in a shell too. [`kin describe`](#kin-describe) and
+[`kin call`](#kin-call) are the other two words that tool teaches.
 
 ## More graph queries
 
@@ -546,6 +640,7 @@ kin trace-data-flow [options]
 | `--depth <n>` |  | Maximum traversal depth from the focal (default 3, capped at 8). |
 | `--direction <dir>` |  | Traversal direction: `calls`, `callers`, or `both` (default both). |
 | `--limit-per-step <m>` |  | Max relations expanded per step (default 5, capped at 25). |
+| `--max-response-chars <c>` |  | UTF-8 bytes the printed JSON may occupy (default 45,000; a value below 2,000 or above 60,000 is served as 2,000 or 60,000). Bodies go first, then whole branches, and at least one step is kept. A walk whose smallest retained form still does not fit is refused with an error naming that floor, rather than printed over the limit. The MCP `trace_data_flow` tool answers the same walk with a disclosed overrun instead. |
 
 ### `kin security`
 
@@ -825,7 +920,9 @@ kin stash list [options]
 
 ### `kin rollback`
 
-Publish an exact restoration of a previous change
+Publish a new change restoring an earlier change's complete content
+
+This is not a single-change undo. Later changes remain in immutable history, but their effects are removed from the working view. Unless the target already is the tip, `--discard-later` must accept restoring its complete content, including when the bounded preview cannot count later changes. If repository or workspace authority changes after the preview, rollback refuses; run it again to preview the current state. Restore the previous tip's content with another rollback using `--discard-later`; the output names that command.
 
 ```
 kin rollback [change-id] [options]
@@ -833,11 +930,12 @@ kin rollback [change-id] [options]
 
 | Argument | Required | Description |
 | --- | --- | --- |
-| `[change-id]` | no | Change ID to rollback to. Omit when naming a work item with --feature. |
+| `[change-id]` | no | Change whose complete content the new restoring change will carry. Omit when naming a work item with --feature. |
 
 | Flag | Default | Description |
 | --- | --- | --- |
 | `--feature <feature>` |  | Roll back every change the named work item records |
+| `--discard-later` |  | Accept replacing current content, even when the preview count is unknown |
 
 ### `kin tag`
 
@@ -1352,13 +1450,15 @@ over the same MCP server `kin mcp start` serves, so it sees the real tools, the 
 freshness envelope, and the `negative` verdict on an empty result.
 
 The policy is the product's thesis, enforced in the agent's own process rather than
-borrowed from a vendor's permission layer. The belt is Kin's tools plus exactly two
-local tools, `edit_file` and `write_file`. There is no shell, no grep and no
-file-reading tool, so there is nothing to fall back to, and a tool the model invents is
-refused by name. When a result reports `safe_to_conclude_absent` false, the agent is
+borrowed from a vendor's permission layer. The belt is Kin's tools and nothing else.
+There is no shell, no grep, no file-reading tool and no file-writing tool, so there is
+nothing to fall back to, and a tool the model invents is refused by name. The model
+changes code through `kin_mutate`, naming the entity it changes. When a result reports `safe_to_conclude_absent` false, the agent is
 told the answer is unknown and given the named gap rather than being allowed to conclude
-the thing does not exist. Every edit runs inside a Kin transaction under a Kin session,
-so the change carries provenance naming the agent.
+the thing does not exist. Every change runs under a Kin session, so it carries
+provenance naming the agent. The agent creates only what `kin_mutate` can create; for a
+change it cannot make, it is told to stop and say so. `KIN_AGENT_PURE_KIN` set to a false value makes `kin agent run`
+refuse to start, because the local file tools it used to add are retired.
 
 Working with Claude Code, Codex, Cursor and Gemini stays first class; `kin setup
 --intent agent` still configures every client it detects.
@@ -1480,31 +1580,18 @@ third of the idle window the session reply named in `idle_timeout_secs`, so a tu
 than that window does not cost the run its session. A reply that names no window gets no
 heartbeat rather than a guessed one. The result record counts them in `session_heartbeats`.
 
-The local `edit_file` and `write_file` tools publish through a Kin session and transaction.
-They require the server to expose session start plus transaction begin, stage, commit and
-abort. A query-only or search-only profile that omits those tools refuses the change before
-writing any file, returns an error to the model and increments `unpublished_changes`.
-Use `agent-default` for native agent tasks that need these writing tools. Discovering a
-transaction tool later does not provision the harness's publication session.
-
-A replacement whose `find` text is not in the file is refused, and the refusal carries what
-a retry needs: why it did not match, the file's exact current bytes at the closest span,
-bounded to six lines and 400 bytes between `<<<KIN-EXACT` and `>>>KIN-EXACT` markers, and
-one instruction to re-issue with those bytes. The named causes are escape sequences that
-arrived literal, carriage returns the file does not have, and whitespace that is not the
-file's; when none of those explains it the refusal quotes the nearest line instead and says
-so rather than presenting it as a swap. Every such refusal also names the route that needs
-no old bytes at all: `kin_mutate` with one `update` operation naming the entity and its
-complete new source. A target refused twice this way is not attempted a third time. The
-run's repeat guard answers the third attempt itself, sends the model to read the entity's
-source, and records `repeat_guard` in the trace sidecar with the escalation count.
+Changes go through `kin_mutate` on the server, so a native agent task that changes code
+needs a profile that serves it, such as `agent-default`. A query-only or search-only
+profile serves no `kin_mutate`, and the agent is told the run is read-only.
 
 The exit code is the run's outcome: `0` a final answer, `1` a harness error, `2` the
 tool-call budget was spent, `3` the deadline expired, `4` the endpoint was unreachable or
-answered with nothing usable, `5` the MCP server failed, `6` requested changes were not
-published by repository authority, `7` the conversation reached the model's context
-window. A transcript is written and closed on every one of them, so a failed run is still
-measurable.
+answered with nothing usable, `5` the MCP server failed, `7` the conversation reached the
+model's context window. A transcript is written and closed on every one of them, so a
+failed run is still measurable. Code `6` is retired with the file tools, whose unpublished
+changes it reported. A change Kin refuses comes back to the model as an error result it
+can read and correct, and the run ends on the model's answer, so the result record's
+`entities_changed` is what names the entities a run changed.
 
 #### `kin agent doctor`
 
@@ -1585,7 +1672,7 @@ kin with <assistant> [options] [-- <task>...]
 
 | Flag | Default | Description |
 | --- | --- | --- |
-| `--semantic-only` |  | Deny the assistant's native discovery tools for this launch, leaving Kin's semantic tools as the only discovery surface; the enforcement tier is printed at launch and differs per assistant |
+| `--semantic-only` |  | Launch the assistant with none of its built-in tools and Kin's MCP server as its only other one, so it reads and changes code through Kin, by entity; the enforcement tier is printed at launch and differs per assistant |
 
 ### `kin mcp`
 
@@ -1609,7 +1696,7 @@ kin mcp start [options]
 | --- | --- | --- |
 | `--global` |  | Run in global mode, serving every repo in this home's registry (KIN_REGISTRY_PATH, else <KIN_HOME>/registry.toml, else ~/.kin/registry.toml) |
 | `--repo <path>` |  | Bind this server to a specific Kin repository instead of relying on the launching process's working directory. Overrides KIN_MCP_REPO. Use this for a global agent-CLI MCP entry that may launch outside any Kin repository (e.g. an umbrella workspace root). |
-| `--tool-profile <profile>` |  | Tool surface to serve: `agent-default` (the curated agent belt, and the default), `agent-query` (that belt without the session and transaction tools, for a client that only queries), `agent-search` (the measured always-on set, with every other tool reached through `kin_tool_search`), `full` (every tool), `benchmark`, or `context-bench`. Overrides KIN_MCP_TOOL_PROFILE. |
+| `--tool-profile <profile>` |  | Tool surface to serve: `agent-default` (the curated agent belt, and the default), `agent-query` (that belt without the session and transaction tools, for a client that only queries), `agent-search` (the measured always-on set, with every other tool reached through `kin_tool_search`), `agent-routed` (one tool, `kin`, whose commands reach the agent belt, writes included, and every other tool through `describe` and `call`, for a client that sends every tool with every request), `agent-routed-query` (that one tool without a write path), `full` (every tool), `benchmark`, or `context-bench`. Overrides KIN_MCP_TOOL_PROFILE. |
 | `--no-spawn` |  | Never start or revive a daemon from this server: bind only a daemon that is already running, and answer graph tool calls with an honest "no daemon is running" error otherwise. This is the probe mode for watchdogs and boot-time checks (equivalent to KIN_NO_DAEMON=1): the MCP handshake and tool list are served in full, and nothing heavy is ever spawned by the check itself. |
 
 What each profile costs before the model has asked anything, measured on 2026-09-15
@@ -1641,8 +1728,7 @@ raise either up to 60,000. `full` serves 45,000 on everything.
 `kin agent run` does not put a whole profile on the model. It withholds the session and
 transaction tools it drives itself, folds `trace_data_flow` and `trace_path` into one
 `trace` tool, and withholds the tools `KIN_AGENT_BELT=wide` exists to restore, so the belt
-a model receives is smaller than any row above: 2,917 tokens on the same model, for ten Kin
-tools plus `edit_file` and `write_file`.
+a model receives is smaller than any row above, and it carries Kin tools only.
 
 `get_entity_source` and its `get_entity_body` alias ask the selected repository daemon on
 every call, including retries after a source gap. A committed generation does not describe
@@ -1650,6 +1736,65 @@ every live semantic derivation: the daemon may repair an entity's span against c
 workspace bytes before a semantic commit. The source response still verifies that the span
 belongs to those bytes; an unresolved mismatch remains an error. Retrying a read does not
 admit files or create a commit, and a successful precommit read is not durable publication.
+
+### `kin describe`
+
+Show a routed kin tool command's or any Kin tool's arguments
+
+```
+kin describe [command]
+```
+
+| Argument | Required | Description |
+| --- | --- | --- |
+| `[command]` | no | A routed command, such as locate or mutate, or any Kin tool's name. Omit it to list them all |
+
+Prints what the routed `kin` MCP tool's `describe` command answers, as JSON: the command's
+or tool's arguments as a schema and one call that works, or, with no command, every routed
+command with its CLI spelling and every other tool `kin call` runs, each marked where it
+writes. It is read from the same table the routed tool reads, answers as the
+`agent-routed` profile does, and needs no repository. A name that is neither a command nor
+a tool is refused, and exits 1.
+
+```
+kin describe
+kin describe mutate
+kin describe graph_neighborhood
+```
+
+### `kin call`
+
+Run any Kin tool by its registered name, as the routed kin tool's call
+
+```
+kin call <tool> [arguments]
+```
+
+| Argument | Required | Description |
+| --- | --- | --- |
+| `<tool>` | yes | The tool's registered name, as `kin describe` lists it |
+| `[arguments]` | no | The tool's arguments as one JSON object, or `-` to read it from stdin. Omitted, the tool is called with none |
+
+Sends the routed `kin` MCP tool's `call` command through the same server path
+`kin mcp start` answers it on, against this repository's daemon, which it reaches the way
+`kin graph source` does. The answer is the one the routed tool gives: the tool's payload
+with its `_kin` envelope, and hints that name a spelling this shell runs. A call refused on
+its fields is answered without a daemon, naming the fields. A tool that answers with an
+error exits 1, with the answer printed as usual.
+
+```
+kin call graph_neighborhood '{"entity_id":"<entity id from kin locate>","depth":2}'
+kin call kin_session_start '{"vendor":"shell","client_name":"my script","cwd":"/path/to/repo"}'
+kin call kin_mutate - < change.json
+```
+
+`kin call` answers as the `agent-routed` profile does, writes included. A read-only MCP
+profile such as `agent-routed-query` limits what its one tool reaches, not what a shell on
+the same machine runs, and a shell already writes through `kin commit` and the rest. A
+name a shell runs another way is refused with the command that works: `kin init` for
+`kin_init`, `kin describe` and `kin call` for `kin_tool_search` and `kin_tool_call`, and
+for a routed command's name, such as `locate`, its CLI spelling or `kin call` with the tool
+it runs.
 
 ### `kin assistant`
 
@@ -2540,6 +2685,30 @@ Structural integrity validation
 kin graph validate
 ```
 
+#### `kin graph owed`
+
+Show the owed derivation ledger repository authority holds: each source body owed a parse, and the re-derivation that last paid the workspace. Reads the local store only; starts no daemon, admits nothing, and migrates no earlier build's records
+
+```
+kin graph owed [options]
+```
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--json` |  | Output machine-readable JSON (`kin.graph.owed-derivations.v1`) |
+
+It reports the owed derivation records persisted in repository authority, and nothing else. It reads the authority snapshot and its acknowledged journal, checks both against the digests the authority record names, replays the journal onto the snapshot's envelope and runs the ledger checks a full open runs. When that read cannot answer, it validates the store in full: the recovery, whole-history replay and body checks a full open runs. Either way the ledger it prints is one an open would accept.
+
+It writes nothing to the store on either path. An open also records its history validation, and finishes what an interrupted write or promotion left behind, such as a superseded snapshot or a staged authority record; this command does neither, so every file in the store is as it found it, and a record an interrupted write left staged is refused until a daemon or another command finishes that write. It never contacts or starts a daemon, admits nothing and reads nothing from the working copy.
+
+It can run while a daemon serves the repository. It reads under the repository authority lock, which a daemon also takes while it commits, and it waits up to 10 seconds in total for the store lock: while another process holds it, the command retries, holding nothing, and when the 10 seconds are spent it refuses with a message that another process held the repository authority lock. How long it then holds the lock depends on the path. The envelope read holds it only while it reads the snapshot and the journal and checks them against the authority record. The full validation, taken only when that read cannot answer, holds it through the whole recovery, history replay and body check until the ledger is printed, which on a large store can take much longer, and a daemon's commit waits for it.
+
+It does not migrate legacy state. The `semantic-debt.json` and `unpublished-enrichment.json` files an earlier build kept beside the store are not ledger records: a daemon of this build judges them at its first start and carries what they still owe into repository authority with its next transaction, and until then this command does not show them. A workspace with no records therefore reads "no owed derivation records in repository authority", which says what the ledger holds and not that no semantic work is owed: an earlier build's record that has not migrated, or enrichment that is still incomplete, can remain.
+
+Every workspace authority holds is listed with its records and, whenever authority records one, its last payment, even when no records remain. The JSON carries `schema`, `repository_id`, the logical `generation` the ledger was read at, and `workspaces`, each with `workspace_id`, `records` and `payment`. A record has `path` (its UTF-8 rendering, or `null` when the path has none), `path_hex` (the exact path bytes), `body` (the digest of the body the parse is owed for), `recorded_at` (the logical generation that recorded it) and `cause` (`publication`, or `legacy` for a record carried in from an earlier build's file). A payment has `paid_through` (the generation the paying commit was taken against), `operation_id` and `hydration_version`.
+
+When authority cannot be read, for example a store layout newer than this build, damaged authority, a ledger that fails its checks, or a lock still held when its 10 seconds are spent, it prints nothing on stdout, names the cause on stderr, and exits non-zero.
+
 #### `kin graph inspect`
 
 Look up an entity by name and show its relations
@@ -2566,11 +2735,15 @@ kin graph source <entity> [options]
 
 | Argument | Required | Description |
 | --- | --- | --- |
-| `<entity>` | yes | Entity name or ID |
+| `<entity>` | yes | Entity name or ID. A name with twins can carry its pin: `Name@file`, `Name@file:line`, `Name#kind` |
 
 | Flag | Default | Description |
 | --- | --- | --- |
+| `--file <file>` |  | Exact repo-relative file of the entity, when its name has twins |
+| `--kind <kind>` |  | Exact entity kind (for example: function), when its name has twins |
 | `--json` |  | Output machine-readable JSON |
+
+[`kin source`](#kin-source) is the same command at the top level.
 
 #### `kin graph body`
 
@@ -2582,10 +2755,12 @@ kin graph body <entity> [options]
 
 | Argument | Required | Description |
 | --- | --- | --- |
-| `<entity>` | yes | Entity name or ID |
+| `<entity>` | yes | Entity name or ID. A name with twins can carry its pin: `Name@file`, `Name@file:line`, `Name#kind` |
 
 | Flag | Default | Description |
 | --- | --- | --- |
+| `--file <file>` |  | Exact repo-relative file of the entity, when its name has twins |
+| `--kind <kind>` |  | Exact entity kind (for example: function), when its name has twins |
 | `--json` |  | Output machine-readable JSON |
 
 #### `kin graph export`
@@ -2849,6 +3024,7 @@ kin daemon stop [options]
 | --- | --- | --- |
 | `--all` |  | Stop every worker daemon under this KIN_HOME, then the supervisor  The supervisor is machine-wide, so it can hold daemons from other managed homes. Those are skipped and named rather than stopped, and the supervisor itself is left running while any of them remain. Use --machine to stop every daemon on the box regardless of home. |
 | `--machine` |  | Widen --all to every daemon on this machine, whatever KIN_HOME it runs under |
+| `--when-unused` |  | Stop only daemons nothing is using, and name the rest  A daemon with an attached client, a request in flight, a write it has not flushed, or enrichment or embedding still running is left up and says which, then exits on its own as soon as that ends. Without this flag the stop happens now, whatever is attached. |
 | `--json` |  | Emit machine-readable JSON |
 
 #### `kin daemon sweep`
@@ -3050,6 +3226,7 @@ kin setup [<subcommand>] [options]
 | `--embedding-model <when>` | `later` | When the embedding model is fetched: `later`, or `never` on a machine that does not fetch it. Setup never downloads it either way |
 | `--embedding-provider <where>` | `local` | Where vectors are computed: `local`, or `remote` for an OpenAI-compatible endpoint. `remote` collects no credential |
 | `--skip-path` |  | Do not add `~/.kin/bin` to the shell profile. Only asked about for an npm or npx install, which cannot make the edit itself |
+| `--tool-profile <profile>` |  | Tool profile to write into every AI client this run configures: agent-default, agent-query, agent-search, agent-routed or agent-routed-query. Without it each client gets its own default, and a profile set by hand is kept and pinned; with it the entry carries `KIN_MCP_TOOL_PROFILE_PINNED=1`, and later `kin setup` and `kin update` runs keep the profile |
 | `--check` |  | Skip the wizard and only run the first-run health check |
 
 The wizard opens with a hardware check. It reports the architecture, the
@@ -3143,6 +3320,17 @@ kin doctor [options]
 | `--json` |  | Emit the machine-readable health report as JSON |
 | `--drift` |  | Compare an explicit projection observation with graph truth |
 | `--heal` |  | Rematerialize the derived projection from graph truth, DISCARDING uncommitted changes to tracked files that diverge from it |
+| `--conversion-source <path>` |  | Report one file's persisted conversion coverage and its entity counts by kind |
+
+`--conversion-source` is a conversion diagnostic for one repository-relative
+path. It reports what conversion recorded for the file: whether an adapter
+parsed it and how completely, the tier it is tracked at, whether its type is one
+no adapter claims and why, whether its entity set can be certified as whole,
+and how many entities of each kind it produced. It lists no entities, since you
+work with entities through `kin locate` and the other graph commands. A path
+the graph does not track is refused with a nonzero exit rather than reported as
+empty. With `--json` it prints `path`, `file_coverage`, `counts_by_kind` and
+`total`.
 
 Two rows cover filesystem projection and they answer different questions.
 `VFS projection` says whether projection is installed on this machine.
@@ -3200,6 +3388,28 @@ kin update [options]
 | `--dry-run` |  | With --apply: print the ordered steps and change nothing. |
 | `--unattended` |  | Run the unattended executor (what the update watchdog invokes on a stale install with policy auto): evaluate the machine-activity gates, and on proceed stop the managed daemon and VFS server cooperatively and run the full --apply chain. Agent MCP servers keep running; each picks up the new binary when its agent next starts it. Blocked runs persist a deferral clock instead of installing. The final stdout line is one JSON record (also appended to ~/.kin/update-ledger.jsonl) carrying the decision, reason, blocked_seconds, window_seconds, and how many releases the deferral has blocked across. |
 | `--force-window` |  | With --unattended: apply despite the activity gates. For the watchdog once a deferred record shows blocked_seconds >= window_seconds, which starts at 24h and shortens as the installation falls further behind, to a floor of 6h. Never overrides a recorded prompt or manual policy, only the executor's own activity gates. |
+
+### `kin upgrade`
+
+Bring this store up to this build's replay semantics, keeping its history
+
+```
+kin upgrade [options]
+```
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--json` |  | Output machine-readable JSON (`kin.store-upgrade.v1`): the state (`upgraded`, `requalified` or `already_current`), the versions it moved from and to, each head it re-derived, whether uncommitted work was re-derived, the source files parsed, whether binding history is checked afterwards, the elapsed time and any follow-up warnings. |
+
+A store an older Kin build wrote serves the state that build derived, so every answer over it is qualified until it is re-derived. `kin status`, `kin graph status`, `kin doctor` and an MCP answer's trust reason name this command for it; through npm it is `npx -y @kinlab/kin@<version> upgrade`.
+
+It re-derives the state every local branch head and a detached workspace base serve, from the exact trees and bodies the store keeps, and records each head's difference as one new native change on top of that head, with no file change. Uncommitted work is re-derived under the same build and stays pending. Every earlier change, branch, review, spec and history record is kept as it was, and history recorded before the upgrade keeps the replay version that authored it. The command stops this repository's daemon and holds the repository's runtime authority while it runs, so no daemon starts beside it, commits everything in one repository transaction, and writes the store's replay-semantics record last, so a run stopped before the commit changes nothing and a run stopped after it is finished by running it again.
+
+The same transaction pays the workspace's owed derivation ledger (see [`kin graph owed`](#kin-graph-owed)) against the generation it was planned from, and only where its re-derivation verifier proves the workspace's committed graph is exactly this build's derivation of its tree. The payment says the owed parses were made, not that every file parsed completely: a file that does not parse keeps its incomplete coverage. A record a daemon's publication makes after the commit stays owed for the next commit, and one that lands before it makes the commit refuse. Once authority records the payment, the upgrade removes the owed-work files an earlier build kept beside the store.
+
+It refuses, changing nothing, on a store a newer build recorded, a replay-semantics record this build cannot read, a store holding more than its own workspace, an open merge, a stash sealed on a head it would move, or while another process holds the repository's runtime authority. On a store already current it does nothing, unless the workspace's binding history is no longer checked; then it re-derives and checks it again without rewriting the record. It exits non-zero when a step after the commit did not complete, and names the step; running it again finishes it.
+
+Kin 0.7.21 does not read the store formats owed derivation records need. While the ledger holds records, this build writes the authority snapshot at format version 19 (20 when it carries a graph section) and journal frames at version 5. Kin 0.7.21 reads snapshot versions 13 through 16 and frame versions 2 to 3, and its source (release commit `67a772ec0`, `crates/kin-db/src/storage/format.rs` and `crates/kin-db/src/storage/authority_frame.rs`) refuses such a store with `incompatible snapshot schema: on-disk snapshot format version 19 is newer than the range this binary supports (versions 13 through 16); this graph was written by a newer Kin; upgrade Kin to a build that supports this snapshot`, or with `unsupported authority frame version: 5 (this kin-db reads versions 2 to 3); a newer kin-db wrote it, so open this store with a kin built on a kin-db that reads frame version 5`. Those messages are from 0.7.21's source, not observed by running 0.7.21 against such a store, and no path back to 0.7.21 is promised for a store this build has written.
 
 ### `kin completions`
 

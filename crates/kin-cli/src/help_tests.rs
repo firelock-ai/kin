@@ -160,9 +160,47 @@ fn grouped_help_keeps_task_groups_and_global_options_at_narrow_and_wide_widths()
                 assert!(help.contains(option), "width={width}: {option}");
             }
             assert!(help.contains("[alias: fetch]"), "width={width}");
-            assert!(help.contains("[alias: revert]"), "width={width}");
+            assert!(
+                !help.contains("[alias: revert]"),
+                "width={width}: revert must not read as a rollback alias"
+            );
             assert!(!help.contains("Other commands:"), "width={width}");
         }
+    });
+}
+
+/// The bug this guards: rollback's own `--help` used to call itself an alias
+/// of "revert" while actually restoring an earlier complete state, so a
+/// reader had no reason to expect that from the name or the help text.
+#[test]
+fn rollback_help_tells_the_truth_about_discarding_later_changes() {
+    on_cli_stack(|| {
+        let error = Cli::try_parse_from(["kin", "rollback", "--help"])
+            .err()
+            .expect("--help must not execute rollback");
+        let help = error.to_string();
+        assert!(help.contains("discard"), "{help}");
+        assert!(help.contains("--discard-later"), "{help}");
+        assert!(help.contains("new change"), "{help}");
+        assert!(help.contains("immutable"), "{help}");
+        assert!(!help.contains("tip to a named change"), "{help}");
+        assert!(
+            !help.contains("[alias:"),
+            "{help}: rollback must carry no alias"
+        );
+    });
+}
+
+/// `revert` no longer runs rollback's destructive path under a name that
+/// promises a single-change undo; it refuses and names the real command.
+#[test]
+fn revert_help_names_rollback_instead_of_acting_like_it() {
+    on_cli_stack(|| {
+        let error = Cli::try_parse_from(["kin", "revert", "--help"])
+            .err()
+            .expect("--help must not execute revert");
+        let help = error.to_string();
+        assert!(help.contains("rollback"), "{help}");
     });
 }
 

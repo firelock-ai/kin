@@ -6,6 +6,11 @@ use std::time::{Duration, Instant};
 
 use tracing::{debug, error, info, warn};
 
+pub(crate) mod lsp_publication;
+
+#[cfg(all(test, unix))]
+mod language_server_group_test;
+
 use crate::api;
 use crate::error::{DaemonError, Result};
 use crate::loop_runner::{self, LoopConfig};
@@ -239,24 +244,58 @@ fn next_embed_error_backoff(current: Option<Duration>, base: Duration, max: Dura
 }
 
 #[derive(Debug)]
-enum BackgroundEmbeddingBatchOutcome {
+pub(crate) enum BackgroundEmbeddingBatchOutcome {
     Completed(usize),
     ResetAfterIndexError(kin_db::KinDbError),
     Failed(kin_db::KinDbError),
 }
 
+/// How long building the embedder may take before the daemon logs it.
+///
+/// The first build on a machine fetches the model, and this record is how a
+/// slow fetch shows up in the log as its own event instead of inside the
+/// duration of the first batch.
+const SLOW_EMBEDDER_PREPARE: Duration = Duration::from_secs(1);
+
 /// Run one background embedding batch and any first-error vector recovery under
 /// one `embedding_work` guard.
+///
+/// `prepare` runs first, before the guard is taken. It builds the embedder,
+/// which on a machine that has never embedded fetches the model from Hugging
+/// Face. That fetch used to run inside `process`, under the guard, and
+/// `kin_graph_status` samples every counter under the same guard, so for as
+/// long as the fetch took every status call replayed the reading settled
+/// before it began. A commit made during the fetch still read as uncommitted
+/// work. Building the embedder moves no queue, index or counter the guard
+/// fences, so it has no reason to hold it.
+///
+/// A `prepare` that fails ends the batch as
+/// [`BackgroundEmbeddingBatchOutcome::Failed`] without taking the guard. It
+/// drained nothing, and a model that cannot be fetched is not a stale vector
+/// index, so the index reset below is not its recovery.
 ///
 /// The recovery decision belongs inside this critical section. In particular,
 /// a foreground `/embed --rebuild` that is already waiting must not acquire the
 /// guard, publish a fresh index, and then be wiped by recovery from this stale
 /// failed batch.
-fn run_background_embedding_batch(
+pub(crate) fn run_background_embedding_batch(
     state: &DaemonState,
     reset_on_index_error: bool,
+    prepare: impl FnOnce(&DaemonState) -> std::result::Result<(), kin_db::KinDbError>,
     process: impl FnOnce(&DaemonState) -> std::result::Result<usize, kin_db::KinDbError>,
 ) -> BackgroundEmbeddingBatchOutcome {
+    let preparing = Instant::now();
+    if let Err(error) = prepare(state) {
+        return BackgroundEmbeddingBatchOutcome::Failed(error);
+    }
+    let prepared_in = preparing.elapsed();
+    if prepared_in >= SLOW_EMBEDDER_PREPARE {
+        info!(
+            elapsed_ms = u64::try_from(prepared_in.as_millis()).unwrap_or(u64::MAX),
+            "built the embedder before taking embedding-work serialization"
+        );
+    }
+
     let _embedding_guard = match state.embedding_work.lock() {
         Ok(guard) => guard,
         Err(_) => {
@@ -476,6 +515,7 @@ async fn probe_resolved_language_server(
             &args_refs,
             workspace_root,
             initialization_options,
+            Some(typescript_grammars()),
         ),
     )
     .await
@@ -490,12 +530,22 @@ async fn probe_resolved_language_server(
         Ok(Err(error)) => LanguageServerReadiness::Unusable {
             reason: error.to_string(),
         },
-        // Dropped rather than shut down: `kill_on_drop` ends the process at
-        // once, and a probe has no session worth closing.
+        // Dropped rather than shut down: a drop ends the server's whole
+        // process group at once, and a probe has no session worth closing.
         Ok(Ok(server)) => {
             drop(server);
             LanguageServerReadiness::Usable
         }
+    }
+}
+
+/// The grammars every language server this daemon starts proves TypeScript and
+/// TSX binding initializers with: Kin's patched grammar, which reads two
+/// constructs the upstream grammar turns into errors.
+fn typescript_grammars() -> kin_lsp::TypeScriptGrammars {
+    kin_lsp::TypeScriptGrammars {
+        typescript: kin_grammar_typescript::LANGUAGE_TYPESCRIPT,
+        tsx: kin_grammar_typescript::LANGUAGE_TSX,
     }
 }
 
@@ -540,9 +590,118 @@ async fn start_resolved_language_server(
         &args_refs,
         workspace_root,
         initialization_options,
+        Some(typescript_grammars()),
     )
     .await
     .map_err(|error| error.to_string())
+}
+
+/// Stop language servers, each with every process it started, all at once.
+///
+/// A stop is the shutdown request's reply budget plus the process group's
+/// termination grace, and the daemon pays it out of a shutdown drain sized for
+/// the whole enrichment worker, so the servers stop together rather than one
+/// language after another. Dropping this future mid-stop aborts the stops, and
+/// each server's drop still ends its group.
+async fn stop_language_servers(
+    servers: impl IntoIterator<Item = (kin_model::LanguageId, kin_lsp::lifecycle::LspServer)>,
+    reason: &'static str,
+) {
+    let mut stopping = tokio::task::JoinSet::new();
+    for (language, server) in servers {
+        info!(
+            %language,
+            reason, "stopping the language server and every process it started"
+        );
+        stopping.spawn(async move {
+            let _ = server.shutdown().await;
+        });
+    }
+    while stopping.join_next().await.is_some() {}
+}
+
+/// Take out of `servers` every server a sweep started, leaving the ones that
+/// were already running when it began.
+///
+/// A taken language also leaves `first_open_done`. That settle belonged to the
+/// server being stopped, and the next one started for the language is fresh.
+fn take_servers_a_sweep_started<S>(
+    servers: &mut std::collections::HashMap<kin_model::LanguageId, S>,
+    resident: &std::collections::HashSet<kin_model::LanguageId>,
+    first_open_done: &mut std::collections::HashSet<kin_model::LanguageId>,
+) -> Vec<(kin_model::LanguageId, S)> {
+    let started: Vec<kin_model::LanguageId> = servers
+        .keys()
+        .filter(|language| !resident.contains(*language))
+        .copied()
+        .collect();
+    started
+        .into_iter()
+        .filter_map(|language| {
+            first_open_done.remove(&language);
+            servers.remove(&language).map(|server| (language, server))
+        })
+        .collect()
+}
+
+/// Take a server that stopped answering out of `servers`, keep what it left
+/// behind, and end it with every process it started.
+///
+/// Returns the reason a skipped language or an owed file carries, naming the
+/// command, how its process ended and the last of its stderr. Returns `None`,
+/// and leaves everything as it was, when the server is still connected or the
+/// language has none.
+///
+/// A server that dies mid-sweep fails every later request at once. A pass that
+/// kept asking it recorded each remaining file as a question that got no
+/// answer, and counted each one as enriched: 546 files in fifteen seconds on
+/// one Go repository, with the reason for the death nowhere. Nothing restarts
+/// the server here. The rest of the pass reports the language unserved, and
+/// the next sweep starts a fresh one, as it would after a failed start.
+async fn retire_disconnected_server(
+    servers: &mut std::collections::HashMap<kin_model::LanguageId, kin_lsp::lifecycle::LspServer>,
+    first_open_done: &mut std::collections::HashSet<kin_model::LanguageId>,
+    language: kin_model::LanguageId,
+    command: &str,
+) -> Option<String> {
+    if !servers.get(&language)?.is_disconnected() {
+        return None;
+    }
+    let mut server = servers.remove(&language)?;
+    // The settle belonged to this server, and the next one started for the
+    // language is fresh.
+    first_open_done.remove(&language);
+    let departure = server.departure().await;
+    warn!(
+        %language,
+        command,
+        exit = departure.exit.as_deref().unwrap_or("its process had not exited"),
+        stderr = %departure.stderr,
+        "the language server stopped answering partway through this sweep; the rest of this \
+         language is left unenriched in this pass"
+    );
+    server.abandon().await;
+    Some(format!(
+        "the `{command}` language server stopped answering partway through this sweep ({}), so \
+         the rest of this language was not asked",
+        departure.describe(LOST_SERVER_STDERR_IN_REASON)
+    ))
+}
+
+/// How much of a lost server's stderr a reason carries. The warning logs the
+/// whole retained tail. A reason travels through the status payload and the
+/// `kin init` summary, and the end of the tail is what explains a death.
+const LOST_SERVER_STDERR_IN_REASON: usize = 1024;
+
+/// The command `lsp_adapter_for` starts for `language`, for naming it in a
+/// reason, or the language itself when none is wired.
+fn language_server_command_name(
+    language: kin_model::LanguageId,
+    workspace_root: &std::path::Path,
+) -> String {
+    lsp_adapter_for(language, workspace_root)
+        .map(|(command, _, _)| command)
+        .unwrap_or_else(|| language.to_string())
 }
 
 pub fn lsp_adapter_for(
@@ -919,6 +1078,7 @@ const DEFERRED_CHECKPOINT_RETRY_MAX: Duration = Duration::from_secs(300);
 /// test that only ever drives the periodic path proves the guard is positioned
 /// correctly by inspection rather than by behaviour.
 pub(crate) async fn run_shutdown_persistence(state: &Arc<DaemonState>) {
+    state.prepared_publication.shutdown();
     if state.is_dirty() {
         if state.shutdown_flush_would_wipe_graph() {
             // The in-memory graph collapsed to a small fraction of the last
@@ -1499,6 +1659,54 @@ fn embed_work_in_flight(state: &DaemonState) -> bool {
     )
 }
 
+/// Language-server enrichment running right now: the cold sweep, or an
+/// incremental pass partway through a file.
+///
+/// Gated for the same reason embedding is. The idle clock never sees it, so a
+/// daemon idled out under a sweep stops it partway, and the next start queues
+/// the sweep again from its own beginning.
+fn enrichment_in_flight(state: &DaemonState) -> bool {
+    state
+        .lsp_sweep_running
+        .load(std::sync::atomic::Ordering::SeqCst)
+        || state
+            .background_work
+            .registered(crate::background_work::PASS_LSP)
+            .is_some_and(|pass| pass.is_working())
+}
+
+/// Something that keeps a daemon up after its idle window has run out.
+///
+/// Named rather than folded into one boolean because each is also a sentence a
+/// caller is owed: a daemon asked to retire answers with the ones it is waiting
+/// on, instead of leaving the caller to guess why it is still running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShutdownBlocker {
+    PreparedPublication,
+    RequestInFlight,
+    FirstScan,
+    Reconciliation,
+    Embedding,
+    Enrichment,
+    EventSubscriber,
+    AttachedSession,
+}
+
+impl ShutdownBlocker {
+    pub(crate) fn describe(self) -> &'static str {
+        match self {
+            Self::PreparedPublication => "a publication is being prepared",
+            Self::RequestInFlight => "a request is in flight",
+            Self::FirstScan => "the first scan of the repository is still running",
+            Self::Reconciliation => "reconciliation is running",
+            Self::Embedding => "embedding is running or queued",
+            Self::Enrichment => "language-server enrichment is running",
+            Self::EventSubscriber => "a client is subscribed to its events",
+            Self::AttachedSession => "a client session is attached",
+        }
+    }
+}
+
 /// Work a shutdown would destroy rather than merely interrupt, independent of
 /// whether any client can currently reach this daemon.
 ///
@@ -1508,24 +1716,64 @@ fn embed_work_in_flight(state: &DaemonState) -> bool {
 /// ingest queued, reads as perfectly idle to the monitor, and a CLI autostart,
 /// which injects a 60s timeout, kills it mid-pass. None of that work resumes:
 /// the next command starts the pass over from the beginning.
-fn work_would_be_lost_by_shutdown(state: &DaemonState) -> bool {
-    if state.active_request_count() > 0 {
-        return true;
+///
+/// `requests_to_ignore` lets a request that is asking the question leave
+/// itself out of the in-flight count.
+fn work_blockers(state: &DaemonState, requests_to_ignore: u64) -> Vec<ShutdownBlocker> {
+    let mut blockers = Vec::new();
+    if state.prepared_publication.pending() {
+        blockers.push(ShutdownBlocker::PreparedPublication);
+    }
+    if state.active_request_count() > requests_to_ignore {
+        blockers.push(ShutdownBlocker::RequestInFlight);
     }
     if !state
         .is_initialized
         .load(std::sync::atomic::Ordering::Relaxed)
     {
-        return true;
+        blockers.push(ShutdownBlocker::FirstScan);
     }
     if state
         .reconciliation_status
         .load(std::sync::atomic::Ordering::Relaxed)
         != RECON_IDLE
     {
-        return true;
+        blockers.push(ShutdownBlocker::Reconciliation);
     }
-    embed_work_in_flight(state)
+    if embed_work_in_flight(state) {
+        blockers.push(ShutdownBlocker::Embedding);
+    }
+    if enrichment_in_flight(state) {
+        blockers.push(ShutdownBlocker::Enrichment);
+    }
+    blockers
+}
+
+fn work_would_be_lost_by_shutdown(state: &DaemonState) -> bool {
+    !work_blockers(state, 0).is_empty()
+}
+
+/// Clients this daemon can see are still attached to it.
+fn client_blockers(state: &DaemonState) -> Vec<ShutdownBlocker> {
+    let mut blockers = Vec::new();
+    if state.event_tx.receiver_count() > 0 {
+        blockers.push(ShutdownBlocker::EventSubscriber);
+    }
+    if state.has_external_sessions() {
+        blockers.push(ShutdownBlocker::AttachedSession);
+    }
+    blockers
+}
+
+/// Everything keeping this daemon from retiring right now, for the caller
+/// that asked it to. See [`work_blockers`] for `requests_to_ignore`.
+pub(crate) fn retirement_blockers(
+    state: &DaemonState,
+    requests_to_ignore: u64,
+) -> Vec<ShutdownBlocker> {
+    let mut blockers = work_blockers(state, requests_to_ignore);
+    blockers.extend(client_blockers(state));
+    blockers
 }
 
 fn ready_for_idle_shutdown(
@@ -1550,17 +1798,14 @@ fn ready_for_idle_shutdown(
         // blip is transient where a discarded first ingest is not.
         return state.idle_duration() >= idle_timeout;
     }
-    if state.event_tx.receiver_count() > 0 {
-        return false;
-    }
-    if state.has_external_sessions() {
+    if !client_blockers(state).is_empty() {
         return false;
     }
     state.idle_duration() >= idle_timeout
 }
 
-async fn save_snapshot_blocking(state: Arc<DaemonState>) -> Result<()> {
-    tokio::task::spawn_blocking(move || state.save_snapshot())
+async fn save_snapshot_blocking(state: Arc<DaemonState>) -> Result<crate::state::EnrichmentFlush> {
+    tokio::task::spawn_blocking(move || state.save_snapshot_reporting_enrichment())
         .await
         .map_err(|error| DaemonError::Io(std::io::Error::other(error.to_string())))?
 }
@@ -1626,7 +1871,7 @@ async fn timed_flush(state: &Arc<DaemonState>) -> Result<Duration> {
     if outcome.is_ok() {
         record_flush_elapsed(state, elapsed);
     }
-    outcome.map(|()| elapsed)
+    outcome.map(|_| elapsed)
 }
 
 /// Keep a finished flush's duration for the next stop to judge by, when it ran
@@ -1703,7 +1948,7 @@ const WATCH_ARMING_BOUND: Duration = Duration::from_secs(30);
 /// the endpoint appears will be observed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum WatchArming {
-    /// The loop reported its watcher. Publication is safe to proceed.
+    /// The loop reported its watcher. Canonical readiness is checked separately.
     Armed,
     /// The loop closed its signal without reporting one. A disabled reconciler
     /// or bare checkout may remain parked until shutdown; a refused watcher may
@@ -1742,6 +1987,28 @@ pub(crate) async fn await_watch_armed(
     }
 }
 
+/// Canonical repair has a separate lifetime from watcher registration. A loop
+/// that exits or is cancelled cannot turn its closed channel into readiness.
+/// Large admitted stores may take longer than the fast watch registration bound.
+pub(crate) async fn await_canonical_ready(
+    ready: tokio::sync::oneshot::Receiver<std::result::Result<(), String>>,
+    mut cancel: tokio::sync::watch::Receiver<bool>,
+) -> std::result::Result<(), String> {
+    if *cancel.borrow() {
+        return Err("daemon startup cancelled before canonical repair completed".into());
+    }
+    let result = tokio::select! {
+        result = ready => result.map_err(|_| {
+            "reconciliation loop ended before canonical repair completed".to_string()
+        })?,
+        _ = cancel.changed() => Err("daemon startup cancelled before canonical repair completed".into()),
+    };
+    if *cancel.borrow() || cancel.has_changed().is_err() {
+        return Err("daemon startup cancelled before canonical repair completed".into());
+    }
+    result
+}
+
 /// Say what the wait produced, at the level each outcome deserves.
 fn announce_watch_arming(arming: &WatchArming, bound: Duration) {
     match arming {
@@ -1749,11 +2016,11 @@ fn announce_watch_arming(arming: &WatchArming, bound: Duration) {
             error!(%error, "refusing daemon startup because watcher delivery could not be established")
         }
         WatchArming::Armed => {
-            debug!("the reconciliation watch is armed; publishing the daemon endpoint")
+            debug!("the reconciliation watch is armed; canonical readiness still gates endpoint publication")
         }
         WatchArming::LoopGone => info!(
             "the reconciliation loop will not arm a watch, so this daemon observes no \
-             working-copy edits; publishing the endpoint so it stays reachable"
+             working-copy edits; canonical readiness still gates endpoint publication"
         ),
         WatchArming::TimedOut => warn!(
             bound_s = bound.as_secs(),
@@ -1829,12 +2096,12 @@ mod watch_arming_log_tests {
                 (
                     tracing::Level::INFO,
                     "the reconciliation loop will not arm a watch, so this daemon observes no \
-                     working-copy edits; publishing the endpoint so it stays reachable"
+                     working-copy edits; canonical readiness still gates endpoint publication"
                         .to_string(),
                 ),
                 (
                     tracing::Level::DEBUG,
-                    "the reconciliation watch is armed; publishing the daemon endpoint".to_string(),
+                    "the reconciliation watch is armed; canonical readiness still gates endpoint publication".to_string(),
                 ),
             ],
             "the no-watch arm and enabled control must make different operator-facing promises"
@@ -2115,6 +2382,30 @@ fn record_self_termination(kin_root: &std::path::Path, ending: SelfTermination) 
 /// The exit is what releases the store lock, and nothing before it does, so a
 /// successor cannot take the store while a flush this cut short is still
 /// writing.
+/// Never return to a caller that could drop publication or singleton custody.
+/// The diagnostic is optional and bounded; it is not the required DB record.
+pub(crate) fn protected_prepared_publication_stop(
+    root: std::path::PathBuf,
+    operation: kin_model::OperationId,
+    reason: &'static str,
+) -> ! {
+    let (done, received) = std::sync::mpsc::channel();
+    let _ = std::thread::Builder::new()
+        .name("prepared-publication-death-note".into())
+        .spawn(move || {
+            record_self_termination(&root, SelfTermination {
+                killed_by: "kin-daemon prepared publication",
+                reason: reason.to_string(),
+                in_flight: Some(format!("unresolved prepared operation {operation}; required recovery must precede serving")),
+            });
+            let _ = done.send(());
+        });
+    let _ = received.recv_timeout(Duration::from_millis(100));
+    #[cfg(test)]
+    pause_before_exit_for_test();
+    std::process::exit(70);
+}
+
 fn end_this_daemon(ending: Option<(std::path::PathBuf, SelfTermination)>) -> ! {
     if let Some((kin_root, ending)) = ending {
         record_self_termination(&kin_root, ending);
@@ -2229,6 +2520,23 @@ fn control_plane_demands_shutdown(
     }
 }
 
+/// The window the idle monitor decides against this tick, or `None` when the
+/// daemon never idles out.
+///
+/// Read every tick rather than closed over at startup. An attached client whose
+/// session outlasts the window this daemon was spawned with can raise it (see
+/// `DaemonState::raise_idle_timeout`), and a monitor holding the old value would
+/// shut down underneath the client that just said so. A caller that asked the
+/// daemon to retire makes it zero, which drops only the wait: every gate
+/// `ready_for_idle_shutdown` applies still holds, and a daemon configured never
+/// to idle out honours the request the same way.
+fn monitor_window(state: &DaemonState) -> Option<Duration> {
+    if state.retirement_requested() {
+        return Some(Duration::ZERO);
+    }
+    state.idle_timeout()
+}
+
 async fn run_idle_monitor(
     state: Arc<DaemonState>,
     idle_timeout: Option<Duration>,
@@ -2236,58 +2544,24 @@ async fn run_idle_monitor(
     cancel_tx: tokio::sync::watch::Sender<bool>,
     mut cancel_rx: tokio::sync::watch::Receiver<bool>,
 ) {
-    let Some(idle_timeout) = idle_timeout else {
-        // Endpoint repair is the idle monitor's other job, so it must keep
-        // running even for a daemon that never idles out.
-        loop {
-            tokio::select! {
-                _ = tokio::time::sleep(CONTROL_PLANE_CHECK_INTERVAL) => {}
-                _ = cancel_rx.changed() => return,
-            }
-            if *cancel_rx.borrow() {
-                return;
-            }
-            if control_plane_demands_shutdown(&state, bound_port, *cancel_rx.borrow()) {
-                let _ = cancel_tx.send(true);
-                return;
-            }
-        }
-    };
-    // Start the idle window from when monitoring begins, not from process
-    // construction. `last_activity_ms` is seeded to 0, so without this the
-    // idle clock counts from `started_at` — which includes snapshot load and
-    // projection rebuild — and a short timeout can fire before the daemon has
-    // ever served a request, racing clients that haven't connected yet.
-    state.touch_activity();
-    info!(
-        idle_timeout_s = idle_timeout.as_secs_f64(),
-        "daemon idle shutdown enabled"
-    );
+    if let Some(idle_timeout) = idle_timeout {
+        // Start the idle window from when monitoring begins, not from process
+        // construction. `last_activity_ms` is seeded to 0, so without this the
+        // idle clock counts from `started_at` — which includes snapshot load and
+        // projection rebuild — and a short timeout can fire before the daemon has
+        // ever served a request, racing clients that haven't connected yet.
+        state.touch_activity();
+        info!(
+            idle_timeout_s = idle_timeout.as_secs_f64(),
+            "daemon idle shutdown enabled"
+        );
+    }
 
     loop {
-        // Re-read the window every tick rather than closing over the startup
-        // value. An attached client whose session outlasts the window this
-        // daemon was spawned with can raise it (see
-        // `DaemonState::raise_idle_timeout`), and a monitor holding the old
-        // value would shut down underneath the client that just said so.
-        let Some(idle_timeout) = state.idle_timeout() else {
-            // Only reachable if the window were switched off mid-run, which
-            // raising cannot do. Treat it as "never idles out" rather than as
-            // "idle out now".
-            tokio::select! {
-                _ = tokio::time::sleep(CONTROL_PLANE_CHECK_INTERVAL) => {}
-                _ = cancel_rx.changed() => return,
-            }
-            if *cancel_rx.borrow() {
-                return;
-            }
-            if control_plane_demands_shutdown(&state, bound_port, *cancel_rx.borrow()) {
-                let _ = cancel_tx.send(true);
-                return;
-            }
-            continue;
-        };
-        let check_interval = idle_check_interval(idle_timeout);
+        // Endpoint repair is the idle monitor's other job, so it keeps running
+        // at the control-plane cadence for a daemon that never idles out.
+        let check_interval =
+            monitor_window(&state).map_or(CONTROL_PLANE_CHECK_INTERVAL, idle_check_interval);
         tokio::select! {
             _ = tokio::time::sleep(check_interval) => {}
             _ = cancel_rx.changed() => return,
@@ -2300,11 +2574,15 @@ async fn run_idle_monitor(
             let _ = cancel_tx.send(true);
             return;
         }
-        // Re-read once more before deciding: a raise that landed during the
-        // sleep above must be honoured by this tick, not the next one.
-        let idle_timeout = state.idle_timeout().unwrap_or(idle_timeout);
+        // Re-read once more before deciding: a raise or a retirement request
+        // that landed during the sleep above must be honoured by this tick, not
+        // the next one.
+        let Some(window) = monitor_window(&state) else {
+            continue;
+        };
+        let retiring = state.retirement_requested();
         let control_plane = classify_control_plane(&state);
-        if ready_for_idle_shutdown(&state, idle_timeout, control_plane) {
+        if ready_for_idle_shutdown(&state, window, control_plane) {
             if state.is_dirty() {
                 if repository_root_missing(&state) {
                     warn!(
@@ -2329,10 +2607,14 @@ async fn run_idle_monitor(
                     }
                 }
             }
-            info!(
-                idle_ms = state.idle_duration().as_millis(),
-                "daemon idle timeout reached, shutting down"
-            );
+            if retiring {
+                info!("daemon asked to retire and nothing needs it now, shutting down");
+            } else {
+                info!(
+                    idle_ms = state.idle_duration().as_millis(),
+                    "daemon idle timeout reached, shutting down"
+                );
+            }
             let _ = cancel_tx.send(true);
             return;
         }
@@ -2344,7 +2626,124 @@ async fn run_idle_monitor(
 /// Operational state, beside the pid and port files, not semantic authority: it
 /// records what a background pass DID, and nothing answers a query from it.
 fn lsp_enriched_marker_path(state: &DaemonState) -> std::path::PathBuf {
-    state.layout.root().join("lsp-enriched-files.json")
+    lsp_enriched_marker_path_in(&state.layout)
+}
+
+/// [`lsp_enriched_marker_path`] for a store no daemon state has opened yet.
+fn lsp_enriched_marker_path_in(layout: &kin_core::KinLayout) -> std::path::PathBuf {
+    layout.root().join("lsp-enriched-files.json")
+}
+
+/// Which enrichment the completion marker describes.
+///
+/// A file's marker says the sweep has nothing more to ask about it, which is
+/// only true of the enrichment that wrote it. A build that asks more, or
+/// classifies an answer differently, would skip every file an older build
+/// marked and never ask its own questions about them. So the marker carries
+/// this version, and a marker of any other version is ignored and its files
+/// swept again, which is the cheap direction to be wrong in.
+///
+/// Version 2: declined answers are counted apart from failures, a file pass
+/// keeps what it proved around a failure, and the uses-type arm skips a
+/// declined position instead of stopping. Unversioned markers are version 1.
+///
+/// Version 3: a Go method's reference sites are proven one by one and recorded
+/// under [`kin_model::LSP_PROVEN_METHOD_REFERENCES_RULE`]. Version 2 recorded
+/// gopls's widened answer as it came, and readers take those records as no
+/// evidence, so a Go file a version 2 pass enriched is swept again to re-derive
+/// its methods' sites. Nothing else about the enrichment changed, so a version
+/// 2 marker still stands for every other file (see [`decode_enriched_marker`]).
+// Version 4 re-asks Python under an explicitly initialized workspace. Other
+// languages retain their version-3 completion; version-2 Go also stays owed.
+const LSP_ENRICHMENT_MARKER_VERSION: u32 = 4;
+
+/// The version whose Go files predate proven Go method reference sites and
+/// whose other files are still this build's enrichment.
+const LSP_ENRICHMENT_MARKER_VERSION_BEFORE_PROVEN_GO_METHOD_REFERENCES: u32 = 2;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct EnrichedMarker {
+    version: u32,
+    files: Vec<String>,
+}
+
+/// The marker's bytes for `files`, at this build's version.
+pub(crate) fn encode_enriched_marker(files: &[String]) -> Vec<u8> {
+    serde_json::to_vec(&EnrichedMarker {
+        version: LSP_ENRICHMENT_MARKER_VERSION,
+        files: files.to_vec(),
+    })
+    .unwrap_or_default()
+}
+
+/// The files a marker names that this build's enrichment has nothing more to
+/// ask about.
+///
+/// This build's marker keeps every file. Version 3 keeps all but Python,
+/// whose initialization scope changed. Version 2 also drops Go, whose method
+/// reference sites were not independently proven. Other languages retain their
+/// completion without a new pass. Any other version marks nothing.
+pub(crate) fn decode_enriched_marker(bytes: &[u8]) -> Option<Vec<String>> {
+    let marker = serde_json::from_slice::<EnrichedMarker>(bytes).ok()?;
+    match marker.version {
+        LSP_ENRICHMENT_MARKER_VERSION => Some(marker.files),
+        3 => Some(
+            marker
+                .files
+                .into_iter()
+                .filter(|file| !kin_core::lsp_scope::is_python_path(file))
+                .collect(),
+        ),
+        LSP_ENRICHMENT_MARKER_VERSION_BEFORE_PROVEN_GO_METHOD_REFERENCES => Some(
+            marker
+                .files
+                .into_iter()
+                .filter(|file| {
+                    !kin_lsp::enrichment::is_go_source(file)
+                        && !kin_core::lsp_scope::is_python_path(file)
+                })
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+/// Whether a marker's bytes were written before a Go method's reference sites
+/// were proven, so its Go files are swept again.
+fn marker_predates_proven_go_method_references(bytes: &[u8]) -> bool {
+    serde_json::from_slice::<EnrichedMarker>(bytes).is_ok_and(|marker| {
+        marker.version == LSP_ENRICHMENT_MARKER_VERSION_BEFORE_PROVEN_GO_METHOD_REFERENCES
+            && marker
+                .files
+                .iter()
+                .any(|file| kin_lsp::enrichment::is_go_source(file))
+    })
+}
+
+/// The marker set a previous daemon persisted. Absent, unreadable, malformed
+/// and written by another enrichment version all read as `None`, which every
+/// caller takes to mean nothing is known to be enriched.
+fn read_enriched_marker(layout: &kin_core::KinLayout) -> Option<Vec<String>> {
+    let bytes = std::fs::read(lsp_enriched_marker_path_in(layout)).ok()?;
+    let files = decode_enriched_marker(&bytes).map(|mut files| {
+        if !kin_core::lsp_scope::upgrade_recorded(layout) {
+            files.retain(|file| !kin_core::lsp_scope::is_python_path(file));
+        }
+        files
+    });
+    if files.is_none() && !bytes.is_empty() {
+        info!(
+            "ignoring a language-server enrichment marker another enrichment version wrote; \
+             the files it names are swept again"
+        );
+    }
+    if marker_predates_proven_go_method_references(&bytes) {
+        info!(
+            "the language-server enrichment marker predates proven Go method reference \
+             sites; its Go files are swept again"
+        );
+    }
+    files
 }
 
 /// Load the marker set, so a daemon that restarts does not re-sweep a graph a
@@ -2370,11 +2769,8 @@ fn lsp_enriched_marker_path(state: &DaemonState) -> std::path::PathBuf {
 ///
 /// The scan runs only when a marker exists, and costs one snapshot at startup
 /// beside a read-index build that already walks the whole graph.
-fn load_lsp_enriched_marker(state: &DaemonState) {
-    let Ok(bytes) = std::fs::read(lsp_enriched_marker_path(state)) else {
-        return;
-    };
-    let Ok(files) = serde_json::from_slice::<Vec<String>>(&bytes) else {
+pub(crate) fn load_lsp_enriched_marker(state: &DaemonState) {
+    let Some(files) = read_enriched_marker(&state.layout) else {
         return;
     };
     if files.is_empty() {
@@ -2442,9 +2838,10 @@ pub(crate) fn current_marker_epoch(state: &DaemonState) -> u64 {
 /// also what keeps this file's raw filesystem touches to the three the
 /// zero-file-search allowlist accounts for.
 fn persist_enriched_marker(state: &DaemonState, files: &[String]) {
-    if let Ok(bytes) = serde_json::to_vec(files) {
-        let _ = std::fs::write(lsp_enriched_marker_path(state), bytes);
-    }
+    let _ = std::fs::write(
+        lsp_enriched_marker_path(state),
+        encode_enriched_marker(files),
+    );
 }
 
 pub(crate) fn mark_files_enriched(state: &DaemonState, files: &[String], captured_epoch: u64) {
@@ -2473,8 +2870,11 @@ pub(crate) fn mark_files_enriched(state: &DaemonState, files: &[String], capture
             );
             return;
         }
+        let python_scope_current = kin_core::lsp_scope::upgrade_recorded(&state.layout);
         for file in files {
-            marked.insert(file.clone());
+            if python_scope_current || !kin_core::lsp_scope::is_python_path(file) {
+                marked.insert(file.clone());
+            }
         }
         // Written INSIDE the guard, not after it. Written after, an old pass's
         // snapshot could reach the file behind the cleared write a merge just
@@ -2505,31 +2905,94 @@ pub(crate) fn mark_files_enriched(state: &DaemonState, files: &[String], capture
 /// the answers, a wrong re-sweep only costs time. The persisted set is rewritten
 /// so a restart does not reload the entry this just dropped.
 pub(crate) fn retire_enrichment_marker(state: &DaemonState, files: &[String]) {
+    if let Err(error) = retire_enrichment_marker_checked(state, files) {
+        warn!(%error, "could not persist retired LSP completion markers");
+    }
+}
+
+/// Prepared publication must not report success while an old durable marker
+/// can make a future sweep skip the source it just changed.
+pub(crate) fn retire_enrichment_marker_checked(
+    state: &DaemonState,
+    files: &[String],
+) -> Result<()> {
     if files.is_empty() {
-        return;
+        return Ok(());
     }
-    let snapshot = {
-        let Ok(mut marked) = state.lsp_enriched_files.lock() else {
-            return;
-        };
-        let mut retired = 0usize;
-        for file in files {
-            if marked.remove(file) {
-                retired += 1;
-            }
-        }
-        if retired == 0 {
-            return;
-        }
-        marked.iter().cloned().collect::<Vec<_>>()
-    };
-    debug!(
-        files = files.len(),
-        "retired the enrichment marker for edited files; the next sweep re-enriches them"
-    );
-    if let Ok(bytes) = serde_json::to_vec(&snapshot) {
-        let _ = std::fs::write(lsp_enriched_marker_path(state), bytes);
+    let mut marked = state.lsp_enriched_files.lock().map_err(|_| {
+        DaemonError::Io(std::io::Error::other(
+            "LSP completion marker lock is poisoned",
+        ))
+    })?;
+    // Also invalidate a sweep that has captured the old source but has not
+    // marked it yet. Keep unrelated completed paths; only in-flight marks need
+    // to prove the new epoch before they can be published.
+    state
+        .lsp_enriched_marker_epoch
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let mut remaining: Vec<_> = marked
+        .iter()
+        .filter(|file| !files.contains(file))
+        .cloned()
+        .collect();
+    // Rewrite even if memory had no matching path: startup may have ignored
+    // an old on-disk set because none of its LSP evidence survived. That set
+    // must not become eligible again after unrelated enrichment is published.
+    remaining.sort();
+    // Keep the marker lock through persistence, matching mark_files_enriched:
+    // no older set may race this write and restore a retired skip on restart.
+    write_retired_marker(&state.layout, &remaining)?;
+    // The marker and the evidence it certifies move together. A file whose
+    // marker is retired has bindings the recorded relations may no longer
+    // describe, and replaying them on the next start would reinstall exactly
+    // the stale edges this retirement exists to drop.
+    crate::accepted_enrichment::retire(&state.layout, files);
+    marked.retain(|file| !files.contains(file));
+    Ok(())
+}
+
+/// Persist what remains of the marker set after a retirement.
+fn write_retired_marker(layout: &kin_core::KinLayout, remaining: &[String]) -> Result<()> {
+    std::fs::write(
+        lsp_enriched_marker_path_in(layout),
+        encode_enriched_marker(remaining),
+    )
+    .map_err(DaemonError::Io)
+}
+
+/// Retire the markers, and the accepted evidence that moves with them, of the
+/// files a publication recovered at startup changed.
+///
+/// Live finalization retires them through [`retire_enrichment_marker_checked`]
+/// right after a session publication commits. A daemon that dies in between
+/// leaves authority holding the new bodies while the marker still names them,
+/// and startup recovery installs the publication without that finalization.
+/// The next daemon then honors the marker, and its sweep skips exactly the
+/// files the publication changed. This runs before any daemon state exists,
+/// so there is no in-memory set or in-flight sweep to fence, only the
+/// persisted records.
+///
+/// A failed rewrite refuses rather than warns, so recovery retries it on the
+/// next start instead of serving the skip.
+pub(crate) fn retire_enrichment_marker_before_hydration(
+    layout: &kin_core::KinLayout,
+    files: &[String],
+) -> Result<()> {
+    if files.is_empty() {
+        return Ok(());
     }
+    if let Some(marked) = read_enriched_marker(layout) {
+        let remaining: Vec<String> = marked
+            .iter()
+            .filter(|file| !files.contains(file))
+            .cloned()
+            .collect();
+        if remaining.len() != marked.len() {
+            write_retired_marker(layout, &remaining)?;
+        }
+    }
+    crate::accepted_enrichment::retire(layout, files);
+    Ok(())
 }
 
 fn buffer_lsp_startup(
@@ -2634,6 +3097,10 @@ pub(crate) fn retire_enrichment_evidence_for_merge(state: &DaemonState) {
         if retired > 0 {
             persist_enriched_marker(state, &[]);
         }
+        // The whole marker set goes, so the whole evidence record goes with it:
+        // what a merge invalidates is the cross-file binding these relations
+        // name, not only the files it changed.
+        crate::accepted_enrichment::clear(&state.layout);
         retired
     };
     if retired > 0 {
@@ -2805,13 +3272,17 @@ pub(crate) struct ProcessRow {
 /// the life of the container. Skipping the row outright loses nothing a real
 /// child would have contributed, because Linux parents a process forked from a
 /// thread to the thread's PROCESS, so no real descendant ever hangs off a tid.
-pub(crate) fn tree_footprint_from(
+///
+/// It answers with the descendant pids it charged beside the figure, out of the
+/// one traversal, so a caller that grades which processes were counted grades
+/// this fold rather than a second copy of its rules.
+pub(crate) fn tree_footprint_and_descendants(
     root: u32,
     rows: &[ProcessRow],
-) -> kin_core::memory_pressure::TreeFootprint {
+) -> (kin_core::memory_pressure::TreeFootprint, Vec<u32>) {
     let mut own_bytes = 0;
     let mut children_bytes = 0u64;
-    let mut child_count = 0usize;
+    let mut descendants = Vec::new();
     let mut visited = std::collections::HashSet::from([root]);
     let mut frontier = vec![root];
     while let Some(pid) = frontier.pop() {
@@ -2829,16 +3300,29 @@ pub(crate) fn tree_footprint_from(
                 continue;
             }
             children_bytes = children_bytes.saturating_add(row.footprint_bytes);
-            child_count += 1;
+            descendants.push(row.pid);
             frontier.push(row.pid);
         }
     }
-    kin_core::memory_pressure::TreeFootprint {
-        own_bytes,
-        children_bytes,
-        child_count,
-        kernel_capped: false,
-    }
+    (
+        kin_core::memory_pressure::TreeFootprint {
+            own_bytes,
+            children_bytes,
+            child_count: descendants.len(),
+            kernel_capped: false,
+        },
+        descendants,
+    )
+}
+
+/// The fold above without its pid list, for a reader that needs only the
+/// figure. The synthetic-table checks take this; the walk takes both.
+#[cfg(test)]
+pub(crate) fn tree_footprint_from(
+    root: u32,
+    rows: &[ProcessRow],
+) -> kin_core::memory_pressure::TreeFootprint {
+    tree_footprint_and_descendants(root, rows).0
 }
 
 /// How long a sampled footprint is reused before the process table is walked
@@ -2896,6 +3380,12 @@ pub(crate) fn seed_tree_footprint_for_test(footprint: kin_core::memory_pressure:
 /// accessor states the intent without arguing with a guard that is right to be
 /// blunt.
 fn walk_process_table() -> Option<kin_core::memory_pressure::TreeFootprint> {
+    walk_process_table_with_descendants().map(|(footprint, _)| footprint)
+}
+
+/// [`walk_process_table`], with the descendant pids the fold charged.
+fn walk_process_table_with_descendants(
+) -> Option<(kin_core::memory_pressure::TreeFootprint, Vec<u32>)> {
     let (me, rows) = current_process_rows()?;
     if rows.is_empty() {
         return None;
@@ -2911,11 +3401,14 @@ fn walk_process_table() -> Option<kin_core::memory_pressure::TreeFootprint> {
     {
         return None;
     }
-    let folded = tree_footprint_from(me, &rows);
+    let (folded, descendants) = tree_footprint_and_descendants(me, &rows);
     // Held to what the kernel says this container is charged, so the figure a
     // reader sees beside a cap can never exceed it. Off a cgroup there is no
     // such ceiling and the reading stands as measured.
-    Some(folded.clamped_to(kin_daemon_spawn::cgroup_memory().current_bytes))
+    Some((
+        folded.clamped_to(kin_daemon_spawn::cgroup_memory().current_bytes),
+        descendants,
+    ))
 }
 
 /// This process's pid and the host's process table as rows the fold can take.
@@ -3179,6 +3672,11 @@ pub(crate) fn publish_footprint_standing_on_idle_tick(state: &DaemonState) {
 /// be the one field worth having promptly. Both the interval and the rung are
 /// this store's own; see [`FOOTPRINT_LAST_PUBLISH`].
 pub(crate) fn publish_footprint_standing(state: &DaemonState, call: &PressureCall) {
+    // Optional query reuse must yield memory before heavy work waits for it.
+    // Observe even without a readable process tree, and before publication's
+    // rate limit: a host pressure reading still owns this retention decision.
+    // The current verdict remains conservative until a later real sample.
+    state.xref_graph_cache.observe_pressure(call.level);
     let Some(standing) = call.standing.as_ref() else {
         return;
     };
@@ -4041,6 +4539,48 @@ fn lsp_query_column(signature: &str, name: &str, start_col: u32) -> u32 {
     start_col
 }
 
+/// The language-server view of one graph entity, as every enrichment path in
+/// this daemon builds it: its span in `file_path`, where its name is asked
+/// about, and whether it declares a name of its own at all.
+///
+/// The name sits on the declaration line, which is not the span's first line
+/// when the parser widened the span over what precedes the declaration: a
+/// decorated Python definition opens on its first decorator, and a Rust item
+/// on its doc comments. Asked on that first line, a decorated method's column
+/// ran past the end of `@property` and failed its whole file's pass. The column
+/// is a hint from the signature; `kin_lsp` asks at the token the admitted
+/// source spells the name with, which differs from the hint whenever the
+/// signature is not a copy of the declaration line.
+pub fn lsp_entity_ref(entity: &kin_model::Entity, file_path: &str) -> Option<kin_lsp::EntityRef> {
+    let span = entity.span.as_ref()?;
+    let (start_line, end_line) = (span.start_line as u32, span.end_line as u32);
+    let name_line = entity
+        .metadata
+        .extra
+        .get(kin_parser::DECLARATION_LINE_KEY)
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|line| u32::try_from(line).ok())
+        .filter(|line| (start_line..=end_line).contains(line))
+        .unwrap_or(start_line);
+    let hint_start = if name_line == start_line {
+        span.start_col as u32
+    } else {
+        0
+    };
+    Some(kin_lsp::EntityRef {
+        id: entity.id,
+        name: entity.name.clone(),
+        file_path: file_path.to_owned(),
+        start_line,
+        start_col: span.start_col as u32,
+        end_line,
+        name_line,
+        name_col: lsp_query_column(&entity.signature, &entity.name, hint_start),
+        declares_name: kin_lsp::EntityRef::kind_declares_name(entity.kind),
+        kind: entity.kind,
+    })
+}
+
 /// What a cold sweep did with every file it walked.
 ///
 /// The sweep used to report only the files it counted, and it counted a file in
@@ -4055,13 +4595,24 @@ fn lsp_query_column(signature: &str, name: &str, start_col: u32) -> u32 {
 /// catches the next one that does not.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct SweepTally {
-    /// Files the sweep queried a language server about.
+    /// Files whose language-server passes all completed in this sweep.
     enriched: usize,
+    /// Files the sweep asked about whose passes did not all complete: a query
+    /// got no answer, one ran over its budget, the server died partway through
+    /// the file, or the pass's inputs moved underneath it.
+    ///
+    /// Kept apart from `enriched` because the two are opposite outcomes of the
+    /// same visit. Counting both as enriched is how a sweep whose server died
+    /// after its handshake reported 546 of 546 files done with no answer to any
+    /// of them. What these files got stays in the graph; they are not marked,
+    /// and those whose queries went unanswered are owed.
+    held_back: usize,
     /// Files skipped because this graph already holds server evidence for them.
     already_enriched: usize,
     /// Files whose extension maps to no language this build enriches.
     unsupported_language: usize,
-    /// Files whose language server could not be started.
+    /// Files whose language server could not be started, or had stopped
+    /// answering before the sweep asked about them.
     server_unavailable: usize,
     /// Files whose source could not be loaded from graph authority.
     source_unreadable: usize,
@@ -4071,7 +4622,17 @@ struct SweepTally {
     /// carries it. These files are still visited and still get the per-entity
     /// arm, so they are not blocked; what they lost is the definitions pass.
     definitions_over_budget: usize,
+    /// Queries that got no considered answer: a timeout, a dead server, an
+    /// answer this build could not decode or refused to trust, or one of the
+    /// protocol's "ask again" codes. A file with one is held back and owed.
     query_failures: usize,
+    /// Queries the server answered by declining them, such as gopls's
+    /// `typeDefinition` at a keyword. Counted for the completion line, never
+    /// held against a file: asking again returns the same answer.
+    query_declines: usize,
+    /// Owed files whose backoff had not run out, so this pass did not ask
+    /// about them again. They stay owed and are named on the status surface.
+    owed_deferred: usize,
     /// Whether the loop stopped before walking every file, on shutdown or on
     /// the background-work supervisor's verdict.
     ///
@@ -4086,9 +4647,20 @@ struct SweepTally {
 
 impl SweepTally {
     /// What the sweep reports as `files`, and what `/lsp/sweep/status` serves
-    /// as `files_done`. Unchanged in meaning: a file the sweep is done with.
+    /// as `files_done`: a file the sweep is done with, because its passes
+    /// completed or because it was already enriched. A held-back file is not
+    /// done.
     fn files_processed(&self) -> usize {
         self.enriched + self.already_enriched
+    }
+
+    /// Files the sweep asked a language server about, whatever came of it.
+    ///
+    /// The work-attempt count, for the accounting that is about effort rather
+    /// than success: the interruption breaker, and the check that every asked
+    /// file landed in exactly one of the two marker sets.
+    fn visited(&self) -> usize {
+        self.enriched + self.held_back
     }
 
     /// Files the sweep walked past without being able to do anything.
@@ -4101,7 +4673,9 @@ impl SweepTally {
     /// Shared arithmetic for the two questions below; on its own it cannot say
     /// which of them applies, which is exactly the confusion this split fixes.
     fn unreached(&self, total_files: usize) -> usize {
-        total_files.saturating_sub(self.files_processed() + self.blocked())
+        total_files.saturating_sub(
+            self.files_processed() + self.held_back + self.blocked() + self.owed_deferred,
+        )
     }
 
     /// Files the loop never walked because it was told to stop.
@@ -4143,8 +4717,17 @@ impl SweepTally {
         if total_files == 0 || self.files_processed() > 0 || self.ended_early {
             return None;
         }
+        // Waiting out a backoff is not being blocked, and neither is asking and
+        // getting no complete answer. Those files are owed and named on the
+        // status surface, with what failed and when they are asked again.
+        if (self.owed_deferred > 0 || self.held_back > 0) && self.blocked() == 0 {
+            return None;
+        }
         if self.server_unavailable > 0 {
-            return Some("no language server could be started for these files");
+            return Some(
+                "no language server could serve these files: none started, or the one that \
+                 started stopped answering",
+            );
         }
         if self.source_unreadable > 0 {
             return Some("their source could not be read from graph authority");
@@ -4172,6 +4755,129 @@ fn file_passes_completed(
         && tally.definitions_over_budget == definitions_over_budget_before
 }
 
+/// Why a file whose every query was declined is owed rather than enriched.
+///
+/// A decline is an answer about a position, and a file whose server declined
+/// some positions and answered others is done. A file it answered nothing at
+/// all about is different: gopls reports "no package metadata for file" with
+/// the same code as an ordinary decline, so a package it could not load reads
+/// as a file of nothing but declines. Marking that file would record it as
+/// enriched with no evidence and never ask again, so it is owed instead, and
+/// asked again after its backoff.
+fn declined_everything(declined: usize, answered: u64) -> Option<String> {
+    (declined > 0 && answered == 0).then(|| {
+        format!(
+            "the language server declined all {declined} queries about this file and answered \
+             none, which is how a server reports a file it could not load"
+        )
+    })
+}
+
+/// How many owed files the held-back warning names before it points at the
+/// status surface, which names every one.
+const OWED_FILES_LOGGED: usize = 20;
+
+/// Load the owed-file record a previous daemon left, beside the marker it
+/// records the other half of.
+fn load_lsp_owed_files(state: &DaemonState) {
+    let owed = crate::owed_enrichment::load(&state.layout);
+    if owed.is_empty() {
+        return;
+    }
+    info!(
+        owed = owed.len(),
+        "loaded the files earlier sweeps owe; each is asked again when its backoff ends or its \
+         bytes change"
+    );
+    if let Ok(mut slot) = state.lsp_owed_files.lock() {
+        *slot = owed;
+    }
+}
+
+/// What a sweep does with one file before it asks a server anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SweepGate {
+    /// The file's enrichment is durable: skip it.
+    AlreadyEnriched,
+    /// The file is owed and its backoff has not run out: defer it.
+    Owed { retry_in: Duration },
+    /// Ask about it.
+    Ask,
+}
+
+/// The sweep's decision for one file, in the order the sweep takes it: a
+/// marked file is skipped, an owed one waits out its backoff, and anything
+/// else is asked about.
+fn sweep_gate(
+    state: &DaemonState,
+    owed: &crate::owed_enrichment::OwedFiles,
+    file: &str,
+    blob: Option<&str>,
+    retry_owed_now: bool,
+    now_unix_s: u64,
+) -> SweepGate {
+    if file_already_enriched(state, file) {
+        return SweepGate::AlreadyEnriched;
+    }
+    match owed_backoff_remaining(owed, file, blob, retry_owed_now, now_unix_s) {
+        Some(retry_in) => SweepGate::Owed { retry_in },
+        None => SweepGate::Ask,
+    }
+}
+
+/// How long an owed file still waits before a sweep asks about it again, or
+/// `None` when the sweep should ask now.
+///
+/// Asked right after the already-enriched skip, so a marked file is never
+/// asked about and an owed one is asked only once its backoff ends, its bytes
+/// change, or someone asks for a sweep outright.
+fn owed_backoff_remaining(
+    owed: &crate::owed_enrichment::OwedFiles,
+    file: &str,
+    blob: Option<&str>,
+    retry_owed_now: bool,
+    now_unix_s: u64,
+) -> Option<Duration> {
+    if retry_owed_now {
+        return None;
+    }
+    crate::owed_enrichment::retry_after(owed.get(file)?, blob?, now_unix_s)
+}
+
+/// Bring the owed-file record up to date with the pass that just ended, and
+/// return how many files are still owed.
+///
+/// A file this pass recorded as enriched is owed nothing. A file whose queries
+/// got no answer is owed one more attempt, keyed to the bytes it was asked
+/// about. A file no longer in the tree is dropped, since there is nothing left
+/// to ask about. Written only when something changed.
+fn settle_owed_files(
+    state: &DaemonState,
+    inputs: &lsp_publication::QueryInputs,
+    recorded: &[String],
+    failed: &[(String, String)],
+) -> usize {
+    let Ok(mut owed) = state.lsp_owed_files.lock() else {
+        return 0;
+    };
+    let before = owed.clone();
+    for file in recorded {
+        owed.remove(file);
+    }
+    owed.retain(|file, _| inputs.blob(file).is_some());
+    let now = crate::owed_enrichment::now_unix_s();
+    for (file, reason) in failed {
+        let Some(blob) = inputs.blob(file) else {
+            continue;
+        };
+        crate::owed_enrichment::record_failure(&mut owed, file, &blob, reason.clone(), now);
+    }
+    if *owed != before {
+        crate::owed_enrichment::persist(&state.layout, &owed);
+    }
+    owed.len()
+}
+
 /// Record `files` as durably enriched, when this sweep's write was durable.
 ///
 /// `files` holds only the files whose passes completed ([`file_passes_completed`]).
@@ -4195,6 +4901,83 @@ fn mark_completed_sweep_files(
     true
 }
 
+/// How one enrichment reservation ends.
+///
+/// A stale capture is not failed work when the retry it asked for was queued:
+/// the graph moved, the answers from the old snapshot are discarded, and the
+/// fresh sweep owns the same job. Counting that attempt sticks `failed_work`
+/// after the retry has already succeeded, which is what made a drained mixin
+/// sweep unreadable. A retry that could not be queued, and any other
+/// incomplete attempt, still count.
+enum EnrichmentAttempt {
+    Finished,
+    Superseded { retry_queued: bool },
+    Failed,
+}
+
+fn enrichment_attempt_after_sweep(
+    succeeded: bool,
+    superseded: bool,
+    retry_queued: bool,
+) -> EnrichmentAttempt {
+    if succeeded {
+        EnrichmentAttempt::Finished
+    } else if superseded {
+        EnrichmentAttempt::Superseded { retry_queued }
+    } else {
+        EnrichmentAttempt::Failed
+    }
+}
+
+fn settle_enrichment_attempt(work: &mut crate::state::LspWorkGuard, attempt: EnrichmentAttempt) {
+    match attempt {
+        EnrichmentAttempt::Finished | EnrichmentAttempt::Superseded { retry_queued: true } => {
+            work.complete()
+        }
+        EnrichmentAttempt::Superseded {
+            retry_queued: false,
+        }
+        | EnrichmentAttempt::Failed => {}
+    }
+}
+
+/// Whether the pending-sweep bit was consumed, which is how the worker tells
+/// that [`lsp_publication::request_fresh_sweep`] actually queued the retry.
+fn fresh_sweep_was_queued(state: &DaemonState) -> bool {
+    !state
+        .lsp_sweep_pending
+        .load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Whether one incremental file's reservation finished.
+///
+/// A language-server query arm can return an error for a position that is not
+/// a symbol, and this path does not requeue that file. Treating the error as
+/// abandoned work leaves `failed_work` set after the relations that did
+/// publish are already in the graph, which is what `enrichment_drained` reads
+/// as incomplete. A stale snapshot is the sweep's job. A relation the graph
+/// refused, or a vector invalidation that failed, is still unfinished.
+///
+/// Not abandoned work is not the same as nothing happened. Those query errors
+/// are counted and published on the enrichment status, because the sweep path
+/// grades its own through `sweep_work_succeeded` and leaving the incremental
+/// side with no record at all grades one failure twice and the same failure
+/// nowhere. The count never gates completion, which is the whole point.
+fn finish_incremental_reservation(
+    work: &mut crate::state::LspWorkGuard,
+    refused: Option<lsp_publication::Refused>,
+    lost: usize,
+    vector_stale: usize,
+    failed_queries: usize,
+) {
+    work.record_query_failures(failed_queries);
+    match refused {
+        None if lost == 0 && vector_stale == 0 => work.complete(),
+        Some(lsp_publication::Refused::Stale) => work.complete(),
+        Some(lsp_publication::Refused::UnprovenSource) | None => {}
+    }
+}
+
 fn sweep_work_succeeded(
     tally: &SweepTally,
     total_files: usize,
@@ -4207,6 +4990,9 @@ fn sweep_work_succeeded(
         && tally.not_visited(total_files) == 0
         && tally.definitions_over_budget == 0
         && tally.query_failures == 0
+        // A pass that left owed files waiting did not finish the work either,
+        // even though it failed nothing itself.
+        && tally.owed_deferred == 0
         && relations.lost() == 0
         && relations.vector_stale == 0
         && (relations.published == 0 || published)
@@ -4293,22 +5079,55 @@ fn lsp_file_definitions_budget() -> Duration {
 /// than losing it. Split out from the call site so the budget decision can be
 /// tested against a provider that never answers, which is the case that
 /// motivated it and the one a live language server will not reproduce on demand.
-async fn file_definitions_within_budget<F, E>(
+///
+/// Returns the pass's result and, when it failed or ran over, what happened,
+/// which is the reason an owed file carries. A pass the server declined as a
+/// whole is counted as a decline and costs the file nothing.
+async fn file_definitions_within_budget<F>(
     pass: F,
     budget: Duration,
     file: &str,
     tally: &mut SweepTally,
-) -> kin_lsp::file_enrichment::FileEnrichmentResult
+) -> (
+    kin_lsp::file_enrichment::FileEnrichmentResult,
+    Option<String>,
+)
 where
     F: std::future::Future<
-        Output = std::result::Result<kin_lsp::file_enrichment::FileEnrichmentResult, E>,
+        Output = kin_lsp::Result<kin_lsp::file_enrichment::FileEnrichmentResult>,
     >,
 {
     match tokio::time::timeout(budget, pass).await {
-        Ok(Ok(result)) => result,
-        Ok(Err(_)) => {
+        // The relations stand. A query inside the pass that got no answer still
+        // keeps the file from being recorded as enriched, and a declined one is
+        // counted and holds nothing back.
+        Ok(Ok(result)) => {
+            tally.query_failures += result.failed_queries;
+            tally.query_declines += result.declined_queries;
+            let failure = (result.failed_queries > 0).then(|| {
+                format!(
+                    "the file-level definitions pass got no answer to {} of its queries; the \
+                     first: {}",
+                    result.failed_queries,
+                    result.first_failure.as_deref().unwrap_or("not recorded")
+                )
+            });
+            (result, failure)
+        }
+        // The pass as a whole declined: an answer with nothing in it.
+        Ok(Err(error)) if error.is_declined() => {
+            tally.query_declines += 1;
+            (
+                kin_lsp::file_enrichment::FileEnrichmentResult::default(),
+                None,
+            )
+        }
+        Ok(Err(error)) => {
             tally.query_failures += 1;
-            kin_lsp::file_enrichment::FileEnrichmentResult::default()
+            (
+                kin_lsp::file_enrichment::FileEnrichmentResult::default(),
+                Some(format!("the file-level definitions pass failed: {error}")),
+            )
         }
         Err(_) => {
             tally.definitions_over_budget += 1;
@@ -4318,7 +5137,13 @@ where
                 "the file-level definitions pass exceeded its budget and was abandoned for \
                  this file; its language server is not answering"
             );
-            kin_lsp::file_enrichment::FileEnrichmentResult::default()
+            (
+                kin_lsp::file_enrichment::FileEnrichmentResult::default(),
+                Some(format!(
+                    "the file-level definitions pass ran over its {}s budget",
+                    budget.as_secs()
+                )),
+            )
         }
     }
 }
@@ -4403,7 +5228,7 @@ impl std::ops::AddAssign for EnrichmentWrite {
 }
 
 #[derive(Default)]
-struct PendingEnrichment {
+pub(crate) struct PendingEnrichment {
     relations: Vec<kin_model::Relation>,
 }
 
@@ -4476,6 +5301,11 @@ impl PendingEnrichment {
 /// neighbourhood abandons the comparison and offers everything, which costs a
 /// rewrite and can never drop a relation wrongly.
 ///
+/// An offer identical to the held record is dropped before any merge. That is
+/// the same test kin-db's `upsert_relation` makes, and it holds for every
+/// evidence shape, including evidence the site union does not own, such as the
+/// parser's occurrence certificates on a held parser edge.
+///
 /// What it offers for an edge the graph already holds is the union of both
 /// records' sites, by [`with_union_of_sites`], so one pass's positions cannot
 /// erase another's.
@@ -4506,6 +5336,7 @@ fn unheld_lsp_relations(
         .iter()
         .filter_map(|candidate| match held.get(&candidate.id) {
             None => Some(candidate.clone()),
+            Some(held) if held == candidate => None,
             Some(held) => {
                 let merged = with_union_of_sites(held, candidate);
                 (&merged != held).then_some(merged)
@@ -4534,6 +5365,14 @@ const MAX_ENRICHMENT_EVIDENCE: usize = kin_lsp::enrichment::MAX_SITES_PER_EDGE;
 /// produces the same record whichever pass arrives first. That is also what
 /// keeps a converged re-sweep writing nothing, because an offer whose sites the
 /// held record already carries merges back to the held record exactly.
+///
+/// The parser's occurrence certificates are not sites and stay out of that
+/// key. Every one is span-free and they all share one rule, so keyed on span
+/// and rule they collapsed into the first of them and sorted ahead of every
+/// site, the reverse of the order the linker writes. They follow the sites
+/// instead, deduplicated on the whole record and ordered by token, which is
+/// the linker's own order for them, so a held parser edge merges back to
+/// itself. When the ceiling trims a site, that site's certificate goes with it.
 fn with_union_of_sites(
     held: &kin_model::Relation,
     offered: &kin_model::Relation,
@@ -4552,18 +5391,51 @@ fn with_union_of_sites(
 
     let mut merged = offered.clone();
     let mut seen: std::collections::HashSet<_> = std::collections::HashSet::new();
-    let mut evidence: Vec<kin_model::RelationEvidence> = held
+    // An offer of a Go method's proven reference sites replaces the widened
+    // answer an older pass recorded on the same edge, rather than joining it.
+    // Those records are what the proof exists to refuse, readers already take
+    // them as no evidence, and keeping them would hold the edge's evidence
+    // ceiling with sites no pass will ever offer again.
+    let supersedes_widened = offered.evidence.iter().any(|record| {
+        record.parser_rule.as_deref() == Some(kin_model::LSP_PROVEN_METHOD_REFERENCES_RULE)
+    });
+    let (certificates, records): (Vec<_>, Vec<_>) = held
         .evidence
         .iter()
+        .filter(|record| {
+            !(supersedes_widened
+                && record.parser_rule.as_deref() == Some(kin_model::LSP_REFERENCES_RULE))
+        })
         .chain(offered.evidence.iter())
+        .partition(|record| kin_index::occurrence::is_certificate(record));
+    let mut evidence: Vec<kin_model::RelationEvidence> = records
+        .into_iter()
         .filter(|record| seen.insert(key(record)))
         .cloned()
         .collect();
     // An evidence record with no span is a marker rather than a site, and one
     // sorts ahead of every site because its key's file is empty.
     evidence.sort_by(|left, right| key(left).cmp(&key(right)));
-    evidence.truncate(MAX_ENRICHMENT_EVIDENCE);
+    // The ceiling is the producer's cap on the positions one edge records, so
+    // it applies before the certificates join. Counted under it, they took the
+    // places of the last real sites. They need no ceiling of their own, since
+    // the parser writes at most one for each site it recorded.
+    let trimmed = evidence.split_off(evidence.len().min(MAX_ENRICHMENT_EVIDENCE));
+    let mut proofs: Vec<kin_model::RelationEvidence> = Vec::new();
+    for certificate in certificates {
+        if !proofs.contains(certificate) {
+            proofs.push(certificate.clone());
+        }
+    }
+    proofs.sort_by(|left, right| left.token.as_deref().cmp(&right.token.as_deref()));
+    evidence.extend(proofs);
     merged.evidence = evidence;
+    // A certificate whose site the ceiling just trimmed names an occurrence the
+    // edge no longer carries, and one such certificate fails validation for
+    // every other site on the edge. kin-index removes exactly those and keeps
+    // any certificate it cannot vouch for, so an edge whose proofs failed
+    // closed before the merge still fails closed after it.
+    kin_index::occurrence::remove_proofs_of_trimmed_sites(&mut merged, &trimmed);
     merged
 }
 
@@ -4597,7 +5469,17 @@ fn held_relation_ids(
     held
 }
 
+// Test-only protocol injection for old buffer controls and the causal race probe.
+#[cfg(test)]
 pub(crate) fn install_lsp_relations(
+    state: &DaemonState,
+    relations: &[kin_model::Relation],
+) -> EnrichmentWrite {
+    install_lsp_relations_locked(state, relations)
+}
+
+// Called only by lsp_publication with coordination held across union and write.
+fn install_lsp_relations_locked(
     state: &DaemonState,
     relations: &[kin_model::Relation],
 ) -> EnrichmentWrite {
@@ -4613,6 +5495,17 @@ pub(crate) fn install_lsp_relations(
 
     use kin_model::EntityStore;
     let graph_mutation = state.begin_graph_authority_mutation();
+    // No `binding_history::Derivation` guard here, deliberately. Wrapping this
+    // write in one restored a checked binding witness across it, and a fresh
+    // language-server answer is the event that makes the local binding interval
+    // unknown: the edges it installs are unverified input, so an interval
+    // containing one must not keep a checked capability. Three tests say so
+    // directly, over a late fresh call and over two crash prefixes.
+    //
+    // What the committed tree's absence actually needs is the re-offer guard in
+    // kin-db's `upsert_relation`: a sweep that offers edges the graph already
+    // holds changes nothing and so must not take the truth lock or clear the
+    // witness. A write that DOES move an edge has earned the clear.
     let offered = relations.len();
     let mut errored: std::collections::HashSet<kin_model::RelationId> =
         std::collections::HashSet::new();
@@ -4653,6 +5546,19 @@ pub(crate) fn install_lsp_relations(
         offered,
         vector_stale,
     };
+    // Record what the graph actually took, not what was offered, and record it
+    // while the mutation guard still holds. Authority learns about this
+    // evidence only when some later publication commits the graph, so until
+    // then this record is the one thing that survives the process that
+    // accepted it.
+    let accepted: Vec<_> = relations
+        .iter()
+        .filter(|relation| held.contains(&relation.id))
+        .cloned()
+        .collect();
+    if !crate::accepted_enrichment::record(&state.layout, &accepted) {
+        note_unrecorded_evidence(state, &accepted);
+    }
 
     if written.lost() > 0 {
         warn!(
@@ -4670,22 +5576,91 @@ pub(crate) fn install_lsp_relations(
         );
     }
     state.bump_version();
+    state.mark_dirty();
     drop(graph_mutation);
     written
 }
 
-async fn lsp_query_within_budget<F, T, E>(
+/// How one entity's language-server query arms ended.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct QueryOutcomes {
+    /// Arms that got no considered answer. Any one holds the file back.
+    failures: usize,
+    /// Arms the server answered by declining, which hold nothing back.
+    declines: usize,
+    /// What the first failure was, for the owed-file record.
+    first_failure: Option<String>,
+}
+
+impl QueryOutcomes {
+    fn fail(&mut self, arm: &str, what: String) {
+        self.failures += 1;
+        if self.first_failure.is_none() {
+            self.first_failure = Some(format!("the {arm} query {what}"));
+        }
+    }
+}
+
+/// Name the files whose accepted evidence the crash record could not keep.
+///
+/// A relation is named by the file its evidence sits in, or by its source
+/// entity's file when it carries no span, which is what a status reader needs
+/// to know which files a crash before the next publication would cost.
+fn note_unrecorded_evidence(state: &DaemonState, accepted: &[kin_model::Relation]) {
+    use kin_model::EntityStore as _;
+    let mut files = std::collections::BTreeSet::new();
+    for relation in accepted {
+        let spanned: Vec<String> = relation
+            .evidence
+            .iter()
+            .filter_map(|evidence| evidence.source_span.as_ref())
+            .map(|span| span.file.0.clone())
+            .collect();
+        if !spanned.is_empty() {
+            files.extend(spanned);
+            continue;
+        }
+        if let kin_model::GraphNodeId::Entity(id) = relation.src {
+            if let Ok(Some(entity)) = state.graph.get_entity(&id) {
+                if let Some(file) = entity.file_origin {
+                    files.insert(file.0);
+                }
+            }
+        }
+    }
+    if let Ok(mut unrecorded) = state.lsp_evidence_unrecorded.lock() {
+        unrecorded.extend(files);
+    }
+}
+
+/// Run one query arm under its budget, and say how it ended.
+///
+/// Three outcomes, not two. An answer is evidence. A decline is an answer too,
+/// the server saying there is nothing of this kind here, and asking again
+/// returns it again. Anything else, a timeout included, got no considered
+/// answer, and only that holds the file back for a retry. Counting declines as
+/// failures is what held every Go file back on every sweep.
+async fn lsp_query_within_budget<F, T>(
+    arm: &'static str,
     pass: F,
     budget: Duration,
-    failures: &mut usize,
+    outcomes: &mut QueryOutcomes,
 ) -> Option<T>
 where
-    F: std::future::Future<Output = std::result::Result<T, E>>,
+    F: std::future::Future<Output = kin_lsp::Result<T>>,
 {
     match tokio::time::timeout(budget, pass).await {
         Ok(Ok(answer)) => Some(answer),
-        _ => {
-            *failures += 1;
+        Ok(Err(error)) if error.is_declined() => {
+            outcomes.declines += 1;
+            None
+        }
+        Ok(Err(error)) => {
+            outcomes.fail(arm, format!("failed: {error}"));
+            None
+        }
+        Err(_) => {
+            outcomes.fail(arm, format!("ran over its {}s budget", budget.as_secs()));
             None
         }
     }
@@ -4704,50 +5679,59 @@ async fn enrich_single_entity(
     index: &kin_lsp::EntityIndex,
     root: &std::path::Path,
     documents: Option<kin_lsp::DocumentProvider<'_>>,
-) -> (Vec<kin_model::Relation>, usize) {
+) -> (Vec<kin_model::Relation>, QueryOutcomes) {
     let timeout = Duration::from_secs(5);
     let mut derived = Vec::new();
-    let mut failures = 0;
+    let mut outcomes = QueryOutcomes::default();
     if let Some(relations) = lsp_query_within_budget(
-        kin_lsp::enrichment::enrich_entity_calls(server, entity_ref, index, root),
+        "calls",
+        kin_lsp::enrichment::enrich_entity_calls(server, entity_ref, index, root, documents),
         timeout,
-        &mut failures,
+        &mut outcomes,
     )
     .await
     {
         derived.extend(relations);
     }
     if let Some(relations) = lsp_query_within_budget(
-        kin_lsp::enrichment::enrich_entity_overrides(server, entity_ref, index, root),
+        "overrides",
+        kin_lsp::enrichment::enrich_entity_overrides(server, entity_ref, index, root, documents),
         timeout,
-        &mut failures,
+        &mut outcomes,
     )
     .await
     {
         derived.extend(relations);
     }
     if let Some(relations) = lsp_query_within_budget(
+        "uses-type",
         kin_lsp::enrichment::enrich_entity_uses_type(server, entity_ref, index, root, documents),
         timeout,
-        &mut failures,
+        &mut outcomes,
     )
     .await
     {
         derived.extend(relations);
     }
     if let Some(relations) = lsp_query_within_budget(
-        kin_lsp::enrichment::enrich_entity_references(server, entity_ref, index, root),
+        "references",
+        kin_lsp::enrichment::enrich_entity_references(server, entity_ref, index, root, documents),
         timeout,
-        &mut failures,
+        &mut outcomes,
     )
     .await
     {
         derived.extend(relations);
     }
-    if failures > 0 {
-        debug!(entity = %entity_ref.name, failures, "LSP query arms failed or exceeded their budget");
+    if outcomes.failures > 0 {
+        debug!(
+            entity = %entity_ref.name,
+            failures = outcomes.failures,
+            first = outcomes.first_failure.as_deref().unwrap_or(""),
+            "LSP query arms failed or exceeded their budget"
+        );
     }
-    (derived, failures)
+    (derived, outcomes)
 }
 
 /// Run the kin daemon. This is the main entry point.
@@ -4814,6 +5798,12 @@ pub async fn run_with_authority_on(
         });
     }
 
+    // This registration borrows singleton authority until normal run teardown.
+    // Any unresolved publication stops synchronously before that lock can drop.
+    let _prepared_runtime = state
+        .prepared_publication
+        .register(&daemon_lock, state.layout.root())?;
+
     // Refuse to serve an incompatible `.kin/` layout. We now hold the singleton
     // lock (sole writer for this repo) but have not bound a port, written
     // endpoint files, or touched graph/kindb state — the safe point to validate
@@ -4839,8 +5829,10 @@ pub async fn run_with_authority_on(
     // enrichment switched off produces no reference edge either, so its answers
     // must not claim otherwise.
     // Load what a previous daemon already enriched, so a restart resumes rather
-    // than re-sweeping a converged graph.
+    // than re-sweeping a converged graph, and what it still owes, so a restart
+    // does not ask a failing file again before its backoff ends.
     load_lsp_enriched_marker(&state);
+    load_lsp_owed_files(&state);
 
     // Set up LSP enrichment channel before wrapping state in Arc.
     let enrichment_enabled =
@@ -5008,6 +6000,7 @@ pub async fn run_with_authority_on(
     // watcher can leave this daemon waiting indefinitely. A refused watcher
     // reports its error and exits before publication.
     let (armed_tx, armed_rx) = tokio::sync::oneshot::channel();
+    let (canonical_tx, canonical_rx) = tokio::sync::oneshot::channel();
     let loop_state = Arc::clone(&state);
     let loop_config = config.loop_config.clone();
     let loop_cancel = cancel_rx.clone();
@@ -5016,7 +6009,10 @@ pub async fn run_with_authority_on(
             loop_state,
             loop_config,
             loop_cancel,
-            Some(loop_runner::WatchArmed::new(armed_tx)),
+            Some(loop_runner::WatchArmed::with_canonical_ready(
+                armed_tx,
+                canonical_tx,
+            )),
         )
         .await
     });
@@ -5027,6 +6023,16 @@ pub async fn run_with_authority_on(
         loop_handle.abort();
         let _ = loop_handle.await;
         return Err(DaemonError::Index(kin_index::IndexError::Watcher(error)));
+    }
+
+    // Watch delivery alone is not permission to replay completed sessions.
+    // Keep the warming surface until layouts and dependency caches have been
+    // reconstructed from admitted CAS. Failure must never publish the full API.
+    if let Err(error) = await_canonical_ready(canonical_rx, cancel_rx.clone()).await {
+        let _ = cancel_tx.send(true);
+        loop_handle.abort();
+        let _ = loop_handle.await;
+        return Err(DaemonError::SemanticReadmissionFailed(error));
     }
 
     // Publish PID and the actual bound port as one lifecycle-authorized
@@ -5180,6 +6186,12 @@ pub async fn run_with_authority_on(
         api::serve_bound_with_shutdown(api_state, api_listener, Some(api_cancel_tx), api_cancel)
             .await
     });
+
+    #[cfg(test)]
+    crate::prepared_publication::tests::install_actual_daemon_control(
+        Arc::clone(&state),
+        cancel_tx.clone(),
+    );
 
     // Register this repo-scoped graph daemon with the lightweight central
     // supervisor when one is available. The supervisor owns process/routing
@@ -5356,6 +6368,9 @@ pub async fn run_with_authority_on(
     //   - Shutdown flush: handled separately in the graceful shutdown path
     let persist_state = Arc::clone(&state);
     let mut persist_cancel = cancel_rx.clone();
+    // Sent by the stop once the enrichment worker has drained, so the shutdown
+    // flush below publishes what that worker accepted on its way out.
+    let (lsp_drained_tx, mut persist_lsp_drained) = tokio::sync::watch::channel(false);
     let persist_handle = tokio::spawn(async move {
         let idle_flush =
             duration_from_env_secs("KIN_DAEMON_IDLE_FLUSH_SECS", Duration::from_secs(2));
@@ -5377,6 +6392,7 @@ pub async fn run_with_authority_on(
             tokio::select! {
                 _ = tokio::time::sleep(current_interval) => {}
                 _ = persist_cancel.changed() => {
+                    await_lsp_drain(&mut persist_lsp_drained).await;
                     run_shutdown_persistence(&persist_state).await;
                     break;
                 }
@@ -5558,23 +6574,6 @@ pub async fn run_with_authority_on(
         let lsp_pass = state.background_work.pass(crate::background_work::PASS_LSP);
         lsp_handle = Some(tokio::spawn(async move {
             info!("LSP enrichment worker started");
-            let source_view = match lsp_state.graph_owned_source_view() {
-                Ok(view) => view,
-                Err(error) => {
-                    error!(
-                        error = %error,
-                        "LSP enrichment worker cannot open graph-owned source authority"
-                    );
-                    return;
-                }
-            };
-            let load_document = |path: &str| -> Option<String> {
-                source_view
-                    .load_text(&kin_model::FilePathId::new(path))
-                    .ok()
-            };
-            let documents: Option<kin_lsp::DocumentProvider<'_>> = Some(&load_document);
-
             // Lazily start LSP servers on first use per language.
             let mut servers: std::collections::HashMap<
                 kin_model::LanguageId,
@@ -5593,10 +6592,11 @@ pub async fn run_with_authority_on(
                 // checkpoint, so an enrichment in flight finishes rather than
                 // being torn out from under the LSP server it is talking to.
                 if lsp_pass.halted() {
-                    for (lang, server) in servers {
-                        info!(language = %lang, "shutting down LSP server");
-                        let _ = server.shutdown().await;
-                    }
+                    stop_language_servers(
+                        servers,
+                        "the background-work supervisor stopped enrichment",
+                    )
+                    .await;
                     info!("LSP enrichment worker stopped by the background-work supervisor");
                     break;
                 }
@@ -5627,10 +6627,7 @@ pub async fn run_with_authority_on(
                         // nobody can use.
                         biased;
                         _ = lsp_cancel.changed() => {
-                            for (lang, server) in servers {
-                                info!(language = %lang, "shutting down LSP server");
-                                let _ = server.shutdown().await;
-                            }
+                            stop_language_servers(servers, "the daemon is shutting down").await;
                             info!("LSP enrichment worker shutting down");
                             break;
                         }
@@ -5661,6 +6658,10 @@ pub async fn run_with_authority_on(
                         };
 
                         let Some(lang) = language else {
+                            // Not a language this worker enriches. The file was
+                            // not failed work, and leaving the reservation to
+                            // drop would stick failed_work for the whole daemon.
+                            work.complete();
                             continue;
                         };
 
@@ -5703,44 +6704,38 @@ pub async fn run_with_authority_on(
                         let Some(server) = servers.get(&lang) else {
                             continue;
                         };
-                        use kin_model::EntityStore;
-                        let entities = match lsp_state.graph.list_all_entities() {
-                            Ok(e) => e,
-                            Err(_) => continue,
+                        let inputs = match lsp_publication::QueryInputs::capture(&lsp_state).await {
+                            Ok(inputs) => inputs,
+                            Err(reason) => {
+                                warn!(?reason, "LSP input universe could not be proved; enrichment remains incomplete");
+                                if reason == lsp_publication::Refused::Stale {
+                                    lsp_publication::request_fresh_sweep(&lsp_state);
+                                    // The next receive drains that demand. This
+                                    // attempt's snapshot is obsolete, so it is
+                                    // not failed work.
+                                    work.complete();
+                                }
+                                continue;
+                            }
                         };
+                        let entities = &inputs.entities;
+                        let load_document = |path: &str| inputs.document(path);
+                        let documents: Option<kin_lsp::DocumentProvider<'_>> = Some(&load_document);
                         let entity_refs: Vec<kin_lsp::EntityRef> = entities
                             .iter()
-                            .filter_map(|e| {
-                                let fo = e.file_origin.as_ref()?;
-                                let span = e.span.as_ref()?;
-                                // Compute name position by finding name in signature.
-                                // LSP needs cursor on name, not declaration start.
-                                let name_col =
-                                    lsp_query_column(&e.signature, &e.name, span.start_col as u32);
-                                Some(kin_lsp::EntityRef {
-                                    id: e.id,
-                                    name: e.name.clone(),
-                                    file_path: fo.0.clone(),
-                                    start_line: span.start_line as u32,
-                                    start_col: span.start_col as u32,
-                                    end_line: span.end_line as u32,
-                                    name_line: span.start_line as u32,
-                                    name_col,
-                                })
-                            })
+                            .filter_map(|e| lsp_entity_ref(e, &e.file_origin.as_ref()?.0))
                             .collect();
-                        let index = kin_lsp::EntityIndex::new(entity_refs);
+                        let index = kin_lsp::EntityIndex::new(entity_refs, &lsp_root);
 
                         // Open exact graph/CAS bytes in the LSP server. A
                         // missing body or authority mismatch fails this
                         // enrichment request loudly; the working tree is never
                         // allowed to repair or answer it.
-                        let file_content = match source_view.load_text(&request.file_id) {
-                            Ok(content) => content,
-                            Err(error) => {
+                        let file_content = match inputs.document(&request.file_id.0) {
+                            Some(content) => content,
+                            None => {
                                 warn!(
                                     file = %request.file_id,
-                                    error = %error,
                                     "LSP enrichment skipped because graph-owned source could not be loaded"
                                 );
                                 continue;
@@ -5791,6 +6786,10 @@ pub async fn run_with_authority_on(
                                 max = MAX_ENTITIES_PER_REQUEST,
                                 "skipping LSP enrichment: too many changed entities (likely full re-parse)"
                             );
+                            // The cold sweep walks the file. This skip is the
+                            // handoff, not a failed attempt.
+                            lsp_publication::request_fresh_sweep(&lsp_state);
+                            work.complete();
                             continue;
                         }
 
@@ -5806,41 +6805,41 @@ pub async fn run_with_authority_on(
                             .iter()
                             .filter_map(|id| {
                                 let entity = entities.iter().find(|e| e.id == *id)?;
-                                let fo = entity.file_origin.as_ref()?;
-                                let span = entity.span.as_ref()?;
-                                let name_col = lsp_query_column(
-                                    &entity.signature,
-                                    &entity.name,
-                                    span.start_col as u32,
-                                );
-                                Some(kin_lsp::EntityRef {
-                                    id: entity.id,
-                                    name: entity.name.clone(),
-                                    file_path: fo.0.clone(),
-                                    start_line: span.start_line as u32,
-                                    start_col: span.start_col as u32,
-                                    end_line: span.end_line as u32,
-                                    name_line: span.start_line as u32,
-                                    name_col,
-                                })
+                                lsp_entity_ref(entity, &entity.file_origin.as_ref()?.0)
                             })
                             .collect();
 
                         let mut failed_queries = 0;
+                        let mut refused = None;
                         let mut pending = PendingEnrichment::default();
                         let mut total_relations = EnrichmentWrite::default();
                         for entity_ref in &file_entities {
                             info!(entity = %entity_ref.name, "querying LSP for entity");
-                            let (derived, failures) = enrich_single_entity(
+                            let (derived, outcomes) = enrich_single_entity(
                                 server, entity_ref, &index, &lsp_root, documents,
                             )
                             .await;
-                            failed_queries += failures;
-                            total_relations += pending
-                                .absorb(derived, |batch| install_lsp_relations(&lsp_state, batch));
+                            failed_queries += outcomes.failures;
+                            match inputs.absorb(&lsp_state, &mut pending, derived).await {
+                                Ok(written) => total_relations += written,
+                                Err(reason) => {
+                                    refused = Some(reason);
+                                    break;
+                                }
+                            }
                         }
-                        total_relations +=
-                            pending.flush(|batch| install_lsp_relations(&lsp_state, batch));
+                        if refused.is_none() {
+                            match inputs.flush(&lsp_state, &mut pending).await {
+                                Ok(written) => total_relations += written,
+                                Err(reason) => refused = Some(reason),
+                            }
+                        }
+                        if let Some(reason) = refused {
+                            warn!(?reason, path = %rel_path, "discarded LSP answers; enrichment remains incomplete");
+                            if reason == lsp_publication::Refused::Stale {
+                                lsp_publication::request_fresh_sweep(&lsp_state);
+                            }
+                        }
 
                         if total_relations.published > 0 {
                             info!(
@@ -5855,23 +6854,35 @@ pub async fn run_with_authority_on(
                             // not progress, and crediting it would let a worker
                             // that answers "no relations" forever look healthy.
                             lsp_pass.advanced(total_relations.published as u64, Instant::now());
-                        } else {
+                        } else if refused.is_none() {
                             info!(
                                 path = %rel_path,
                                 entities_queried = file_entities.len(),
                                 "LSP enrichment completed: no new relations found"
                             );
                         }
-                        if failed_queries == 0
-                            && total_relations.lost() == 0
-                            && total_relations.vector_stale == 0
-                        {
-                            work.complete();
-                        }
+                        // `failed_queries` is intentionally not a reason to
+                        // abandon the reservation. The arms that answered are
+                        // already in `total_relations`, and a protocol error
+                        // on one position does not get a retry. It is still
+                        // disclosed, on the enrichment status, rather than
+                        // dropped on the floor here.
+                        finish_incremental_reservation(
+                            &mut work,
+                            refused,
+                            total_relations.lost(),
+                            total_relations.vector_stale,
+                            failed_queries,
+                        );
                     } // end Incremental
 
                     LspEnrichmentMessage::Sweep => {
                         info!("LSP cold sweep started, enriching all entities");
+                        // Servers already running when this pass began serve
+                        // the incremental path and outlive it. The ones this
+                        // pass starts are stopped at its end.
+                        let resident: std::collections::HashSet<kin_model::LanguageId> =
+                            servers.keys().copied().collect();
                         // Durable, and before any work, so a process that ends
                         // between here and the tail leaves the store saying so.
                         // First, because "any work" includes the probe below.
@@ -5900,21 +6911,40 @@ pub async fn run_with_authority_on(
                         // rather than at the tail, because the tail is where
                         // the record is written and by then the graph may have
                         // moved underneath every answer in it.
-                        let marker_epoch = current_marker_epoch(&lsp_state);
-
-                        // Get all entities from the graph.
-                        use kin_model::EntityStore;
-                        let entities = match lsp_state.graph.list_all_entities() {
-                            Ok(e) => e,
-                            Err(_) => continue,
+                        let inputs = match lsp_publication::QueryInputs::capture(&lsp_state).await {
+                            Ok(inputs) => inputs,
+                            Err(reason) => {
+                                warn!(?reason, "LSP input universe could not be proved; enrichment remains incomplete");
+                                let superseded = reason == lsp_publication::Refused::Stale;
+                                if superseded {
+                                    lsp_publication::request_fresh_sweep(&lsp_state);
+                                }
+                                sweep_finished(&lsp_state, true, 0);
+                                // A stale snapshot blocked nothing. Counting it
+                                // as files_blocked made the retry unreadably
+                                // incomplete before it could run.
+                                complete_lsp_sweep(&lsp_state, if superseded { 0 } else { 1 });
+                                settle_enrichment_attempt(
+                                    &mut work,
+                                    enrichment_attempt_after_sweep(
+                                        false,
+                                        superseded,
+                                        superseded && fresh_sweep_was_queued(&lsp_state),
+                                    ),
+                                );
+                                continue;
+                            }
                         };
+                        let entities = &inputs.entities;
+                        let load_document = |path: &str| inputs.document(path);
+                        let documents: Option<kin_lsp::DocumentProvider<'_>> = Some(&load_document);
 
                         // Group entities by file.
                         let mut by_file: std::collections::HashMap<
                             kin_model::FilePathId,
                             Vec<&kin_model::Entity>,
                         > = std::collections::HashMap::new();
-                        for entity in &entities {
+                        for entity in entities {
                             if let Some(ref fo) = entity.file_origin {
                                 by_file.entry(fo.clone()).or_default().push(entity);
                             }
@@ -5926,9 +6956,25 @@ pub async fn run_with_authority_on(
                             .store(total_files as u64, std::sync::atomic::Ordering::SeqCst);
                         let mut tally = SweepTally::default();
                         let mut enriched_this_sweep: Vec<String> = Vec::new();
-                        // Files the sweep finished whose queries failed or ran over
-                        // budget: counted enriched, never marked, retried next pass.
+                        // Files the sweep asked about whose queries failed or ran
+                        // over budget: counted held back, never marked, retried
+                        // next pass.
                         let mut held_back_this_sweep: Vec<String> = Vec::new();
+                        // The held-back files that are OWED, with what failed. A
+                        // stale capture holds its files back too and owes nothing
+                        // for them: the fresh sweep it queues asks again at once.
+                        let mut owed_this_sweep: Vec<(String, String)> = Vec::new();
+                        // An explicit sweep request asks about owed files now;
+                        // every other pass honors their backoff.
+                        let retry_owed_now = lsp_state
+                            .lsp_retry_owed_now
+                            .swap(false, std::sync::atomic::Ordering::SeqCst);
+                        let owed_at_start = lsp_state
+                            .lsp_owed_files
+                            .lock()
+                            .map(|owed| owed.clone())
+                            .unwrap_or_default();
+                        let sweep_clock = crate::owed_enrichment::now_unix_s();
                         let file_definitions_budget = lsp_file_definitions_budget();
                         let mut total_relations = EnrichmentWrite::default();
                         // Languages whose server refused to start, remembered for
@@ -5968,26 +7014,17 @@ pub async fn run_with_authority_on(
                         // Build entity index for the whole graph (used for target matching).
                         let entity_refs: Vec<kin_lsp::EntityRef> = entities
                             .iter()
-                            .filter_map(|e| {
-                                let fo = e.file_origin.as_ref()?;
-                                let span = e.span.as_ref()?;
-                                let name_col =
-                                    lsp_query_column(&e.signature, &e.name, span.start_col as u32);
-                                Some(kin_lsp::EntityRef {
-                                    id: e.id,
-                                    name: e.name.clone(),
-                                    file_path: fo.0.clone(),
-                                    start_line: span.start_line as u32,
-                                    start_col: span.start_col as u32,
-                                    end_line: span.end_line as u32,
-                                    name_line: span.start_line as u32,
-                                    name_col,
-                                })
-                            })
+                            .filter_map(|e| lsp_entity_ref(e, &e.file_origin.as_ref()?.0))
                             .collect();
-                        let index = kin_lsp::EntityIndex::new(entity_refs);
+                        let index = kin_lsp::EntityIndex::new(entity_refs, &lsp_root);
 
+                        let mut refused = None;
                         for (file_id, file_entities) in &by_file {
+                            if let Err(reason) = inputs.current(&lsp_state).await {
+                                refused = Some(reason);
+                                tally.ended_early = true;
+                                break;
+                            }
                             let abs_path = lsp_root.join(&file_id.0);
 
                             // Determine language from file extension.
@@ -6019,7 +7056,15 @@ pub async fn run_with_authority_on(
                             // so re-running one from scratch on every daemon start
                             // is not a cost anyone would accept, and a sweep nobody
                             // dares run is a sweep that never runs.
-                            if file_already_enriched(&lsp_state, &file_id.0) {
+                            let gate = sweep_gate(
+                                &lsp_state,
+                                &owed_at_start,
+                                &file_id.0,
+                                inputs.blob(&file_id.0).as_deref(),
+                                retry_owed_now,
+                                sweep_clock,
+                            );
+                            if gate == SweepGate::AlreadyEnriched {
                                 tally.already_enriched += 1;
                                 *already_enriched_by_language.entry(lang).or_insert(0) += 1;
                                 // Published here as well as on the enriching
@@ -6051,6 +7096,22 @@ pub async fn run_with_authority_on(
                                         tally.files_processed()
                                     ),
                                     "sweep skipped an already-enriched file"
+                                );
+                                continue;
+                            }
+
+                            // An owed file whose last attempt got no answer waits
+                            // out its backoff rather than being asked the same
+                            // question on every pass. New bytes are a new question
+                            // and are asked about at once.
+                            if let SweepGate::Owed { retry_in: wait } = gate {
+                                tally.owed_deferred += 1;
+                                info!(
+                                    file = %file_id.0,
+                                    retry_in_s = wait.as_secs(),
+                                    "sweep deferred an owed file: its language-server queries got \
+                                     no answer on its last attempt, and it is asked again when its \
+                                     backoff ends or its bytes change"
                                 );
                                 continue;
                             }
@@ -6130,12 +7191,11 @@ pub async fn run_with_authority_on(
                             // didOpen exact graph/CAS content. The compatibility
                             // path may not exist on the host; that must not
                             // affect graph-owned semantic enrichment.
-                            let file_content = match source_view.load_text(file_id) {
-                                Ok(content) => content,
-                                Err(error) => {
+                            let file_content = match inputs.document(&file_id.0) {
+                                Some(content) => content,
+                                None => {
                                     warn!(
                                         file = %file_id,
-                                        error = %error,
                                         "LSP sweep skipped graph source that could not be loaded from authority"
                                     );
                                     tally.source_unreadable += 1;
@@ -6162,34 +7222,42 @@ pub async fn run_with_authority_on(
                                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                             }
 
+                            // A server that died before this file's first
+                            // question cannot answer it or any question after
+                            // it. Nothing about the file was asked, so it is
+                            // blocked rather than owed, and so is the rest of
+                            // the language for this pass.
+                            if server.is_disconnected() {
+                                let reason = retire_disconnected_server(
+                                    &mut servers,
+                                    &mut first_open_done,
+                                    lang,
+                                    &language_server_command_name(lang, &lsp_root),
+                                )
+                                .await
+                                .unwrap_or_else(|| {
+                                    "its language server stopped answering".to_string()
+                                });
+                                server_start_failed.insert(lang);
+                                skip_reason.insert(lang, reason);
+                                tally.server_unavailable += 1;
+                                *skip_files.entry(lang).or_insert(0) += 1;
+                                continue;
+                            }
+
                             // Enrich each entity in this file.
                             let file_entity_refs: Vec<kin_lsp::EntityRef> = file_entities
                                 .iter()
-                                .filter_map(|e| {
-                                    let span = e.span.as_ref()?;
-                                    let name_col = lsp_query_column(
-                                        &e.signature,
-                                        &e.name,
-                                        span.start_col as u32,
-                                    );
-                                    Some(kin_lsp::EntityRef {
-                                        id: e.id,
-                                        name: e.name.clone(),
-                                        file_path: file_id.0.clone(),
-                                        start_line: span.start_line as u32,
-                                        start_col: span.start_col as u32,
-                                        end_line: span.end_line as u32,
-                                        name_line: span.start_line as u32,
-                                        name_col,
-                                    })
-                                })
+                                .filter_map(|e| lsp_entity_ref(e, &file_id.0))
                                 .collect();
 
                             // File-level enrichment: query definition at every identifier
                             // to capture ALL relationships (40-50x more than per-entity).
                             let query_failures_before = tally.query_failures;
                             let definitions_over_budget_before = tally.definitions_over_budget;
-                            let file_result = file_definitions_within_budget(
+                            let query_declines_before = tally.query_declines;
+                            let answered_before = server.client.answered();
+                            let (file_result, mut file_failure) = file_definitions_within_budget(
                                 kin_lsp::file_enrichment::enrich_file_definitions(
                                     server,
                                     &abs_path,
@@ -6210,27 +7278,43 @@ pub async fn run_with_authority_on(
                             // requests corpus), so the buffer bounds itself
                             // rather than trusting the file to be small.
                             let mut pending = PendingEnrichment::default();
-                            let mut file_relations = pending
-                                .absorb(file_result.relations, |batch| {
-                                    install_lsp_relations(&lsp_state, batch)
-                                });
+                            let mut file_relations = EnrichmentWrite::default();
+                            match inputs
+                                .absorb(&lsp_state, &mut pending, file_result.relations)
+                                .await
+                            {
+                                Ok(written) => file_relations += written,
+                                Err(reason) => refused = Some(reason),
+                            }
 
                             // Also run per-entity call hierarchy for Calls relations
                             // (definition approach gives References, call hierarchy gives Calls).
                             for entity_ref in &file_entity_refs {
-                                let (derived, failures) = enrich_single_entity(
+                                if refused.is_some() {
+                                    break;
+                                }
+                                let (derived, outcomes) = enrich_single_entity(
                                     server, entity_ref, &index, &lsp_root, documents,
                                 )
                                 .await;
-                                tally.query_failures += failures;
-                                file_relations += pending.absorb(derived, |batch| {
-                                    install_lsp_relations(&lsp_state, batch)
-                                });
+                                tally.query_failures += outcomes.failures;
+                                tally.query_declines += outcomes.declines;
+                                if file_failure.is_none() {
+                                    file_failure = outcomes.first_failure;
+                                }
+                                match inputs.absorb(&lsp_state, &mut pending, derived).await {
+                                    Ok(written) => file_relations += written,
+                                    Err(reason) => refused = Some(reason),
+                                }
                             }
                             // Written before the file is closed, so the graph
                             // holds this file's work before the next didOpen.
-                            file_relations +=
-                                pending.flush(|batch| install_lsp_relations(&lsp_state, batch));
+                            if refused.is_none() {
+                                match inputs.flush(&lsp_state, &mut pending).await {
+                                    Ok(written) => file_relations += written,
+                                    Err(reason) => refused = Some(reason),
+                                }
+                            }
 
                             // didClose to free LSP server memory.
                             let _ = server
@@ -6243,15 +7327,58 @@ pub async fn run_with_authority_on(
                                 )
                                 .await;
 
-                            tally.enriched += 1;
-                            if file_passes_completed(
-                                &tally,
-                                query_failures_before,
-                                definitions_over_budget_before,
+                            if let Some(reason) = declined_everything(
+                                tally.query_declines - query_declines_before,
+                                server.client.answered() - answered_before,
                             ) {
+                                tally.query_failures += 1;
+                                file_failure.get_or_insert(reason);
+                            }
+
+                            // A server that died during this file's questions
+                            // left some of them unanswered, and those failures
+                            // already hold the file back. Its reason gains what
+                            // the server left behind, and the rest of the
+                            // language is not asked.
+                            if server.is_disconnected() {
+                                let reason = retire_disconnected_server(
+                                    &mut servers,
+                                    &mut first_open_done,
+                                    lang,
+                                    &language_server_command_name(lang, &lsp_root),
+                                )
+                                .await
+                                .unwrap_or_else(|| {
+                                    "its language server stopped answering".to_string()
+                                });
+                                file_failure = Some(match file_failure.take() {
+                                    Some(first) => format!("{first}; {reason}"),
+                                    None => reason.clone(),
+                                });
+                                server_start_failed.insert(lang);
+                                skip_reason.insert(lang, reason);
+                            }
+
+                            if refused.is_none()
+                                && file_passes_completed(
+                                    &tally,
+                                    query_failures_before,
+                                    definitions_over_budget_before,
+                                )
+                            {
+                                tally.enriched += 1;
                                 enriched_this_sweep.push(file_id.0.clone());
                             } else {
+                                tally.held_back += 1;
                                 held_back_this_sweep.push(file_id.0.clone());
+                                if refused.is_none() {
+                                    owed_this_sweep.push((
+                                        file_id.0.clone(),
+                                        file_failure.unwrap_or_else(|| {
+                                            "a language-server query got no answer".to_string()
+                                        }),
+                                    ));
+                                }
                             }
                             lsp_state.lsp_sweep_files_done.store(
                                 tally.files_processed() as u64,
@@ -6292,6 +7419,10 @@ pub async fn run_with_authority_on(
                                 );
                             }
 
+                            if refused.is_some() {
+                                tally.ended_early = true;
+                                break;
+                            }
                             // Check for shutdown between files.
                             if *lsp_cancel.borrow() {
                                 tally.ended_early = true;
@@ -6308,6 +7439,67 @@ pub async fn run_with_authority_on(
                             }
                         }
 
+                        if let Err(reason) = inputs.current(&lsp_state).await {
+                            refused = Some(reason);
+                            tally.ended_early = true;
+                        }
+                        if let Some(reason) = refused {
+                            warn!(?reason, "LSP sweep inputs are no longer provable; no completion marker will be recorded");
+                            held_back_this_sweep.append(&mut enriched_this_sweep);
+                            if reason == lsp_publication::Refused::Stale {
+                                lsp_publication::request_fresh_sweep(&lsp_state);
+                            }
+                        }
+
+                        // Every question this pass asks is behind it, so stop
+                        // the servers it started now, before the census and
+                        // the publication below, rather than at its tail. A
+                        // server keeps what it loaded until it is stopped, and
+                        // the publication is when the daemon itself grows, so
+                        // holding both at once sets the pass's memory peak.
+                        //
+                        // The languages that had a server in this pass are
+                        // taken first, because the readiness check below reads
+                        // them and a stopped server has left `servers`.
+                        //
+                        // Not on a pass the daemon's shutdown ended. A polite
+                        // stop can spend its whole reply and termination budget
+                        // per server, and that grace goes to making the
+                        // finished work durable first; the tail stops the
+                        // servers after, as it always has.
+                        let served_this_pass: std::collections::HashSet<kin_model::LanguageId> =
+                            servers.keys().copied().collect();
+                        if !*lsp_cancel.borrow() {
+                            let released = take_servers_a_sweep_started(
+                                &mut servers,
+                                &resident,
+                                &mut first_open_done,
+                            );
+                            let stopping = stop_language_servers(
+                                released,
+                                "the sweep that started it has asked its last question",
+                            );
+                            tokio::pin!(stopping);
+                            // A shutdown that arrives mid-stop must not spend
+                            // the drain on the stop. Dropping the stop drops
+                            // each server, which ends its process group with
+                            // SIGKILL at once, and the publication below runs
+                            // on what is left of the budget. A clone waits for
+                            // the signal, so the worker's own receiver still
+                            // sees it unread and stops the resident servers.
+                            let mut stop_cancel = lsp_cancel.clone();
+                            tokio::select! {
+                                biased;
+                                () = &mut stopping => {}
+                                _ = stop_cancel.changed() => {
+                                    info!(
+                                        "the daemon began shutting down while this sweep's \
+                                         servers were stopping; they were killed instead, so \
+                                         the sweep's work is published first"
+                                    );
+                                }
+                            }
+                        }
                         if total_relations.published > 0 {
                             lsp_state.mark_dirty();
                         }
@@ -6361,9 +7553,21 @@ pub async fn run_with_authority_on(
                         // already recovers by re-sweeping.
                         let published = if total_relations.published > 0 {
                             match save_snapshot_blocking(Arc::clone(&lsp_state)).await {
-                                Ok(()) => {
+                                Ok(crate::state::EnrichmentFlush::Proceeded) => {
                                     lsp_state.mark_clean();
                                     true
+                                }
+                                // Not durable, so the marker must not say it is.
+                                // Left dirty, and a later sweep re-derives these
+                                // files rather than skipping them.
+                                Ok(crate::state::EnrichmentFlush::HeldForOpenMerge) => {
+                                    info!(
+                                        relations = total_relations.published,
+                                        "held this sweep's enrichment while a merge is open \
+                                         on this workspace; the relations stay live and \
+                                         these files are not recorded as enriched"
+                                    );
+                                    false
                                 }
                                 Err(error) => {
                                     // Loud, and not fatal. The relations stay in
@@ -6390,8 +7594,6 @@ pub async fn run_with_authority_on(
                         // daemon restarts rather than living inside one. The
                         // same call clears the in-flight record, so reaching
                         // here is what makes this sweep a finished one.
-                        let interruptions =
-                            sweep_finished(&lsp_state, tally.ended_early, tally.enriched);
 
                         // The marker records durability, so it is written here
                         // and only here, after the publication above settled it.
@@ -6399,31 +7601,62 @@ pub async fn run_with_authority_on(
                         // divergence means a file was counted enriched without
                         // being recorded, or recorded without being counted.
                         // Either way the marker would stop describing the sweep.
-                        if enriched_this_sweep.len() + held_back_this_sweep.len() != tally.enriched
+                        if enriched_this_sweep.len() + held_back_this_sweep.len() != tally.visited()
                         {
                             warn!(
                                 recorded = enriched_this_sweep.len(),
                                 held_back = held_back_this_sweep.len(),
-                                counted = tally.enriched,
-                                "the enriched-file sets and the enriched count disagree; the \
+                                counted = tally.visited(),
+                                "the enriched-file sets and the visited count disagree; the \
                                  marker no longer describes this sweep"
                             );
                         }
-                        if let Some(first) = held_back_this_sweep.first() {
+                        if let Some((_, first_reason)) = owed_this_sweep.first() {
+                            let named: Vec<&str> = owed_this_sweep
+                                .iter()
+                                .take(OWED_FILES_LOGGED)
+                                .map(|(file, _)| file.as_str())
+                                .collect();
                             warn!(
-                                files = held_back_this_sweep.len(),
-                                first = %first,
+                                files = owed_this_sweep.len(),
+                                named = ?named,
+                                first_reason = %first_reason,
                                 "not recording these files as enriched: a language-server query \
-                                 failed or ran over its budget for them, so the next sweep retries them"
+                                 got no answer for them, so they are owed and asked again after a \
+                                 backoff; /lsp/sweep/status names every one with its reason"
                             );
                         }
-                        if !mark_completed_sweep_files(
-                            &lsp_state,
-                            &enriched_this_sweep,
-                            marker_epoch,
-                            total_relations,
-                            published,
-                        ) {
+                        let superseded_files = held_back_this_sweep
+                            .len()
+                            .saturating_sub(owed_this_sweep.len());
+                        if superseded_files > 0 {
+                            warn!(
+                                files = superseded_files,
+                                "not recording these files as enriched: this pass's inputs moved \
+                                 or could not be proved while it ran, so their answers describe a \
+                                 graph that is gone"
+                            );
+                        }
+                        let marker_written = match inputs
+                            .mark_completed(
+                                &lsp_state,
+                                &enriched_this_sweep,
+                                total_relations,
+                                published,
+                            )
+                            .await
+                        {
+                            Ok(written) => written,
+                            Err(reason) => {
+                                tally.ended_early = true;
+                                warn!(?reason, "LSP completion marker refused after publication");
+                                if reason == lsp_publication::Refused::Stale {
+                                    lsp_publication::request_fresh_sweep(&lsp_state);
+                                }
+                                false
+                            }
+                        };
+                        if !marker_written {
                             warn!(
                                 files = enriched_this_sweep.len(),
                                 relations = total_relations.published,
@@ -6431,6 +7664,19 @@ pub async fn run_with_authority_on(
                                  not published, so the next sweep must redo them"
                             );
                         }
+                        let owed_after = settle_owed_files(
+                            &lsp_state,
+                            &inputs,
+                            if marker_written {
+                                &enriched_this_sweep
+                            } else {
+                                &[]
+                            },
+                            &owed_this_sweep,
+                        );
+
+                        let interruptions =
+                            sweep_finished(&lsp_state, tally.ended_early, tally.visited());
 
                         // A language whose every file this pass skipped as
                         // already enriched never reached a server start, so the
@@ -6449,7 +7695,7 @@ pub async fn run_with_authority_on(
                         if !tally.ended_early {
                             let mut readiness_now = std::collections::HashMap::new();
                             for language in already_enriched_by_language.keys() {
-                                if servers.contains_key(language) {
+                                if served_this_pass.contains(language) {
                                     continue;
                                 }
                                 // A language whose server already refused in
@@ -6515,9 +7761,20 @@ pub async fn run_with_authority_on(
                         }
                         let unaccounted = tally.unaccounted(total_files);
                         let not_visited = tally.not_visited(total_files);
-                        if sweep_work_succeeded(&tally, total_files, total_relations, published) {
-                            work.complete();
-                        }
+                        let superseded = refused == Some(lsp_publication::Refused::Stale);
+                        settle_enrichment_attempt(
+                            &mut work,
+                            enrichment_attempt_after_sweep(
+                                sweep_work_succeeded(
+                                    &tally,
+                                    total_files,
+                                    total_relations,
+                                    published,
+                                ),
+                                superseded,
+                                superseded && fresh_sweep_was_queued(&lsp_state),
+                            ),
+                        );
 
                         // The sweep's own zero-loss verdict, written where a
                         // later process can read it. A pass that published
@@ -6552,11 +7809,16 @@ pub async fn run_with_authority_on(
                             total_files,
                             relations = total_relations.published,
                             enriched = tally.enriched,
+                            held_back = tally.held_back,
                             already_enriched = tally.already_enriched,
                             unsupported_language = tally.unsupported_language,
                             server_unavailable = tally.server_unavailable,
                             source_unreadable = tally.source_unreadable,
                             definitions_over_budget = tally.definitions_over_budget,
+                            query_failures = tally.query_failures,
+                            query_declines = tally.query_declines,
+                            owed = owed_after,
+                            owed_deferred = tally.owed_deferred,
                             not_visited,
                             ended_early = tally.ended_early,
                             published,
@@ -6584,6 +7846,20 @@ pub async fn run_with_authority_on(
                                  sweep loop is not being counted"
                             );
                         }
+
+                        // Stop what this pass started, each server with every
+                        // process it started. Held, a server runs for the life
+                        // of the daemon, and a cold sweep is the pass that
+                        // starts one for every language the graph holds. A pass
+                        // stopped them before it published unless the daemon's
+                        // shutdown ended it, so this finds them only then.
+                        let released = take_servers_a_sweep_started(
+                            &mut servers,
+                            &resident,
+                            &mut first_open_done,
+                        );
+                        stop_language_servers(released, "the sweep that started it has ended")
+                            .await;
                     } // end Sweep
                 } // end match
             }
@@ -6609,9 +7885,12 @@ pub async fn run_with_authority_on(
         supervisor_handle,
         lsp_handle,
         cancel_tx,
+        lsp_drained_tx,
         &state,
     )
     .await;
+
+    state.prepared_publication.shutdown();
 
     // The derived ingestion CAS defers its directory barriers and commits them
     // on an explicit sync, on drop, or on a self-drain. This process ends in
@@ -6652,6 +7931,7 @@ async fn select_with_signals(
     supervisor_handle: tokio::task::JoinHandle<()>,
     lsp_handle: Option<tokio::task::JoinHandle<()>>,
     cancel_tx: tokio::sync::watch::Sender<bool>,
+    lsp_drained: tokio::sync::watch::Sender<bool>,
     state: &Arc<DaemonState>,
 ) -> Result<()> {
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -6727,6 +8007,8 @@ async fn select_with_signals(
         }
     };
 
+    state.prepared_publication.shutdown();
+
     // The escalation watchdog's grace began when the stop was signalled, so a
     // flush in flight is judged against the same end.
     let grace_ends = Instant::now().checked_add(shutdown_escalation_grace());
@@ -6739,6 +8021,11 @@ async fn select_with_signals(
     // minutes would otherwise spend the entire escalation grace before the sweep
     // was ever asked to stop.
     drain_lsp_enrichment(lsp_handle).await;
+    // Only now may the persistence task run its shutdown flush, which it holds
+    // until this is sent. The worker installs and records what it accepted
+    // before it exits, so the flush publishes it, rather than the next daemon
+    // replaying it as evidence that authority never committed.
+    let _ = lsp_drained.send(true);
 
     drain_handles(
         (completed != CompletedTask::Reconciliation).then_some(loop_handle),
@@ -6781,6 +8068,27 @@ fn lsp_drain_budget_from(escalation_grace: Duration) -> Duration {
 
 fn lsp_drain_budget() -> Duration {
     lsp_drain_budget_from(shutdown_escalation_grace())
+}
+
+/// Hold the persistence task's shutdown flush until the stop has drained the
+/// enrichment worker.
+///
+/// The stop drains that worker before the persistence task on purpose, so the
+/// final flush carries what the worker accepted on its way out. The persistence
+/// task used to start that flush the moment cancel was signalled, which is
+/// before the drain, so a language server that answered while the stop waited
+/// on it had its relations installed after the last flush. They reached no
+/// authority, only the accepted-evidence record, and the next daemon replayed
+/// them as unverified input: its live graph lost the checked binding witness,
+/// the next admission could not extend the durable one, and an absence over
+/// the tree committed after that read `local_binding_unproven`.
+///
+/// Bounded by the ceiling the stop itself spends on the drain, so a stop that
+/// never sends still flushes, inside the half of the escalation grace that
+/// budget leaves for it. A sender dropped without sending releases the wait at
+/// once.
+async fn await_lsp_drain(drained: &mut tokio::sync::watch::Receiver<bool>) {
+    let _ = tokio::time::timeout(lsp_drain_budget(), drained.wait_for(|drained| *drained)).await;
 }
 
 /// Wait for the enrichment worker to finish what it was doing, under a ceiling.
@@ -6994,6 +8302,7 @@ async fn select_with_signals(
     supervisor_handle: tokio::task::JoinHandle<()>,
     lsp_handle: Option<tokio::task::JoinHandle<()>>,
     cancel_tx: tokio::sync::watch::Sender<bool>,
+    lsp_drained: tokio::sync::watch::Sender<bool>,
     state: &Arc<DaemonState>,
 ) -> Result<()> {
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -7061,6 +8370,8 @@ async fn select_with_signals(
         }
     };
 
+    state.prepared_publication.shutdown();
+
     // The escalation watchdog's grace began when the stop was signalled, so a
     // flush in flight is judged against the same end.
     let grace_ends = Instant::now().checked_add(shutdown_escalation_grace());
@@ -7073,6 +8384,11 @@ async fn select_with_signals(
     // minutes would otherwise spend the entire escalation grace before the sweep
     // was ever asked to stop.
     drain_lsp_enrichment(lsp_handle).await;
+    // Only now may the persistence task run its shutdown flush, which it holds
+    // until this is sent. The worker installs and records what it accepted
+    // before it exits, so the flush publishes it, rather than the next daemon
+    // replaying it as evidence that authority never committed.
+    let _ = lsp_drained.send(true);
 
     drain_handles(
         (completed != CompletedTask::Reconciliation).then_some(loop_handle),
@@ -7420,6 +8736,7 @@ pub(crate) fn spawn_background_embedding_worker(
                     run_background_embedding_batch(
                         &state_for_embed,
                         reset_on_index_error,
+                        |state| state.graph.prepare_embedder(),
                         |state| {
                             if is_artifact {
                                 state.graph.process_artifact_embedding_queue(batch)
@@ -8067,11 +9384,384 @@ mod tests {
             !marked.contains("pkg/sessions.py") && !marked.contains("pkg/adapters.py"),
             "{marked:?}"
         );
-        let saved: Vec<String> = serde_json::from_slice(
+        let saved = super::decode_enriched_marker(
             &std::fs::read(super::lsp_enriched_marker_path(&state)).unwrap(),
         )
-        .unwrap();
+        .expect("the marker is written at this build's version");
         assert_eq!(saved, completed);
+
+        // A marker another enrichment version wrote, including the unversioned
+        // list every earlier build wrote, marks nothing: its files are swept
+        // again by this build.
+        let unversioned = serde_json::to_vec(&completed).unwrap();
+        assert_eq!(super::decode_enriched_marker(&unversioned), None);
+        let older =
+            serde_json::to_vec(&serde_json::json!({"version": 1, "files": completed})).unwrap();
+        assert_eq!(super::decode_enriched_marker(&older), None);
+    }
+
+    /// Version 2 predates proven Go sites and both old versions predate
+    /// explicit Python workspace initialization. Unchanged languages keep
+    /// completion rather than paying another sweep.
+    #[test]
+    fn older_markers_reask_only_languages_whose_enrichment_contract_changed() {
+        let files = [
+            "pkg/cmd/pr/create/create.go",
+            "src/requests/sessions.py",
+            "src/hono-base.ts",
+            "internal/ghrepo/repo.go",
+        ];
+        let v2 = serde_json::to_vec(&serde_json::json!({"version": 2, "files": files})).unwrap();
+        assert_eq!(
+            super::decode_enriched_marker(&v2),
+            Some(vec!["src/hono-base.ts".to_string()])
+        );
+        assert!(super::marker_predates_proven_go_method_references(&v2));
+        let v3 = serde_json::to_vec(&serde_json::json!({"version": 3, "files": files})).unwrap();
+        assert_eq!(
+            super::decode_enriched_marker(&v3),
+            Some(vec![
+                files[0].to_string(),
+                files[2].to_string(),
+                files[3].to_string()
+            ])
+        );
+
+        // This build's own marker stands whole.
+        let current = super::encode_enriched_marker(
+            &files
+                .iter()
+                .map(|file| file.to_string())
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            super::decode_enriched_marker(&current),
+            Some(files.iter().map(|file| file.to_string()).collect())
+        );
+        assert!(!super::marker_predates_proven_go_method_references(
+            &current
+        ));
+    }
+
+    /// A file pass that kept what it proved around a failed query hands the
+    /// relations back and the failure with them, and the file is held back.
+    #[tokio::test]
+    async fn a_file_pass_that_counted_a_failure_holds_its_file_back() {
+        let mut tally = super::SweepTally::default();
+        let (failures_before, over_budget_before) =
+            (tally.query_failures, tally.definitions_over_budget);
+        let proven = kin_model::Relation {
+            id: kin_model::RelationId::new(),
+            kind: kin_model::RelationKind::References,
+            src: kin_model::GraphNodeId::Entity(kin_model::EntityId::new()),
+            dst: kin_model::GraphNodeId::Entity(kin_model::EntityId::new()),
+            confidence: 0.95,
+            origin: kin_model::RelationOrigin::Lsp,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        };
+        let pass = kin_lsp::file_enrichment::FileEnrichmentResult {
+            relations: vec![proven.clone()],
+            failed_queries: 2,
+            declined_queries: 3,
+            first_failure: Some("a definition got no answer: timeout".into()),
+            ..Default::default()
+        };
+        let (result, failure) = super::file_definitions_within_budget(
+            async { kin_lsp::Result::Ok(pass) },
+            std::time::Duration::from_secs(5),
+            "pkg/a.go",
+            &mut tally,
+        )
+        .await;
+        assert_eq!(result.relations, vec![proven], "the proven relations stand");
+        assert_eq!((tally.query_failures, tally.query_declines), (2, 3));
+        assert!(failure.is_some_and(
+            |reason| reason.contains("2 of its queries") && reason.contains("timeout")
+        ));
+        assert!(
+            !super::file_passes_completed(&tally, failures_before, over_budget_before),
+            "a partial pass is held back, not marked"
+        );
+    }
+
+    /// A partial member join keeps its independently proven edges, but its
+    /// unasked candidate withholds completion and survives in the owed record.
+    #[tokio::test]
+    async fn a_partial_member_join_keeps_proven_edges_and_persists_its_owed_reason() {
+        use kin_lsp::{EntityIndex, EntityRef};
+        use kin_model::{EntityId, GraphNodeId, RelationKind};
+        use serde_json::json;
+
+        let root = tempfile::tempdir().unwrap();
+        let text = "export function run() {\n    beta();\n  mod.go();\n}\n";
+        let candidates = "@decorate\nexport function go() {}\nexport function go() {}\n";
+        std::fs::create_dir(root.path().join("lib")).unwrap();
+        for (file, body) in [
+            ("source.ts", text),
+            ("lib/mod.ts", candidates),
+            ("lib/beta.ts", "export function beta() {}\n"),
+        ] {
+            std::fs::write(root.path().join(file), body).unwrap();
+        }
+        let init = kin_core::init(root.path()).unwrap();
+        let state = super::DaemonState::open(init.layout.clone()).unwrap();
+        crate::loop_runner::sync_filesystem_with_graph(&state)
+            .await
+            .unwrap();
+        let inputs = super::lsp_publication::QueryInputs::capture(&state)
+            .await
+            .unwrap();
+        let entity = |name: &str, file: &str, start, end| EntityRef {
+            id: EntityId::new(),
+            name: name.into(),
+            file_path: file.into(),
+            start_line: start,
+            start_col: 0,
+            end_line: end,
+            name_line: start,
+            name_col: 16,
+            declares_name: true,
+            kind: kin_model::EntityKind::Function,
+        };
+        // One candidate retains the decorator line instead of its name line.
+        // The other must still bind from independent definition evidence.
+        let run = entity("run", "source.ts", 0, 3);
+        let unasked = entity("go", "lib/mod.ts", 0, 1);
+        let proven = entity("go", "lib/mod.ts", 2, 2);
+        let beta = entity("beta", "lib/beta.ts", 0, 0);
+        let index = EntityIndex::new(
+            vec![run.clone(), unasked, proven.clone(), beta.clone()],
+            root.path(),
+        );
+        let uri = kin_lsp::protocol::path_to_uri(&root.path().join("source.ts"));
+        let module_uri = kin_lsp::protocol::path_to_uri(&root.path().join("lib/mod.ts"));
+        let beta_uri = kin_lsp::protocol::path_to_uri(&root.path().join("lib/beta.ts"));
+        let at = |target: &str, start, end| {
+            json!({"result": [{"uri": target, "range": {
+            "start": {"line": 0, "character": start},
+            "end": {"line": 0, "character": end}}}]})
+        };
+        let mut responses = json!({"initialize": {"result": {"capabilities": {
+            "definitionProvider": true, "typeDefinitionProvider": true,
+            "callHierarchyProvider": false
+        }}}});
+        responses[format!("textDocument/definition@{uri}#4")] = at(&beta_uri, 16, 20);
+        responses[format!("textDocument/definition@{uri}#2")] = at(&module_uri, 0, 0);
+        responses[format!("textDocument/typeDefinition@{uri}#2")] = at(&module_uri, 0, 0);
+        responses[format!("textDocument/definition@{uri}#6")] =
+            at("file:///dependency/go.ts", 0, 2);
+        responses[format!("textDocument/definition@{module_uri}#16")] =
+            at("file:///dependency/go.ts", 0, 2);
+        // Reuse the existing framed peer without changing global process env.
+        let script = include_str!("../../kin-lsp/src/enrichment_test_peer.py")
+            .replace("os.environ[\"KIN_LSP_TEST_RESPONSES\"]", "sys.argv[1]");
+        let responses = responses.to_string();
+        let server = kin_lsp::lifecycle::LspServer::start(
+            "python3",
+            &["-u", "-c", &script, &responses],
+            root.path(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let provider = |path: &str| inputs.document(path);
+        let mut tally = super::SweepTally::default();
+        let (result, failure) = super::file_definitions_within_budget(
+            kin_lsp::file_enrichment::enrich_file_definitions(
+                &server,
+                &root.path().join("source.ts"),
+                text,
+                &index,
+                root.path(),
+                Some(&provider),
+            ),
+            std::time::Duration::from_secs(5),
+            "source.ts",
+            &mut tally,
+        )
+        .await;
+        server.shutdown().await.unwrap();
+        assert_eq!((result.failed_queries, result.declined_queries), (1, 0));
+        assert_eq!((tally.query_failures, tally.query_declines), (1, 0));
+        let edges: Vec<_> = result
+            .relations
+            .iter()
+            .map(|relation| (relation.kind, relation.src, relation.dst))
+            .collect();
+        assert_eq!(
+            edges,
+            [
+                (
+                    RelationKind::References,
+                    GraphNodeId::Entity(run.id),
+                    GraphNodeId::Entity(beta.id)
+                ),
+                (
+                    RelationKind::References,
+                    GraphNodeId::Entity(run.id),
+                    GraphNodeId::Entity(proven.id)
+                ),
+            ],
+            "both the earlier edge and the independent member binding survive"
+        );
+        let reason = failure.expect("the partial join must name why the file is owed");
+        assert!(
+            reason.contains("could not locate 1 candidate declaration"),
+            "{reason}"
+        );
+        let completed = if super::file_passes_completed(&tally, 0, 0) {
+            vec!["source.ts".to_string()]
+        } else {
+            Vec::new()
+        };
+        assert!(completed.is_empty());
+        assert!(super::mark_completed_sweep_files(
+            &state,
+            &completed,
+            inputs.marker_epoch,
+            super::EnrichmentWrite::all_published(0),
+            false,
+        ));
+        assert!(!super::file_already_enriched(&state, "source.ts"));
+        assert_eq!(
+            super::settle_owed_files(
+                &state,
+                &inputs,
+                &completed,
+                &[("source.ts".into(), reason.clone())],
+            ),
+            1
+        );
+        state.lsp_owed_files.lock().unwrap().clear();
+        super::load_lsp_owed_files(&state);
+        let owed = state.lsp_owed_files.lock().unwrap();
+        assert_eq!(owed["source.ts"].reason, reason);
+        assert_eq!(owed["source.ts"].blob, inputs.blob("source.ts").unwrap());
+    }
+
+    /// A file whose every query was declined, with none answered, is owed; a
+    /// file with declines among answers is not.
+    #[test]
+    fn a_file_the_server_answered_nothing_about_is_owed() {
+        assert!(super::declined_everything(3, 0)
+            .is_some_and(|reason| reason.contains("declined all 3")));
+        assert_eq!(super::declined_everything(3, 1), None);
+        assert_eq!(super::declined_everything(0, 0), None);
+        let mut tally = super::SweepTally {
+            enriched: 1,
+            ..Default::default()
+        };
+        tally.owed_deferred = 1;
+        assert!(
+            !super::sweep_work_succeeded(&tally, 2, Default::default(), false),
+            "a pass that left an owed file waiting did not finish the work"
+        );
+    }
+
+    /// A file whose queries got no answer is owed and asked again on its own,
+    /// and the files that completed are never asked again.
+    ///
+    /// One pass over three admitted files: two complete and are marked, and the
+    /// third's references query runs out of budget, so it is owed. The owed
+    /// record survives a reload. The next pass skips the two marked files and
+    /// defers the owed one inside its backoff, so it asks the server nothing.
+    /// Once the backoff ends, when its bytes change, or when a sweep is asked
+    /// for outright, the owed file is the ONLY one asked about. When that
+    /// attempt completes it is marked and nothing is owed any more.
+    #[tokio::test]
+    async fn a_failing_file_is_owed_and_retried_alone() {
+        let root = tempfile::tempdir().unwrap();
+        for (file, body) in [
+            ("a.py", "def a():\n    return 1\n"),
+            ("b.py", "def b():\n    return 2\n"),
+            ("c.py", "def c():\n    return 3\n"),
+        ] {
+            std::fs::write(root.path().join(file), body).unwrap();
+        }
+        let init = kin_core::init(root.path()).unwrap();
+        let state = super::DaemonState::open(init.layout.clone()).unwrap();
+        crate::loop_runner::sync_filesystem_with_graph(&state)
+            .await
+            .unwrap();
+        let inputs = super::lsp_publication::QueryInputs::capture(&state)
+            .await
+            .unwrap();
+        let files = ["a.py", "b.py", "c.py"];
+        for file in files {
+            assert!(inputs.blob(file).is_some(), "{file} is admitted");
+        }
+
+        // The first pass: two files complete, one gets no answer.
+        let epoch = super::current_marker_epoch(&state);
+        let completed = vec!["a.py".to_string(), "b.py".to_string()];
+        let failed = vec![(
+            "c.py".to_string(),
+            "the references query ran over its 5s budget".to_string(),
+        )];
+        assert!(super::mark_completed_sweep_files(
+            &state,
+            &completed,
+            epoch,
+            super::EnrichmentWrite::all_published(0),
+            false
+        ));
+        assert_eq!(
+            super::settle_owed_files(&state, &inputs, &completed, &failed),
+            1
+        );
+
+        // What a restarting daemon reads back.
+        state.lsp_owed_files.lock().unwrap().clear();
+        super::load_lsp_owed_files(&state);
+        let owed = state.lsp_owed_files.lock().unwrap().clone();
+        let entry = owed.get("c.py").expect("the failing file is owed");
+        assert_eq!(entry.attempts, 1);
+        assert_eq!(entry.reason, failed[0].1);
+
+        // Which files the next pass asks a server about, by the sweep's own
+        // gate: a marked file is skipped, an owed one waits.
+        let asked = |now: u64, retry_now: bool, blob_of_c: Option<&str>| -> Vec<&str> {
+            files
+                .into_iter()
+                .filter(|file| {
+                    let blob = if *file == "c.py" {
+                        blob_of_c.map(str::to_string)
+                    } else {
+                        inputs.blob(file)
+                    };
+                    super::sweep_gate(&state, &owed, file, blob.as_deref(), retry_now, now)
+                        == super::SweepGate::Ask
+                })
+                .collect()
+        };
+        let blob = inputs.blob("c.py").unwrap();
+        let failed_at = entry.last_attempt_unix_s;
+        let backoff = crate::owed_enrichment::retry_interval(1).as_secs();
+        assert!(
+            asked(failed_at + 1, false, Some(&blob)).is_empty(),
+            "inside its backoff the owed file waits and the marked files are skipped"
+        );
+        assert_eq!(asked(failed_at + backoff, false, Some(&blob)), vec!["c.py"]);
+        assert_eq!(asked(failed_at + 1, true, Some(&blob)), vec!["c.py"]);
+        assert_eq!(asked(failed_at + 1, false, Some("new-bytes")), vec!["c.py"]);
+
+        // The retry completes: marked, and owed nothing.
+        let retried = vec!["c.py".to_string()];
+        assert!(super::mark_completed_sweep_files(
+            &state,
+            &retried,
+            epoch,
+            super::EnrichmentWrite::all_published(0),
+            false
+        ));
+        assert_eq!(super::settle_owed_files(&state, &inputs, &retried, &[]), 0);
+        assert!(crate::owed_enrichment::load(&state.layout).is_empty());
+        assert!(files
+            .into_iter()
+            .all(|file| super::file_already_enriched(&state, file)));
     }
 
     #[test]
@@ -8099,48 +9789,135 @@ mod tests {
 
     #[tokio::test]
     async fn failed_and_timed_out_lsp_queries_are_not_successful_empty_answers() {
-        let mut failures = 0;
+        let mut outcomes = super::QueryOutcomes::default();
         assert_eq!(
             super::lsp_query_within_budget(
-                async { Ok::<_, ()>(Vec::<u8>::new()) },
+                "calls",
+                async { kin_lsp::Result::Ok(Vec::<u8>::new()) },
                 std::time::Duration::from_millis(5),
-                &mut failures
+                &mut outcomes
             )
             .await,
             Some(Vec::new())
         );
-        assert_eq!(failures, 0);
+        assert_eq!(outcomes, super::QueryOutcomes::default());
         assert_eq!(
             super::lsp_query_within_budget(
-                async { Err::<Vec<u8>, _>(()) },
+                "calls",
+                async { kin_lsp::Result::<Vec<u8>>::Err(kin_lsp::LspError::ServerDied) },
                 std::time::Duration::from_millis(5),
-                &mut failures
+                &mut outcomes
             )
             .await,
             None
         );
-        assert_eq!(failures, 1);
+        assert_eq!(outcomes.failures, 1);
+        assert!(outcomes
+            .first_failure
+            .as_deref()
+            .is_some_and(|reason| reason.starts_with("the calls query failed")));
         assert_eq!(
             super::lsp_query_within_budget(
-                std::future::pending::<Result<Vec<u8>, ()>>(),
+                "references",
+                std::future::pending::<kin_lsp::Result<Vec<u8>>>(),
                 std::time::Duration::from_millis(1),
-                &mut failures
+                &mut outcomes
             )
             .await,
             None
         );
-        assert_eq!(failures, 2);
+        assert_eq!(outcomes.failures, 2);
+        // A server's internal error is not an answer either.
+        assert_eq!(
+            super::lsp_query_within_budget(
+                "uses-type",
+                async {
+                    kin_lsp::Result::<Vec<u8>>::Err(kin_lsp::LspError::JsonRpc(
+                        serde_json::json!({"code": -32603, "message": "panic"}).to_string(),
+                    ))
+                },
+                std::time::Duration::from_millis(5),
+                &mut outcomes
+            )
+            .await,
+            None
+        );
+        assert_eq!(outcomes.failures, 3);
+        assert_eq!(outcomes.declines, 0);
+        // A code-0 error the client did not recognize as a decline is a
+        // failure: gopls sends "no package metadata" exactly that way.
+        assert_eq!(
+            super::lsp_query_within_budget(
+                "references",
+                async {
+                    kin_lsp::Result::<Vec<u8>>::Err(kin_lsp::LspError::JsonRpc(
+                        serde_json::json!({"code": 0, "message": "no package metadata for file"})
+                            .to_string(),
+                    ))
+                },
+                std::time::Duration::from_millis(5),
+                &mut outcomes
+            )
+            .await,
+            None
+        );
+        assert_eq!(
+            outcomes.failures, 4,
+            "an unrecognized code-0 error is a failure"
+        );
+        // A declined request, as the client names one, is an answer with
+        // nothing in it: no relation, and no failure held against the file.
+        assert_eq!(
+            super::lsp_query_within_budget(
+                "uses-type",
+                async {
+                    kin_lsp::Result::<Vec<u8>>::Err(kin_lsp::LspError::Declined {
+                        method: "textDocument/typeDefinition".into(),
+                        message: "no enclosing expression has a type".into(),
+                    })
+                },
+                std::time::Duration::from_millis(5),
+                &mut outcomes
+            )
+            .await,
+            None
+        );
+        assert_eq!(outcomes.failures, 4, "a decline is not a failure");
+        assert_eq!(outcomes.declines, 1);
         let mut tally = super::SweepTally::default();
-        super::file_definitions_within_budget(
-            async { Err::<kin_lsp::file_enrichment::FileEnrichmentResult, _>(()) },
+        let (_, failure) = super::file_definitions_within_budget(
+            async {
+                kin_lsp::Result::<kin_lsp::file_enrichment::FileEnrichmentResult>::Err(
+                    kin_lsp::LspError::Timeout,
+                )
+            },
             std::time::Duration::from_millis(5),
             "pkg/other.py",
             &mut tally,
         )
         .await;
         assert_eq!(tally.query_failures, 1);
+        assert!(failure.is_some());
+        let (_, failure) = super::file_definitions_within_budget(
+            async {
+                kin_lsp::Result::<kin_lsp::file_enrichment::FileEnrichmentResult>::Err(
+                    kin_lsp::LspError::Declined {
+                        method: "textDocument/prepareCallHierarchy".into(),
+                        message: "no symbol here".into(),
+                    },
+                )
+            },
+            std::time::Duration::from_millis(5),
+            "pkg/other.py",
+            &mut tally,
+        )
+        .await;
+        assert_eq!(tally.query_failures, 1, "a declined pass is not a failure");
+        assert_eq!(tally.query_declines, 1);
+        assert_eq!(failure, None);
         super::file_definitions_within_budget(
-            std::future::pending::<Result<kin_lsp::file_enrichment::FileEnrichmentResult, ()>>(),
+            std::future::pending::<kin_lsp::Result<kin_lsp::file_enrichment::FileEnrichmentResult>>(
+            ),
             std::time::Duration::from_millis(1),
             "pkg/other.py",
             &mut tally,
@@ -8236,6 +10013,107 @@ mod tests {
         drop(tracker.resume());
         assert_eq!(tracker.pending.load(Ordering::SeqCst), 0);
         assert_eq!(tracker.failed.load(Ordering::SeqCst), 1);
+    }
+
+    /// The acceptance status was `failed_work: 1` with `files_total: 0` after a
+    /// sweep whose snapshot went stale and queued another pass. The stale pass
+    /// is not failed work once that retry is queued. A retry that never queued,
+    /// and a real incomplete pass, still are.
+    #[test]
+    fn a_superseded_sweep_whose_retry_was_queued_is_not_failed_work() {
+        use crate::state::LspWorkTracker;
+        use std::sync::{atomic::Ordering, Arc};
+
+        fn reserved_attempt(tracker: &Arc<LspWorkTracker>) -> crate::state::LspWorkGuard {
+            let held = tracker.reserve();
+            held.transfer();
+            tracker.resume()
+        }
+
+        let queued = Arc::new(LspWorkTracker::default());
+        let mut work = reserved_attempt(&queued);
+        super::settle_enrichment_attempt(
+            &mut work,
+            super::enrichment_attempt_after_sweep(false, true, true),
+        );
+        drop(work);
+        assert_eq!(queued.pending.load(Ordering::SeqCst), 0);
+        assert_eq!(queued.failed.load(Ordering::SeqCst), 0);
+
+        let stranded = Arc::new(LspWorkTracker::default());
+        let mut work = reserved_attempt(&stranded);
+        super::settle_enrichment_attempt(
+            &mut work,
+            super::enrichment_attempt_after_sweep(false, true, false),
+        );
+        drop(work);
+        assert_eq!(stranded.pending.load(Ordering::SeqCst), 0);
+        assert_eq!(stranded.failed.load(Ordering::SeqCst), 1);
+
+        let broken = Arc::new(LspWorkTracker::default());
+        let mut work = reserved_attempt(&broken);
+        super::settle_enrichment_attempt(
+            &mut work,
+            super::enrichment_attempt_after_sweep(false, false, false),
+        );
+        drop(work);
+        assert_eq!(broken.failed.load(Ordering::SeqCst), 1);
+
+        let done = Arc::new(LspWorkTracker::default());
+        let mut work = reserved_attempt(&done);
+        super::settle_enrichment_attempt(
+            &mut work,
+            super::enrichment_attempt_after_sweep(true, false, false),
+        );
+        drop(work);
+        assert_eq!(done.failed.load(Ordering::SeqCst), 0);
+        assert_eq!(done.pending.load(Ordering::SeqCst), 0);
+    }
+
+    /// The mixin fixture's per-entity queries return a protocol error for the
+    /// file-module surface and still publish the method relations. That error
+    /// used to leave the reservation unfinished, so `failed_work` stayed 1
+    /// after the useful edges were already in the graph.
+    ///
+    /// Both halves, because the first fix dropped the count on the floor to get
+    /// the first half: the reservation completes AND the query error is still
+    /// counted somewhere a reader can see it.
+    #[test]
+    fn a_clean_incremental_write_finishes_when_a_query_arm_failed() {
+        use crate::state::LspWorkTracker;
+        use std::sync::{atomic::Ordering, Arc};
+        let tracker = Arc::new(LspWorkTracker::default());
+        let held = tracker.reserve();
+        held.transfer();
+        let mut work = tracker.resume();
+        super::finish_incremental_reservation(&mut work, None, 0, 0, 2);
+        drop(work);
+        assert_eq!(tracker.failed.load(Ordering::SeqCst), 0);
+        assert_eq!(tracker.pending.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            tracker.incremental_query_failures.load(Ordering::SeqCst),
+            2,
+            "a query error that does not fail the pass still has to be visible"
+        );
+
+        // The control: a pass with no query error leaves the count alone, so
+        // the field cannot be satisfied by counting every pass.
+        let clean = Arc::new(LspWorkTracker::default());
+        let held = clean.reserve();
+        held.transfer();
+        let mut work = clean.resume();
+        super::finish_incremental_reservation(&mut work, None, 0, 0, 0);
+        drop(work);
+        assert_eq!(clean.failed.load(Ordering::SeqCst), 0);
+        assert_eq!(clean.incremental_query_failures.load(Ordering::SeqCst), 0);
+
+        let lost = Arc::new(LspWorkTracker::default());
+        let held = lost.reserve();
+        held.transfer();
+        let mut work = lost.resume();
+        super::finish_incremental_reservation(&mut work, None, 1, 0, 0);
+        drop(work);
+        assert_eq!(lost.failed.load(Ordering::SeqCst), 1);
     }
 
     use super::{
@@ -8805,6 +10683,245 @@ mod tests {
         assert_eq!(raise.effective_secs(), 0);
         assert!(!raise.raised());
         assert_eq!(state.idle_timeout(), None);
+    }
+
+    // ── Attached clients and work in progress vs idle shutdown ─────────────
+    //
+    // A client tells a daemon it is still there by holding a registered
+    // session for a live process, which is what `kin with`, `kin shell` and an
+    // editor launcher do. These drive the real idle monitor with real child
+    // processes standing in for the clients.
+
+    /// A stand-in client: a live process whose pid a session can name, killed
+    /// on drop so a failed assertion never leaks it.
+    #[cfg(unix)]
+    struct StandInClient(std::process::Child);
+
+    #[cfg(unix)]
+    impl StandInClient {
+        fn spawn() -> Self {
+            Self(
+                std::process::Command::new("sleep")
+                    .arg("600")
+                    .spawn()
+                    .expect("spawn a stand-in client process"),
+            )
+        }
+
+        fn attach(&self, state: &DaemonState) {
+            state
+                .coordinator
+                .register_session(
+                    "claude-code",
+                    "stand-in-client",
+                    kin_model::SessionTransport::Mcp,
+                    Some(self.0.id()),
+                    state.layout.working_dir().to_path_buf(),
+                    kin_model::SessionCapabilities::default(),
+                )
+                .expect("register the stand-in client's session");
+        }
+
+        /// The client's process ends, and the sweeper does what its 30-second
+        /// pass would: it reaps the session whose process is gone.
+        fn detach(mut self, state: &DaemonState) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+            state
+                .coordinator
+                .sweep_stale_sessions()
+                .expect("sweep the detached client's session");
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for StandInClient {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[cfg(unix)]
+    fn attached_clients(state: &DaemonState) -> usize {
+        state
+            .coordinator
+            .list_sessions()
+            .unwrap()
+            .iter()
+            .filter(|session| session.vendor != "kin-daemon")
+            .count()
+    }
+
+    #[cfg(unix)]
+    async fn open_idle_daemon(window: Option<Duration>) -> (tempfile::TempDir, Arc<DaemonState>) {
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let state = Arc::new(DaemonState::open(initialized.layout).unwrap());
+        state.is_initialized.store(true, Ordering::Relaxed);
+        state.install_idle_timeout(window);
+        (repo, state)
+    }
+
+    /// Two clients attached, one detaches, and the daemon stays. The last one
+    /// detaches, and the daemon idles out, but only once its window has run
+    /// from that client's last call.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_daemon_outlives_each_attached_client_and_idles_out_after_the_last() {
+        let window = Duration::from_secs(2);
+        let (_repo, state) = open_idle_daemon(Some(window)).await;
+        let first = StandInClient::spawn();
+        let second = StandInClient::spawn();
+        first.attach(&state);
+        second.attach(&state);
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let monitor = tokio::spawn(super::run_idle_monitor(
+            Arc::clone(&state),
+            Some(window),
+            4219,
+            cancel_tx.clone(),
+            cancel_rx,
+        ));
+
+        tokio::time::sleep(window + Duration::from_millis(500)).await;
+        assert!(
+            !*cancel_tx.borrow(),
+            "a daemon with two attached clients idled out"
+        );
+
+        first.detach(&state);
+        assert_eq!(
+            attached_clients(&state),
+            1,
+            "only the first client detached"
+        );
+        tokio::time::sleep(window + Duration::from_millis(500)).await;
+        assert!(
+            !*cancel_tx.borrow(),
+            "a daemon with one client still attached idled out"
+        );
+
+        // The last client's last call, then it goes. The window runs from here.
+        state.touch_activity();
+        second.detach(&state);
+        assert_eq!(attached_clients(&state), 0);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !*cancel_tx.borrow(),
+            "the daemon went before its window had run from the last client's call"
+        );
+        tokio::time::timeout(Duration::from_secs(30), monitor)
+            .await
+            .expect("with no client left, the daemon must idle out after its window")
+            .expect("the idle monitor must not panic");
+        assert!(*cancel_tx.borrow());
+    }
+
+    /// With nothing attached and the window long gone, work in progress still
+    /// keeps the daemon up: a request in flight, a language-server sweep, and
+    /// enrichment partway through a file. Each one clears, and then it goes.
+    #[tokio::test]
+    async fn work_in_progress_keeps_an_unattached_daemon_up_past_its_window() {
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let state = DaemonState::open(initialized.layout).unwrap();
+        state.is_initialized.store(true, Ordering::Relaxed);
+        let expired = Duration::ZERO;
+        assert!(
+            super::ready_for_idle_shutdown(&state, expired, ControlPlane::Ours),
+            "control: an idle daemon with nothing in progress must idle out"
+        );
+
+        state.begin_request();
+        assert!(
+            !super::ready_for_idle_shutdown(&state, expired, ControlPlane::Ours),
+            "a request in flight, such as a write on its way, must hold the daemon"
+        );
+        state.end_request();
+
+        state.lsp_sweep_running.store(true, Ordering::SeqCst);
+        assert!(
+            !super::ready_for_idle_shutdown(&state, expired, ControlPlane::Ours),
+            "a running language-server sweep must hold the daemon"
+        );
+        state.lsp_sweep_running.store(false, Ordering::SeqCst);
+
+        let enrichment = state.background_work.pass(crate::background_work::PASS_LSP);
+        enrichment.working(std::time::Instant::now());
+        assert!(
+            !super::ready_for_idle_shutdown(&state, expired, ControlPlane::Ours),
+            "enrichment partway through a file must hold the daemon"
+        );
+        enrichment.idle();
+
+        assert!(
+            super::ready_for_idle_shutdown(&state, expired, ControlPlane::Ours),
+            "once the work is done the daemon must still idle out"
+        );
+    }
+
+    /// Asked to retire, a daemon drops only the wait. With a client attached it
+    /// stays, whatever its window; the moment the client goes, it goes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_retiring_daemon_waits_for_its_last_client_and_nothing_longer() {
+        let window = Duration::from_secs(3600);
+        let (_repo, state) = open_idle_daemon(Some(window)).await;
+        let client = StandInClient::spawn();
+        client.attach(&state);
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let monitor = tokio::spawn(super::run_idle_monitor(
+            Arc::clone(&state),
+            Some(window),
+            4219,
+            cancel_tx.clone(),
+            cancel_rx,
+        ));
+
+        assert!(
+            state.request_retirement(),
+            "the first request is the one that asks"
+        );
+        assert!(!state.request_retirement(), "a repeat changes nothing");
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(
+            !*cancel_tx.borrow(),
+            "a retiring daemon went while a client was still attached"
+        );
+
+        client.detach(&state);
+        tokio::time::timeout(Duration::from_secs(10), monitor)
+            .await
+            .expect("a retiring daemon must go as soon as its last client has")
+            .expect("the idle monitor must not panic");
+        assert!(*cancel_tx.borrow());
+    }
+
+    /// A daemon configured never to idle out still honours a retirement
+    /// request once nothing needs it. Retirement is a person asking, not a
+    /// window.
+    #[tokio::test]
+    async fn a_daemon_that_never_idles_out_still_retires_when_asked() {
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let state = Arc::new(DaemonState::open(initialized.layout).unwrap());
+        state.is_initialized.store(true, Ordering::Relaxed);
+        state.install_idle_timeout(None);
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let monitor = tokio::spawn(super::run_idle_monitor(
+            Arc::clone(&state),
+            None,
+            4219,
+            cancel_tx.clone(),
+            cancel_rx,
+        ));
+        state.request_retirement();
+        tokio::time::timeout(Duration::from_secs(30), monitor)
+            .await
+            .expect("an unused daemon asked to retire must go")
+            .expect("the idle monitor must not panic");
+        assert!(*cancel_tx.borrow());
     }
 
     #[tokio::test]
@@ -9466,13 +11583,18 @@ mod tests {
 
         let batch_state = Arc::clone(&state);
         let background = std::thread::spawn(move || {
-            super::run_background_embedding_batch(&batch_state, true, move |_| {
-                batch_started_tx.send(()).unwrap();
-                foreground_waiting_rx.recv().unwrap();
-                Err(kin_db::KinDbError::IndexError(
-                    "synthetic stale background index".to_string(),
-                ))
-            })
+            super::run_background_embedding_batch(
+                &batch_state,
+                true,
+                |_| Ok(()),
+                move |_| {
+                    batch_started_tx.send(()).unwrap();
+                    foreground_waiting_rx.recv().unwrap();
+                    Err(kin_db::KinDbError::IndexError(
+                        "synthetic stale background index".to_string(),
+                    ))
+                },
+            )
         });
 
         batch_started_rx.recv().unwrap();
@@ -9514,6 +11636,66 @@ mod tests {
             state.graph.vector_index_stats(),
             Some((4, 1)),
             "no stale recovery may run after the waiting foreground rebuild publishes"
+        );
+    }
+
+    /// A batch whose embedder cannot be built fails before it takes
+    /// `embedding_work`, runs nothing, and leaves the vector index attached.
+    ///
+    /// The first build fetches the model, and a fetch can fail for reasons that
+    /// say nothing about the index: no network, a rate limit, a full disk. While
+    /// the build ran inside the batch, its `IndexError` took the stale-index
+    /// recovery and detached an index that was fine.
+    #[cfg(feature = "vector")]
+    #[test]
+    fn a_batch_whose_embedder_cannot_be_built_fails_without_touching_the_index() {
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let state = Arc::new(DaemonState::open(initialized.layout).unwrap());
+
+        let descriptor = kin_db::IndexDescriptor {
+            model_id: Some("unbuildable-embedder-fixture@v1".to_string()),
+            graph_root: Some(hex::encode(state.graph.compute_root_hash())),
+        };
+        let vectors = kin_db::VectorIndex::new(4).unwrap();
+        vectors
+            .upsert(kin_model::EntityId::new(), &[1.0, 0.0, 0.0, 0.0])
+            .unwrap();
+        vectors.set_descriptor(descriptor.clone());
+        let sidecar = state.layout.root().join("unbuildable-embedder.kvec");
+        vectors.save(&sidecar).unwrap();
+        assert!(matches!(
+            state
+                .graph
+                .load_vector_index_compatible(&sidecar, &descriptor),
+            kin_db::VectorIndexLoad::Loaded(1)
+        ));
+
+        let outcome = super::run_background_embedding_batch(
+            &state,
+            true,
+            |state| {
+                assert!(
+                    state.embedding_work.try_lock().is_ok(),
+                    "the embedder is built before the batch takes embedding_work"
+                );
+                Err(kin_db::KinDbError::IndexError(
+                    "failed to download model config: synthetic outage".to_string(),
+                ))
+            },
+            |_| panic!("a batch whose embedder could not be built must not run"),
+        );
+
+        match outcome {
+            super::BackgroundEmbeddingBatchOutcome::Failed(kin_db::KinDbError::IndexError(
+                message,
+            )) => assert!(message.contains("synthetic outage"), "{message}"),
+            other => panic!("unexpected background batch outcome: {other:?}"),
+        }
+        assert_eq!(
+            state.graph.vector_index_stats(),
+            Some((4, 1)),
+            "a model that could not be fetched is not a stale index, so the index stays attached"
         );
     }
 
@@ -9873,6 +12055,38 @@ mod enrichment_marker_tests {
         }
     }
 
+    #[test]
+    fn python_scope_completion_waits_for_the_upgrade_claim() {
+        let repo = tempfile::tempdir().unwrap();
+        let layout = kin_core::init(repo.path()).unwrap().layout;
+        let state = DaemonState::open(layout.clone()).unwrap();
+        kin_core::hydration_semantics::write(
+            &layout,
+            &kin_core::hydration_semantics::HydrationSemanticsStamp::new(30, chrono::Utc::now()),
+        )
+        .unwrap();
+        let files = vec!["source.py".to_string(), "other.go".to_string()];
+        std::fs::write(
+            lsp_enriched_marker_path(&state),
+            super::encode_enriched_marker(&files),
+        )
+        .unwrap();
+        assert_eq!(
+            super::read_enriched_marker(&layout),
+            Some(vec!["other.go".to_string()])
+        );
+        super::mark_files_enriched(&state, &files, super::current_marker_epoch(&state));
+        assert!(!file_already_enriched(&state, "source.py"));
+        assert!(file_already_enriched(&state, "other.go"));
+        kin_core::hydration_semantics::write(
+            &layout,
+            &kin_core::hydration_semantics::HydrationSemanticsStamp::new(31, chrono::Utc::now()),
+        )
+        .unwrap();
+        super::mark_files_enriched(&state, &files, super::current_marker_epoch(&state));
+        assert!(file_already_enriched(&state, "source.py"));
+    }
+
     fn install_language_server_relation(state: &DaemonState) {
         let src = entity("send");
         let dst = entity("adapter_send");
@@ -9897,7 +12111,7 @@ mod enrichment_marker_tests {
     fn write_marker(state: &DaemonState, files: &[&str]) {
         std::fs::write(
             lsp_enriched_marker_path(state),
-            serde_json::to_vec(&files.iter().map(|f| f.to_string()).collect::<Vec<_>>()).unwrap(),
+            super::encode_enriched_marker(&files.iter().map(|f| f.to_string()).collect::<Vec<_>>()),
         )
         .unwrap();
     }
@@ -10217,7 +12431,7 @@ mod memory_pressure_tests {
     // that cannot, so an ungated import here is dead on Windows and `-D
     // warnings` makes dead imports fatal.
     #[cfg(unix)]
-    use super::walk_process_table;
+    use super::walk_process_table_with_descendants;
     use crate::state::DaemonState;
     use kin_core::memory_pressure::{
         admit_refused_embed, BudgetObservation, HeavyWork, PressureLevel, PressureRefusal,
@@ -10887,36 +13101,48 @@ mod memory_pressure_tests {
     /// per-pid. That is the exact blindness the budget exists to end, so it
     /// gets a test that talks to the kernel.
     ///
-    /// `walk_process_table` rather than `sample_tree_footprint`, because the
-    /// sampler caches for two seconds and a test that read a cache primed by
-    /// its neighbours would pass without asking anything.
+    /// The real walk rather than `sample_tree_footprint`, because the sampler
+    /// caches for two seconds and a test that read a cache primed by its
+    /// neighbours would pass without asking anything.
+    ///
+    /// It asks whether THIS pid was charged, not whether a total grew. The
+    /// suite spawns and reaps its own processes around this test, so a
+    /// neighbour exiting inside the retry window lowers a count that already
+    /// carried the child. A hosted arm64 run read one small child where two
+    /// larger ones had stood, and called a walk that had counted the child
+    /// correctly blind. A named pid cannot be cancelled out that way, and it
+    /// still grades the two failures the count was there for: a `parent()`
+    /// this platform leaves empty, and a table this build reads per-pid.
     #[test]
     #[cfg(unix)]
     fn a_real_child_process_is_counted_by_the_real_walk() {
-        let before = walk_process_table().expect("this host publishes a process table");
         let mut child = std::process::Command::new("sleep")
             .arg("30")
             .spawn()
             .expect("spawn a child");
+        let spawned = child.id();
         // The child has to be scheduled and carry a resident set before the
         // table can show one. That wait is this test's whole flake surface, so
         // it retries rather than sleeping once and hoping.
-        let mut after = before;
+        let mut counted = false;
+        let mut walked = None;
         for _ in 0..40 {
             std::thread::sleep(std::time::Duration::from_millis(50));
-            after = walk_process_table().expect("this host publishes a process table");
-            if after.child_count > before.child_count {
+            let reading =
+                walk_process_table_with_descendants().expect("this host publishes a process table");
+            counted = reading.1.contains(&spawned);
+            walked = Some(reading);
+            if counted {
                 break;
             }
         }
-        let counted = after.child_count > before.child_count;
         let _ = child.kill();
         let _ = child.wait();
         assert!(
             counted,
-            "a process this one started was not counted: before={before:?} after={after:?}. \
-             A daemon that cannot see the language server it spawned is the blindness that \
-             let the sweep run"
+            "a process this one started was not counted: pid {spawned} is absent from the \
+             walk {walked:?}. A daemon that cannot see the language server it spawned is the \
+             blindness that let the sweep run"
         );
     }
 
@@ -11783,6 +14009,46 @@ mod sweep_lifecycle_tests {
         );
     }
 
+    /// The shutdown flush waits for the stop to drain the enrichment worker,
+    /// and nothing the stop does can leave it waiting past that.
+    ///
+    /// The flush used to start on the cancel signal, ahead of the drain, so a
+    /// language server that answered during the stop had its relations accepted
+    /// after the last flush, and the next daemon replayed them as unverified
+    /// input. The acceptance suite for working-copy freshness grades the whole
+    /// chain; this grades the hold it depends on.
+    #[tokio::test]
+    async fn the_shutdown_flush_waits_for_the_enrichment_drain_and_no_longer() {
+        let (drained, mut waiting) = tokio::sync::watch::channel(false);
+        let early = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            super::await_lsp_drain(&mut waiting),
+        )
+        .await;
+        assert!(
+            early.is_err(),
+            "the flush must not start before the stop signals the drain"
+        );
+        drained.send(true).unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            super::await_lsp_drain(&mut waiting),
+        )
+        .await
+        .expect("a signalled drain releases the flush at once");
+
+        // A stop that fails before it can signal drops the sender, and that
+        // must release the flush rather than strand it until the bound.
+        let (dropped, mut orphaned) = tokio::sync::watch::channel(false);
+        drop(dropped);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            super::await_lsp_drain(&mut orphaned),
+        )
+        .await
+        .expect("a dropped sender releases the flush at once");
+    }
+
     /// The breaker still turns, so counting kills does not mint an endless loop.
     #[test]
     fn enough_killed_sweeps_open_the_circuit() {
@@ -12261,28 +14527,99 @@ mod language_server_resolution_tests {
 #[cfg(test)]
 mod sweep_tally_tests {
     use super::{
-        file_definitions_within_budget, next_interruption_count, sweep_circuit_open,
-        sweep_marker_is_durable, EnrichmentWrite, SweepTally, SWEEP_INTERRUPTION_LIMIT,
+        file_definitions_within_budget, file_passes_completed, next_interruption_count,
+        sweep_circuit_open, sweep_marker_is_durable, EnrichmentWrite, SweepTally,
+        SWEEP_INTERRUPTION_LIMIT,
     };
     use std::time::Duration;
 
     /// The number the sweep reports as `files`, and the one `/lsp/sweep/status`
-    /// serves as `files_done`, is unchanged in meaning by the tally: a file the
-    /// sweep finished with, whether it enriched it or found it already done.
+    /// serves as `files_done`: a file the sweep finished with, whether its
+    /// passes completed or it was already done. A file it asked about and got
+    /// no complete answer for is visited, and not done.
     #[test]
     fn files_processed_counts_enriched_and_already_enriched_only() {
         let tally = SweepTally {
             enriched: 3,
+            held_back: 2,
             already_enriched: 4,
             unsupported_language: 5,
             server_unavailable: 6,
             source_unreadable: 7,
             definitions_over_budget: 0,
             query_failures: 0,
+            query_declines: 0,
+            owed_deferred: 0,
             ended_early: false,
         };
         assert_eq!(tally.files_processed(), 7);
+        assert_eq!(tally.visited(), 5);
         assert_eq!(tally.blocked(), 18);
+    }
+
+    /// Both ways a language server can die partway through. Before its first answer:
+    /// every file is blocked, none is done, and the reason names the server.
+    /// Mid-question: the file it was answering is held back, the rest are
+    /// blocked, and still none is done. Every file lands in exactly one field.
+    #[test]
+    fn a_sweep_whose_server_died_claims_no_file_as_done() {
+        let before_first_answer = SweepTally {
+            server_unavailable: 546,
+            ..SweepTally::default()
+        };
+        assert_eq!(before_first_answer.files_processed(), 0);
+        assert_eq!(before_first_answer.unaccounted(546), 0);
+        assert!(before_first_answer
+            .blocked_reason(546)
+            .is_some_and(|reason| reason.contains("stopped answering")));
+
+        let mid_question = SweepTally {
+            held_back: 1,
+            server_unavailable: 545,
+            query_failures: 24,
+            ..SweepTally::default()
+        };
+        assert_eq!(
+            mid_question.files_processed(),
+            0,
+            "a file whose questions went unanswered is not done"
+        );
+        assert_eq!(mid_question.visited(), 1);
+        assert_eq!(mid_question.unaccounted(546), 0);
+        assert!(mid_question.blocked_reason(546).is_some());
+    }
+
+    /// A live server that answered some files and not others: the unanswered
+    /// ones are held back and owed, not done, and not blocked either, so the
+    /// sweep is not told its language server is missing.
+    #[test]
+    fn held_back_files_are_neither_done_nor_blocked() {
+        let tally = SweepTally {
+            enriched: 3,
+            held_back: 2,
+            query_failures: 2,
+            ..SweepTally::default()
+        };
+        assert_eq!(tally.files_processed(), 3);
+        assert_eq!(tally.blocked(), 0);
+        assert_eq!(tally.unaccounted(5), 0);
+        let all_held_back = SweepTally {
+            held_back: 5,
+            query_failures: 5,
+            ..SweepTally::default()
+        };
+        assert_eq!(all_held_back.files_processed(), 0);
+        assert_eq!(
+            all_held_back.blocked_reason(5),
+            None,
+            "held-back files are owed and named on the status surface, not blocked"
+        );
+        assert!(!super::sweep_work_succeeded(
+            &all_held_back,
+            5,
+            EnrichmentWrite::default(),
+            false
+        ));
     }
 
     /// A sweep that did work is not asked to explain itself. This is the arm
@@ -12308,7 +14645,10 @@ mod sweep_tally_tests {
         };
         assert_eq!(
             tally.blocked_reason(66),
-            Some("no language server could be started for these files"),
+            Some(
+                "no language server could serve these files: none started, or the one that \
+                 started stopped answering"
+            ),
             "a sweep that enriched nothing because no server started must not be \
              indistinguishable from a converged one"
         );
@@ -12505,15 +14845,19 @@ mod sweep_tally_tests {
     async fn a_definitions_pass_that_never_answers_is_abandoned_and_counted() {
         let mut tally = SweepTally::default();
         let stalled = std::future::pending::<
-            std::result::Result<kin_lsp::file_enrichment::FileEnrichmentResult, ()>,
+            kin_lsp::Result<kin_lsp::file_enrichment::FileEnrichmentResult>,
         >();
-        let result = file_definitions_within_budget(
+        let (result, failure) = file_definitions_within_budget(
             stalled,
             Duration::from_millis(60),
             "src/requests/models.py",
             &mut tally,
         )
         .await;
+        assert!(
+            failure.is_some_and(|reason| reason.contains("budget")),
+            "the owed file names what failed"
+        );
         assert_eq!(
             tally.definitions_over_budget, 1,
             "a pass abandoned at its budget must be counted, not merely logged"
@@ -12550,6 +14894,7 @@ mod sweep_tally_tests {
             }],
             definitions_resolved: 7,
             positions_queried: 913,
+            ..Default::default()
         };
         let expected = build();
         let mut tally = SweepTally::default();
@@ -12560,15 +14905,16 @@ mod sweep_tally_tests {
         // this very test: at a 1 ns budget it stayed green.
         let healthy = async move {
             tokio::time::sleep(Duration::from_millis(40)).await;
-            std::result::Result::<_, ()>::Ok(build())
+            kin_lsp::Result::Ok(build())
         };
-        let result = file_definitions_within_budget(
+        let (result, failure) = file_definitions_within_budget(
             healthy,
             Duration::from_secs(120),
             "src/requests/models.py",
             &mut tally,
         )
         .await;
+        assert_eq!(failure, None);
         assert_eq!(
             tally.definitions_over_budget, 0,
             "a pass that answered in time must not be counted against the budget"
@@ -12580,6 +14926,57 @@ mod sweep_tally_tests {
         );
         assert_eq!(result.definitions_resolved, expected.definitions_resolved);
         assert_eq!(result.positions_queried, expected.positions_queried);
+    }
+
+    /// A pass that finished without proving every query keeps what it proved
+    /// and holds its file back.
+    ///
+    /// The pass counts one entity's call hierarchy that failed, or a query the
+    /// server let time out, in `failed_queries` instead of discarding the
+    /// file. Those have to reach the tally, or a file missing some of its edges
+    /// is recorded as enriched and no later sweep ever asks about it again.
+    #[tokio::test]
+    async fn a_partial_pass_keeps_its_relations_and_holds_its_file_back() {
+        use kin_model::{GraphNodeId, Relation, RelationId, RelationKind, RelationOrigin};
+        let partial = kin_lsp::file_enrichment::FileEnrichmentResult {
+            relations: vec![Relation {
+                id: RelationId::from_bytes([7u8; 16]),
+                kind: RelationKind::References,
+                src: GraphNodeId::Entity(kin_model::EntityId::new()),
+                dst: GraphNodeId::Entity(kin_model::EntityId::new()),
+                confidence: 0.95,
+                origin: RelationOrigin::Lsp,
+                created_in: None,
+                import_source: None,
+                evidence: Vec::new(),
+            }],
+            definitions_resolved: 1,
+            positions_queried: 3,
+            failed_queries: 2,
+            ..Default::default()
+        };
+        let expected = partial.relations.clone();
+        let mut tally = SweepTally::default();
+        let (failures_before, over_budget_before) =
+            (tally.query_failures, tally.definitions_over_budget);
+        let answered = async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            kin_lsp::Result::Ok(partial)
+        };
+        let (result, failure) = file_definitions_within_budget(
+            answered,
+            Duration::from_secs(120),
+            "src/flask/app.py",
+            &mut tally,
+        )
+        .await;
+        assert_eq!(result.relations, expected, "what the pass proved is kept");
+        assert_eq!(tally.query_failures, failures_before + 2);
+        assert!(failure.is_some(), "the owed file names what failed");
+        assert!(
+            !file_passes_completed(&tally, failures_before, over_budget_before),
+            "a file some of whose queries failed must not be recorded as enriched"
+        );
     }
 
     /// An interrupted sweep is not a miscounted one, and the guard must not
@@ -12663,7 +15060,10 @@ mod sweep_tally_tests {
         };
         assert_eq!(
             really_blocked.blocked_reason(37),
-            Some("no language server could be started for these files")
+            Some(
+                "no language server could serve these files: none started, or the one that \
+                 started stopped answering"
+            )
         );
     }
 
@@ -12948,10 +15348,15 @@ mod shutdown_vector_checkpoint_tests {
 
 #[cfg(test)]
 mod enrichment_site_union_tests {
-    use super::{with_union_of_sites, MAX_ENRICHMENT_EVIDENCE};
+    use super::{
+        install_lsp_relations, unheld_lsp_relations, with_union_of_sites, EnrichmentWrite,
+        MAX_ENRICHMENT_EVIDENCE,
+    };
+    use crate::state::DaemonState;
+    use kin_index::occurrence::{original_evidence, proven_sites, OCCURRENCE_RULE};
     use kin_model::{
-        EntityId, FilePathId, GraphNodeId, Relation, RelationEvidence, RelationId, RelationKind,
-        RelationOrigin, SourceSpan,
+        EntityId, EntityStore, FilePathId, GraphNodeId, Relation, RelationEvidence, RelationId,
+        RelationKind, RelationOrigin, SourceSpan,
     };
 
     fn site(file: &str, line: u32) -> RelationEvidence {
@@ -13047,5 +15452,559 @@ mod enrichment_site_union_tests {
         );
         let merged = with_union_of_sites(&held, &edge(vec![site("caller.go", 9_000)]));
         assert_eq!(merged.evidence.len(), MAX_ENRICHMENT_EVIDENCE);
+    }
+
+    fn proven(file: &str, line: u32) -> RelationEvidence {
+        RelationEvidence {
+            parser_rule: Some(kin_model::LSP_PROVEN_METHOD_REFERENCES_RULE.to_string()),
+            ..site(file, line)
+        }
+    }
+
+    fn rules(relation: &Relation) -> Vec<(u32, String)> {
+        relation
+            .evidence
+            .iter()
+            .map(|record| {
+                (
+                    record.source_span.as_ref().unwrap().start_line,
+                    record.parser_rule.clone().unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    /// A Go method's proven sites replace the widened answer an older pass
+    /// recorded on the same edge. Joined to it, as any other pass's sites are,
+    /// the sites the proof refused would stay on the edge for good.
+    ///
+    /// On the gh CLI a released build recorded `NewCreateContext`'s direct
+    /// `Repository.RepoOwner` calls on lines 678 and 723 as references to
+    /// `Interface.RepoOwner`, beside the real ones on 649 and 697, and a sweep
+    /// of this build offered 649 and 697 alone. The union kept all four.
+    #[test]
+    fn proven_go_method_sites_replace_the_widened_answer_they_supersede() {
+        let held = edge(vec![
+            site("create.go", 648),
+            site("create.go", 677),
+            site("create.go", 696),
+            site("create.go", 722),
+        ]);
+        let merged = with_union_of_sites(
+            &held,
+            &edge(vec![proven("create.go", 648), proven("create.go", 696)]),
+        );
+        let proven_rule = kin_model::LSP_PROVEN_METHOD_REFERENCES_RULE.to_string();
+        assert_eq!(
+            rules(&merged),
+            vec![(648, proven_rule.clone()), (696, proven_rule.clone())],
+            "only the proven sites remain: {merged:?}"
+        );
+        // Converged: offering the same proof again writes nothing.
+        let again = with_union_of_sites(
+            &merged,
+            &edge(vec![proven("create.go", 648), proven("create.go", 696)]),
+        );
+        assert_eq!(again, merged);
+        // An offer under the plain rule is any other pass and joins as before.
+        let joined = with_union_of_sites(&held, &edge(vec![site("create.go", 800)]));
+        assert_eq!(lines(&joined), vec![648, 677, 696, 722, 800]);
+    }
+
+    /// A parser call site, as the parser records it: a span and no rule.
+    fn call_site(file: &str, line: u32) -> RelationEvidence {
+        RelationEvidence {
+            parser_rule: None,
+            ..site(file, line)
+        }
+    }
+
+    /// A span-free occurrence certificate. The daemon never reads its token,
+    /// so any distinct string stands in for the proof the parser serializes.
+    fn certificate(token: &str) -> RelationEvidence {
+        RelationEvidence {
+            parser_rule: Some(OCCURRENCE_RULE.to_string()),
+            token: Some(token.to_string()),
+            occurrence_count: 0,
+            ..RelationEvidence::default()
+        }
+    }
+
+    fn parser_edge(evidence: Vec<RelationEvidence>) -> Relation {
+        Relation {
+            kind: RelationKind::Calls,
+            origin: RelationOrigin::Parsed,
+            confidence: 1.0,
+            ..edge(evidence)
+        }
+    }
+
+    fn is_certificate(record: &RelationEvidence) -> bool {
+        record.parser_rule.as_deref() == Some(OCCURRENCE_RULE)
+    }
+
+    fn certificate_tokens(relation: &Relation) -> Vec<String> {
+        relation
+            .evidence
+            .iter()
+            .filter(|record| is_certificate(record))
+            .map(|record| record.token.clone().unwrap_or_default())
+            .collect()
+    }
+
+    /// A parser `Calls` edge exactly as the pipeline and linker produce it: two
+    /// calls of `target` inside `caller`, so two sites and a certificate for
+    /// each, the sites first and the certificates after them.
+    fn parsed_call_edge() -> Relation {
+        let source = b"int target(void) { return 1; }\n\
+                       int caller(void) { return target() + target(); }\n";
+        let relation = kin_index::IndexPipeline::new()
+            .index_file_content_with_tests(
+                &FilePathId::new("calls.c"),
+                source,
+                kin_blobs::digest(source),
+            )
+            .expect("the fixture parses")
+            .indexed_file
+            .relations
+            .into_iter()
+            .find(|relation| relation.kind == RelationKind::Calls)
+            .expect("the fixture holds a call");
+        assert!(
+            relation.evidence.iter().any(is_certificate) && !is_certificate(&relation.evidence[0]),
+            "the parser stamps each call occurrence with a certificate it keeps after the \
+             sites, which is the shape this control is about: {relation:?}"
+        );
+        relation
+    }
+
+    /// Re-offering a parser edge the graph already holds, byte for byte, is not
+    /// a write.
+    ///
+    /// The parser's occurrence certificates carry no span, and the site union
+    /// used to sort every span-free record ahead of the sites, so the merge of
+    /// an identical offer came back as the held record reordered. The daemon
+    /// took that for new evidence, `upsert_relation` saw a record that differed
+    /// from the one it held, and the write dropped a committed tree's binding
+    /// witness. The local binding absence control in the API tests is the same
+    /// failure seen from the MCP surface.
+    #[test]
+    fn an_identical_re_offer_of_a_certificate_bearing_parser_edge_is_not_a_write() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = DaemonState::open(kin_core::init(repo.path()).unwrap().layout).unwrap();
+        let parsed = parsed_call_edge();
+        state.graph.upsert_relation(&parsed).unwrap();
+        let GraphNodeId::Entity(source) = parsed.src else {
+            panic!("a parser call leaves an entity");
+        };
+        let held = state
+            .graph
+            .get_all_relations_for_entity(&source)
+            .unwrap()
+            .into_iter()
+            .find(|relation| relation.id == parsed.id)
+            .expect("the graph holds the parser edge");
+        assert_eq!(held, parsed, "the graph holds the edge exactly as offered");
+
+        let unheld = unheld_lsp_relations(&state, std::slice::from_ref(&held));
+        assert!(
+            unheld.is_empty(),
+            "an offer identical to the held record must write nothing: {unheld:?}"
+        );
+    }
+
+    /// The union itself is canonical in the linker's order, so a parser edge
+    /// merged with its own sites comes back exactly as held. That is the
+    /// invariant the union's documentation states, held for an edge whose
+    /// evidence the union does not own.
+    #[test]
+    fn a_certificate_bearing_parser_edge_merges_back_to_itself() {
+        let held = parsed_call_edge();
+        assert_eq!(
+            with_union_of_sites(&held, &held),
+            held,
+            "an offer whose sites the held record already carries merges back exactly"
+        );
+        let sites_only = Relation {
+            evidence: held
+                .evidence
+                .iter()
+                .filter(|record| !is_certificate(record))
+                .cloned()
+                .collect(),
+            ..held.clone()
+        };
+        assert_eq!(
+            with_union_of_sites(&held, &sites_only),
+            held,
+            "an offer of the held sites alone keeps the held certificates where they were"
+        );
+    }
+
+    /// Every certificate survives the union. They share a rule and carry no
+    /// span, so a union keyed on span and rule alone kept the first and dropped
+    /// the rest, and each one dropped leaves a site the parser proved with no
+    /// proof beside it.
+    #[test]
+    fn every_occurrence_certificate_survives_the_union() {
+        let held = parser_edge(vec![
+            call_site("caller.c", 3),
+            call_site("caller.c", 7),
+            certificate("a"),
+            certificate("b"),
+        ]);
+        let merged = with_union_of_sites(&held, &held);
+        assert_eq!(certificate_tokens(&merged), vec!["a", "b"], "{merged:?}");
+        assert_eq!(merged, held);
+
+        let offered = parser_edge(vec![call_site("caller.c", 11), certificate("c")]);
+        let merged = with_union_of_sites(&held, &offered);
+        assert_eq!(lines(&merged), vec![3, 7, 11]);
+        assert_eq!(certificate_tokens(&merged), vec!["a", "b", "c"]);
+        assert!(
+            merged.evidence[..3]
+                .iter()
+                .all(|record| record.source_span.is_some()),
+            "the sites come first and the certificates after them, as the linker orders \
+             them: {merged:?}"
+        );
+        assert_eq!(
+            with_union_of_sites(&offered, &held).evidence,
+            merged.evidence,
+            "and the union does not depend on which record arrived first"
+        );
+    }
+
+    /// The ceiling bounds sites, and a certificate never takes a site's place
+    /// under it.
+    ///
+    /// The ceiling is the producer's cap on positions per edge. With the
+    /// certificates sorted ahead of the sites, a truncation to it kept the
+    /// markers and dropped the last real sites.
+    #[test]
+    fn the_ceiling_never_drops_a_site_for_a_certificate() {
+        let ceiling = MAX_ENRICHMENT_EVIDENCE as u32;
+        let held = parser_edge(
+            (0..ceiling)
+                .map(|line| call_site("caller.c", line))
+                .chain([certificate("a"), certificate("b")])
+                .collect(),
+        );
+        let merged = with_union_of_sites(&held, &parser_edge(vec![call_site("caller.c", 9_000)]));
+        assert_eq!(
+            lines(&merged),
+            (0..ceiling).collect::<Vec<_>>(),
+            "every held site survives the ceiling: {merged:?}"
+        );
+        assert_eq!(certificate_tokens(&merged), vec!["a", "b"]);
+        assert_eq!(merged.evidence.len(), MAX_ENRICHMENT_EVIDENCE + 2);
+        assert_eq!(with_union_of_sites(&held, &held), held);
+    }
+
+    /// A parser `Calls` edge with `calls` certified sites: `caller` calls
+    /// `target` once per line.
+    fn parsed_edge_with_calls(calls: usize) -> Relation {
+        let source = format!(
+            "int target(void) {{ return 1; }}\nint caller(void) {{\n    int total = 0;\n{}    \
+             return total;\n}}\n",
+            "    total += target();\n".repeat(calls)
+        );
+        let relation = kin_index::IndexPipeline::new()
+            .index_file_content_with_tests(
+                &FilePathId::new("calls.c"),
+                source.as_bytes(),
+                kin_blobs::digest(source.as_bytes()),
+            )
+            .expect("the fixture parses")
+            .indexed_file
+            .relations
+            .into_iter()
+            .find(|relation| relation.kind == RelationKind::Calls)
+            .expect("the fixture holds a call");
+        assert_eq!(
+            (lines(&relation).len(), certificate_tokens(&relation).len()),
+            (calls, calls),
+            "one site and one certificate per call: {relation:?}"
+        );
+        assert!(
+            original_evidence(&relation).is_some(),
+            "the parser's proof set validates: {relation:?}"
+        );
+        relation
+    }
+
+    /// A language server's answer on `held`'s edge whose `count` sites sort
+    /// ahead of every parser site, so a union with it trims parser sites first.
+    fn answer_ahead_of(held: &Relation, count: u32) -> Relation {
+        Relation {
+            evidence: (0..count).map(|line| site("a.c", line)).collect(),
+            ..held.clone()
+        }
+    }
+
+    /// The spans in `merged` that were sites of the parser edge `held`.
+    fn parser_sites_kept(held: &Relation, merged: &Relation) -> Vec<SourceSpan> {
+        merged
+            .evidence
+            .iter()
+            .filter_map(|record| record.source_span.clone())
+            .filter(|span| {
+                held.evidence
+                    .iter()
+                    .any(|record| record.source_span.as_ref() == Some(span))
+            })
+            .collect()
+    }
+
+    fn certificates(relation: &Relation) -> Vec<RelationEvidence> {
+        relation
+            .evidence
+            .iter()
+            .filter(|record| is_certificate(record))
+            .cloned()
+            .collect()
+    }
+
+    fn malformed_certificate() -> RelationEvidence {
+        certificate("not a proof")
+    }
+
+    /// An identical re-offer of a held edge with more sites than the ceiling
+    /// writes nothing.
+    ///
+    /// Merged with itself, such an edge loses the sites past the ceiling and so
+    /// differs from the held record. Only a test for an identical offer made
+    /// before any merge keeps it from being rewritten, so this fails if that
+    /// test moves after the merge or goes.
+    #[test]
+    fn an_identical_re_offer_of_an_edge_past_the_ceiling_writes_nothing() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = DaemonState::open(kin_core::init(repo.path()).unwrap().layout).unwrap();
+        let parsed = parsed_edge_with_calls(MAX_ENRICHMENT_EVIDENCE + 6);
+        state.graph.upsert_relation(&parsed).unwrap();
+        let GraphNodeId::Entity(source) = parsed.src else {
+            panic!("a parser call leaves an entity");
+        };
+        let held_now = || {
+            state
+                .graph
+                .get_all_relations_for_entity(&source)
+                .unwrap()
+                .into_iter()
+                .find(|relation| relation.id == parsed.id)
+                .expect("the graph holds the parser edge")
+        };
+        let held = held_now();
+        assert_eq!(held, parsed, "the graph holds the edge exactly as offered");
+        assert_ne!(
+            with_union_of_sites(&held, &held),
+            held,
+            "the union alone would rewrite this edge"
+        );
+
+        let unheld = unheld_lsp_relations(&state, std::slice::from_ref(&held));
+        assert!(
+            unheld.is_empty(),
+            "an offer identical to the held record must write nothing: {unheld:?}"
+        );
+        assert_eq!(
+            install_lsp_relations(&state, std::slice::from_ref(&held)),
+            EnrichmentWrite::default(),
+            "nothing reaches the graph's upsert"
+        );
+        assert_eq!(
+            held_now(),
+            held,
+            "and the graph still holds the edge exactly"
+        );
+    }
+
+    /// Every site the ceiling keeps stays proven when the union trims others.
+    ///
+    /// The ceiling trims sites before the certificates join. A certificate
+    /// whose site it trimmed names an occurrence the edge no longer carries,
+    /// and one such certificate fails validation for the edge's whole proof
+    /// set, so every parser site the ceiling kept read as unproven. These are
+    /// the parser's own certificates with their real tokens.
+    #[test]
+    fn the_ceiling_keeps_the_proof_of_every_site_it_keeps() {
+        // Beside a language server's answer that sorts ahead of it, the ceiling
+        // keeps one of the parser edge's three sites.
+        let held = parsed_edge_with_calls(3);
+        let merged = with_union_of_sites(
+            &held,
+            &answer_ahead_of(&held, MAX_ENRICHMENT_EVIDENCE as u32 - 1),
+        );
+        let kept = parser_sites_kept(&held, &merged);
+        assert_eq!(lines(&merged).len(), MAX_ENRICHMENT_EVIDENCE);
+        assert_eq!(kept.len(), 1, "{merged:?}");
+        assert!(
+            original_evidence(&merged).is_some(),
+            "no certificate outlives the site it certifies: {merged:?}"
+        );
+        assert_eq!(certificates(&merged).len(), kept.len());
+        assert!(
+            certificates(&merged)
+                .iter()
+                .all(|record| held.evidence.contains(record)),
+            "the certificates kept are the parser's own, unchanged"
+        );
+        assert_eq!(
+            proven_sites(&merged).0,
+            kept,
+            "the parser site the ceiling kept is still proven"
+        );
+
+        // A parser edge past the ceiling on its own.
+        let held = parsed_edge_with_calls(MAX_ENRICHMENT_EVIDENCE + 6);
+        let offered = Relation {
+            evidence: vec![call_site("calls.c", 9_000)],
+            ..held.clone()
+        };
+        let merged = with_union_of_sites(&held, &offered);
+        let kept = parser_sites_kept(&held, &merged);
+        assert_eq!(kept.len(), MAX_ENRICHMENT_EVIDENCE);
+        assert!(
+            original_evidence(&merged).is_some(),
+            "no certificate outlives the site it certifies: {merged:?}"
+        );
+        assert_eq!(certificates(&merged).len(), MAX_ENRICHMENT_EVIDENCE);
+        assert!(certificates(&merged)
+            .iter()
+            .all(|record| held.evidence.contains(record)));
+        assert_eq!(proven_sites(&merged), (kept, false));
+    }
+
+    /// A malformed certificate is never trimmed away. The held proof set was
+    /// invalid before the merge and stays invalid after it, so the site the
+    /// ceiling kept stays unproven rather than turning certified.
+    #[test]
+    fn a_malformed_certificate_survives_the_ceiling_and_keeps_the_edge_unproven() {
+        let mut held = parsed_edge_with_calls(3);
+        held.evidence.push(malformed_certificate());
+        assert!(original_evidence(&held).is_none());
+        let merged = with_union_of_sites(
+            &held,
+            &answer_ahead_of(&held, MAX_ENRICHMENT_EVIDENCE as u32 - 1),
+        );
+        assert_eq!(parser_sites_kept(&held, &merged).len(), 1, "{merged:?}");
+        assert!(
+            certificates(&merged).contains(&malformed_certificate()),
+            "the malformed certificate survives: {merged:?}"
+        );
+        assert!(
+            original_evidence(&merged).is_none(),
+            "and the proof set still fails closed"
+        );
+        assert!(
+            proven_sites(&merged).0.is_empty(),
+            "so no site the ceiling kept reads as proven"
+        );
+    }
+
+    /// A certificate for a site the edge did not carry before the merge is not
+    /// the ceiling's to remove. The held proof set was already invalid, and it
+    /// stays invalid.
+    #[test]
+    fn a_certificate_for_a_site_the_edge_never_held_survives_the_ceiling() {
+        let mut held = parsed_edge_with_calls(3);
+        let last = held
+            .evidence
+            .iter()
+            .rposition(|record| record.source_span.is_some())
+            .unwrap();
+        held.evidence.remove(last);
+        let sites: Vec<_> = held
+            .evidence
+            .iter()
+            .filter(|record| record.source_span.is_some())
+            .cloned()
+            .collect();
+        let stranded: Vec<_> = certificates(&held)
+            .into_iter()
+            .filter(|record| {
+                let alone = Relation {
+                    evidence: sites.iter().cloned().chain([record.clone()]).collect(),
+                    ..held.clone()
+                };
+                original_evidence(&alone).is_none()
+            })
+            .collect();
+        assert_eq!(stranded.len(), 1, "one certificate names the removed site");
+        assert!(original_evidence(&held).is_none());
+
+        let merged = with_union_of_sites(
+            &held,
+            &answer_ahead_of(&held, MAX_ENRICHMENT_EVIDENCE as u32 - 1),
+        );
+        assert_eq!(parser_sites_kept(&held, &merged).len(), 1, "{merged:?}");
+        assert!(
+            certificates(&merged).contains(&stranded[0]),
+            "the stranded certificate survives: {merged:?}"
+        );
+        assert!(original_evidence(&merged).is_none());
+        assert!(proven_sites(&merged).0.is_empty());
+    }
+
+    /// With nothing trimmed, the union leaves the certificates exactly as held,
+    /// valid or not.
+    #[test]
+    fn without_trimming_the_certificates_are_the_held_ones_byte_for_byte() {
+        let held = parsed_edge_with_calls(3);
+        let merged = with_union_of_sites(&held, &answer_ahead_of(&held, 2));
+        assert_eq!(lines(&merged).len(), 5);
+        assert_eq!(certificates(&merged), certificates(&held));
+        assert!(original_evidence(&merged).is_some());
+
+        // A malformed certificate, placed where the linker's token order puts it.
+        let mut malformed = held.clone();
+        let first = malformed
+            .evidence
+            .iter()
+            .position(|record| is_certificate(record))
+            .unwrap();
+        malformed.evidence.insert(first, malformed_certificate());
+        let merged = with_union_of_sites(&malformed, &answer_ahead_of(&malformed, 2));
+        assert_eq!(certificates(&merged), certificates(&malformed));
+        assert!(original_evidence(&merged).is_none());
+    }
+}
+
+#[cfg(test)]
+mod prepared_owner_idle_tests {
+    use super::*;
+
+    #[test]
+    fn prepared_guard_request_independent_owner_prevents_idle_shutdown() {
+        let repo = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo.path()).unwrap();
+        let state = DaemonState::open(init.layout).unwrap();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Release);
+        let singleton = crate::lifecycle::acquire_singleton_lock(state.layout.root())
+            .unwrap()
+            .unwrap();
+        let _runtime = state
+            .prepared_publication
+            .register(&singleton, state.layout.root())
+            .unwrap();
+        assert_eq!(state.active_request_count(), 0);
+        let guard = state
+            .prepared_publication
+            .begin(kin_model::OperationId::new(), ())
+            .unwrap();
+        assert!(work_would_be_lost_by_shutdown(&state));
+        assert!(!ready_for_idle_shutdown(
+            &state,
+            Duration::ZERO,
+            ControlPlane::EndpointLost
+        ));
+        drop(guard);
+        assert!(ready_for_idle_shutdown(
+            &state,
+            Duration::ZERO,
+            ControlPlane::EndpointLost
+        ));
     }
 }

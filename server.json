@@ -8,12 +8,22 @@
     "url": "https://github.com/firelock-ai/kin",
     "source": "github"
   },
-  "version": "0.5.27",
+  "version": "0.8.0",
   "packages": [
     {
       "registryType": "npm",
-      "identifier": "@kinlab/kin-mcp",
-      "version": "0.5.27",
+      "identifier": "@kinlab/kin",
+      "version": "0.8.0",
+      "packageArguments": [
+        {
+          "type": "positional",
+          "value": "mcp"
+        },
+        {
+          "type": "positional",
+          "value": "start"
+        }
+      ],
       "transport": {
         "type": "stdio"
       }

@@ -88,6 +88,12 @@ pub struct ResolvedIdentity {
     /// Whether the query parsed as an entity id. An id names one entity, so a
     /// caller that passed one has already disambiguated and gets no twin note.
     pub addressed_by_id: bool,
+    /// Whether the query reached its matches as a member name, `get` for the
+    /// method `Scaffold.get`, because no entity is named it exactly
+    /// ([`kin_ranking::entity_ranking::NameReach`]). Several such matches are
+    /// several owners' members, and a caller is asked which one it meant
+    /// rather than handed one.
+    pub member_name: bool,
 }
 
 /// Resolve `query` to the entities it can mean, then narrow by `qualifiers`.
@@ -109,6 +115,7 @@ pub fn resolve_identity<G: GraphStore>(
     let trimmed = query.trim();
     let addressed_by_id = uuid::Uuid::parse_str(trimmed).is_ok();
 
+    let mut member_name = false;
     let mut matches: Vec<Entity> = if let Ok(uuid) = uuid::Uuid::parse_str(trimmed) {
         graph.get_entity(&EntityId(uuid))?.into_iter().collect()
     } else {
@@ -118,22 +125,21 @@ pub fn resolve_identity<G: GraphStore>(
         };
         let mut matches = graph.query_entities(&filter)?;
         matches.retain(|entity| !kin_index::is_external_reference_target(entity));
-        // Broad matching is for discovery: "resolve" should still reach
-        // resolve_binary. But when the query names an entity exactly, substring
-        // cousins force an ambiguity note onto an unambiguous ask, so an
-        // exact-name hit narrows the set to the exact matches.
-        let exact: Vec<Entity> = matches
-            .iter()
-            .filter(|entity| entity.name == trimmed)
-            .cloned()
-            .collect();
-        if !exact.is_empty() {
-            matches = exact;
+        // The tiers every surface shares. An exact name narrows to the
+        // entities named it, never pooled with members; with none, the owners'
+        // members that carry it as their member name; with neither, the broad
+        // match that discovery wants ("resolve" still reaches resolve_binary).
+        match kin_ranking::entity_ranking::reach_by_name(graph, trimmed)? {
+            kin_ranking::entity_ranking::NameReach::Exact(exact) => exact,
+            kin_ranking::entity_ranking::NameReach::Members(members) => {
+                member_name = true;
+                members
+            }
+            kin_ranking::entity_ranking::NameReach::Neither => matches,
         }
-        matches
     };
 
-    let exact_name = matches.iter().any(|entity| entity.name == trimmed);
+    let exact_name = !member_name && matches.iter().any(|entity| entity.name == trimmed);
     let name_matches = matches.clone();
     apply_qualifiers(&mut matches, qualifiers);
 
@@ -142,6 +148,7 @@ pub fn resolve_identity<G: GraphStore>(
         name_matches,
         exact_name,
         addressed_by_id,
+        member_name,
     })
 }
 
@@ -263,6 +270,10 @@ pub enum NameMatch {
     Id,
     /// Some entity's name is the query exactly.
     Exact,
+    /// No entity is named the query exactly, and it is the member name of an
+    /// owner's member: `get` for the method `Scaffold.get`. Tried before case
+    /// folding, because it matches the member's own spelling exactly.
+    Member,
     /// Some entity's name is the query once ASCII case is ignored.
     CaseInsensitive,
     /// The query is only part of the names it reached.
@@ -297,10 +308,25 @@ impl EntityResolution {
         self.name_match == NameMatch::Exact
     }
 
-    /// A partial name that reaches several entities names none of them, so the
+    /// The query reached its candidates as a member name, `get` for
+    /// `Scaffold.get`. One such candidate names one entity as surely as an
+    /// exact name does.
+    pub fn member_name(&self) -> bool {
+        self.name_match == NameMatch::Member
+    }
+
+    /// The query is a member name several owners share and nothing pinned one
+    /// of them, so it names none of them.
+    pub fn shares_member_name(&self) -> bool {
+        self.member_name() && self.candidates.len() > 1
+    }
+
+    /// A partial name that reaches several entities names none of them, and a
+    /// member name several owners share names none of them either, so the
     /// caller is asked which it meant instead of being handed a guess.
     pub fn needs_a_pin(&self) -> bool {
-        self.name_match == NameMatch::Partial && self.candidates.len() > 1
+        (self.name_match == NameMatch::Partial || self.shares_member_name())
+            && self.candidates.len() > 1
     }
 
     /// The name reaches entities and the pins exclude every one of them, which
@@ -401,7 +427,16 @@ pub fn resolve_entity_among<'a>(
             })
             .map(|entity| (*entity).clone())
             .collect();
-        narrow_by_name(reached, &name)
+        match kin_ranking::entity_ranking::reach_among(
+            entities.iter().map(|entity| (*entity).clone()),
+            &name,
+        ) {
+            kin_ranking::entity_ranking::NameReach::Exact(exact) => (exact, NameMatch::Exact),
+            kin_ranking::entity_ranking::NameReach::Members(members) => {
+                (members, NameMatch::Member)
+            }
+            kin_ranking::entity_ranking::NameReach::Neither => narrow_by_name(reached, &name),
+        }
     };
     finish_resolution(reference, name_matches, name_match, has_dependents)
 }
@@ -479,6 +514,20 @@ fn merge_pins(mut reference: EntityRef, flags: &IdentityQualifiers) -> Result<En
 fn gather_by_name<G: GraphStore>(graph: &G, name: &str) -> Result<(Vec<Entity>, NameMatch)> {
     if name.is_empty() {
         return Ok((Vec::new(), NameMatch::Partial));
+    }
+    // The tiers every surface shares, asked of the store directly rather than
+    // read off the name pattern below: the index answers a plain name with
+    // whole-name and token matches first and can leave a member out entirely.
+    // An exact name is never pooled with members, and members answer only when
+    // nothing is named exactly.
+    match kin_ranking::entity_ranking::reach_by_name(graph, name)? {
+        kin_ranking::entity_ranking::NameReach::Exact(exact) => {
+            return Ok((exact, NameMatch::Exact))
+        }
+        kin_ranking::entity_ranking::NameReach::Members(members) => {
+            return Ok((members, NameMatch::Member))
+        }
+        kin_ranking::entity_ranking::NameReach::Neither => {}
     }
     let mut matches = kin_core::query_trace_matches(graph, name)?;
     matches.retain(|entity| !kin_index::is_external_reference_target(entity));
@@ -645,6 +694,13 @@ pub fn pin_request_lines_by(
     resolution: &EntityResolution,
     locate: impl Fn(&Entity) -> String,
 ) -> Vec<String> {
+    if resolution.member_name() {
+        return name_candidate_lines(
+            &resolution.reference.name,
+            kin_ranking::entity_ranking::CandidateReason::SharedMemberName,
+            &resolution.candidates,
+        );
+    }
     let mut lines = vec![format!(
         "No entity is named '{}' exactly, and it is part of the names of {} entities, so there \
          is no one entity to answer about:",
@@ -658,6 +714,32 @@ pub fn pin_request_lines_by(
             .to_string(),
     );
     lines
+}
+
+/// The answer when a name names several entities and none may be chosen: the
+/// words, rows and hint every surface prints for it, from the one renderer the
+/// MCP text tools use, over the candidates in the one listing order. A row
+/// carries the kind, the name, the file and the id, never a line number.
+pub fn name_candidate_lines(
+    query: &str,
+    reason: kin_ranking::entity_ranking::CandidateReason,
+    candidates: &[Entity],
+) -> Vec<String> {
+    let mut candidates = candidates.to_vec();
+    kin_ranking::entity_ranking::sort_name_candidates(&mut candidates);
+    kin_mcp::handlers::entities::name_candidates_lines(query, reason, &candidates)
+}
+
+/// Why a resolution that reached several entities names none of them, for a
+/// surface that may not choose among them.
+pub fn candidate_reason(name_match: NameMatch) -> kin_ranking::entity_ranking::CandidateReason {
+    match name_match {
+        NameMatch::Id | NameMatch::Exact => kin_ranking::entity_ranking::CandidateReason::SameName,
+        NameMatch::Member => kin_ranking::entity_ranking::CandidateReason::SharedMemberName,
+        NameMatch::CaseInsensitive | NameMatch::Partial => {
+            kin_ranking::entity_ranking::CandidateReason::PartialName
+        }
+    }
 }
 
 /// The answer when the name resolves and the pins exclude every entity it

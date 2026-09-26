@@ -699,6 +699,9 @@ impl std::fmt::Display for MaterializedGraphRefusal {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GraphSnapshot {
+    /// Runtime-only capability admitted against one exact workspace graph.
+    #[serde(skip)]
+    pub verified_binding_history: Option<super::binding_history::VerifiedBindingHistory>,
     pub version: u32,
     pub entities: HashMap<EntityId, Entity>,
     pub relations: HashMap<RelationId, Relation>,
@@ -895,7 +898,25 @@ impl GraphSnapshot {
     /// through
     /// [`snapshot_schema_too_new`](crate::error::KinDbError::snapshot_schema_too_new),
     /// which names the versions the binary can read.
-    pub const CURRENT_VERSION: u32 = 16;
+    /// v17/v18 require schema5 binding-history-aware writers (without/with
+    /// a materialized section). Legacy v13–16 remain readable and writable.
+    /// v19/v20 carry a non-empty owed derivation ledger (without/with a
+    /// section), at any envelope schema: an older binary would otherwise drop
+    /// owed work it cannot decode, so it refuses at the header instead. A
+    /// store whose ledger is empty keeps the version and the bytes it had.
+    pub const CURRENT_VERSION: u32 = Self::OWED_DERIVATION_SECTION_VERSION;
+
+    pub const LEGACY_SECTION_TRIMMED_VERSION: u32 = 16;
+    pub const BINDING_HISTORY_VERSION: u32 = 17;
+
+    /// Schema5 binding-history-aware, with a section.
+    pub const BINDING_HISTORY_SECTION_VERSION: u32 = 18;
+
+    /// A non-empty owed derivation ledger and no section.
+    pub const OWED_DERIVATION_VERSION: u32 = 19;
+
+    /// A non-empty owed derivation ledger and a section.
+    pub const OWED_DERIVATION_SECTION_VERSION: u32 = 20;
 
     /// A section, and receipts that still embed their operation records.
     pub const SECTION_VERSION: u32 = 14;
@@ -915,12 +936,36 @@ impl GraphSnapshot {
     /// One trimmed receipt is enough to move the receipt axis: a pre-v15 binary
     /// decodes receipts positionally, so the first seven-element one refuses
     /// the whole envelope whether the rest are trimmed or not.
+    ///
+    /// Owed derivation work outranks both axes. Every binary that reads v19
+    /// reads every receipt shape and every envelope schema, so only the section
+    /// still decides the width.
     pub fn wire_version(&self) -> u32 {
+        if self
+            .repository_authority
+            .as_ref()
+            .is_some_and(|a| !a.owed_derivations.is_empty())
+        {
+            return if self.materialized_graph.is_some() {
+                Self::OWED_DERIVATION_SECTION_VERSION
+            } else {
+                Self::OWED_DERIVATION_VERSION
+            };
+        }
+        if self.repository_authority.as_ref().is_some_and(|a| {
+            a.schema_version >= super::binding_history::BINDING_HISTORY_AUTHORITY_SCHEMA
+        }) {
+            return if self.materialized_graph.is_some() {
+                Self::BINDING_HISTORY_SECTION_VERSION
+            } else {
+                Self::BINDING_HISTORY_VERSION
+            };
+        }
         match (
             self.materialized_graph.is_some(),
             self.persists_a_trimmed_receipt(),
         ) {
-            (true, true) => Self::CURRENT_VERSION,
+            (true, true) => Self::LEGACY_SECTION_TRIMMED_VERSION,
             (false, true) => Self::TRIMMED_RECEIPT_VERSION,
             (true, false) => Self::SECTION_VERSION,
             (false, false) => Self::MIN_SUPPORTED_VERSION,
@@ -946,7 +991,13 @@ impl GraphSnapshot {
     /// were two versions and would have silently demanded the narrow width from
     /// a v14 body the moment a third arrived.
     pub(crate) const fn version_carries_a_section(version: u32) -> bool {
-        matches!(version, Self::SECTION_VERSION | Self::CURRENT_VERSION)
+        matches!(
+            version,
+            Self::SECTION_VERSION
+                | Self::LEGACY_SECTION_TRIMMED_VERSION
+                | Self::BINDING_HISTORY_SECTION_VERSION
+                | Self::OWED_DERIVATION_SECTION_VERSION
+        )
     }
 
     /// The newest on-disk format version this binary READS.
@@ -955,10 +1006,12 @@ impl GraphSnapshot {
     /// and moves nothing, so a v13 body is a v14 body with its last element
     /// missing and the field's `serde(default)` supplies it. v15 and v16 leave
     /// the top level alone and change only what each persisted receipt carries,
-    /// which the receipt's own trailing `serde(default)` reads either way. One
-    /// decoder reads all four and no second copy of the field list exists to
+    /// which the receipt's own trailing `serde(default)` reads either way. v19
+    /// and v20 append one trailing element inside the envelope, which its own
+    /// `serde(default)` reads as an empty ledger when it is absent. One
+    /// decoder reads every rung and no second copy of the field list exists to
     /// drift.
-    pub const MAX_SUPPORTED_VERSION: u32 = 16;
+    pub const MAX_SUPPORTED_VERSION: u32 = Self::OWED_DERIVATION_SECTION_VERSION;
 
     /// Magic bytes for the file header: "KNDB"
     pub const MAGIC: [u8; 4] = *b"KNDB";
@@ -979,6 +1032,7 @@ impl GraphSnapshot {
             // version its own bytes do not serialize as, which `to_bytes`
             // refuses.
             version: Self::MIN_SUPPORTED_VERSION,
+            verified_binding_history: None,
             entities: HashMap::new(),
             relations: HashMap::new(),
             outgoing: HashMap::new(),
@@ -1188,12 +1242,15 @@ impl GraphSnapshot {
         if self.version != wire_version {
             return Err(crate::error::KinDbError::StorageError(format!(
                 "refusing to serialize a snapshot whose body declares v{} while its contents \
-                 serialize as v{}; a section with trimmed receipts makes a body v{}, trimmed \
+                 serialize as v{}; owed derivation work requires v{}/v{} without/with a section; \
+                 schema5 requires v17/v18 without/with a section; legacy section plus trimmed receipts makes v{}, trimmed \
                  receipts alone make it v{}, a section alone makes it v{}, and neither makes \
                  it v{}",
                 self.version,
                 wire_version,
-                Self::CURRENT_VERSION,
+                Self::OWED_DERIVATION_VERSION,
+                Self::OWED_DERIVATION_SECTION_VERSION,
+                Self::LEGACY_SECTION_TRIMMED_VERSION,
                 Self::TRIMMED_RECEIPT_VERSION,
                 Self::SECTION_VERSION,
                 Self::MIN_SUPPORTED_VERSION
@@ -2832,6 +2889,7 @@ fn validate_external_reference_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::change_map::{HistoryReopen, ReopenedHistory};
 
     /// Regression (found by fuzzing): a snapshot header whose body_len is near
     /// usize::MAX must be rejected with an error, never wrap `16 + body_len`
@@ -3107,6 +3165,7 @@ mod tests {
             PersistedRepositoryAuthority::empty(repository_id.clone(), &snapshot)
                 .expect("an empty authority is constructible"),
         );
+        snapshot.version = snapshot.wire_version();
         let bytes = snapshot.to_bytes().expect("serializes");
 
         let envelope = AuthorityEnvelopeSnapshot::from_bytes(&bytes).expect("the envelope decodes");
@@ -4738,19 +4797,24 @@ mod tests {
             GRAPH_SNAPSHOT_FIELD_COUNT - 1,
             "v14 appends exactly one element to v13"
         );
-        // Four contiguous rungs encoding two independent bits, and the
-        // width is a function of the version rather than a second opinion
-        // about it. Asserted rather than described, because the reader's
-        // width check reads the version and would silently demand the wrong
-        // element count if a rung were added without updating it.
+        // Eight contiguous rungs, including the required-capability pair and
+        // the owed-derivation pair; the width is a function of the version
+        // rather than a second opinion about it. Asserted rather than
+        // described, because the reader's width check reads the version and
+        // would silently demand the wrong element count if a rung were added
+        // without updating it.
         assert_eq!(
             [
                 GraphSnapshot::MIN_SUPPORTED_VERSION,
                 GraphSnapshot::SECTION_VERSION,
                 GraphSnapshot::TRIMMED_RECEIPT_VERSION,
-                GraphSnapshot::CURRENT_VERSION,
+                GraphSnapshot::LEGACY_SECTION_TRIMMED_VERSION,
+                GraphSnapshot::BINDING_HISTORY_VERSION,
+                GraphSnapshot::BINDING_HISTORY_SECTION_VERSION,
+                GraphSnapshot::OWED_DERIVATION_VERSION,
+                GraphSnapshot::OWED_DERIVATION_SECTION_VERSION,
             ],
-            [13, 14, 15, 16],
+            [13, 14, 15, 16, 17, 18, 19, 20],
             "the ladder is contiguous, which is what lets one decoder read every \
              rung with defaulted trailing fields"
         );
@@ -4765,7 +4829,11 @@ mod tests {
             (GraphSnapshot::MIN_SUPPORTED_VERSION, false),
             (GraphSnapshot::SECTION_VERSION, true),
             (GraphSnapshot::TRIMMED_RECEIPT_VERSION, false),
-            (GraphSnapshot::CURRENT_VERSION, true),
+            (GraphSnapshot::LEGACY_SECTION_TRIMMED_VERSION, true),
+            (GraphSnapshot::BINDING_HISTORY_VERSION, false),
+            (GraphSnapshot::BINDING_HISTORY_SECTION_VERSION, true),
+            (GraphSnapshot::OWED_DERIVATION_VERSION, false),
+            (GraphSnapshot::OWED_DERIVATION_SECTION_VERSION, true),
         ] {
             assert_eq!(
                 GraphSnapshot::version_carries_a_section(version),
@@ -5196,6 +5264,359 @@ mod tests {
         file.seek(SeekFrom::Start(0)).unwrap();
         file.write_all(&frame).unwrap();
         assert_eq!(changes.change_ids().unwrap(), expected);
+    }
+
+    /// How many `tracing` events at `WARN` or above a scoped subscriber
+    /// observed, so a test can assert that a code path did, or did not, emit
+    /// one, without parsing formatted log output.
+    #[derive(Clone, Default)]
+    struct WarnAndAboveEventCounter(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl WarnAndAboveEventCounter {
+        fn count(&self) -> usize {
+            self.0.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl tracing::Subscriber for WarnAndAboveEventCounter {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            if *event.metadata().level() <= tracing::Level::WARN {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    // Like the repository's tracing tests, keep a no-op global dispatcher
+    // interested so an uninstrumented parallel reader cannot cache `never`
+    // for the recovery event before this test installs its scoped counter.
+    fn keep_history_callsites_dynamic() {
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            struct DynamicNoop;
+            impl tracing::Subscriber for DynamicNoop {
+                fn register_callsite(
+                    &self,
+                    _: &'static tracing::Metadata<'static>,
+                ) -> tracing::subscriber::Interest {
+                    tracing::subscriber::Interest::sometimes()
+                }
+                fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                    false
+                }
+                fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                    tracing::span::Id::from_u64(1)
+                }
+                fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+                fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+                fn event(&self, _: &tracing::Event<'_>) {}
+                fn enter(&self, _: &tracing::span::Id) {}
+                fn exit(&self, _: &tracing::span::Id) {}
+            }
+            let _ = tracing::subscriber::set_global_default(DynamicNoop);
+        });
+    }
+
+    /// The storage-layer half of the idle-restart 409: a positional read
+    /// through a retained snapshot handle whose file has been superseded and
+    /// is no longer readable through that handle must reopen the durable
+    /// history at its current on-disk generation and retry, once, rather than
+    /// surfacing a refusal for bytes that are actually still there.
+    #[test]
+    fn history_read_recovers_once_through_a_reopen_after_a_stale_retained_handle() {
+        use std::io::Write;
+        keep_history_callsites_dynamic();
+        let original = a_snapshot_with_history(3);
+        let target_id = original
+            .changes
+            .iter()
+            .find(|(_, change)| change.message == "history change 1")
+            .map(|(id, _)| *id)
+            .expect("fixture carries the targeted change");
+        let expected_change = original.changes.get(&target_id).cloned().unwrap();
+
+        let frame = encode_snapshot_without_admission_validation(&original);
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&frame).unwrap();
+        let (decoded, _) = decode_lazily(
+            &frame,
+            HistorySource::File {
+                file: Arc::new(file.try_clone().unwrap()),
+                display: "stale handle fixture".into(),
+                frame_len: frame.len() as u64,
+            },
+        );
+        let mut changes = decoded.changes;
+
+        // What a reopen of the current on-disk generation would hand back:
+        // the same history, decoded straight into memory, with no file
+        // dependency of its own to go stale.
+        let reopen_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let reopen_calls_for_closure = Arc::clone(&reopen_calls);
+        let recovered_changes = original.changes.clone();
+        let reopen: HistoryReopen = Arc::new(move || {
+            reopen_calls_for_closure.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(ReopenedHistory {
+                changes: recovered_changes.clone(),
+                physical_generation: 9,
+                logical_generation: 8,
+            })
+        });
+        assert!(
+            changes.install_stale_handle_recovery(reopen, 3, 3),
+            "a freshly decoded, not-yet-shared map must accept stale-handle recovery"
+        );
+
+        // Simulate the superseded-and-unreadable case by truncating the file
+        // behind the retained handle, so the positional read for the target
+        // record runs past the end of the file. `read_exact_at` reports that
+        // as `UnexpectedEof` on every platform, which is the failure class a
+        // platform that does not keep an unlinked file's bytes readable
+        // through an already-open handle produces here.
+        file.set_len(0).unwrap();
+
+        let events = WarnAndAboveEventCounter::default();
+        let events_for_assert = events.clone();
+        let answer =
+            tracing::subscriber::with_default(events, || changes.read_change(&target_id)).unwrap();
+        assert_eq!(answer, Some(expected_change));
+        // Every other record and every shared view must stop reading the
+        // failed source too; the recovery is for the source, not one lookup.
+        for shared in [changes.clone(), changes.clone()] {
+            for (id, expected) in original.changes.iter() {
+                assert_eq!(shared.read_change(id).unwrap().as_ref(), Some(expected));
+            }
+        }
+        assert_eq!(
+            reopen_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the stale read must reopen exactly once"
+        );
+        assert_eq!(
+            events_for_assert.count(),
+            1,
+            "a recovered stale-handle read must emit exactly one tracing event"
+        );
+    }
+
+    fn stale_history_with_reopen(
+        original: &GraphSnapshot,
+        reopen: HistoryReopen,
+    ) -> crate::storage::change_map::ChangeMap {
+        use std::io::Write;
+        let frame = encode_snapshot_without_admission_validation(original);
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&frame).unwrap();
+        let (decoded, _) = decode_lazily(
+            &frame,
+            HistorySource::File {
+                file: Arc::new(file.try_clone().unwrap()),
+                display: "stale shared history fixture".into(),
+                frame_len: frame.len() as u64,
+            },
+        );
+        let mut changes = decoded.changes;
+        assert!(changes.install_stale_handle_recovery(reopen, 3, 3));
+        file.set_len(0).unwrap();
+        changes
+    }
+
+    #[test]
+    fn history_recovery_is_shared_by_concurrent_readers_without_widening_the_view() {
+        let original = a_snapshot_with_history(3);
+        let mut current = original.clone();
+        let extra = a_history_change(99, None);
+        let extra_id = extra.id;
+        current.changes.insert(extra_id, extra);
+        let reopen_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = Arc::clone(&reopen_calls);
+        let changes = stale_history_with_reopen(
+            &original,
+            Arc::new(move || {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(ReopenedHistory {
+                    changes: current.changes.clone(),
+                    physical_generation: 9,
+                    logical_generation: 8,
+                })
+            }),
+        );
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let shared = changes.clone();
+                let expected = &original.changes;
+                let barrier = Arc::clone(&barrier);
+                scope.spawn(move || {
+                    barrier.wait();
+                    for (id, change) in expected.iter() {
+                        assert_eq!(shared.read_change(id).unwrap().as_ref(), Some(change));
+                    }
+                });
+            }
+        });
+        assert_eq!(reopen_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(changes.len(), original.changes.len());
+        assert!(!changes.contains_key(&extra_id));
+        assert_eq!(changes.read_change(&extra_id).unwrap(), None);
+        assert_eq!(
+            changes.change_ids().unwrap(),
+            original.changes.change_ids().unwrap()
+        );
+    }
+
+    #[test]
+    fn history_recovery_refuses_missing_or_changed_indexed_records() {
+        let original = a_snapshot_with_history(3);
+        let target_id = original.changes.change_ids().unwrap()[0];
+        for missing in [true, false] {
+            let mut replacement = original.changes.clone();
+            if missing {
+                replacement.remove(&target_id);
+            } else {
+                let mut changed = replacement.get(&target_id).unwrap().clone();
+                changed.message.push_str(" altered");
+                replacement.insert(target_id, changed);
+            }
+            let changes = stale_history_with_reopen(
+                &original,
+                Arc::new(move || {
+                    Ok(ReopenedHistory {
+                        changes: replacement.clone(),
+                        physical_generation: 9,
+                        logical_generation: 8,
+                    })
+                }),
+            );
+            let error = changes.read_change(&target_id).unwrap_err();
+            let expected = if missing {
+                "missing previously indexed change"
+            } else {
+                "changed the content"
+            };
+            assert!(error.to_string().contains(expected), "{error}");
+            assert!(changes.contains_key(&target_id));
+        }
+    }
+
+    #[test]
+    fn history_recovery_can_retry_after_a_busy_refusal() {
+        let original = a_snapshot_with_history(3);
+        let target_id = original.changes.change_ids().unwrap()[0];
+        let expected = original.changes.get(&target_id).unwrap().clone();
+        let replacement = original.changes.clone();
+        let reopen_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = Arc::clone(&reopen_calls);
+        let changes = stale_history_with_reopen(
+            &original,
+            Arc::new(move || {
+                if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    return Err(crate::KinDbError::StorageError(
+                        "authority lock is busy".into(),
+                    ));
+                }
+                Ok(ReopenedHistory {
+                    changes: replacement.clone(),
+                    physical_generation: 9,
+                    logical_generation: 8,
+                })
+            }),
+        );
+        assert!(changes
+            .read_change(&target_id)
+            .unwrap_err()
+            .to_string()
+            .contains("busy"));
+        assert_eq!(
+            changes.read_change(&target_id).unwrap(),
+            Some(expected.clone())
+        );
+        assert_eq!(changes.read_change(&target_id).unwrap(), Some(expected));
+        assert_eq!(reopen_calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// The reopen path above must never run for a corruption mismatch: bytes
+    /// that disagree with what the open verified are a different and more
+    /// serious question than a handle that stopped answering, and reopening a
+    /// different generation cannot make disagreeing bytes agree.
+    #[test]
+    fn history_read_refuses_a_corruption_mismatch_without_reopening() {
+        use std::io::{Seek, SeekFrom, Write};
+        keep_history_callsites_dynamic();
+        let original = a_snapshot_with_history(3);
+        let target_id = original
+            .changes
+            .iter()
+            .find(|(_, change)| change.message == "history change 1")
+            .map(|(id, _)| *id)
+            .expect("fixture carries the targeted change");
+
+        let frame = encode_snapshot_without_admission_validation(&original);
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&frame).unwrap();
+        let (decoded, _) = decode_lazily(
+            &frame,
+            HistorySource::File {
+                file: Arc::new(file.try_clone().unwrap()),
+                display: "corruption fixture".into(),
+                frame_len: frame.len() as u64,
+            },
+        );
+        let mut changes = decoded.changes;
+
+        let reopen_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let reopen_calls_for_closure = Arc::clone(&reopen_calls);
+        let recovered_changes = original.changes.clone();
+        let reopen: HistoryReopen = Arc::new(move || {
+            reopen_calls_for_closure.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(ReopenedHistory {
+                changes: recovered_changes.clone(),
+                physical_generation: 9,
+                logical_generation: 8,
+            })
+        });
+        assert!(changes.install_stale_handle_recovery(reopen, 3, 3));
+
+        // Flip one byte inside the target record's own serialized bytes, in
+        // place, so the file keeps its recorded length and the positional
+        // read succeeds; only what it reads is wrong.
+        let position = frame
+            .windows(b"history change 1".len())
+            .position(|part| part == b"history change 1")
+            .expect("fixture contains the targeted change's message bytes");
+        file.seek(SeekFrom::Start(position as u64)).unwrap();
+        file.write_all(&[frame[position] ^ 1]).unwrap();
+
+        let events = WarnAndAboveEventCounter::default();
+        let events_for_assert = events.clone();
+        let error = tracing::subscriber::with_default(events, || changes.read_change(&target_id))
+            .unwrap_err();
+        assert!(error.to_string().contains("changed after open"), "{error}");
+        assert_eq!(
+            reopen_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a corruption mismatch must never trigger a reopen"
+        );
+        assert_eq!(
+            events_for_assert.count(),
+            0,
+            "a corruption mismatch must not emit the stale-handle recovery event"
+        );
     }
 
     #[test]

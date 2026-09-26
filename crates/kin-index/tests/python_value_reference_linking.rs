@@ -27,10 +27,6 @@ const IMPORT_RESOLVED_CONFIDENCE: f32 = 0.95;
 /// (`import parsing` then `parsing.TAG_RE`, tier (b2)).
 const MODULE_MEMBER_CONFIDENCE: f32 = 0.9;
 
-/// Confidence for the blind cross-file exact-name fallback (tier (c)). An edge
-/// at this tier proves only that one entity of that name exists somewhere.
-const NAME_ONLY_CONFIDENCE: f32 = 0.7;
-
 fn parse_py(path: &str, source: &str) -> FileParseData {
     let adapter = PythonAdapter;
     let file_id = FilePathId::new(path);
@@ -173,11 +169,8 @@ fn a_same_file_value_reference_resolves_without_the_linker() {
 
 #[test]
 fn a_value_reference_resolves_exactly_as_the_same_call_would() {
-    // Requirement: value references go through the SAME tiers as calls, so they
-    // must reach the same target at the same confidence. Asserting parity
-    // rather than an absolute rule is what keeps this honest, because a bare
-    // unresolved module name (`requests`) is deliberately left to the
-    // name-global tiers rather than orphaned, for calls and references alike.
+    // Both relation kinds retain the recorded external module pin. A local
+    // declaration with the same leaf is a decoy, never a resolution fallback.
     let referencing = vec![
         parse_py(
             "cli.py",
@@ -215,10 +208,31 @@ fn a_value_reference_resolves_exactly_as_the_same_call_would() {
         "a value reference and the identical call must resolve alike"
     );
     assert_eq!(
-        reference_edge,
-        Some(NAME_ONLY_CONFIDENCE),
-        "and both land on the blind name tier for an unresolved bare module name"
+        reference_edge, None,
+        "neither explicit external import captures the unrelated local declaration"
     );
+    for (files, kind) in [
+        (&referencing, RelationKind::References),
+        (&calling, RelationKind::Calls),
+    ] {
+        let relations = link(files);
+        let source = entity_id_in(files, "cli.py", "build");
+        let external: Vec<_> = relations
+            .iter()
+            .filter(|relation| {
+                relation.kind == kind
+                    && relation.src == GraphNodeId::Entity(source)
+                    && kin_index::is_external_import_placeholder(relation)
+            })
+            .collect();
+        assert_eq!(
+            external.len(),
+            1,
+            "retain the explicit external boundary: {relations:?}"
+        );
+        assert_eq!(external[0].confidence, 0.2);
+        assert_eq!(external[0].import_source.as_deref(), Some("requests"));
+    }
 }
 
 #[test]
@@ -248,4 +262,32 @@ fn an_unimported_same_named_entity_still_reaches_the_name_fallback() {
         None,
         "and nothing else in the repository is reached"
     );
+}
+
+#[test]
+fn value_and_call_resolve_a_real_local_import_and_refuse_the_decoy() {
+    for (body, kind) in [
+        ("Session", RelationKind::References),
+        ("Session()", RelationKind::Calls),
+    ] {
+        let files = vec![
+            parse_py(
+                "cli.py",
+                &format!("from requests import Session\ndef build():\n    return {body}\n"),
+            ),
+            parse_py("requests.py", "def Session():\n    return 1\n"),
+            parse_py("vendor.py", "def Session():\n    return 2\n"),
+        ];
+        let source = entity_id_in(&files, "cli.py", "build");
+        let target = entity_id_in(&files, "requests.py", "Session");
+        let relations = link(&files);
+        let edges: Vec<_> = relations
+            .iter()
+            .filter(|relation| relation.kind == kind && relation.src == GraphNodeId::Entity(source))
+            .collect();
+        assert_eq!(edges.len(), 1, "{edges:?}");
+        assert_eq!(edges[0].dst, GraphNodeId::Entity(target));
+        assert_eq!(edges[0].confidence, IMPORT_RESOLVED_CONFIDENCE);
+        assert!(!kin_index::is_external_import_placeholder(edges[0]));
+    }
 }

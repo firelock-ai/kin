@@ -706,13 +706,21 @@ fn remove_endpoint_components(kin_root: &Path) {
 /// actually installed — an endpoint belonging to a process that is still
 /// running is never in that set.
 pub fn publish_daemon_endpoint(kin_root: &Path, port: u16) -> std::io::Result<()> {
+    publish_daemon_endpoint_until(kin_root, port, Instant::now() + SINGLETON_LOCK_RETRY_BUDGET)
+}
+
+fn publish_daemon_endpoint_until(
+    kin_root: &Path,
+    port: u16,
+    deadline: Instant,
+) -> std::io::Result<()> {
     // Waiting out the coordination lock is a synchronous sleep reached from
     // async contexts, and holding a worker hostage here is what once starved
     // the liveness routes a client was polling before it clobbered the very
     // endpoint being published.
     without_blocking_runtime_worker(|| {
-        let _authority = acquire_singleton_coordination_guard(kin_root)?;
-        publish_daemon_endpoint_under_authority(kin_root, port)
+        let _authority = acquire_singleton_coordination_guard_until(kin_root, deadline)?;
+        publish_daemon_endpoint_under_authority(kin_root, port, deadline)
     })
 }
 
@@ -724,16 +732,22 @@ fn publish_daemon_endpoint_with_probe(
     port: u16,
     probe: impl FnOnce(&kin_cli::daemon_client::ProcessIdentity) -> std::io::Result<bool>,
 ) -> std::io::Result<()> {
+    let deadline = Instant::now() + SINGLETON_LOCK_RETRY_BUDGET;
     without_blocking_runtime_worker(|| {
-        let _authority = acquire_singleton_coordination_guard(kin_root)?;
-        publish_daemon_endpoint_under_authority_with_probe(kin_root, port, probe)
+        let _authority = acquire_singleton_coordination_guard_until(kin_root, deadline)?;
+        publish_daemon_endpoint_under_authority_with_probe(kin_root, port, deadline, probe)
     })
 }
 
-fn publish_daemon_endpoint_under_authority(kin_root: &Path, port: u16) -> std::io::Result<()> {
+fn publish_daemon_endpoint_under_authority(
+    kin_root: &Path,
+    port: u16,
+    deadline: Instant,
+) -> std::io::Result<()> {
     publish_daemon_endpoint_under_authority_with_probe(
         kin_root,
         port,
+        deadline,
         kin_cli::daemon_client::process_identity_is_current,
     )
 }
@@ -741,6 +755,7 @@ fn publish_daemon_endpoint_under_authority(kin_root: &Path, port: u16) -> std::i
 fn publish_daemon_endpoint_under_authority_with_probe(
     kin_root: &Path,
     port: u16,
+    deadline: Instant,
     probe: impl FnOnce(&kin_cli::daemon_client::ProcessIdentity) -> std::io::Result<bool>,
 ) -> std::io::Result<()> {
     // Port 0 means "the OS will pick one", never "connect here". Publishing it
@@ -765,8 +780,10 @@ fn publish_daemon_endpoint_under_authority_with_probe(
         ));
     }
 
-    let owner =
-        EndpointOwnerRecord::current().and_then(|record| serde_json::to_string(&record).ok());
+    // Lock contention and executable observation share one lifecycle budget.
+    // Exhausted image evidence still leaves an incarnation for cooperation.
+    let owner = EndpointOwnerRecord::current_with_deadline(deadline)
+        .and_then(|record| serde_json::to_string(&record).ok());
     let pid = std::process::id().to_string();
     let port = port.to_string();
 
@@ -4452,6 +4469,74 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         assert_eq!(endpoint_ownership(root), EndpointOwnership::Absent);
         assert!(!root.join("daemon.port").exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn publication_records_the_publishers_executable() {
+        let dir = tempfile::tempdir().unwrap();
+        // Linux hashes the debug test executable; retain the actual production
+        // wrapper on macOS and its constant-time executable observation.
+        let image_budget = Duration::from_secs(60);
+        #[cfg(target_os = "linux")]
+        publish_daemon_endpoint_until(dir.path(), 51234, Instant::now() + image_budget)
+            .expect("publish our endpoint");
+        #[cfg(target_os = "macos")]
+        publish_daemon_endpoint(dir.path(), 51234).expect("publish our endpoint");
+        let raw = std::fs::read(dir.path().join(ENDPOINT_OWNER_FILE)).unwrap();
+        let published: EndpointOwnerRecord = serde_json::from_slice(&raw).unwrap();
+        let observed = EndpointOwnerRecord::current_with_deadline(Instant::now() + image_budget)
+            .expect("observe this publisher");
+        assert_eq!(published.identity(), observed.identity());
+        let published = serde_json::to_value(published).unwrap();
+        let observed = serde_json::to_value(observed).unwrap();
+        assert!(
+            observed.get("executable").is_some(),
+            "the real test executable must yield usable image evidence"
+        );
+        assert_eq!(published.get("executable"), observed.get("executable"));
+        assert_eq!(recorded_daemon_pid(dir.path()), Some(std::process::id()));
+        assert_eq!(read_port_file(dir.path()), Some(51234));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn exhausted_publication_budget_preserves_incarnation_and_owner_first_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let _authority = acquire_singleton_coordination_guard(root).unwrap();
+        publish_daemon_endpoint_under_authority(root, 51234, Instant::now())
+            .expect("an exhausted image budget still allows cooperative publication");
+        let raw = std::fs::read(root.join(ENDPOINT_OWNER_FILE)).unwrap();
+        let owner: EndpointOwnerRecord = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(
+            owner,
+            EndpointOwnerRecord::for_identity(
+                kin_cli::daemon_client::current_process_identity().unwrap()
+            )
+        );
+        let json: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert!(json.get("executable").is_none());
+        assert_eq!(recorded_daemon_pid(root), Some(std::process::id()));
+        assert_eq!(read_port_file(root), Some(51234));
+
+        // If owner installation fails, even the PID of an older publication
+        // must remain untouched. Publishing PID first would violate this.
+        std::fs::remove_file(root.join(ENDPOINT_OWNER_FILE)).unwrap();
+        std::fs::create_dir(root.join(ENDPOINT_OWNER_FILE)).unwrap();
+        std::fs::write(root.join(ENDPOINT_OWNER_FILE).join("occupant"), b"x").unwrap();
+        std::fs::write(root.join("daemon.pid"), b"123456789").unwrap();
+        publish_daemon_endpoint_under_authority(root, 51235, Instant::now())
+            .expect_err("owner installation must precede PID replacement");
+        assert_eq!(
+            std::fs::read(root.join("daemon.pid")).unwrap(),
+            b"123456789"
+        );
+        assert_eq!(read_port_file(root), Some(51234));
+        assert!(root.join(ENDPOINT_OWNER_FILE).join("occupant").exists());
+        assert!(!root.join("daemon.owner.tmp").exists());
+        assert!(!root.join("daemon.pid.tmp").exists());
+        assert!(!root.join("daemon.port.tmp").exists());
     }
 
     #[test]

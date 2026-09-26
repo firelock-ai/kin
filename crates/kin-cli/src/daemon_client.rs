@@ -31,6 +31,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 pub(crate) mod probe_process;
+pub(crate) mod process_executable;
 
 static BUILD_MISMATCH_REPORTED: AtomicBool = AtomicBool::new(false);
 static BEHAVIOR_ENV_DIVERGENCE_REPORTED: AtomicBool = AtomicBool::new(false);
@@ -172,6 +173,13 @@ struct SupervisorRegistration {
     port: u16,
     endpoint: String,
     graph_entity_count: Option<usize>,
+    /// The managed home the daemon runs under, when this process knows it:
+    /// only for a daemon this process started, which inherited its home.
+    /// Empty otherwise, which the supervisor records as unrecorded until the
+    /// daemon's own heartbeat says. Left empty for a daemon this process just
+    /// spawned, it was unrecorded for its first five seconds, and a home-scoped
+    /// stop in that window skipped it as another home's.
+    kin_home: String,
 }
 
 /// A repo worker daemon as recorded by the per-user supervisor's `/daemons`
@@ -2037,6 +2045,66 @@ impl DaemonClient {
             .ok_or_else(|| anyhow::anyhow!("daemon session registration returned no session_id"))
     }
 
+    /// Refresh one agent session's idle window and read it back: its vendor,
+    /// client name and capabilities. `None` when the daemon holds no such
+    /// session, because it ended or was reaped.
+    pub async fn refresh_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<kin_model::session::AgentSession>> {
+        let heartbeat = self
+            .send(
+                self.client.post(format!(
+                    "{}/session/{}/heartbeat",
+                    self.base_url, session_id
+                )),
+                "session heartbeat",
+            )
+            .await?;
+        if heartbeat.status().as_u16() == 404 {
+            return Ok(None);
+        }
+        if !heartbeat.status().is_success() {
+            return Err(self.http_refusal("session heartbeat", heartbeat).await);
+        }
+        let resp = self
+            .send(
+                self.client
+                    .get(format!("{}/session/{}", self.base_url, session_id)),
+                "session read",
+            )
+            .await?;
+        if resp.status().as_u16() == 404 {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            return Err(self.http_refusal("session read", resp).await);
+        }
+        Ok(Some(resp.json().await.context("parse daemon session")?))
+    }
+
+    /// Record an agent toolchain run's admitted write-back as a change,
+    /// attributed to the session that ran it.
+    pub async fn exec_commit(
+        &self,
+        request: &crate::commands::agent_exec::ExecCommitRequest,
+    ) -> Result<crate::commands::agent_exec::ExecCommitResponse> {
+        let resp = self
+            .send(
+                self.client
+                    .post(format!("{}/commands/exec-commit", self.base_url))
+                    .json(request),
+                "exec commit",
+            )
+            .await?;
+        if !resp.status().is_success() {
+            return Err(self.http_refusal("exec commit", resp).await);
+        }
+        resp.json()
+            .await
+            .context("parse daemon exec commit response")
+    }
+
     /// Release a session lease registered by [`Self::start_session`].
     pub async fn end_session(&self, session_id: &str) -> Result<()> {
         let resp = self
@@ -2263,9 +2331,25 @@ fn daemon_http_error(base_url: &str, leaf: &str, status: u16, body: &str) -> any
             "the kin daemon at {base_url} answered HTTP {status} with an empty body for {leaf}; \
              read .kin/daemon.log, then stop it with `kin daemon stop` and re-run"
         )
+    } else if let Some(sentence) = read_only_session_sentence(body) {
+        anyhow::anyhow!(sentence)
     } else {
         anyhow::anyhow!("kin {leaf} refused (HTTP {status}): {body}")
     }
+}
+
+/// The sentence a read-only session refusal carries, when `body` is one.
+///
+/// The daemon refuses a write from a session that declared itself read-only
+/// with a worded sentence inside a JSON envelope. Printed whole, the reader has
+/// to dig the sentence out of the envelope, which `kin commit` already spares
+/// them; `kin push`, `kin pull` and `kin reconcile` print it the same way.
+fn read_only_session_sentence(body: &str) -> Option<String> {
+    let parsed: serde_json::Value = serde_json::from_str(body).ok()?;
+    if parsed.get("error")?.as_str()? != "read_only_session" {
+        return None;
+    }
+    Some(parsed.get("message")?.as_str()?.to_string())
 }
 
 fn check_response_build_match(headers: &reqwest::header::HeaderMap) -> Result<()> {
@@ -2986,6 +3070,15 @@ fn process_image_path(pid: u32) -> Option<String> {
     None
 }
 
+/// Whether the observed path has a Kin-like name, or None if unreadable.
+///
+/// This is a conservative name hint, not executable provenance. It must never
+/// authorize a signal: endpoint publication plus current executing-image
+/// equality provides that separate authority.
+pub fn process_runs_a_kin_image(pid: u32) -> Option<bool> {
+    process_image_path(pid).map(|image| image_path_could_be_kin(&image))
+}
+
 /// Whether the process holding a startup lock is running an image that is not
 /// Kin's, which is the one shape affirmative liveness cannot see.
 ///
@@ -3002,21 +3095,6 @@ fn process_image_path(pid: u32) -> Option<String> {
 /// by policy for the legacy supervisor endpoint. Widening that is a separate
 /// decision about a different piece of state; this reader is scoped to the lock
 /// whose holder Kin itself recorded.
-/// Whether `pid` is running a Kin image right now, or `None` when the image
-/// could not be read.
-///
-/// The second of the two proofs `kin daemon stop` takes before it signals a
-/// recorded daemon pid. The first, [`process_identity_is_current`], proves the
-/// pid still names the incarnation the endpoint recorded; this one reads the
-/// executable from the OS and proves that process is one of ours, so the
-/// decision does not rest on the record alone.
-///
-/// `None` is "do not signal", never "not Kin". A caller that cannot read an
-/// image knows nothing about the process and must not act on that.
-pub fn process_runs_a_kin_image(pid: u32) -> Option<bool> {
-    process_image_path(pid).map(|image| image_path_could_be_kin(&image))
-}
-
 fn startup_lock_holder_is_foreign(pid: u32) -> bool {
     match process_image_path(pid) {
         Some(image) => !image_path_could_be_kin(&image),
@@ -3060,12 +3138,134 @@ fn legacy_supervisor_pid_authorizes_cleanup(pid: u32) -> bool {
     process_liveness(pid).authorizes_cleanup() || pid_runs_a_foreign_image(pid)
 }
 
-/// Whether a TCP port on localhost is accepting connections. Distinguishes a
-/// daemon that is alive and serving from one whose process exists but whose
-/// port is not (yet) bound.
-pub fn is_port_open(port: u16) -> bool {
+/// What one TCP connect to a loopback port established.
+///
+/// This used to be a boolean, `is_port_open`, and its `false` meant two things
+/// a waiting caller must never confuse. A port nothing listens on yet refuses
+/// the connect, and waiting changes that. A process the operating system will
+/// not let connect at all is refused by the kernel before any packet leaves,
+/// and no amount of waiting changes that. The proof container's Kin role runs
+/// under a seccomp filter that answers every connect() with EACCES while
+/// leaving bind, listen and accept alone, so `kin init` started a supervisor
+/// that bound and published its port, then read each refused connect as a port
+/// that was not open yet and polled it until the supervisor, which never saw a
+/// client, reached its own 60-second idle timeout and exited.
+#[derive(Debug)]
+pub enum LoopbackConnect {
+    /// The handshake completed.
+    Open,
+    /// The connect failed in a way waiting can change: nothing is listening
+    /// yet, the handshake did not finish inside the probe window, the call was
+    /// interrupted, or a local resource ran short.
+    NotYet(std::io::Error),
+    /// The connect failed in a way waiting cannot change. The operating system
+    /// refused this process the call itself (EACCES from a seccomp filter, EPERM
+    /// from a macOS sandbox profile or a firewall rule on locally generated
+    /// traffic), or this host has no route to loopback at all.
+    Blocked(std::io::Error),
+}
+
+impl LoopbackConnect {
+    /// Whether the handshake completed, for a caller that only reports what is
+    /// reachable now and never waits on the answer.
+    pub fn is_open(&self) -> bool {
+        matches!(self, Self::Open)
+    }
+}
+
+/// Connect once to `127.0.0.1:port` and say which of the three it was.
+pub fn connect_loopback_port(port: u16) -> LoopbackConnect {
     let addr: std::net::SocketAddr = ([127, 0, 0, 1], port).into();
-    std::net::TcpStream::connect_timeout(&addr, PORT_PROBE_CONNECT_TIMEOUT).is_ok()
+    classify_loopback_connect(
+        std::net::TcpStream::connect_timeout(&addr, PORT_PROBE_CONNECT_TIMEOUT).map(drop),
+    )
+}
+
+/// The classification behind [`connect_loopback_port`], apart from the socket
+/// so every arm can be proved without a sandbox.
+///
+/// Only errors that name a permanent condition are `Blocked`, and everything
+/// else is `NotYet`. Reading a transient error as permanent would fail a start
+/// on a loaded machine that one more poll would have finished, while reading a
+/// permanent one as transient costs the wait this type exists to remove, so an
+/// error nobody has classified keeps the old behavior.
+fn classify_loopback_connect(result: std::io::Result<()>) -> LoopbackConnect {
+    use std::io::ErrorKind;
+    match result {
+        Ok(()) => LoopbackConnect::Open,
+        Err(error)
+            if matches!(
+                error.kind(),
+                ErrorKind::PermissionDenied
+                    | ErrorKind::NetworkUnreachable
+                    | ErrorKind::HostUnreachable
+                    | ErrorKind::NetworkDown
+            ) =>
+        {
+            LoopbackConnect::Blocked(error)
+        }
+        Err(error) => LoopbackConnect::NotYet(error),
+    }
+}
+
+/// A loopback connect this process can never make.
+///
+/// Its own error type rather than a sentence inside another, so a caller can
+/// tell it apart from every startup failure that waiting or a retry could cure,
+/// and so `kin init` can report it as its own reason.
+#[derive(Debug)]
+pub struct LoopbackBlocked {
+    target: String,
+    error: std::io::Error,
+}
+
+impl LoopbackBlocked {
+    pub(crate) fn new(target: impl Into<String>, error: std::io::Error) -> Self {
+        Self {
+            target: target.into(),
+            error,
+        }
+    }
+
+    /// The operating system's own error for the refused connect.
+    pub fn os_error(&self) -> &std::io::Error {
+        &self.error
+    }
+}
+
+impl fmt::Display for LoopbackBlocked {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let cause = if self.error.kind() == std::io::ErrorKind::PermissionDenied {
+            "a sandbox, seccomp filter or firewall rule that denies connect() does this"
+        } else {
+            "this host has no usable route to loopback"
+        };
+        write!(
+            f,
+            "the operating system refused this process a connection to {} ({}), so it cannot \
+             reach a kin supervisor or daemon over loopback, and waiting will not change that; \
+             {cause}",
+            self.target, self.error
+        )
+    }
+}
+
+impl std::error::Error for LoopbackBlocked {}
+
+/// Whether this process is blocked from connecting to loopback at all.
+///
+/// Answered by one connect against a listener this process opens for the
+/// purpose, so the refusal cannot be a peer that is missing or slow. A listener
+/// this process cannot bind, and a connect that fails in a way waiting could
+/// change, both answer `None` and leave the start to the paths that already
+/// report those, because neither shows that starting a daemon is hopeless.
+pub fn loopback_blocked() -> Option<LoopbackBlocked> {
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).ok()?;
+    let port = listener.local_addr().ok()?.port();
+    match connect_loopback_port(port) {
+        LoopbackConnect::Blocked(error) => Some(LoopbackBlocked::new("loopback", error)),
+        LoopbackConnect::Open | LoopbackConnect::NotYet(_) => None,
+    }
 }
 
 /// How long a port probe waits for the TCP handshake.
@@ -3077,13 +3277,14 @@ const PORT_PROBE_ANSWER_TIMEOUT: Duration = Duration::from_millis(750);
 
 /// What a probe established about a recorded daemon port.
 ///
-/// [`is_port_open`] collapses all of this into one boolean, and the collapse is
-/// what let `kin daemon status` report "port closed" for a port `lsof` showed
-/// in LISTEN. A wedged daemon still holds its listening socket: the kernel
-/// keeps the listener, the accept queue fills because nothing is calling
-/// accept, and a connect against it times out rather than being refused. Being
-/// refused and timing out are different facts about the daemon and lead an
-/// operator to different remedies, so they are different answers here.
+/// A bare connect collapses all of this into whether the handshake completed,
+/// and the collapse is what let `kin daemon status` report "port closed" for a
+/// port `lsof` showed in LISTEN. A wedged daemon still holds its listening
+/// socket: the kernel keeps the listener, the accept queue fills because
+/// nothing is calling accept, and a connect against it times out rather than
+/// being refused. Being refused and timing out are different facts about the
+/// daemon and lead an operator to different remedies, so they are different
+/// answers here.
 ///
 /// Stated as what the probe can prove rather than as what the kernel table
 /// says. A socket bound without `listen` also swallows the connect on macOS
@@ -3194,9 +3395,10 @@ pub const ENDPOINT_OWNER_SCHEMA: &str = "kin.daemon.endpoint-owner.v1";
 /// singleton lock stamps, so ownership can be *proved* rather than inferred
 /// from a number.
 ///
-/// The record carries identity and nothing else. A port field was tempting and
-/// is deliberately absent: `daemon.port` is the port, nothing would read a
-/// second copy, and two records of the same fact can only ever disagree.
+/// New publishers also record their executing image. The optional nested
+/// evidence leaves the outer v1 incarnation contract readable by old clients;
+/// missing or unusable image evidence never authorizes a signal in a new client.
+/// It is not authentication against a writer able to replace the owner file.
 ///
 /// The definition lives here rather than beside the daemon that writes it for
 /// the same reason. The daemon publishes the record and the CLI start path
@@ -3207,21 +3409,68 @@ pub const ENDPOINT_OWNER_SCHEMA: &str = "kin.daemon.endpoint-owner.v1";
 pub struct EndpointOwnerRecord {
     schema: String,
     identity: ProcessIdentity,
+    // Keep unknown/malformed nested evidence separate from incarnation parsing:
+    // an unreadable image must not erase a live owner's cooperative-stop route.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    executable: Option<serde_json::Value>,
 }
 
 impl EndpointOwnerRecord {
     /// A record attributing an endpoint to this process incarnation, or `None`
     /// on a target that cannot describe one.
     pub fn current() -> Option<Self> {
+        Self::current_with_deadline(Instant::now() + LIFECYCLE_AUTHORITY_RETRY_BUDGET)
+    }
+
+    /// Capture only this publisher's own image, within its lifecycle budget.
+    /// Failure keeps an incarnation-only publication usable for cooperation.
+    pub fn current_with_deadline(deadline: Instant) -> Option<Self> {
+        let identity = current_process_identity().ok()?;
+        let observed = process_executable::observe(identity.pid(), deadline);
+        let executable = match observed {
+            Ok(image)
+                if matches!(process_identity_is_current(&identity), Ok(true))
+                    && Instant::now() < deadline =>
+            {
+                serde_json::to_value(image).ok()
+            }
+            Ok(_) => None,
+            Err(error) => {
+                debug!(%error, "publishing incarnation without executable signal evidence");
+                None
+            }
+        };
         Some(Self {
             schema: ENDPOINT_OWNER_SCHEMA.to_string(),
-            identity: current_process_identity().ok()?,
+            identity,
+            executable,
         })
     }
 
     /// The incarnation this record names.
     pub fn identity(&self) -> &ProcessIdentity {
         &self.identity
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn executable_identity(
+        &self,
+    ) -> std::io::Result<process_executable::ExecutableIdentity> {
+        let value = self.executable.clone().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "the endpoint publisher recorded no executable identity; only cooperative shutdown is allowed",
+            )
+        })?;
+        let image: process_executable::ExecutableIdentity =
+            serde_json::from_value(value).map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("published executable identity is unsupported or malformed: {error}"),
+                )
+            })?;
+        image.validate()?;
+        Ok(image)
     }
 
     /// Attribute an endpoint to an incarnation other than this process, so a
@@ -3235,6 +3484,7 @@ impl EndpointOwnerRecord {
         Self {
             schema: ENDPOINT_OWNER_SCHEMA.to_string(),
             identity,
+            executable: None,
         }
     }
 }
@@ -4510,7 +4760,7 @@ fn read_port_file(kin_root: &Path) -> Option<u16> {
 /// The (pid, port) recorded for the current repo's worker daemon, read from its
 /// `.kin/daemon.{pid,port}` files with no liveness probe. Either component is
 /// `None` when its file is absent or unparseable. Callers classify liveness
-/// separately via [`is_process_alive`]/[`is_port_open`].
+/// separately via [`is_process_alive`]/[`connect_loopback_port`].
 pub fn repo_daemon_recorded_endpoint(kin_root: &Path) -> (Option<u32>, Option<u16>) {
     (read_pid_file(kin_root), read_port_file(kin_root))
 }
@@ -4606,7 +4856,7 @@ fn live_supervisor_endpoint() -> Option<LiveDaemonEndpoint> {
 
 pub fn daemon_is_up(kin_root: &Path) -> Option<u16> {
     let port = live_daemon_endpoint(kin_root)?.port;
-    if is_port_open(port) {
+    if connect_loopback_port(port).is_open() {
         Some(port)
     } else {
         None
@@ -7031,12 +7281,88 @@ impl Drop for StartupNotice {
     }
 }
 
+/// The most a command that just started a daemon waits for that daemon to take
+/// the tracked files the working copy changed while no daemon watched.
+///
+/// A catch-up over a handful of edited files is one ordinary admission, which
+/// takes seconds on a busy machine and less on a quiet one. The bound exists
+/// for the far end of that range, a branch switched while nothing watched, and
+/// past it the command asks anyway and its answer says the graph is behind
+/// rather than waiting on it indefinitely.
+const STARTUP_CATCH_UP_PATIENCE: Duration = Duration::from_secs(30);
+
+/// Let a daemon this command just started take what the working copy changed
+/// while no daemon watched it, before the command asks it anything.
+///
+/// The daemon plans that catch-up before it publishes its endpoint, so its
+/// first `/health` already names the tracked files it owes, and every answer it
+/// gives until they land is qualified by them. A command that asked at once
+/// would get exactly such an answer: the renamed function under its old name,
+/// the deleted file still ranked. Waiting here for that one admission turns
+/// it into a current answer. Bounded by
+/// [`STARTUP_CATCH_UP_PATIENCE`] and by the caller's own deadline, and it stops
+/// as soon as the daemon reports a failed admission, because a refusal is not
+/// going to clear by waiting and the answer that follows says what is owed.
+async fn await_startup_catch_up(
+    client: &reqwest::Client,
+    base_url: &str,
+    first: &HealthResponse,
+    deadline: Instant,
+) {
+    let owes = |health: &HealthResponse| health.reconcile.changed_path_count > 0;
+    let refused = |health: &HealthResponse| health.reconcile.admission_failure_streak > 0;
+    if !owes(first) {
+        return;
+    }
+    let bound = deadline.min(Instant::now() + STARTUP_CATCH_UP_PATIENCE);
+    info!(
+        owed = first.reconcile.changed_path_count,
+        "waiting for the daemon to admit tracked files changed while no daemon was watching"
+    );
+    while Instant::now() < bound {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // A daemon whose health will not read is not one this wait can learn
+        // anything from, so the command asks now and its answer says what it
+        // can rather than this spending the whole bound on silence.
+        let Ok(response) = client.get(format!("{base_url}/health")).send().await else {
+            return;
+        };
+        let Ok(health) = response.json::<HealthResponse>().await else {
+            return;
+        };
+        if !owes(&health) || refused(&health) {
+            return;
+        }
+    }
+}
+
 async fn wait_for_daemon_ready(
     kin_root: &Path,
     child: &mut Child,
     deadline: Instant,
     log_offset: u64,
     notice: Option<&mut StartupNotice>,
+) -> std::result::Result<String, DaemonReadinessError> {
+    wait_for_daemon_ready_with(
+        kin_root,
+        child,
+        deadline,
+        log_offset,
+        notice,
+        connect_loopback_port,
+    )
+    .await
+}
+
+/// [`wait_for_daemon_ready`] with the connect taken as an argument, so a test
+/// can hand it a refusal that would otherwise need a sandbox to produce.
+async fn wait_for_daemon_ready_with(
+    kin_root: &Path,
+    child: &mut Child,
+    deadline: Instant,
+    log_offset: u64,
+    notice: Option<&mut StartupNotice>,
+    connect: impl Fn(u16) -> LoopbackConnect,
 ) -> std::result::Result<String, DaemonReadinessError> {
     let timeout = deadline.saturating_duration_since(Instant::now());
     let client = daemon_health_client();
@@ -7068,38 +7394,60 @@ async fn wait_for_daemon_ready(
         };
         let base_url = format!("http://127.0.0.1:{port}");
 
-        if is_port_open(port) {
-            match client.get(format!("{base_url}/readiness")).send().await {
-                Ok(resp) if resp.status().is_success() => {
-                    let health_result: Result<HealthResponse> = async {
-                        client
-                            .get(format!("{base_url}/health"))
-                            .send()
-                            .await
-                            .context("probe daemon health")?
-                            .error_for_status()
-                            .context("daemon health returned an error")?
-                            .json()
-                            .await
-                            .context("parse daemon health response")
+        match connect(port) {
+            LoopbackConnect::Open => {
+                match client.get(format!("{base_url}/readiness")).send().await {
+                    Ok(resp) if resp.status().is_success() => {
+                        let health_result: Result<HealthResponse> = async {
+                            client
+                                .get(format!("{base_url}/health"))
+                                .send()
+                                .await
+                                .context("probe daemon health")?
+                                .error_for_status()
+                                .context("daemon health returned an error")?
+                                .json()
+                                .await
+                                .context("parse daemon health response")
+                        }
+                        .await;
+                        match health_result.and_then(|health| {
+                            let working_dir = kin_root
+                                .parent()
+                                .ok_or_else(|| anyhow!("invalid .kin layout: no parent"))?;
+                            validate_health_repo(&health, working_dir)?;
+                            Ok(health)
+                        }) {
+                            Ok(health) => {
+                                await_startup_catch_up(&client, &base_url, &health, deadline).await;
+                                return Ok(base_url);
+                            }
+                            Err(err) => last_error = err.to_string(),
+                        }
                     }
-                    .await;
-                    match health_result.and_then(|health| {
-                        let working_dir = kin_root
-                            .parent()
-                            .ok_or_else(|| anyhow!("invalid .kin layout: no parent"))?;
-                        validate_health_repo(&health, working_dir)
-                    }) {
-                        Ok(()) => return Ok(base_url),
-                        Err(err) => last_error = err.to_string(),
+                    Ok(resp) => {
+                        last_error = format!("readiness returned HTTP {}", resp.status());
+                    }
+                    Err(err) => {
+                        last_error = err.to_string();
                     }
                 }
-                Ok(resp) => {
-                    last_error = format!("readiness returned HTTP {}", resp.status());
-                }
-                Err(err) => {
-                    last_error = err.to_string();
-                }
+            }
+            // Nothing is listening yet, or it is not accepting inside the probe
+            // window. The next poll can change either.
+            LoopbackConnect::NotYet(_) => {}
+            // No poll can change this, so the wait ends at the first one rather
+            // than at the deadline. The daemon is left alone for the reason the
+            // deadline below leaves a live one alone: nothing here proves it
+            // dead, and with no client able to reach it, it retires on its own
+            // idle window.
+            LoopbackConnect::Blocked(error) => {
+                return Err(DaemonReadinessError::Failed(anyhow::Error::new(
+                    LoopbackBlocked::new(
+                        format!("127.0.0.1:{port}, where the daemon it started is listening"),
+                        error,
+                    ),
+                )));
             }
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -7774,8 +8122,10 @@ async fn follow_existing_supervisor_publication(
     }
 }
 
+const SUPERVISOR_LOG_FILE: &str = "supervisor.log";
+
 fn supervisor_log_path() -> PathBuf {
-    supervisor_dir().join("supervisor.log")
+    supervisor_dir().join(SUPERVISOR_LOG_FILE)
 }
 
 fn supervisor_log_len() -> u64 {
@@ -7787,9 +8137,8 @@ fn supervisor_log_len() -> u64 {
 /// Render the supervisor output produced by this start attempt only, mirroring
 /// [`daemon_log_tail_since`]. The exit status of a supervisor that died on
 /// launch is a symptom; the reason is in this log and was previously never read.
-fn supervisor_log_tail_since(since_offset: u64) -> String {
-    let path = supervisor_log_path();
-    let Ok(content) = std::fs::read_to_string(&path) else {
+fn supervisor_log_tail_since(path: &Path, since_offset: u64) -> String {
+    let Ok(content) = std::fs::read_to_string(path) else {
         return format!("supervisor log unavailable at {}", path.display());
     };
     let fresh = content
@@ -7824,18 +8173,41 @@ async fn wait_for_supervisor_ready(
     startup_authority: &mut SupervisorStartupLock,
     log_offset: u64,
 ) -> Result<String> {
+    wait_for_supervisor_ready_in(
+        &supervisor_dir(),
+        child,
+        deadline,
+        startup_authority,
+        log_offset,
+        connect_loopback_port,
+    )
+    .await
+}
+
+/// [`wait_for_supervisor_ready`] against the supervisor directory `dir`, with
+/// the connect taken as an argument, so a test can hand it a refusal that
+/// would otherwise need a sandbox to produce.
+async fn wait_for_supervisor_ready_in(
+    dir: &Path,
+    child: &mut Child,
+    deadline: Instant,
+    startup_authority: &mut SupervisorStartupLock,
+    log_offset: u64,
+    connect: impl Fn(u16) -> LoopbackConnect,
+) -> Result<String> {
     let timeout = deadline.saturating_duration_since(Instant::now());
     let client = daemon_health_client();
     let mut last_error = String::from("supervisor did not report its port");
     let mut next_startup_heartbeat = Instant::now();
+    let log_path = dir.join(SUPERVISOR_LOG_FILE);
 
     while Instant::now() < deadline {
         if let Some(status) = child.try_wait().context("check supervisor child status")? {
             bail!(
                 "the kin supervisor exited during startup with status {status}; recent log from \
                  {}:\n{}",
-                supervisor_log_path().display(),
-                supervisor_log_tail_since(log_offset)
+                log_path.display(),
+                supervisor_log_tail_since(&log_path, log_offset)
             );
         }
         if Instant::now() >= next_startup_heartbeat {
@@ -7853,7 +8225,7 @@ async fn wait_for_supervisor_ready(
         // The supervisor binds :0 and writes its real bound port to its port
         // file once listening. Read it each poll until it appears — the port
         // file is the supervisor→CLI handshake.
-        let Some(port) = std::fs::read_to_string(supervisor_port_path())
+        let Some(port) = std::fs::read_to_string(dir.join(SUPERVISOR_PORT_FILE))
             .ok()
             .and_then(|value| value.trim().parse::<u16>().ok())
         else {
@@ -7862,11 +8234,27 @@ async fn wait_for_supervisor_ready(
         };
         let base_url = format!("http://127.0.0.1:{port}");
 
-        if is_port_open(port) {
-            match client.get(format!("{base_url}/health")).send().await {
+        match connect(port) {
+            LoopbackConnect::Open => match client.get(format!("{base_url}/health")).send().await {
                 Ok(resp) if resp.status().is_success() => return Ok(base_url),
                 Ok(resp) => last_error = format!("health returned HTTP {}", resp.status()),
                 Err(err) => last_error = err.to_string(),
+            },
+            LoopbackConnect::NotYet(_) => {}
+            // The supervisor this call started is listening where this process
+            // may not connect. Nothing but that supervisor ever ended this wait,
+            // and it only ended it by giving up: with no client able to reach
+            // it, it exits at its own idle timeout, a minute after it published.
+            // So the wait ends at the first refusal, and the child goes the way
+            // the deadline below sends it, because it is this call's own and
+            // nothing can use it.
+            LoopbackConnect::Blocked(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(anyhow::Error::new(LoopbackBlocked::new(
+                    format!("127.0.0.1:{port}, where the supervisor it started is listening"),
+                    error,
+                )));
             }
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -7927,6 +8315,16 @@ pub async fn ensure_supervisor_running() -> Result<String> {
             "KIN_NO_DAEMON is set and no supervisor is running, so none may be started; unset \
              KIN_NO_DAEMON (or drop --no-spawn) to let kin start one"
         );
+    }
+
+    // Everything below ends in a loopback connect, whether it waits on a
+    // supervisor another command started or starts one. A process the operating
+    // system will not let connect to loopback can do neither, and it used to
+    // find that out by starting a supervisor and waiting a minute for it to give
+    // up. One connect against a listener of its own settles it before anything
+    // is started or waited on.
+    if let Some(blocked) = loopback_blocked() {
+        return Err(anyhow::Error::new(blocked));
     }
 
     // Validate the binary's explicit protocol acknowledgement before taking
@@ -8157,6 +8555,7 @@ async fn register_repo_daemon_with_supervisor(
     kin_root: &Path,
     daemon_url: &str,
     supervisor_url: &str,
+    spawned_here: bool,
 ) -> Result<()> {
     let working_dir = kin_root
         .parent()
@@ -8193,6 +8592,11 @@ async fn register_repo_daemon_with_supervisor(
         port,
         endpoint: daemon_url.to_string(),
         graph_entity_count: health.graph_entity_count,
+        kin_home: if spawned_here {
+            caller_home_id()
+        } else {
+            String::new()
+        },
     };
 
     // The shared supervisor self-terminates after an idle window and deletes its
@@ -8264,7 +8668,7 @@ impl kin_daemon_spawn::DaemonSpawnRegistrar for CliSpawnRegistrar {
             let supervisor_url = ensure_supervisor_running()
                 .await
                 .map_err(|error| format!("{error:#}"))?;
-            register_repo_daemon_with_supervisor(&kin_root, &daemon_url, &supervisor_url)
+            register_repo_daemon_with_supervisor(&kin_root, &daemon_url, &supervisor_url, true)
                 .await
                 .map_err(|error| format!("{error:#}"))
         })
@@ -8321,7 +8725,7 @@ pub async fn ensure_daemon_running_with_idle_timeout(
 
     match wait_for_existing_daemon(kin_root).await {
         ExistingDaemon::Connected(base_url) => {
-            register_repo_daemon_with_supervisor(kin_root, &base_url, &supervisor_url)
+            register_repo_daemon_with_supervisor(kin_root, &base_url, &supervisor_url, false)
                 .await
                 .map_err(AutoStartError::spawn)?;
             attach_to_existing_daemon(&base_url, idle_timeout_override).await?;
@@ -8342,7 +8746,7 @@ pub async fn ensure_daemon_running_with_idle_timeout(
     }
     match wait_for_existing_daemon(kin_root).await {
         ExistingDaemon::Connected(base_url) => {
-            register_repo_daemon_with_supervisor(kin_root, &base_url, &supervisor_url)
+            register_repo_daemon_with_supervisor(kin_root, &base_url, &supervisor_url, false)
                 .await
                 .map_err(AutoStartError::spawn)?;
             attach_to_existing_daemon(&base_url, idle_timeout_override).await?;
@@ -8435,7 +8839,7 @@ pub async fn ensure_daemon_running_with_idle_timeout(
             return Err(AutoStartError::StartupTimeout(detail))
         }
     };
-    register_repo_daemon_with_supervisor(kin_root, &base_url, &supervisor_url)
+    register_repo_daemon_with_supervisor(kin_root, &base_url, &supervisor_url, true)
         .await
         .map_err(AutoStartError::spawn)?;
     // A death note explains the outage that made this spawn necessary, and
@@ -8740,12 +9144,21 @@ async fn resolve_daemon_url_inner(
             } else {
                 kin_daemon_spawn::EnrichmentState::Available
             };
-            let headline = match kin_daemon_spawn::peek_unwatched_daemon_death(layout.root()) {
+            let mut headline = match kin_daemon_spawn::peek_unwatched_daemon_death(layout.root()) {
                 Some(record) => {
                     format!("kin daemon is required. {}", record.summary_in(state))
                 }
                 None => "kin daemon is required".to_string(),
             };
+            // A store an older build wrote can refuse a newer daemon's startup
+            // repair, and it is the one cause here a reader can always act on
+            // without a daemon: `kin upgrade` re-derives the store in place.
+            // Named in the words every other CLI surface prints it with.
+            if let Some(line) = crate::commands::graph::hydration_semantics_line(
+                &kin_core::hydration_semantics::standing(layout),
+            ) {
+                headline = format!("{headline}\n{line}");
+            }
             Err(anyhow::Error::new(err).context(headline))
         }
     }
@@ -9848,13 +10261,13 @@ mod tests {
         );
     }
 
-    /// The probe has to separate three things `is_port_open` collapses into
-    /// one boolean: nothing on the port, something on the port that never
+    /// The probe has to separate three things a bare connect collapses into
+    /// one answer: nothing on the port, something on the port that never
     /// answers, and a daemon that answers.
     ///
     /// The middle one is the wedge KIN-4 recorded, where `lsof` showed the
     /// socket in LISTEN and `kin daemon status` reported "port closed".
-    /// `is_port_open` answers `true` for the silent listener and the serving
+    /// A bare connect succeeds against the silent listener and the serving
     /// one alike, which is why status cannot read it.
     ///
     /// Falsify by returning `Answering` as soon as the connect completes: the
@@ -12478,6 +12891,161 @@ mod tests {
     // The endpoint was never proven invalid, so nothing retired it and nothing
     // respawned.
 
+    fn read_owner_records_from_json_for_test(
+        root: &Path,
+        payload: &serde_json::Value,
+    ) -> [EndpointOwnerRecord; 2] {
+        let raw = serde_json::to_vec(payload).unwrap();
+        std::fs::write(repo_daemon_owner_path(root), &raw).unwrap();
+        std::fs::write(root.join(SUPERVISOR_OWNER_FILE), &raw).unwrap();
+        [
+            read_endpoint_owner_record(root).expect("read the worker's incarnation record"),
+            read_supervisor_owner_record_in_dir(root)
+                .expect("read the supervisor's incarnation record"),
+        ]
+    }
+
+    #[test]
+    fn legacy_owner_records_preserve_identity_without_executable_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = ProcessIdentity {
+            pid: 4242,
+            boot_id: "record-fixture-boot".to_string(),
+            birth_token: "record-fixture-birth".to_string(),
+        };
+        let mut legacy = serde_json::json!({
+            "schema": ENDPOINT_OWNER_SCHEMA,
+            "identity": identity,
+        });
+        for explicit_null in [false, true] {
+            if explicit_null {
+                legacy["executable"] = serde_json::Value::Null;
+            }
+            for owner in read_owner_records_from_json_for_test(dir.path(), &legacy) {
+                assert_eq!(owner.identity(), &identity);
+                assert!(owner.executable.is_none());
+                #[cfg(unix)]
+                assert_eq!(
+                    owner.executable_identity().unwrap_err().kind(),
+                    std::io::ErrorKind::PermissionDenied
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_executable_evidence_preserves_readable_owner_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = ProcessIdentity {
+            pid: 4242,
+            boot_id: "record-fixture-boot".to_string(),
+            birth_token: "record-fixture-birth".to_string(),
+        };
+        for executable in [
+            serde_json::json!({"algorithm": "future-executable-v9", "evidence": true}),
+            serde_json::json!("not an executable record"),
+            serde_json::json!({
+                "algorithm": "macos-proc-execution-v1",
+                "main_executable_uuid": "wrong type",
+                "process_unique_id": 1,
+                "pid_version": 0,
+            }),
+            serde_json::json!({
+                "algorithm": "macos-proc-execution-v1",
+                "main_executable_uuid": vec![0_u8; 16],
+                "process_unique_id": 1,
+                "pid_version": -1,
+            }),
+            serde_json::json!({
+                "algorithm": "linux-proc-exe-sha256-v1",
+                "device": 1,
+                "inode": 1,
+                "sha256": "not a digest",
+            }),
+        ] {
+            let payload = serde_json::json!({
+                "schema": ENDPOINT_OWNER_SCHEMA,
+                "identity": identity,
+                "executable": executable,
+            });
+            for owner in read_owner_records_from_json_for_test(dir.path(), &payload) {
+                assert_eq!(owner.identity(), &identity);
+                assert_eq!(owner.executable.as_ref(), Some(&executable));
+                #[cfg(unix)]
+                assert_eq!(
+                    owner.executable_identity().unwrap_err().kind(),
+                    std::io::ErrorKind::InvalidData,
+                    "unsupported or unusable nested evidence must not grant signal authority"
+                );
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn current_executable_evidence_survives_both_owner_record_readers() {
+        let dir = tempfile::tempdir().unwrap();
+        // This grades serialization of real evidence, not capture within the
+        // production retry budget. Linux hashes the full test executable and
+        // may legitimately publish only its incarnation when that budget ends.
+        let current =
+            EndpointOwnerRecord::current_with_deadline(Instant::now() + Duration::from_secs(60))
+                .expect("observe the current publisher");
+        assert_eq!(
+            current.identity(),
+            &current_process_identity().expect("read this process's incarnation")
+        );
+        let executable = current
+            .executable_identity()
+            .expect("this real executable must supply usable signal evidence");
+        let payload = serde_json::to_value(&current).unwrap();
+        for owner in read_owner_records_from_json_for_test(dir.path(), &payload) {
+            assert_eq!(owner, current);
+            assert_eq!(owner.executable_identity().unwrap(), executable);
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn exhausted_executable_capture_preserves_identity_through_both_owner_readers() {
+        let dir = tempfile::tempdir().unwrap();
+        let current = EndpointOwnerRecord::current_with_deadline(Instant::now())
+            .expect("an expired image budget still captures this process's incarnation");
+        assert_eq!(
+            current.identity(),
+            &current_process_identity().expect("read this process's incarnation")
+        );
+        let payload = serde_json::to_value(&current).unwrap();
+        assert!(payload.get("executable").is_none());
+        for owner in read_owner_records_from_json_for_test(dir.path(), &payload) {
+            assert_eq!(owner, current);
+            assert!(process_identity_is_current(owner.identity()).unwrap());
+            assert_eq!(
+                owner.executable_identity().unwrap_err().kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+        }
+    }
+
+    #[test]
+    fn attributing_an_identity_never_invents_executable_authority() {
+        // Even a live, observable process must not gain image evidence merely
+        // because a caller constructed an attribution for its incarnation.
+        let identity = current_process_identity().expect("read this process's incarnation");
+        let owner = EndpointOwnerRecord::for_identity(identity.clone());
+        assert_eq!(owner.identity(), &identity);
+        assert!(owner.executable.is_none());
+        assert!(serde_json::to_value(&owner)
+            .unwrap()
+            .get("executable")
+            .is_none());
+        #[cfg(unix)]
+        assert_eq!(
+            owner.executable_identity().unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+    }
+
     /// Publish an endpoint attributed to a given incarnation, the way the daemon
     /// does: the owner record first, then the endpoint it attributes.
     fn write_attributed_endpoint_files(
@@ -13891,6 +14459,32 @@ mod tests {
         );
     }
 
+    /// A read-only session refusal reaches `kin push`, `kin pull` and
+    /// `kin reconcile` as its sentence, the way `kin commit` prints it, rather
+    /// than as the JSON envelope the daemon carries it in.
+    #[test]
+    fn a_read_only_session_refusal_is_printed_as_its_sentence() {
+        let sentence = "read_only_session: kin push writes, and session 3f9c2a1e is read-only";
+        let body = serde_json::json!({
+            "error": "read_only_session",
+            "session_id": "3f9c2a1e",
+            "message": sentence,
+        })
+        .to_string();
+        for leaf in ["push", "pull", "reconcile"] {
+            assert_eq!(
+                daemon_http_error("http://127.0.0.1:51234", leaf, 403, &body).to_string(),
+                sentence
+            );
+        }
+        let other = serde_json::json!({ "error": "lease_conflict", "message": "held" }).to_string();
+        assert_eq!(
+            daemon_http_error("http://127.0.0.1:51234", "push", 409, &other).to_string(),
+            format!("kin push refused (HTTP 409): {other}"),
+            "another refusal keeps the envelope its own reader parses"
+        );
+    }
+
     #[test]
     fn the_one_endpointless_resolution_names_the_variable_that_caused_it() {
         let layout = KinLayout::new(std::path::PathBuf::from("/tmp/kin-fixture-repo"));
@@ -14118,6 +14712,235 @@ mod tests {
                 trusted_supervisor_endpoint(hostile).is_none(),
                 "{hostile} must not become this command's daemon"
             );
+        }
+    }
+
+    /// A connect the operating system refuses is a different fact from a port
+    /// nothing listens on yet, and a caller that waits acts on the difference.
+    ///
+    /// The refusals are handed in rather than produced, because producing one
+    /// needs a seccomp filter or a sandbox around this whole test process. The
+    /// integration test `init_enrichment_state` produces a real one around the
+    /// `kin` binary.
+    mod loopback_connect_classes {
+        use super::*;
+
+        #[cfg(unix)]
+        fn os_error(code: i32) -> std::io::Error {
+            std::io::Error::from_raw_os_error(code)
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn a_refusal_by_policy_is_blocked_and_a_missing_listener_is_not_yet() {
+            for (code, label) in [
+                (
+                    libc::EACCES,
+                    "EACCES, what the proof container's seccomp filter returns",
+                ),
+                (
+                    libc::EPERM,
+                    "EPERM, what a macOS sandbox or a firewall rule returns",
+                ),
+                (libc::ENETUNREACH, "no route to loopback"),
+            ] {
+                assert!(
+                    matches!(
+                        classify_loopback_connect(Err(os_error(code))),
+                        LoopbackConnect::Blocked(_)
+                    ),
+                    "{label} can never become a connection"
+                );
+            }
+            for (code, label) in [
+                (libc::ECONNREFUSED, "nothing listening yet"),
+                (
+                    libc::ETIMEDOUT,
+                    "an accept queue that did not take the connect in time",
+                ),
+                (libc::EINTR, "an interrupted call"),
+                (libc::EADDRNOTAVAIL, "no local port free for a moment"),
+            ] {
+                assert!(
+                    matches!(
+                        classify_loopback_connect(Err(os_error(code))),
+                        LoopbackConnect::NotYet(_)
+                    ),
+                    "{label} can change on the next poll"
+                );
+            }
+            assert!(classify_loopback_connect(Ok(())).is_open());
+        }
+
+        /// The control for everything below: on a host that may connect to
+        /// loopback, nothing here reads as blocked.
+        #[test]
+        fn an_unrestricted_host_is_never_read_as_blocked() {
+            let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .expect("bind a loopback listener");
+            let port = listener.local_addr().expect("listener address").port();
+            assert!(
+                connect_loopback_port(port).is_open(),
+                "a live listener accepts the connect"
+            );
+            drop(listener);
+            assert!(
+                !matches!(connect_loopback_port(port), LoopbackConnect::Blocked(_)),
+                "a port nothing holds any more is not yet open, never blocked"
+            );
+            assert!(
+                loopback_blocked().is_none(),
+                "a process that can connect to its own listener is not blocked"
+            );
+        }
+
+        /// The measured failure, one level down. The proof container's supervisor
+        /// bound, published its port and logged that it was listening; the CLI
+        /// polled it for sixty seconds and returned only when the supervisor gave
+        /// up at its idle timeout. The stand-in child here would run for a
+        /// minute too, so a wait that ignored the refusal would fail the budget
+        /// below by fifty seconds.
+        ///
+        /// Falsify by mapping `Blocked` to `NotYet` in the readiness loop: the
+        /// wait then runs to the sleeping child's exit and past the budget.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn a_blocked_connect_ends_the_supervisor_wait_at_once_and_stops_its_child() {
+            let dir = tempfile::tempdir().expect("supervisor directory");
+            let mut authority = try_acquire_supervisor_startup_lock_in_dir(dir.path())
+                .expect("take supervisor startup authority in the test directory");
+            let mut child = std::process::Command::new("sleep")
+                .arg("60")
+                .spawn()
+                .expect("spawn a stand-in for a supervisor that idles for a minute");
+            std::fs::write(dir.path().join(SUPERVISOR_PORT_FILE), "45065")
+                .expect("publish the stand-in's port");
+
+            let started = Instant::now();
+            let error = wait_for_supervisor_ready_in(
+                dir.path(),
+                &mut child,
+                Instant::now() + Duration::from_secs(60),
+                &mut authority,
+                0,
+                |_| LoopbackConnect::Blocked(os_error(libc::EACCES)),
+            )
+            .await
+            .expect_err("a supervisor this process may not connect to is never ready");
+            let waited = started.elapsed();
+
+            assert!(
+                waited < Duration::from_secs(5),
+                "the wait must end at the first refusal, and it took {waited:?}"
+            );
+            let blocked = error
+                .downcast_ref::<LoopbackBlocked>()
+                .unwrap_or_else(|| panic!("the refusal keeps its own type: {error:#}"));
+            assert_eq!(blocked.os_error().raw_os_error(), Some(libc::EACCES));
+            assert!(
+                error.to_string().contains("127.0.0.1:45065"),
+                "the refusal names where it could not connect: {error}"
+            );
+            assert!(
+                child.try_wait().expect("observe the stand-in").is_some(),
+                "the supervisor this call started must not be left running where nothing can \
+                 reach it"
+            );
+        }
+
+        /// The control. A port nothing listens on yet is still waited on, to the
+        /// deadline, so the early end above belongs to the refusal and not to any
+        /// failed connect.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn a_supervisor_port_nothing_listens_on_yet_is_still_waited_on() {
+            let dir = tempfile::tempdir().expect("supervisor directory");
+            let mut authority = try_acquire_supervisor_startup_lock_in_dir(dir.path())
+                .expect("take supervisor startup authority in the test directory");
+            let mut child = std::process::Command::new("sleep")
+                .arg("60")
+                .spawn()
+                .expect("spawn a stand-in supervisor");
+            std::fs::write(dir.path().join(SUPERVISOR_PORT_FILE), "45065")
+                .expect("publish the stand-in's port");
+
+            let started = Instant::now();
+            let error = wait_for_supervisor_ready_in(
+                dir.path(),
+                &mut child,
+                Instant::now() + Duration::from_millis(1500),
+                &mut authority,
+                0,
+                |_| LoopbackConnect::NotYet(os_error(libc::ECONNREFUSED)),
+            )
+            .await
+            .expect_err("a supervisor that never accepts is never ready");
+
+            assert!(
+                started.elapsed() >= Duration::from_millis(1400),
+                "a refused connect is waited on to the deadline, and it stopped after {:?}",
+                started.elapsed()
+            );
+            assert!(
+                error.downcast_ref::<LoopbackBlocked>().is_none(),
+                "nothing listening yet is not a blocked process: {error:#}"
+            );
+            assert!(
+                error.to_string().contains("failed to become ready"),
+                "{error:#}"
+            );
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+
+        /// The repository daemon's wait gets the same early end, and keeps its
+        /// own rule about the child: nothing here proves the daemon dead, so it
+        /// is left running rather than killed.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn a_blocked_connect_ends_the_daemon_wait_at_once_and_leaves_the_daemon_alone() {
+            let kin_root = tempfile::tempdir().expect("kin root");
+            let mut child = std::process::Command::new("sleep")
+                .arg("60")
+                .spawn()
+                .expect("spawn a stand-in for a daemon that is listening");
+            std::fs::write(repo_daemon_port_path(kin_root.path()), "45066")
+                .expect("publish the stand-in's port");
+
+            let started = Instant::now();
+            let result = wait_for_daemon_ready_with(
+                kin_root.path(),
+                &mut child,
+                Instant::now() + Duration::from_secs(60),
+                0,
+                None,
+                |_| LoopbackConnect::Blocked(os_error(libc::EPERM)),
+            )
+            .await;
+            let waited = started.elapsed();
+
+            match result {
+                Err(DaemonReadinessError::Failed(error)) => {
+                    let blocked = error
+                        .downcast_ref::<LoopbackBlocked>()
+                        .unwrap_or_else(|| panic!("the refusal keeps its own type: {error:#}"));
+                    assert_eq!(blocked.os_error().raw_os_error(), Some(libc::EPERM));
+                }
+                Err(DaemonReadinessError::Timeout(detail)) => {
+                    panic!("a refusal is not a timeout: {detail}")
+                }
+                Ok(url) => panic!("a daemon this process may not connect to is not ready: {url}"),
+            }
+            assert!(
+                waited < Duration::from_secs(5),
+                "the wait must end at the first refusal, and it took {waited:?}"
+            );
+            assert!(
+                child.try_wait().expect("observe the stand-in").is_none(),
+                "a daemon nothing proves dead is left alone"
+            );
+            let _ = child.kill();
+            let _ = child.wait();
         }
     }
 }

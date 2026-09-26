@@ -57,8 +57,15 @@ handful of files and none of them touches a corpus. The CHECK line format, the
 exit codes and the JSON shape are the same as every other suite here, because
 scripts/acceptance/gate.py reads all of them through one contract.
 
-Exit status: 1 when any check fails, 2 when none fail but some are unreadable, 3
-on a setup error, 0 only when every selected check passes.
+After the checks, every repository the suite created is stopped through
+`kin daemon stop --json` under the environment it was built with, and the
+result is its own `cleanup` row. A stop that is not confirmed fails that row
+and keeps the run root, because a worker left running holds a store and a port
+that later suites share.
+
+Exit status: 1 when any check or the cleanup fails, 2 when none fail but some
+are unreadable, 3 on a setup error, 0 only when every selected check passes and
+every owned worker stopped.
 """
 
 import argparse
@@ -119,6 +126,96 @@ def run(cmd, cwd=None, env=None, timeout=600, stdin_text=None):
         out, err = proc.communicate()
         return 124, out or "", (err or "") + "\n[timed out after %ss]" % timeout
     return proc.returncode, out or "", err or ""
+
+
+def keep_probe_output(work, name, cmd, rc, out, err, environment):
+    """Write one probe's command, exit status and output into its scratch dir.
+
+    A verdict quotes only a slice of what the probe printed, and a losing run
+    keeps its root, so this is where the exact failure text survives. Keeping
+    it never changes a grade: a file that cannot be written is reported on
+    stderr and skipped.
+    """
+    record = {"command": cmd, "exit": rc, "environment": environment}
+    try:
+        with open(os.path.join(work, name + ".stdout"), "w") as handle:
+            handle.write(out or "")
+        with open(os.path.join(work, name + ".stderr"), "w") as handle:
+            handle.write(err or "")
+        with open(os.path.join(work, name + ".json"), "w") as handle:
+            json.dump(record, handle, indent=2)
+            handle.write("\n")
+    except OSError as exc:
+        sys.stderr.write(
+            "kin-first-contact-honesty: could not keep the %s output: %s\n" % (name, exc))
+
+
+def cleanup_result(status, detail):
+    result = Result("cleanup", "suite-cleanup", "fixture workers stopped and endpoints retired")
+    (result.ok if status == PASS else result.bad)(detail)
+    return result
+
+
+def stop_confirmed(rc, report):
+    """A successful exit alone does not prove that a worker was retired."""
+    if not isinstance(report, dict):
+        return False
+    stopped = report.get("stopped")
+    return (rc == 0 and isinstance(stopped, list)
+            and report.get("schema") == "kin.daemon-stop.v1"
+            and report.get("scope") == "current-repo"
+            and report.get("all_stopped") is True
+            and report.get("endpoints_retired", not stopped) is True
+            and all(isinstance(row, dict)
+                    and row.get("result") in ("stopped", "not-running")
+                    and "preserved_endpoint" not in row for row in stopped))
+
+
+def remove_disposable_run_root(workdir):
+    """Remove an owned fixture, including read-only Go module cache directories.
+
+    Workers must already be stopped and retention checks satisfied. Use directory
+    descriptors so permission repair never follows a fixture symlink, and only
+    repair directories owned by this user. Files need no mode change to unlink.
+    """
+    if not shutil.rmtree.avoids_symlink_attacks:
+        raise OSError("fixture cleanup requires symlink-safe directory removal")
+
+    def traversal_error(error):
+        raise error
+
+    for _, _, _, directory in os.fwalk(workdir, follow_symlinks=False,
+                                      onerror=traversal_error):
+        metadata = os.fstat(directory)
+        if metadata.st_uid != os.geteuid():
+            raise OSError("fixture cleanup refuses a directory owned by another user")
+        os.fchmod(directory, stat.S_IMODE(metadata.st_mode) | stat.S_IRWXU)
+    shutil.rmtree(workdir)
+
+
+def finish_run_root(workdir, results, keep, explicit_workdir):
+    """Keep or remove the run root, and say which and why for the report.
+
+    The rule is run_root_retention's, fed every row including the cleanup
+    rows, so a worker that was not confirmed stopped keeps its fixtures. A
+    removal that fails is its own FAIL row, and whatever it left stays.
+    """
+    failed = [r for r in results if r.status == FAIL]
+    unread = [r for r in results if r.status == UNREADABLE]
+    reasons = run_root_retention(failed, unread, keep, explicit_workdir)
+    if not reasons:
+        try:
+            remove_disposable_run_root(workdir)
+        except OSError as error:
+            removal = cleanup_result(FAIL, "fixture removal failed: %s" % error)
+            removal.id = "cleanup-root"
+            results.append(removal)
+            reasons.append("fixture removal failed; remaining evidence retained")
+    if reasons:
+        print("kin-first-contact-honesty: run root kept at %s: %s"
+              % (workdir, "; ".join(reasons)))
+    return {"run_root": workdir, "run_root_retained": bool(reasons),
+            "run_root_retention_reason": "; ".join(reasons) if reasons else "successful disposable run"}
 
 
 class Result(object):
@@ -245,6 +342,30 @@ NETWORK_SIGNATURES = (
     "network request to", "ERR_SOCKET_TIMEOUT",
 )
 
+# The same precondition in the words of Kin's own pinned-release downloader,
+# which installs rust-analyzer without npm or rustup. `download_to_temp` in
+# crates/kin-cli/src/commands/language_server_release.rs reports every failure
+# as `could not download <url>: <reason>`, and only a request that was never
+# answered, a connection or TLS handshake that did not complete, puts the HTTP
+# client's `error sending request for url (` straight after the URL. A server
+# that answered reads `could not download <url>: the server answered 404 Not
+# Found`, a failed write names the IO error, and a digest mismatch never says
+# `could not download` at all. So the wrapper alone is no evidence of a network
+# cause, even though the product's own `network_shape` in
+# crates/kin-cli/src/commands/language_servers.rs matches it, and this pattern
+# requires the send failure to follow the URL directly.
+RELEASE_TRANSPORT_FAILURE = re.compile(
+    r"could not download \S+: error sending request for url \("
+)
+
+
+def network_described(flat):
+    """Whether an installer said, in its own words, that the network refused it."""
+    return (
+        any(signature in flat for signature in NETWORK_SIGNATURES)
+        or RELEASE_TRANSPORT_FAILURE.search(flat) is not None
+    )
+
 
 # The offline-path line as the product prints it, held here so the self-test
 # can delete exactly it and require the grader to notice.
@@ -264,7 +385,7 @@ def grade_network_diagnosis(output):
             "no language-server install failure was reported, so the run never "
             "reached the classifier and its silence is not evidence"
         )
-    if not any(signature in flat for signature in NETWORK_SIGNATURES):
+    if not network_described(flat):
         return None, (
             "the install failed for a reason the installer did not describe in "
             "network terms, so this probe never asked the question FIR-2629 is "
@@ -542,6 +663,13 @@ def check_2(suite):
     # not this script's. A stubbed npm printing the words the classifier looks
     # for would be a check that cannot fail.
     env["npm_config_registry"] = "http://127.0.0.1:9/"
+    # The same closed port for Kin's own pinned-release download, which fetches
+    # rust-analyzer without npm or rustup. Left alone it goes to the real release
+    # host, so a runner with a network downloads the binary and grades only npm,
+    # while a black-holed one fails on whatever its resolver says. No digest
+    # override is set, so a stray listener on the port could not install
+    # anything either: its bytes would fail the pinned digest.
+    env["KIN_LANGUAGE_SERVER_ASSET_BASE"] = "http://127.0.0.1:9"
     env["npm_config_prefix"] = prefix
     # Retries only, never a timeout knob: npm refuses a maxtimeout below its own
     # default mintimeout, and that refusal is not a network failure, so a probe
@@ -550,11 +678,17 @@ def check_2(suite):
     env["npm_config_audit"] = "false"
     env["npm_config_fund"] = "false"
 
-    rc, out, err = run(
-        [suite.kin, "setup", "--no-interactive", "--skip-mcp-check",
-         "--install-language-servers"],
-        cwd=work, env=env, timeout=1800,
-    )
+    command = [suite.kin, "setup", "--no-interactive", "--skip-mcp-check",
+               "--install-language-servers"]
+    rc, out, err = run(command, cwd=work, env=env, timeout=1800)
+    # The installer's full account, beside the files it touched: the verdict
+    # below quotes 220 characters of it.
+    keep_probe_output(
+        work, "install-language-servers", command, rc, out, err,
+        {name: env.get(name) for name in (
+            "HOME", "KIN_HOME", "PATH", "npm_config_registry",
+            "KIN_LANGUAGE_SERVER_ASSET_BASE", "npm_config_prefix",
+            "npm_config_fetch_retries")})
     ok, detail = grade_network_diagnosis(out + "\n" + err)
     # Every verdict names the surface it was taken on, because the ticket is
     # written about `kin doctor` and this is not that command.
@@ -751,7 +885,16 @@ WINDOWS_V061_ROWS = [
 # redirects between them leaves the verdict unchanged and reads as a surviving
 # check. Each branch therefore also gets an input only it can catch.
 
+# The toolchain homes `kin_core::tool_prefix::usual_tool_dirs` searches for
+# language servers, plus RUSTUP_HOME, which rustup's cargo proxies need. A host
+# with no toolchain has none of them.
+TOOLCHAIN_HOME_VARS = ("CARGO_HOME", "RUSTUP_HOME", "GOBIN", "GOPATH",
+                       "NPM_CONFIG_PREFIX", "npm_config_prefix", "NVM_DIR")
+
 TOOLCHAIN_REFUSAL = "is not installed on this host"
+RUSTUP_REFUSAL = re.compile(
+    r"(?<![\w.-])(?:rustup|'rustup'|\"rustup\"|`rustup`)\s+" + re.escape(TOOLCHAIN_REFUSAL)
+)
 TOOLCHAIN_REMEDY = "install 'rustup'"
 PRESCRIBES_TOOLCHAIN = "prescribes a toolchain install"
 ENDED_ON_ABSENCE = "ended on rustup being absent"
@@ -774,15 +917,17 @@ def grade_toolchain_free_repair(output):
             "read somebody else's code: %s"
             % (PRESCRIBES_TOOLCHAIN, flat[flat.find(TOOLCHAIN_REMEDY):][:180])
         )
-    if "rustup" in flat and TOOLCHAIN_REFUSAL in flat:
+    if RUSTUP_REFUSAL.search(flat):
         return False, (
             "the repair %s, so a host without the toolchain still gets no route "
             "to a server" % ENDED_ON_ABSENCE
         )
     if DOWNLOAD_EVIDENCE not in flat:
+        rust_detail = " ".join(flatten(line) for line in strip_ansi(output).splitlines()
+                               if "rust" in line.lower())
         return None, (
             "no route was taken and no toolchain refusal was reported either, "
-            "so this run establishes nothing either way: %s" % flat[:220]
+            "so this run establishes nothing either way: %s" % rust_detail[:220]
         )
     return True, (
         "the repair took a route that needs no toolchain and disclosed the "
@@ -903,10 +1048,10 @@ def check_4(suite):
     the download, the verification, the unpack, the executable bit and the
     registration are the shipped code on both paths.
 
-    `rustup` is scrubbed from PATH rather than assumed absent, because the
-    runner that builds this suite installs a Rust toolchain and a check that
-    merely hoped for its absence would silently grade the rustup route instead.
-    The scrub is asserted before the repair runs.
+    `rustup` and `rust-analyzer` are scrubbed from PATH rather than assumed
+    absent. A runner's toolchain would select the rustup route, while a
+    standalone server would skip installation altogether. The scrub is
+    asserted before the repair runs.
     """
     res = Result("4", "cold-walk-2026-08-28",
                  "kin doctor --fix --install-language-servers needs no toolchain the host lacks")
@@ -928,21 +1073,29 @@ def check_4(suite):
         env = suite.base_env()
         env["HOME"] = home
         env["KIN_HOME"] = os.path.join(home, ".kin")
+        # CLI startup otherwise re-adds usual host tool directories, including
+        # Homebrew, after the PATH scrub. Keep only the scrubbed PATH and this
+        # fixture's fresh managed tool directory for both init and doctor.
+        env["KIN_LANGUAGE_TOOL_SEARCH"] = "0"
         env["KIN_LANGUAGE_SERVER_ASSET_BASE"] = base
         env["KIN_LANGUAGE_SERVER_ASSET_SHA256"] = digest
-        # Every PATH entry carrying rustup is dropped, then the drop is checked.
-        # A scrub that missed one would grade the route this check exists to
-        # avoid, and would do it silently.
-        kept = [entry for entry in env.get("PATH", "").split(os.pathsep)
-                if entry and not os.path.exists(os.path.join(entry, "rustup"))]
-        env["PATH"] = os.pathsep.join(kept)
-        still_there = [entry for entry in kept
-                       if os.path.exists(os.path.join(entry, "rustup"))]
-        if still_there:
-            res.unknown("the PATH scrub left rustup reachable at %s" % still_there[0])
+        path, complaint = _path_without_rust_analyzer(env)
+        if complaint:
+            res.unknown(complaint)
             return res
+        env["PATH"] = path
+        res.ok("rustup and rust-analyzer are unreachable on the scrubbed PATH")
+        # Kin also looks for a server in the usual tool directories, because a
+        # daemon an MCP client started does not inherit the shell's PATH. The
+        # runner that builds this suite pins CARGO_HOME to its own toolchain,
+        # so an inherited CARGO_HOME hands the repair the runner's rust-analyzer:
+        # the server reads as present, nothing is installed, and the run grades
+        # nothing. The homes go with the PATH entries.
+        for name in TOOLCHAIN_HOME_VARS:
+            env.pop(name, None)
 
         work = suite.scratch("toolchain-free-repo")
+        suite.own(work, env)
         rc, out, err = run([suite.kin, "init", "."], cwd=work, env=env, timeout=900)
         if rc != 0:
             res.unknown("kin init exited %d in the fixture repository: %s"
@@ -1002,7 +1155,10 @@ MCP_PROBE_ID = 4242
 
 # Two sentences the notice owes a reader who is about to be served nothing.
 UNBOUND_NOTICE = "no repository is bound yet"
-UNBOUND_REPAIR = "kin init ."
+# The repairs a registry install can run. It launches Kin through npx and puts
+# no `kin` on the user's PATH, so a notice whose only repair is `kin init .`
+# names a command that user does not have.
+UNBOUND_REPAIRS = ("kin_init", "npx -y @kinlab/kin@")
 
 
 def mcp_initialize(command, cwd, env, timeout=180):
@@ -1115,9 +1271,11 @@ def grade_unbound_start(verdict, alive, stderr_text, stdout_lines, kin_created):
     if UNBOUND_NOTICE not in flat:
         return False, ("the server started and never said that no repository is bound, so the "
                        "user is served an empty graph with no explanation: %s" % flat[:220])
-    if UNBOUND_REPAIR not in flat:
-        return False, ("the notice states the gap and not the repair, so a reader is told "
-                       "something is wrong and not what to run: %s" % flat[:220])
+    missing = [repair for repair in UNBOUND_REPAIRS if repair not in flat]
+    if missing:
+        return False, ("the notice does not name %s, so a reader whose only Kin is this npx "
+                       "wrapper is told something is wrong and not what they can run: %s"
+                       % (" or ".join(missing), flat[:220]))
     return True, ("`initialize` was served, the process stayed up, no repository was created "
                   "behind the user, and the notice named the gap and the repair on stderr")
 
@@ -1372,6 +1530,9 @@ def _fixture_repository(suite, name):
     if git is None:
         return None, "no git on PATH, so no repository can be admitted"
     work = suite.scratch(name)
+    # Owned before git init, so a fixture whose build or init fails is still
+    # accounted for at cleanup. Check 6 attaches the environment it inits with.
+    suite.own(work)
     hooks = suite.scratch(name + "-nohooks")
     os.makedirs(os.path.join(work, "src"))
     os.makedirs(os.path.join(work, "web"))
@@ -1424,9 +1585,10 @@ def _path_without_rust_analyzer(env):
             and not os.path.exists(os.path.join(entry, "rust-analyzer"))
             and not os.path.exists(os.path.join(entry, "rustup"))]
     path = os.pathsep.join(kept)
-    if shutil.which("rust-analyzer", path=path) is not None:
-        return None, ("the scrub left rust-analyzer reachable at %s"
-                      % shutil.which("rust-analyzer", path=path))
+    for binary in ("rust-analyzer", "rustup"):
+        found = shutil.which(binary, path=path)
+        if found is not None:
+            return None, "the scrub left %s reachable at %s" % (binary, found)
     return path, ""
 
 
@@ -1472,6 +1634,7 @@ def check_6(suite):
     skipped_env["KIN_HOME"] = os.path.join(home, ".kin")
     skipped_env["PATH"] = os.pathsep.join([served_only, path])
 
+    suite.own(work, skipped_env)
     rc, out, err = run([suite.kin, "init", "."], cwd=work, env=skipped_env, timeout=1800)
     combined = (out or "") + "\n" + (err or "")
     if rc != 0:
@@ -1514,6 +1677,7 @@ def check_6(suite):
     control_env["KIN_HOME"] = os.path.join(control_home, ".kin")
     control_env["PATH"] = os.pathsep.join([both, path])
 
+    suite.own(control, control_env)
     rc, out, err = run([suite.kin, "init", "."], cwd=control, env=control_env, timeout=1800)
     control_output = (out or "") + "\n" + (err or "")
     if rc != 0:
@@ -1625,6 +1789,62 @@ class Suite(object):
         self.workdir = workdir
         self.repo_root = repo_root
         self.verbose = verbose
+        # Repository path to the environment it was built and initialized with.
+        self.owned_repos = {}
+
+    def own(self, repo, env=None):
+        """Record a repository this run creates, before any init touches it."""
+        repo = os.path.abspath(repo)
+        if env is not None:
+            self.owned_repos[repo] = dict(env)
+        else:
+            self.owned_repos.setdefault(repo, None)
+
+    def shutdown(self):
+        """Stop only this run's repositories, including a failed initialization.
+
+        Each stop runs from the repository itself under the environment that
+        built it, because every repository here has its own HOME and KIN_HOME
+        and the stop has to reach the same registry the init wrote to.
+        """
+        records = []
+        errors = []
+        for repo in sorted(self.owned_repos):
+            env = self.owned_repos[repo]
+            record = {"repo": repo}
+            if env is not None:
+                record.update({"home": env.get("HOME"), "kin_home": env.get("KIN_HOME")})
+            records.append(record)
+            # Never let discovery walk upward and select an unrelated repository.
+            if not os.path.isfile(os.path.join(repo, ".kin", "manifest.json")):
+                record["error"] = "fixture manifest missing; stop was not attempted"
+                errors.append("%s: %s" % (repo, record["error"]))
+                continue
+            if env is None:
+                record["error"] = "no environment was recorded for this repository; stop was not attempted"
+                errors.append("%s: %s" % (repo, record["error"]))
+                continue
+            try:
+                proc = subprocess.run(
+                    [self.kin, "daemon", "stop", "--json"], cwd=repo, env=env,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True,
+                    timeout=60)
+                rc, out, err = proc.returncode, proc.stdout, proc.stderr
+                record.update({"returncode": rc, "stdout": out, "stderr": err})
+                report = json.loads(out) if rc == 0 else None
+                if not stop_confirmed(rc, report):
+                    record["error"] = "worker stop and endpoint retirement were not confirmed"
+                    errors.append("%s: %s" % (repo, record["error"]))
+            except Exception as error:  # noqa: BLE001 - an unconfirmed stop, however it failed
+                record["error"] = "%s: %s" % (type(error).__name__, error)
+                errors.append("%s: %s" % (repo, record["error"]))
+        evidence = os.path.join(self.workdir, "daemon-cleanup.json")
+        with open(evidence, "w") as handle:
+            json.dump(records, handle, indent=2)
+            handle.write("\n")
+        detail = ("; ".join(errors) + "; see " + evidence if errors else
+                  "%d owned fixture workers stopped and endpoints retired" % len(records))
+        return cleanup_result(FAIL if errors else PASS, detail)
 
     def scratch(self, name):
         path = os.path.join(self.workdir, name)
@@ -1683,6 +1903,428 @@ class Suite(object):
 
 
 # ------------------------------------------------------------------- self test
+
+
+def self_test_toolchain_fixture(expect):
+    """Exercise check 4's real environment preparation without running Kin.
+
+    The stand-in repair uses the product's PATH-presence decision: an existing
+    server takes no install route. No process or HTTP listener is started.
+    """
+    from unittest import mock
+
+    with tempfile.TemporaryDirectory(prefix="first-contact-toolchain-test-") as root:
+        rustup_bin = os.path.join(root, "toolchain-bin")
+        server_bin = os.path.join(root, "standalone-server-bin")
+        ordinary_bin = os.path.join(root, "ordinary-bin")
+        for directory in (rustup_bin, server_bin, ordinary_bin):
+            os.mkdir(directory)
+        for directory, name in ((rustup_bin, "rustup"),
+                                (server_bin, "rust-analyzer"),
+                                (ordinary_bin, "git")):
+            path = os.path.join(directory, name)
+            with open(path, "wb") as handle:
+                handle.write(b"#!/bin/sh\nexit 0\n")
+            os.chmod(path, 0o755)
+        inherited = {"PATH": os.pathsep.join((rustup_bin, server_bin, ordinary_bin)),
+                     "KIN_LANGUAGE_TOOL_SEARCH": "1"}
+        inherited.update({name: rustup_bin for name in TOOLCHAIN_HOME_VARS})
+        suite = Suite("/never-executed/kin", None, root, root)
+        suite.base_env = lambda: dict(inherited)
+        asset = []
+        calls = []
+        server, thread = mock.Mock(), mock.Mock()
+
+        def serve(body):
+            asset.append(body)
+            return "http://127.0.0.1:9", server, thread
+
+        def repair(cmd, cwd=None, env=None, timeout=None):
+            calls.append((cmd, dict(env)))
+            # CLI startup appends recorded/usual host tool directories before
+            # running either command. Scrubbing the incoming PATH alone does
+            # not exclude a server in one of those directories.
+            effective_path = env["PATH"]
+            if env.get("KIN_LANGUAGE_TOOL_SEARCH") != "0":
+                effective_path += os.pathsep + server_bin
+            if cmd[1:] == ["init", "."]:
+                return 0, "", ""
+            if cmd[1:] != ["doctor", "--fix", "--install-language-servers"]:
+                raise AssertionError("unexpected command: %r" % cmd)
+            if shutil.which("rust-analyzer", path=effective_path):
+                return 0, "rust language server already installed; nothing to repair", ""
+            installed = os.path.join(env["KIN_HOME"], "tools", "bin", "rust-analyzer")
+            os.makedirs(os.path.dirname(installed))
+            with open(installed, "wb") as handle:
+                handle.write(gzip.decompress(asset[0]))
+            os.chmod(installed, 0o755)
+            return 0, "installed the rust language server\nsha256: %s" % hashlib.sha256(asset[0]).hexdigest(), ""
+
+        with mock.patch(__name__ + "._serve_asset", side_effect=serve), \
+                mock.patch(__name__ + ".run", side_effect=repair), \
+                mock.patch.object(subprocess, "Popen", side_effect=AssertionError("unexpected process")), \
+                mock.patch(__name__ + ".HTTPServer", side_effect=AssertionError("unexpected listener")):
+            result = check_4(suite)
+        expect("check 4 excludes a standalone server and exercises the install route",
+               result.status, PASS)
+        expect("check 4 reaches init and repair", len(calls), 2)
+        expect("both child environments retain only unrelated PATH entries",
+               [env["PATH"] for _, env in calls], [ordinary_bin, ordinary_bin])
+        expect("both child environments omit inherited toolchain homes",
+               any(name in env for _, env in calls for name in TOOLCHAIN_HOME_VARS), False)
+        expect("both child environments disable host tool rediscovery",
+               [env.get("KIN_LANGUAGE_TOOL_SEARCH") for _, env in calls], ["0", "0"])
+        expect("the parent host-search preference remains untouched",
+               inherited["KIN_LANGUAGE_TOOL_SEARCH"], "1")
+        expect("the inherited standalone server remains untouched",
+               shutil.which("rust-analyzer", path=inherited["PATH"]),
+               os.path.join(server_bin, "rust-analyzer"))
+        server.shutdown.assert_called_once_with()
+        thread.join.assert_called_once_with(timeout=5)
+
+        # A failed precondition must be unreadable before init or repair runs.
+        with mock.patch(__name__ + "._path_without_rust_analyzer",
+                        return_value=(None, "fixture server is still reachable")), \
+                mock.patch(__name__ + "._serve_asset", side_effect=serve), \
+                mock.patch(__name__ + ".run", return_value=(
+                    0, "rust language server already installed; nothing to repair", "")) as command:
+            refused = check_4(suite)
+        expect("check 4 refuses a failed PATH precondition", refused.status, UNREADABLE)
+        expect("a failed PATH precondition runs no product command", command.call_count, 0)
+
+
+def self_test_stop_confirmed(expect):
+    """Only a strict kin.daemon-stop.v1 report confirms a stopped worker."""
+    report = {"schema": "kin.daemon-stop.v1", "scope": "current-repo",
+              "stopped": [], "all_stopped": True}
+    expect("a clean report with nothing running confirms", stop_confirmed(0, report), True)
+    expect("a non-zero exit never confirms", stop_confirmed(1, report), False)
+    expect("no report never confirms", stop_confirmed(0, None), False)
+    expect("all_stopped false never confirms",
+           stop_confirmed(0, dict(report, all_stopped=False)), False)
+    expect("a scope wider than the current repository never confirms",
+           stop_confirmed(0, dict(report, scope="all")), False)
+    expect("endpoints_retired false never confirms",
+           stop_confirmed(0, dict(report, endpoints_retired=False)), False)
+    expect("a stopped worker with no endpoint statement never confirms",
+           stop_confirmed(0, dict(report, stopped=[{"result": "stopped"}])), False)
+    retired = dict(report, stopped=[{"result": "stopped"}], endpoints_retired=True)
+    expect("a stopped worker whose endpoint was retired confirms", stop_confirmed(0, retired), True)
+    expect("a failed row never confirms",
+           stop_confirmed(0, dict(retired, stopped=[{"result": "failed"}])), False)
+    expect("a preserved endpoint never confirms",
+           stop_confirmed(0, dict(retired, stopped=[{
+               "result": "stopped", "preserved_endpoint": "still published"}])), False)
+
+
+STUB_KIN = r"""#!%s
+import json, os, sys
+args = sys.argv[1:]
+log = os.environ.get("FIRST_CONTACT_STUB_LOG")
+if log:
+    with open(log, "a") as handle:
+        handle.write(json.dumps({"argv": args, "cwd": os.getcwd(),
+                                 "home": os.environ.get("HOME"),
+                                 "kin_home": os.environ.get("KIN_HOME")}) + "\n")
+if args == ["--version"]:
+    print("kin 0.0.0-first-contact-stub")
+    sys.exit(0)
+if args[:1] == ["init"]:
+    os.makedirs(".kin", exist_ok=True)
+    with open(os.path.join(".kin", "manifest.json"), "w") as handle:
+        handle.write("{}")
+    sys.stderr.write("stub init wrote its manifest and then failed\n")
+    sys.exit(1)
+if args == ["daemon", "stop", "--json"]:
+    mode = os.environ.get("FIRST_CONTACT_STUB_STOP", "confirmed")
+    if mode == "garbage":
+        print("not a stop report")
+        sys.exit(0)
+    row = {"kind": "worker", "label": "fixture", "pid": 1, "result": "stopped"}
+    report = {"schema": "kin.daemon-stop.v1", "scope": "current-repo",
+              "stopped": [row], "all_stopped": True, "endpoints_retired": True}
+    if mode == "unconfirmed":
+        report["endpoints_retired"] = False
+        row["preserved_endpoint"] = {"pid_path": ".kin/daemon.pid", "reason": "stub"}
+    print(json.dumps(report))
+    sys.exit(1 if mode == "rc1" else 0)
+sys.stderr.write("unexpected stub command %%r\n" %% (args,))
+sys.exit(97)
+"""
+
+
+def self_test_readonly_cleanup(expect):
+    """Exercise owned read-only caches without touching symlink targets."""
+    import contextlib
+    from unittest import mock
+
+    root = tempfile.mkdtemp(prefix="first-contact-readonly-test-")
+    outside = os.path.join(root, "outside")
+    os.mkdir(outside)
+    outside_file = os.path.join(outside, "sentinel")
+    with open(outside_file, "w") as handle:
+        handle.write("outside fixture\n")
+    os.chmod(outside_file, 0o444)
+    os.chmod(outside, 0o555)
+    try:
+        disposable = os.path.join(root, "disposable")
+        cache = os.path.join(disposable, "go", "pkg", "mod", "example@v1", ".github", "workflows")
+        os.makedirs(cache)
+        with open(os.path.join(cache, "cifuzz.yml"), "w") as handle:
+            handle.write("owned cache fixture\n")
+        os.chmod(os.path.join(cache, "cifuzz.yml"), 0o444)
+        for path in (cache, os.path.dirname(cache), os.path.dirname(os.path.dirname(cache))):
+            os.chmod(path, 0o555)
+        os.symlink(outside, os.path.join(disposable, "directory-link"))
+        os.symlink(outside_file, os.path.join(disposable, "file-link"))
+        os.symlink(os.path.join(root, "absent"), os.path.join(disposable, "dangling-link"))
+        rows = [cleanup_result(PASS, "no owned workers remain")]
+        with contextlib.redirect_stdout(io.StringIO()):
+            kept = finish_run_root(disposable, rows, True, None)
+        expect("--keep does not repair a read-only cache",
+               (kept["run_root_retained"], stat.S_IMODE(os.stat(cache).st_mode)), (True, 0o555))
+        removed = finish_run_root(disposable, rows, False, None)
+        expect("owned read-only cache is removed with no cleanup failure",
+               (removed["run_root_retained"], os.path.lexists(disposable), len(rows)),
+               (False, False, 1))
+        expect("directory symlink target mode is unchanged",
+               stat.S_IMODE(os.stat(outside).st_mode), 0o555)
+        expect("file symlink target mode is unchanged",
+               stat.S_IMODE(os.stat(outside_file).st_mode), 0o444)
+        with open(outside_file) as handle:
+            expect("symlink target bytes are unchanged", handle.read(), "outside fixture\n")
+
+        root_link = os.path.join(root, "root-link")
+        os.symlink(outside, root_link)
+        rows = [cleanup_result(PASS, "no owned workers remain")]
+        with contextlib.redirect_stdout(io.StringIO()):
+            retained = finish_run_root(root_link, rows, False, None)
+        expect("a substituted symlink root fails cleanup and remains",
+               (retained["run_root_retained"], rows[-1].id, rows[-1].status,
+                os.path.islink(root_link)), (True, "cleanup-root", FAIL, True))
+        expect("a symlink root does not repair its target",
+               stat.S_IMODE(os.stat(outside).st_mode), 0o555)
+
+        foreign = os.path.join(root, "foreign-owner-control")
+        os.mkdir(foreign, 0o500)
+        rows = [cleanup_result(PASS, "no owned workers remain")]
+        with mock.patch.object(os, "geteuid", return_value=os.geteuid() + 1):
+            with contextlib.redirect_stdout(io.StringIO()):
+                retained = finish_run_root(foreign, rows, False, None)
+        expect("a foreign-owned directory is refused before permission repair",
+               (retained["run_root_retained"], rows[-1].status,
+                stat.S_IMODE(os.stat(foreign).st_mode)), (True, FAIL, 0o500))
+    finally:
+        remove_disposable_run_root(root)
+
+
+def self_test_cleanup_dispositions(expect):
+    """Drive the real main() and shutdown against a stub `kin`.
+
+    The stub answers `--version`, writes a manifest and fails on `init`, and
+    prints a kin.daemon-stop.v1 report for `daemon stop --json` whose shape the
+    FIRST_CONTACT_STUB_STOP variable picks. Every stop it receives is logged
+    with its working directory, HOME and KIN_HOME, so a test can tell which
+    registry the stop addressed.
+    """
+    import contextlib
+    from unittest import mock
+
+    root = tempfile.mkdtemp(prefix="first-contact-cleanup-test-")
+    made_roots = []
+    try:
+        stub = os.path.join(root, "kin")
+        with open(stub, "w") as handle:
+            handle.write(STUB_KIN % sys.executable)
+        os.chmod(stub, 0o755)
+        repo_root = os.path.join(root, "repo-root")
+        os.makedirs(os.path.join(repo_root, "packages", "kin"))
+        counter = [0]
+
+        def synthetic(manifest=True):
+            def check(suite):
+                repo = suite.scratch("synthetic-repo")
+                env = suite.base_env()
+                env["HOME"] = os.path.join(suite.workdir, "synthetic-home")
+                env["KIN_HOME"] = os.path.join(env["HOME"], ".kin")
+                suite.own(repo, env)
+                if manifest:
+                    os.makedirs(os.path.join(repo, ".kin"))
+                    with open(os.path.join(repo, ".kin", "manifest.json"), "w") as handle:
+                        handle.write("{}")
+                res = Result("S", "self-test", "a synthetic passing check")
+                res.ok("synthetic pass")
+                return res
+            return [("S", check)]
+
+        def drive(mode="confirmed", checks=None, extra=(), patches=()):
+            counter[0] += 1
+            log = os.path.join(root, "stub-%d.log" % counter[0])
+            out = os.path.join(root, "report-%d.json" % counter[0])
+            argv = ["--kin", stub, "--repo-root", repo_root, "--json", out] + list(extra)
+            env = {"FIRST_CONTACT_STUB_LOG": log, "FIRST_CONTACT_STUB_STOP": mode}
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(mock.patch.dict(os.environ, env))
+                if checks is not None:
+                    stack.enter_context(mock.patch(__name__ + ".CHECKS", checks))
+                for patch in patches:
+                    stack.enter_context(patch)
+                stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+                rc = main(argv)
+            with open(out) as handle:
+                report = json.load(handle)
+            for name in ("run_root", "run_root_retained", "run_root_retention_reason"):
+                report.setdefault(name, None)
+            made_roots.append(report["run_root"] or report.get("workdir"))
+            calls = []
+            if os.path.exists(log):
+                with open(log) as handle:
+                    calls = [json.loads(line) for line in handle if line.strip()]
+            stops = [c for c in calls if c["argv"] == ["daemon", "stop", "--json"]]
+            rows = {r["id"]: r for r in report["results"]}
+            rows.setdefault("cleanup", {"status": None, "detail": ""})
+            return rc, report, rows, stops
+
+        # A confirmed stop on a passing run removes the root.
+        rc, report, rows, stops = drive(checks=synthetic())
+        expect("confirmed stop, passing run: exit 0", rc, 0)
+        expect("confirmed stop, passing run: cleanup PASS", rows["cleanup"]["status"], PASS)
+        expect("confirmed stop, passing run: the report names its run root",
+               bool(report["run_root"]) and report["run_root"] == report.get("workdir"), True)
+        expect("confirmed stop, passing run: root removed",
+               (report["run_root_retained"], os.path.exists(report["workdir"])), (False, False))
+        expect("confirmed stop, passing run: reason recorded",
+               report["run_root_retention_reason"], "successful disposable run")
+        expect("confirmed stop, passing run: the old workdir field is kept",
+               os.path.isabs(report.get("workdir") or ""), True)
+        expect("confirmed stop, passing run: one stop, from the repository, under its own HOME",
+               [(os.path.basename(s["cwd"]), os.path.basename(s["home"] or ""),
+                 s["kin_home"] == os.path.join(s["home"] or "", ".kin")) for s in stops],
+               [("synthetic-repo", "synthetic-home", True)])
+
+        # An unconfirmed stop, a non-zero exit and an unreadable report each fail the
+        # cleanup row and keep the root with its cleanup record.
+        for mode, label in (("unconfirmed", "an unconfirmed stop"),
+                            ("rc1", "a non-zero stop exit"),
+                            ("garbage", "a stop report that raised on parse")):
+            rc, report, rows, stops = drive(mode, checks=synthetic())
+            expect("%s: exit 1" % label, rc, 1)
+            expect("%s: cleanup FAIL" % label, rows["cleanup"]["status"], FAIL)
+            expect("%s: stop attempted once" % label, len(stops), 1)
+            expect("%s: root and cleanup record kept" % label,
+                   (report["run_root_retained"],
+                    os.path.isfile(os.path.join(report["workdir"], "daemon-cleanup.json"))),
+                   (True, True))
+            expect("%s: reason names the cleanup" % label,
+                   "failed or unreadable check or cleanup" in (report["run_root_retention_reason"] or ""),
+                   True)
+
+        # A shutdown that raises is a FAIL row, never a silent pass.
+        rc, report, rows, stops = drive(checks=synthetic(), patches=[
+            mock.patch.object(Suite, "shutdown", side_effect=RuntimeError("simulated"))])
+        expect("a raising shutdown: cleanup FAIL naming the raise",
+               (rows["cleanup"]["status"], "cleanup raised" in rows["cleanup"]["detail"]),
+               (FAIL, True))
+        expect("a raising shutdown: root kept", os.path.isdir(report["workdir"]), True)
+
+        # A missing manifest means no stop is attempted, and the row fails.
+        rc, report, rows, stops = drive(checks=synthetic(manifest=False))
+        expect("a missing manifest: no stop attempted", stops, [])
+        expect("a missing manifest: cleanup FAIL naming it",
+               (rows["cleanup"]["status"], "manifest missing" in rows["cleanup"]["detail"]),
+               (FAIL, True))
+        expect("a missing manifest: root kept", os.path.isdir(report["workdir"]), True)
+
+        # A repository whose kin init failed is still owned and stopped, under the
+        # environment check 4 built for it.
+        no_listener = (lambda body: ("http://127.0.0.1:9", mock.Mock(), mock.Mock()))
+        rc, report, rows, stops = drive(extra=["--only", "4"], patches=[
+            mock.patch(__name__ + "._serve_asset", side_effect=no_listener),
+            mock.patch(__name__ + "._path_without_rust_analyzer",
+                       return_value=(os.defpath, ""))])
+        expect("a failed init in check 4: the check reads unreadable", rows["4"]["status"], UNREADABLE)
+        expect("a failed init in check 4: its repository is still stopped under its own HOME",
+               [(os.path.basename(s["cwd"]), os.path.basename(s["home"] or "")) for s in stops],
+               [("toolchain-free-repo", "toolchain-free-home")])
+        expect("a failed init in check 4: cleanup PASS and root kept",
+               (rows["cleanup"]["status"], os.path.isdir(report["workdir"])), (PASS, True))
+
+        # Check 6 owns its fixture before git init: a git that refuses leaves an
+        # owned repository with no manifest, which fails cleanup without a stop.
+        real_run = run
+
+        def refusing_git(cmd, **kwargs):
+            if os.path.basename(cmd[0]) == "git":
+                return 1, "", "stub git refused"
+            return real_run(cmd, **kwargs)
+
+        rc, report, rows, stops = drive(extra=["--only", "6"], patches=[
+            mock.patch(__name__ + ".run", side_effect=refusing_git),
+            mock.patch.object(shutil, "which", side_effect=lambda name, *a, **k: "/stub/" + name),
+            mock.patch(__name__ + "._path_without_rust_analyzer",
+                       return_value=(os.defpath, ""))])
+        try:
+            with open(os.path.join(report["workdir"], "daemon-cleanup.json")) as handle:
+                owned = [os.path.basename(r["repo"]) for r in json.load(handle)]
+        except (OSError, ValueError, KeyError, TypeError):
+            owned = None
+        expect("a refused git init in check 6: the fixture was already owned",
+               owned, ["skipped-language-repo"])
+        expect("a refused git init in check 6: no stop, cleanup FAIL",
+               (stops, rows["cleanup"]["status"]), ([], FAIL))
+
+        # With git present, check 6 stops its fixture under the environment it inits with.
+        if shutil.which("git") and shutil.which("python3"):
+            rc, report, rows, stops = drive(extra=["--only", "6"], patches=[
+                mock.patch(__name__ + "._path_without_rust_analyzer",
+                           return_value=(os.defpath, ""))])
+            expect("a failed init in check 6: stopped under the skipped fixture's HOME",
+                   [(os.path.basename(s["cwd"]), os.path.basename(s["home"] or "")) for s in stops],
+                   [("skipped-language-repo", "skipped-language-home")])
+
+        # A selection that matches no product check is unreadable, never a bare cleanup PASS.
+        rc, report, rows, stops = drive(extra=["--only", "bogus"])
+        expect("--only bogus: an unreadable selection row, then the cleanup row",
+               [(r["id"], r["status"]) for r in report["results"]],
+               [("selection", UNREADABLE), ("cleanup", PASS)])
+        expect("--only bogus: root kept and the unreadable exit",
+               (report["run_root_retained"], os.path.isdir(report["workdir"]), rc), (True, True, 2))
+
+        # --keep and --workdir always keep, even after a confirmed stop on a passing run.
+        rc, report, rows, stops = drive(checks=synthetic(), extra=["--keep"])
+        expect("--keep: cleanup PASS and root kept",
+               (rows["cleanup"]["status"], report["run_root_retained"],
+                os.path.isdir(report["workdir"])), (PASS, True, True))
+        expect("--keep: reason names it", report["run_root_retention_reason"], "--keep was given")
+        explicit = os.path.join(root, "explicit-root")
+        rc, report, rows, stops = drive(checks=synthetic(), extra=["--workdir", explicit])
+        expect("--workdir: cleanup PASS and root kept",
+               (rows["cleanup"]["status"], report["workdir"], os.path.isdir(explicit)),
+               (PASS, explicit, True))
+        expect("--workdir: reason names it",
+               report["run_root_retention_reason"], "the caller named --workdir")
+
+        # A root that cannot be removed is its own FAIL row, and the rest stays.
+        real_rmtree = shutil.rmtree
+
+        def refusing_rmtree(path, *args, **kwargs):
+            if os.path.basename(str(path)).startswith("kin-first-contact-"):
+                raise OSError("simulated removal failure")
+            return real_rmtree(path, *args, **kwargs)
+
+        rc, report, rows, stops = drive(checks=synthetic(), patches=[
+            mock.patch.object(shutil, "rmtree", side_effect=refusing_rmtree)])
+        expect("a failed removal: cleanup-root FAIL row and exit 1",
+               (rows.get("cleanup-root", {}).get("status"), rc), (FAIL, 1))
+        expect("a failed removal: root reported kept",
+               (report["run_root_retained"], "fixture removal failed" in
+                (report["run_root_retention_reason"] or "")), (True, True))
+    finally:
+        for path in made_roots:
+            if path and (os.path.basename(path).startswith("kin-first-contact-")
+                         or path.startswith(root)):
+                shutil.rmtree(path, ignore_errors=True)
+        shutil.rmtree(root, ignore_errors=True)
 
 
 def self_test():
@@ -1753,6 +2395,62 @@ def self_test():
                "  x could not install the python language server: `npm install -g "
                "pyright` exited with 1: npm error minTimeout is greater than maxTimeout\n"
            )[0], None)
+
+    # The pinned-release downloader, in the form a black-holed Linux runner
+    # printed it: the product's `could not download <url>: <reason>` with the
+    # HTTP client's send failure and its cause beneath.
+    release_url = (
+        "https://github.com/rust-lang/rust-analyzer/releases/download/2026-08-24/"
+        "rust-analyzer-aarch64-unknown-linux-gnu.gz"
+    )
+
+    def release_failure(reason):
+        return ("  x could not install the rust language server: could not download "
+                "%s: %s\n" % (release_url, reason))
+
+    release_remedy = (
+        "      this is the network refusing `rustup component add rust-analyzer`, not "
+        "Kin and not the package: a connection that never completed\n"
+        "      export HTTPS_PROXY=http://proxy.example:3128 HTTP_PROXY=http://proxy.example:3128\n"
+        "      export NO_PROXY=localhost,127.0.0.1\n"
+        "      no registry is needed either: Kin looks for `rust-analyzer` on PATH and "
+        "starts whichever it finds\n"
+        "      Kin runs without this server. Parsing, search, history, review and "
+        "commits are unaffected.\n"
+    )
+    for label, cause in (
+        ("a refused connection", "tcp connect error: Connection refused (os error 111)"),
+        ("a failed lookup", "dns error: failed to lookup address information: "
+                            "Temporary failure in name resolution"),
+    ):
+        sent = release_failure("error sending request for url (%s): client error "
+                               "(Connect): %s" % (release_url, cause))
+        expect("a pinned-release download that died on %s, diagnosed, must PASS" % label,
+               grade_network_diagnosis(sent + release_remedy)[0], True)
+        expect("a pinned-release download that died on %s, left bare, must FAIL" % label,
+               grade_network_diagnosis(
+                   sent + "      run `rustup component add rust-analyzer` yourself "
+                   "to see the installer's own error\n")[0], False)
+    # Every other download failure carries the same wrapper, and the product's
+    # classifier reads the wrapper as the network. Neither the wrapper nor that
+    # remedy is proof of a network cause, so each stays UNREADABLE with the full
+    # network remediation printed beneath it.
+    for label, reason in (
+        ("a server that answered 404", "the server answered 404 Not Found"),
+        ("a failed write", "No space left on device (os error 28)"),
+        ("an oversized response", "the response passed 268435456 bytes and was abandoned"),
+    ):
+        expect("%s is no network cause and is UNREADABLE" % label,
+               grade_network_diagnosis(release_failure(reason) + release_remedy)[0], None)
+    expect("a digest mismatch is no network cause and is UNREADABLE",
+           grade_network_diagnosis(
+               "  x could not install the rust language server: the 12 bytes served by "
+               "%s hash to sha256 %s, and Kin pins %s. Nothing was installed.\n"
+               % (release_url, "a" * 64, "b" * 64) + release_remedy)[0], None)
+    expect("the send-failure words away from the downloader's wrapper are UNREADABLE",
+           grade_network_diagnosis(
+               release_failure("the server answered 404 Not Found") + release_remedy
+               + "      error sending request for url (%s)\n" % release_url)[0], None)
 
     # FIR-2919, both directions, on the row set that fenced v0.6.1.
     #
@@ -1870,6 +2568,11 @@ def self_test():
            grade_toolchain_free_repair("Summary: 9 passed")[0], None)
     expect("a silent no-op is UNREADABLE",
            grade_toolchain_free_repair("  - skipped the rust language server\n")[0], None)
+    no_route = grade_toolchain_free_repair(
+        "Applying safe repairs...\n" + "irrelevant shell hook details\n" * 20
+        + "rust language server already installed; nothing to repair\n")
+    expect("an unreadable route retains the relevant Rust diagnostic",
+           "rust language server already installed" in no_route[1], True)
     expect("installed-but-unusable still PASSes",
            grade_toolchain_free_repair(
                routed + "  x the rust language server installed but did not start\n")[0], True)
@@ -1885,6 +2588,36 @@ def self_test():
     expect("and it must be the absence branch that answered",
            ENDED_ON_ABSENCE in grade_toolchain_free_repair(only_absence)[1], True)
 
+    # These lines came from a toolchain-free repair that installed the served
+    # Rust fixture. The other languages still lacked their installers, and the
+    # Rust runtime advice named sh.rustup.rs. Those unrelated facts must not be
+    # joined into a claim that the Rust installation itself refused.
+    mixed_installers = (
+        "  ✗ install the python language server: `npm` is not installed on this host, "
+        "and Kin pins no python release binary for macos-aarch64\n"
+        "  ✗ install the go language server: `go` is not installed on this host, "
+        "and Kin pins no go release binary for macos-aarch64\n"
+        "  ✗ the rust language server installed but did not start: "
+        "server initialization failed: server shutdown unexpectedly\n"
+        "          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh\n"
+        "  ✓     sha256:   36089c500fb735a5a78fb708a425571a7ce1a17ffb87261eb24778bce8803de2 "
+        "(verified before install)\n"
+    )
+    expect("other installer absences must not become a Rust refusal",
+           grade_toolchain_free_repair(mixed_installers)[0], True)
+    expect("other installer absences without a download remain UNREADABLE",
+           grade_toolchain_free_repair(mixed_installers.split("  ✓")[0])[0], None)
+    for program in ("rustup", "'rustup'", '"rustup"', "`rustup`"):
+        wrapped_refusal = (
+            "  x install the rust language server: " + program + " is not\n"
+            "    installed on this host\n"
+        )
+        verdict, detail = grade_toolchain_free_repair(mixed_installers + wrapped_refusal)
+        expect("a real wrapped %s refusal outranks a disclosed digest" % program,
+               verdict, False)
+        expect("the wrapped %s refusal keeps its own diagnosis" % program,
+               ENDED_ON_ABSENCE in detail, True)
+
 
     # The wrapper's notice, verbatim from `noRepositoryNotice` in
     # packages/kin-mcp/src/index.js, and the 0.6.0 refusal it replaced. Held as
@@ -1895,7 +2628,9 @@ def self_test():
         "No .kin/ found. Run `kin init .` first, or set KIN_MCP_AUTO_INIT=1 to allow "
         "this wrapper to initialize the repo.\n"
     )
-    fixed_notice_stderr = (
+    # 0.7.21's notice: it names only `kin init .`, which a registry install
+    # does not have.
+    native_only_notice_stderr = (
         "kin-mcp: no .kin/ found in /tmp/empty, so no repository is bound yet.\n"
         "Starting anyway. The MCP transport comes up, `initialize` and `tools/list` are served,\n"
         "and a graph tool called before a repository exists answers by naming the gap and telling\n"
@@ -1903,6 +2638,15 @@ def self_test():
         "Run `kin init .` in the repository you want served, or point this client's workspace\n"
         "roots at one. This server re-resolves its repository on later tool calls, so nothing here\n"
         "needs a restart. Set KIN_MCP_AUTO_INIT=1 to let this wrapper run `kin init .` for you.\n"
+    )
+    fixed_notice_stderr = (
+        "kin-mcp: /tmp/empty is not a Kin repository, and neither is any folder above it, so no\n"
+        "repository is bound yet. Starting anyway: `initialize` and `tools/list` are served, and a\n"
+        "graph tool called before a repository exists answers by naming the gap.\n"
+        "To set this folder up, ask your agent to call kin_init, or run\n"
+        "`npx -y @kinlab/kin@0.8.0 init .` in it; the folder must be a Git repository or empty.\n"
+        "This server re-resolves its repository on later tool calls, so nothing here needs a restart.\n"
+        "Set KIN_MCP_AUTO_INIT=1 to let this wrapper run `kin init .` for you at launch.\n"
     )
     served_frame = ['{"jsonrpc":"2.0","id":4242,"result":{"protocolVersion":"2024-11-05"}}\n']
     expect("the 0.6.0 wrapper dying on initialize must FAIL",
@@ -1923,6 +2667,9 @@ def self_test():
                                [fixed_notice_stderr] + served_frame, False)[0], False)
     expect("a silent start with no notice at all must FAIL",
            grade_unbound_start(MCP_SERVED, True, "", served_frame, False)[0], False)
+    expect("a notice naming only a repair a registry install cannot run must FAIL",
+           grade_unbound_start(MCP_SERVED, True, native_only_notice_stderr, served_frame,
+                               False)[0], False)
     expect("a notice naming the gap and not the repair must FAIL",
            grade_unbound_start(MCP_SERVED, True,
                                "kin-mcp: no .kin/ found in /tmp/empty, so no repository is "
@@ -1993,6 +2740,45 @@ def self_test():
     expect("the control on no output is UNREADABLE",
            grade_served_sweep_outcome("")[0], None)
 
+    self_test_toolchain_fixture(expect)
+
+    # A run root goes only when nothing was lost and nobody asked to keep it.
+    expect("a clean, unasked run removes its root",
+           run_root_retention([], [], False, None), [])
+    for label, args in (
+        ("a failing run", (["2"], [], False, None)),
+        ("an unreadable run", ([], ["2"], False, None)),
+        ("a run given --keep", ([], [], True, None)),
+        ("a run given --workdir", ([], [], False, "/explicit/root")),
+    ):
+        expect("%s keeps its root" % label, bool(run_root_retention(*args)), True)
+
+    # A kept probe's own words land beside it, exactly as it printed them.
+    kept = tempfile.mkdtemp(prefix="kin-first-contact-self-test-")
+    try:
+        said = "could not download x: error sending request for url (x)\n"
+        keep_probe_output(kept, "probe", ["kin", "setup"], 1, "printed\n", said,
+                          {"HOME": "/h"})
+
+        def kept_file(name):
+            try:
+                with open(os.path.join(kept, name)) as handle:
+                    return handle.read()
+            except OSError:
+                return None
+
+        expect("a kept probe's stdout is its own", kept_file("probe.stdout"), "printed\n")
+        expect("a kept probe's stderr is its own", kept_file("probe.stderr"), said)
+        expect("a kept probe names its command, exit and environment",
+               json.loads(kept_file("probe.json") or "null"),
+               {"command": ["kin", "setup"], "exit": 1, "environment": {"HOME": "/h"}})
+    finally:
+        shutil.rmtree(kept, ignore_errors=True)
+
+    self_test_stop_confirmed(expect)
+    self_test_readonly_cleanup(expect)
+    self_test_cleanup_dispositions(expect)
+
     for line in failures:
         print("SELF-TEST FAIL %s" % line)
     print("first-contact-honesty self-test: %d grader case(s) failed" % len(failures))
@@ -2004,6 +2790,25 @@ def self_test():
 
 def repo_root_from(script_path):
     return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(script_path))))
+
+
+def run_root_retention(failed, unread, keep, workdir):
+    """Why a finished run keeps its root, or nothing when it may delete it.
+
+    Only a run with no failed and no unreadable row, that was neither asked
+    to keep its root nor given one by the caller, deletes it. The rows include
+    the cleanup rows, so a worker that was not confirmed stopped keeps the
+    root too. Any losing run keeps everything it produced, the probes' own
+    output included, and a harness fault already reads as an unreadable check.
+    """
+    reasons = []
+    if failed or unread:
+        reasons.append("failed or unreadable check or cleanup")
+    if keep:
+        reasons.append("--keep was given")
+    if workdir:
+        reasons.append("the caller named --workdir")
+    return reasons
 
 
 def main(argv):
@@ -2043,7 +2848,8 @@ def main(argv):
         sys.stderr.write("repo root %s carries no packages/kin\n" % repo_root)
         return 3
 
-    workdir = opts.workdir or tempfile.mkdtemp(prefix="kin-first-contact-")
+    workdir = os.path.abspath(opts.workdir) if opts.workdir else tempfile.mkdtemp(
+        prefix="kin-first-contact-")
     if not os.path.isdir(workdir):
         os.makedirs(workdir)
 
@@ -2058,19 +2864,39 @@ def main(argv):
 
     wanted = [w.strip() for w in opts.only.split(",") if w.strip()] or None
     results = []
-    for check_id, fn in CHECKS:
-        if wanted and check_id not in wanted:
-            continue
-        try:
-            res = fn(suite)
-        except Exception as exc:  # noqa: BLE001 - a harness fault is never a pass
-            res = Result(check_id, "?", "harness failure")
-            res.unknown("%s: %s" % (type(exc).__name__, str(exc)[:200]))
-        results.append(res)
+
+    def report_row(res):
         print("CHECK %s %s %s %s" % (res.id, res.ticket, res.status, res.detail))
         if opts.verbose:
             for a in res.asserts:
                 print("      %-11s %s" % (a["status"], a["detail"]))
+
+    try:
+        for check_id, fn in CHECKS:
+            if wanted and check_id not in wanted:
+                continue
+            try:
+                res = fn(suite)
+            except Exception as exc:  # noqa: BLE001 - a harness fault is never a pass
+                res = Result(check_id, "?", "harness failure")
+                res.unknown("%s: %s" % (type(exc).__name__, str(exc)[:200]))
+            results.append(res)
+            report_row(res)
+        if not results:
+            res = Result("selection", "suite-selection", "no product checks were selected")
+            res.unknown("no product checks were selected")
+            results.append(res)
+            report_row(res)
+    finally:
+        try:
+            cleanup = suite.shutdown()
+        except Exception as exc:  # noqa: BLE001 - a cleanup that raised did not confirm a stop
+            cleanup = cleanup_result(FAIL, "cleanup raised: %s: %s" % (type(exc).__name__, exc))
+        results.append(cleanup)
+    graded = len(results) - 1
+    retention = finish_run_root(workdir, results, opts.keep, opts.workdir)
+    for res in results[graded:]:
+        report_row(res)
 
     failed = [r for r in results if r.status == FAIL]
     unread = [r for r in results if r.status == UNREADABLE]
@@ -2078,17 +2904,15 @@ def main(argv):
           % (len(results) - len(failed) - len(unread), len(failed), len(unread)))
 
     if opts.json_out:
+        payload = {"label": opts.label, "kin": kin, "version": version,
+                   "workdir": workdir, "daemon": daemon,
+                   "results": [{"id": r.id, "ticket": r.ticket, "title": r.title,
+                                "status": r.status, "detail": r.detail,
+                                "asserts": r.asserts} for r in results]}
+        payload.update(retention)
         with open(opts.json_out, "w") as handle:
-            json.dump({"label": opts.label, "kin": kin, "version": version,
-                       "workdir": workdir, "daemon": daemon,
-                       "results": [{"id": r.id, "ticket": r.ticket, "title": r.title,
-                                    "status": r.status, "detail": r.detail,
-                                    "asserts": r.asserts} for r in results]},
-                      handle, indent=2)
+            json.dump(payload, handle, indent=2)
             handle.write("\n")
-
-    if not opts.keep and not opts.workdir:
-        shutil.rmtree(workdir, ignore_errors=True)
 
     if failed:
         return 1

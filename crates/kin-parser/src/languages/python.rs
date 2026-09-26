@@ -389,7 +389,15 @@ impl LanguageAdapter for PythonAdapter {
             }
         }
 
+        crate::import_witness::append_python_import_witness(
+            tree,
+            source,
+            file_id,
+            &imports,
+            &mut relations,
+        );
         Ok(ParseOutput {
+            derived_members: Vec::new(),
             entities,
             relations,
             imports,
@@ -567,22 +575,28 @@ fn extract_py_node(
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
                 if child.kind() == "function_definition" || child.kind() == "class_definition" {
+                    let declaration_index = entities.len();
                     extract_py_node(
                         &child, source, file_id, class_ctx, entities, relations, call_audit,
                         value_refs,
                     );
-                    // Prepend decorator names to the last-added entity's signature
+                    // The declaration owns its decorators, including their call
+                    // sites. A class extraction can append methods after the
+                    // class, so retain the declaration's exact emission index.
                     if !decorators.is_empty() {
-                        if let Some(last) = entities.last_mut() {
+                        if let Some(declaration) = entities.get_mut(declaration_index) {
                             let prefix = decorators
                                 .iter()
                                 .map(|(name, _)| format!("@{}", name))
                                 .collect::<Vec<_>>()
                                 .join(" ");
-                            last.signature = format!("{} {}", prefix, last.signature);
+                            declaration.signature = format!("{} {}", prefix, declaration.signature);
+                            declaration.declaration_line = Some(declaration.span.start_line);
+                            declaration.span = span_from_node(node, file_id);
+                            declaration.fingerprint = compute_fingerprint(node, source);
                         }
-                        if let Some(last) = entities.last() {
-                            let src_name = last.name.clone();
+                        if let Some(declaration) = entities.get(declaration_index) {
+                            let src_name = declaration.name.clone();
                             for (dec, site) in &decorators {
                                 if is_valid_callee_name(dec) {
                                     relations.push(ExtractedRelation {
@@ -2194,6 +2208,7 @@ fn extract_py_imports(node: &tree_sitter::Node, source: &[u8]) -> Vec<FileImport
                 local_name,
                 original_name,
                 is_default: false,
+                site: Some(crate::adapter::site_from_node(&child)),
             }],
         });
     }
@@ -2221,6 +2236,7 @@ fn extract_py_from_import(node: &tree_sitter::Node, source: &[u8]) -> Option<Fil
                             local_name: name,
                             original_name: None,
                             is_default: false,
+                            site: Some(crate::adapter::site_from_node(&child)),
                         });
                     }
                 }
@@ -2241,6 +2257,7 @@ fn extract_py_from_import(node: &tree_sitter::Node, source: &[u8]) -> Option<Fil
                         local_name: alias,
                         original_name: Some(orig),
                         is_default: false,
+                        site: Some(crate::adapter::site_from_node(&child)),
                     });
                 }
             }

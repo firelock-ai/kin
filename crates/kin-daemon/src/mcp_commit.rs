@@ -244,8 +244,53 @@ fn authored_files_from_staged(
             Some(kin_mcp::McpMutationPayload::Entity(payload)) => {
                 graph.get_entity(&payload.id).ok().flatten()?
             }
-            Some(kin_mcp::McpMutationPayload::EntitySourceBase(expected)) => {
-                graph.get_entity(&expected.entity_id).ok().flatten()?
+            Some(kin_mcp::McpMutationPayload::EntitySourceBase(expected))
+            | Some(kin_mcp::McpMutationPayload::EntitySourcePatch(
+                kin_mcp::source_base::EntitySourcePatch {
+                    source_base: expected,
+                    ..
+                },
+            )) => graph.get_entity(&expected.entity_id).ok().flatten()?,
+            Some(kin_mcp::McpMutationPayload::EntityRemove(remove)) => {
+                let tree = graph.resolved_tree();
+                let artifact = tree.get(&remove.source_base.artifact_id)?;
+                authored.insert(artifact.path.clone());
+                continue;
+            }
+            Some(kin_mcp::McpMutationPayload::EntityCreate(create))
+                if create.anchor().is_none() =>
+            {
+                authored.insert(
+                    crate::unit_lifecycle::unit_path(&graph.resolved_tree(), operation)?.ok()?,
+                );
+                continue;
+            }
+            Some(kin_mcp::McpMutationPayload::UnitImports(_)) => {
+                authored.insert(
+                    crate::unit_lifecycle::unit_path(&graph.resolved_tree(), operation)?.ok()?,
+                );
+                continue;
+            }
+            Some(kin_mcp::McpMutationPayload::EntityCreate(create)) => {
+                let (source_base, placement) = create.anchor()?;
+                let tree = graph.resolved_tree();
+                let artifact = tree.get(&source_base.artifact_id)?;
+                let path = match placement {
+                    kin_mcp::entity_lifecycle::EntityPlacement::SiblingAfter => {
+                        artifact.path.clone()
+                    }
+                    kin_mcp::entity_lifecycle::EntityPlacement::NewSourceUnit => {
+                        let anchor = graph.get_entity(&source_base.entity_id).ok().flatten()?;
+                        kin_mcp::entity_lifecycle::generated_source_path(
+                            &FilePathId::new(artifact.path.to_string()),
+                            anchor.language,
+                            &create.name,
+                        )
+                        .ok()?
+                    }
+                };
+                authored.insert(path);
+                continue;
             }
             // A relation operation writes no file, so it claims none.
             Some(_) => continue,
@@ -383,7 +428,13 @@ pub(crate) fn commit_exact_transaction(
             return kin_mcp::ToolCallResult::error(error);
         }
     }
-    match commit_exact_transaction_inner(state, sessions, arguments, coordination) {
+    match commit_exact_transaction_inner(
+        state,
+        sessions,
+        arguments,
+        coordination,
+        CommitSurface::Semantic,
+    ) {
         Ok(result) => result,
         Err(error) => kin_mcp::ToolCallResult::error(error),
     }
@@ -405,9 +456,55 @@ pub(crate) fn commit_bound_transaction(
     if let Err(error) = crate::mcp_mutate::validate_bound_commit(state, binding, transaction_id) {
         return kin_mcp::ToolCallResult::error(error);
     }
-    match commit_exact_transaction_inner(state, sessions, arguments, coordination) {
+    match commit_exact_transaction_inner(
+        state,
+        sessions,
+        arguments,
+        coordination,
+        CommitSurface::Semantic,
+    ) {
         Ok(result) => result,
         Err(error) => kin_mcp::ToolCallResult::error(error),
+    }
+}
+
+fn require_new_commit_authority(
+    sessions: &kin_mcp::SessionRegistry,
+    transaction: &kin_mcp::McpTransaction,
+    coordination: Option<&kin_mcp::CoordinationWritePreflight>,
+) -> Result<(), String> {
+    if let Some(preflight) = coordination.filter(|preflight| !preflight.allowed) {
+        let evidence = serde_json::to_string(preflight).map_err(|error| error.to_string())?;
+        return Err(format!(
+            "coordination enforcement rejected transaction before repository publication: {evidence}"
+        ));
+    }
+    sessions.require_live_session(&transaction.session_id)?;
+    // Whatever the coordination mode, a read-only owner does not publish. Only
+    // a new publication is refused: a fenced transaction resumes past this
+    // point, because its payload was fenced by a session that could write and
+    // the resume is what settles whether that write already landed.
+    sessions.require_write_capability(&transaction.session_id, kin_mcp::session::WriteDoor::Commit)
+}
+
+/// Production MCP publication admits semantic work only. Conversion tests can
+/// exercise the retained source-tree planner without reopening an agent route.
+enum CommitSurface {
+    Semantic,
+    #[cfg(test)]
+    Conversion,
+}
+
+impl CommitSurface {
+    fn validate_new_operations(
+        &self,
+        operations: &[kin_mcp::McpMutationOperation],
+    ) -> Result<(), String> {
+        match self {
+            Self::Semantic => kin_mcp::session::validate_semantic_operations(operations),
+            #[cfg(test)]
+            Self::Conversion => kin_mcp::session::validate_staged_operations(operations),
+        }
     }
 }
 
@@ -416,6 +513,7 @@ fn commit_exact_transaction_inner(
     sessions: &kin_mcp::SessionRegistry,
     arguments: &HashMap<String, serde_json::Value>,
     coordination: Option<&kin_mcp::CoordinationWritePreflight>,
+    surface: CommitSurface,
 ) -> Result<kin_mcp::ToolCallResult, String> {
     #[cfg(test)]
     {
@@ -456,6 +554,13 @@ fn commit_exact_transaction_inner(
         return replay_applied_commit(state, &transaction_id, coordination);
     };
 
+    if matches!(transaction.state.as_str(), "active" | "validated") {
+        require_new_commit_authority(sessions, &transaction, coordination)?;
+        // Refuse retained conversion work before appending any new inline work.
+        // Otherwise a retry would grow a transaction that cannot publish.
+        surface.validate_new_operations(&transaction.staged_operations)?;
+    }
+
     // Operations handed to the commit call itself stage and publish in one
     // step. Once the transaction is fenced they are read as a restatement of
     // what is already fenced instead: `kin_transaction_commit` documents
@@ -465,6 +570,7 @@ fn commit_exact_transaction_inner(
     if let Some(inline) = arguments.get("operations") {
         let operations = kin_mcp::session::parse_staged_operations(inline)?;
         kin_mcp::session::validate_staged_operations(&operations)?;
+        kin_mcp::handlers::sessions::reject_truncated_bodies(&operations)?;
         if matches!(transaction.state.as_str(), "committing" | "committed") {
             if !kin_mcp::session::staged_operations_match(
                 &transaction.staged_operations,
@@ -481,6 +587,7 @@ fn commit_exact_transaction_inner(
                 ));
             }
         } else {
+            surface.validate_new_operations(&operations)?;
             transaction = sessions
                 .stage_transaction(&transaction_id, operations)
                 .map_err(|error| format!("cannot stage inline transaction operations: {error}"))?;
@@ -559,6 +666,11 @@ fn commit_exact_transaction_inner(
             ));
         }
 
+        // A fenced operation with no receipt has not published. Resuming it
+        // would be new work, so a revoked owner cannot reset and publish it.
+        // Receipt recovery above remains available after session revocation.
+        require_new_commit_authority(sessions, &transaction, coordination)?;
+
         // Repository-v6 publishes the receipt in the same atomic successor as
         // authority. Its absence proves the fenced attempt did not move
         // authority (it may only have copied immutable CAS bodies), so this
@@ -569,6 +681,11 @@ fn commit_exact_transaction_inner(
         persist_registry_checked(state, sessions)
             .map_err(|error| format!("persist receipt-less committing reset: {error}"))?;
     }
+
+    // Old staged work and receipt-less fences may predate the semantic-only
+    // admission rule. Retain that work, but do not publish it as an agent edit.
+    // Receipt recovery above remains available for already-published work.
+    surface.validate_new_operations(&transaction.staged_operations)?;
 
     // The base, the plan and the publication all read and commit through the
     // authority the daemon holds for the current publication, so a commit pays
@@ -585,7 +702,7 @@ fn commit_exact_transaction_inner(
     })
     .map_err(|error| format!("load exact MCP commit base: {error}"))?;
     require_bound_authority_revision(state, &base, &transaction_id)?;
-    if let Err(reason) = crate::mcp_source_base::require_source_bases(
+    if let Err(stale) = crate::mcp_source_base::require_source_bases(
         &authority_context,
         &held_authority,
         &base,
@@ -598,9 +715,14 @@ fn commit_exact_transaction_inner(
                 "source base conflict; could not durably retain the attempted operations: {error}"
             )
         })?;
-        return Err(kin_mcp::source_base::source_base_conflict(
+        let current = crate::unit_lifecycle::repository_base_from(
+            &held_authority,
+            authority_context.workspace_id(),
+        );
+        return Err(stale.refusal(
             &transaction_id,
-            &reason,
+            current.as_ref(),
+            &transaction.staged_operations,
         ));
     }
     let requested_message = requested_commit_message(arguments);
@@ -806,6 +928,23 @@ fn resolve_commit_actor(sessions: &kin_mcp::SessionRegistry, session_id: &str) -
         .ok()
         .map(kin_model::SessionId)
         .and_then(|id| sessions.get_agent_session(&id));
+    commit_actor_for(agent.as_ref(), session_id)
+}
+
+/// The author a change made for one agent session is recorded under: the
+/// same attribution an MCP transaction commit carries, for a write the
+/// session made another way, such as the manifests its toolchain run wrote.
+pub(crate) fn session_commit_author(
+    agent: Option<&kin_model::session::AgentSession>,
+    session_id: &str,
+) -> kin_model::AuthorId {
+    commit_actor_for(agent, session_id).author
+}
+
+fn commit_actor_for(
+    agent: Option<&kin_model::session::AgentSession>,
+    session_id: &str,
+) -> CommitActor {
     let display_name = match agent {
         Some(agent) => format!(
             "{}/{}",
@@ -1217,8 +1356,6 @@ fn plan_exact_transaction(
     base: &NativeCommitBase,
     requested_message: Option<&str>,
 ) -> Result<ExactMcpPlan, String> {
-    let prospective = kin_db::InMemoryGraph::from_snapshot(base.graph.to_snapshot())
-        .map_err(|error| format!("create prospective exact graph: {error}"))?;
     let mut edits: BTreeMap<String, (FilePathId, Vec<(Entity, Vec<u8>)>)> = BTreeMap::new();
     let mut creations: BTreeMap<String, (FilePathId, Vec<u8>)> = BTreeMap::new();
     let mut replacements: BTreeMap<String, (FilePathId, Vec<u8>)> = BTreeMap::new();
@@ -1227,7 +1364,14 @@ fn plan_exact_transaction(
     let mut relation_operations = Vec::new();
     let mut edited_entities = HashSet::new();
 
-    for operation in &transaction.staged_operations {
+    for (index, operation) in transaction.staged_operations.iter().enumerate() {
+        // Every semantic route refuses a whole-entity replacement that names no
+        // version of the entity before it stages or begins. Refused here as well,
+        // with the same reason, so a caller that reaches this planner directly
+        // still cannot overwrite an entity it never read.
+        if kin_mcp::session::is_unguarded_replacement(operation) {
+            return Err(kin_mcp::session::source_base_required(index, operation));
+        }
         let verb = operation.verb.trim().to_ascii_lowercase();
         // A payload-less `create` carrying a repository path and a body admits
         // source the graph has never seen. It is the only shape that can: an
@@ -1270,37 +1414,63 @@ fn plan_exact_transaction(
             record_renamed_source_path(&mut relocations, base, operation)?;
             continue;
         }
-        // A payload-less `update` carrying a target and a body is the minimal
-        // agent write surface: an agent knows a name and the new source text but
-        // not Kin's entity structs. Staging accepts it, so the planner must too,
-        // or the operation is admitted and then refused at commit. The target is
-        // resolved against repository authority (a uuid must exist, a name must
-        // match exactly one entity by exact name) and lands on the same exact
-        // span edit an entity payload produces.
-        if operation.payload.is_none() {
-            if !kin_mcp::session::is_target_body_update(operation) {
-                return Err(format!("operation '{}' has no payload", operation.verb));
-            }
-            let existing =
-                kin_mcp::handlers::sessions::resolve_target_entity(&base.graph, &operation.target)?;
-            let body = operation
-                .body
-                .as_ref()
-                .expect("a target body update always carries a body");
-            record_source_edit(
-                &mut edits,
-                &mut edited_entities,
-                base,
-                existing,
-                body.as_bytes(),
-            )?;
-            continue;
-        }
+        // A payload-less `update` with a target and a body was refused above: it
+        // names no version of the entity it replaces, and nothing else
+        // payload-less is an entity operation.
         let payload = operation
             .payload
             .as_ref()
             .ok_or_else(|| format!("operation '{}' has no payload", operation.verb))?;
         match payload {
+            kin_mcp::McpMutationPayload::EntityCreate(_)
+            | kin_mcp::McpMutationPayload::EntityRemove(_)
+            | kin_mcp::McpMutationPayload::UnitImports(_) => {
+                // Anchored lifecycle is planned through admitted source
+                // reconciliation below; unit-addressed work after the edits.
+            }
+            kin_mcp::McpMutationPayload::EntitySourcePatch(patch) => {
+                let existing = base
+                    .graph
+                    .get_entity(&patch.source_base.entity_id)
+                    .map_err(|error| error.to_string())?
+                    .ok_or("the guarded patch entity disappeared during planning")?;
+                kin_model::require_independent_source(&existing)?;
+                let origin = existing
+                    .file_origin
+                    .as_ref()
+                    .ok_or("patch entity has no source origin")?;
+                let span = existing
+                    .span
+                    .as_ref()
+                    .ok_or("patch entity has no exact source span")?;
+                let path =
+                    RepoPath::from_utf8(origin.0.clone()).map_err(|error| error.to_string())?;
+                let artifact = base
+                    .tree
+                    .artifact_at_path(&path)
+                    .ok_or("patch source artifact disappeared")?;
+                let TreeEntry::Blob { hash, .. } = artifact.entry else {
+                    return Err("patch source artifact is not a regular blob".into());
+                };
+                // Source-base freshness was checked under the existing authority
+                // locks. Read only the exact committed CAS body, never the
+                // materialized file, and let the shared planner publish it.
+                let original = load_native_source_blob(authority_context, hash)
+                    .map_err(|error| format!("load exact patch source: {error}"))?;
+                let body = original
+                    .get(span.start_byte..span.end_byte)
+                    .ok_or("patch entity span is outside its source artifact")?;
+                let body = std::str::from_utf8(body)
+                    .map_err(|error| format!("patch entity body is not UTF-8: {error}"))?;
+                let patched = patch.apply_to_exact_body(body)?;
+                record_source_edit(
+                    &mut edits,
+                    &mut edited_entities,
+                    base,
+                    existing,
+                    patched.as_bytes(),
+                )?;
+            }
             kin_mcp::McpMutationPayload::EntitySourceBase(expected) => {
                 let existing = base
                     .graph
@@ -1320,98 +1490,23 @@ fn plan_exact_transaction(
                 )?;
             }
             kin_mcp::McpMutationPayload::Entity(payload_entity) => {
-                if operation.target.trim() != payload_entity.id.to_string() {
-                    return Err(format!(
-                        "exact entity mutation target must be the repository entity ID {}; got {:?}",
-                        payload_entity.id, operation.target
-                    ));
-                }
+                // An entity payload with a body was refused above as an unguarded
+                // replacement, so what reaches here carries no source text. An
+                // exact commit changes source, and metadata alone is not a change
+                // it can publish.
                 if !matches!(verb.as_str(), "update" | "modify") {
                     return Err(format!(
-                        "entity verb '{}' is not yet supported by exact MCP commits; create/insertion/delete operations fail before mutation",
+                        "entity_create_required: a structured Entity payload with verb '{}' \
+                         cannot create or delete source. Create a declaration with \
+                         payload.EntityCreate addressed to a unit (repository_base and unit), and \
+                         remove a function with payload.EntityRemove",
                         operation.verb
                     ));
                 }
-                let body = operation.body.as_ref().ok_or_else(|| {
-                    format!(
-                        "source-bound entity {} requires an exact UTF-8 body; metadata-only source mutations are rejected",
-                        payload_entity.id
-                    )
-                })?;
-                let existing = base
-                    .graph
-                    .get_entity(&payload_entity.id)
-                    .map_err(|error| format!("load exact entity {}: {error}", payload_entity.id))?
-                    .ok_or_else(|| {
-                        format!(
-                            "entity {} is absent from repository authority; insertion is not supported",
-                            payload_entity.id
-                        )
-                    })?;
-                if payload_entity.name != existing.name || payload_entity.kind != existing.kind {
-                    return Err(format!(
-                        "exact body edits cannot rename or re-kind entity {}; staged {} {:?}, authority has {} {:?}",
-                        existing.id,
-                        payload_entity.name,
-                        payload_entity.kind,
-                        existing.name,
-                        existing.kind
-                    ));
-                }
-                if payload_entity
-                    .file_origin
-                    .as_ref()
-                    .is_some_and(|origin| Some(origin) != existing.file_origin.as_ref())
-                {
-                    return Err(format!(
-                        "staged file origin for entity {} does not match repository authority",
-                        existing.id
-                    ));
-                }
-                if payload_entity
-                    .span
-                    .as_ref()
-                    .is_some_and(|span| Some(span) != existing.span.as_ref())
-                {
-                    return Err(format!(
-                        "staged source span for entity {} does not match repository authority",
-                        existing.id
-                    ));
-                }
-                // The commit publishes whatever reparsing the new bytes derives,
-                // so a doc summary the caller edited by hand cannot survive.
-                // Refusing an edited one is the same rule already applied to
-                // name, kind, origin, and span: keeping it would report a
-                // documentation edit as committed while publishing only the
-                // body.
-                //
-                // Scoped to `doc_summary` and deliberately not extended to the
-                // whole `metadata` bag. That bag carries values derived from the
-                // entity's own source: `kin-parser` writes
-                // `embedding_body_preview` out of the source bytes at extraction
-                // time, so any commit that changes a body necessarily changes it
-                // too. An agent that reads an entity once and then makes two
-                // edits therefore holds, on the second, a bag that its own first
-                // commit already moved authority past, and comparing the bag
-                // would refuse it for a difference it caused by succeeding.
-                // `doc_summary` is a single named field whose value a caller
-                // either changed on purpose or did not, so a difference there is
-                // real evidence of intent.
-                if payload_entity.doc_summary != existing.doc_summary {
-                    return Err(format!(
-                        "staged doc summary for entity {} differs from repository authority; \
-                         entity documentation is derived from the committed source, so send it \
-                         unchanged and put the new documentation in `body`",
-                        existing.id
-                    ));
-                }
-                record_source_edit(
-                    &mut edits,
-                    &mut edited_entities,
-                    base,
-                    existing,
-                    body.as_bytes(),
-                )?;
+                return Err(format!(
+                    "source-bound entity {} requires an exact UTF-8 body; metadata-only source mutations are rejected",
+                    payload_entity.id
+                ));
             }
             kin_mcp::McpMutationPayload::Relation { .. } => {
                 relation_operations.push((verb, payload.clone()));
@@ -1427,7 +1522,7 @@ fn plan_exact_transaction(
     // workspace's pending tree, and this is the only place that distinction is
     // known: after publication a carried file and an authored one are both just
     // tree deltas.
-    let authored_files = edits
+    let mut authored_files = edits
         .values()
         .map(|(file_id, _)| file_id)
         .chain(creations.values().map(|(file_id, _)| file_id))
@@ -1440,7 +1535,36 @@ fn plan_exact_transaction(
         })
         .collect::<Result<BTreeSet<_>, _>>()?;
 
-    let mut layouts = Vec::new();
+    // Unit-addressed work lands on top of entity edits, so an edit and an
+    // import change to one unit publish together. It may not share a unit with
+    // a whole-file operation or with anchored lifecycle work, whose bytes are
+    // planned from a different base.
+    let mut whole_file_paths = creations
+        .values()
+        .map(|(file_id, _)| file_id)
+        .chain(replacements.values().map(|(file_id, _)| file_id))
+        .chain(retirements.values())
+        .chain(relocations.values().flat_map(|(from, to)| [from, to]))
+        .filter_map(|file_id| RepoPath::from_utf8(file_id.0.clone()).ok())
+        .collect::<BTreeSet<_>>();
+    let lifecycle = crate::entity_lifecycle::prepare(
+        state,
+        authority_context,
+        base,
+        &transaction.staged_operations,
+    )?;
+    let (snapshot, mut layouts) = if let Some(lifecycle) = lifecycle {
+        if !authored_files.is_disjoint(&lifecycle.authored_files) {
+            return Err("lifecycle and other source operations cannot write the same source unit in one transaction".into());
+        }
+        whole_file_paths.extend(lifecycle.authored_files.iter().cloned());
+        authored_files.extend(lifecycle.authored_files);
+        (lifecycle.snapshot, lifecycle.layouts)
+    } else {
+        (base.graph.to_snapshot(), Vec::new())
+    };
+    let prospective = kin_db::InMemoryGraph::from_snapshot(snapshot)
+        .map_err(|error| format!("create prospective exact graph: {error}"))?;
     let pipeline = kin_index::IndexPipeline::new();
 
     refuse_overlapping_file_operations(
@@ -1495,6 +1619,13 @@ fn plan_exact_transaction(
                 error.valid_up_to()
             )
         })?;
+        // Legacy container metadata can look declaration-shaped while its
+        // coordinates still cover unrelated siblings. Validate against the
+        // exact CAS bytes already loaded for splicing, before any publication.
+        for (entity, _) in &file_edits {
+            kin_parser::validate_module_source_span(entity, &original)
+                .map_err(|error| format!("semantic source span refused: {error}"))?;
+        }
         // `entity_body_splice`, not a raw span splice: an entity span opens at
         // the entity's first token, so a nested entity's indentation sits in the
         // file ahead of the span while the rest of its body carries indentation
@@ -1545,18 +1676,23 @@ fn plan_exact_transaction(
         let reconcile = reconciler
             .reconcile_indexed_content(&indexed, state.blobs.as_ref(), &prospective)
             .map_err(|error| format!("derive exact semantics for {file_id}: {error}"))?;
-        if let Some(delta) = reconcile.delta.entity_deltas.iter().find(|delta| {
-            matches!(
-                delta,
-                EntityDelta::Added { .. } | EntityDelta::Removed { .. }
-            )
-        }) {
+        let edited_ids = file_edits
+            .iter()
+            .map(|(entity, _)| entity.id)
+            .collect::<Vec<_>>();
+        if let Some(delta) = crate::source_entity_guard::first_unsupported_entity_change_for_edit(
+            &reconcile.delta,
+            &prospective,
+            &file_id,
+            &edited_ids,
+        )
+        .map_err(|error| format!("validate reparsed source entities for {file_id}: {error}"))?
+        {
             return Err(format!(
                 "body edit for {file_id} would create or remove source entities ({delta:?}); an \
-                 edit may only change the body of the entity it names. To add a whole new file, \
-                 stage verb 'create' with `target` set to its repository path and `body` set to \
-                 its complete text; adding or removing an entity inside an existing file is not \
-                 yet supported"
+                 edit may change the body of the entity it names, including the members nested \
+                 inside a type it edits, but not add or drop a declaration beside it. Create a \
+                 declaration with EntityCreate and remove a function with EntityRemove"
             ));
         }
         prospective
@@ -1590,8 +1726,39 @@ fn plan_exact_transaction(
         layouts.push(layout);
     }
 
+    let unit_files = crate::unit_lifecycle::plan_unit_operations(
+        state,
+        authority_context,
+        &prospective,
+        &pipeline,
+        &transaction.staged_operations,
+        &mut layouts,
+    )?;
+    if let Some(shared) = unit_files
+        .iter()
+        .find(|path| whole_file_paths.contains(*path))
+    {
+        return Err(format!(
+            "a unit-addressed operation and a whole-file operation both write {shared}; split \
+             them into separate transactions"
+        ));
+    }
+    authored_files.extend(unit_files);
+
     apply_relation_operations(&prospective, relation_operations)?;
     if semantic_workspace_matches(&prospective, &base.graph) {
+        if transaction.staged_operations.iter().all(|operation| {
+            matches!(
+                operation.payload,
+                Some(kin_mcp::McpMutationPayload::UnitImports(_))
+            )
+        }) {
+            return Err(
+                "unit_imports_unchanged: every requested import is already as asked, so this \
+                 transaction publishes nothing and repository authority did not move"
+                    .to_string(),
+            );
+        }
         return Err(
             "exact MCP transaction produced no semantic, relation, or tree change".to_string(),
         );
@@ -1752,6 +1919,7 @@ fn record_source_edit(
     existing: Entity,
     body: &[u8],
 ) -> Result<(), String> {
+    kin_model::require_independent_source(&existing)?;
     if !edited_entities.insert(existing.id) {
         return Err(format!(
             "entity {} is edited more than once in one transaction; overlapping source authority is ambiguous",
@@ -2221,6 +2389,14 @@ pub(crate) fn plan_entity_relocations(
         .map(|old| {
             let mut new = old.clone();
             new.file_origin = Some(to_id.clone());
+            if new.kind == kin_model::EntityKind::Module {
+                if let Some(name) = kin_parser::adapter::file_module_surface_name(None, to_id) {
+                    new.name = name;
+                }
+                if let Some(span) = new.span.as_mut() {
+                    span.file = to_id.clone();
+                }
+            }
             EntityDelta::Modified { old, new }
         })
         .collect())
@@ -2733,9 +2909,9 @@ fn refuse_carry_standing_over_unparsed_content(
     Err(format!(
         "the workspace holds pending content for {path} whose new tree entry is {became}, and \
          committing it would publish the {} entities the graph still derives from the source it \
-         replaces over content they never came from. Stage that file in this transaction with \
-         verb 'replace' to re-derive it or verb 'delete' to retire it, or revert the working file, \
-         then re-send this transaction unchanged.",
+         replaces over content they never came from. Resolve the pending content through the \
+         explicit conversion/reconciliation boundary, or restore the prior working content, \
+         then re-send this transaction unchanged. Semantic edits cannot replace or retire files.",
         standing.len()
     ))
 }
@@ -2893,6 +3069,7 @@ fn replay_applied_commit(
         "status": "committed",
         "already_applied": true,
         "empty": false,
+        "publication_accounting": crate::publication_accounting::project(&recovered, None),
         "entity_deltas": recovered.entity_count,
         "relation_deltas": recovered.relation_count,
         "change_id": recovered.change.id.to_string(),
@@ -3115,6 +3292,20 @@ fn finalize_committed_transaction(
         ));
     }
 
+    state.graph.restore_binding_history_from(&authority.graph);
+
+    if transaction.state != "committed" {
+        // Publication and its exact projection have succeeded, and the live
+        // graph and layouts now agree with that authority. The watcher will
+        // see those same bytes and may report no further entity changes, so
+        // this writer must register the enrichment its own change requires.
+        // A fenced publication still owes this on recovery; a terminal replay
+        // must preserve enrichment completed since its original finalization.
+        timed_finalize_step("queue_source_enrichment", || {
+            queue_committed_source_enrichment(state, &committed.change)
+        })?;
+    }
+
     let terminal = if transaction.state == "committed" {
         transaction
     } else {
@@ -3132,6 +3323,7 @@ fn finalize_committed_transaction(
         "status": "committed",
         "already_applied": application.already_applied(),
         "ops_applied": terminal.staged_operations.len(),
+        "publication_accounting": crate::publication_accounting::project(&committed, None),
         "entity_deltas": committed.entity_count,
         "relation_deltas": committed.relation_count,
         "empty": false,
@@ -3153,9 +3345,104 @@ fn finalize_committed_transaction(
             .map(ToString::to_string)
             .collect::<Vec<_>>(),
     );
+    // The next unit-addressed operation is guarded by the workspace instant
+    // this commit left behind, so the reply hands it over rather than making
+    // the caller spend a read on it.
+    if let Some(base) = crate::unit_lifecycle::current_repository_base(state) {
+        result["repository_base"] = serde_json::to_value(base)
+            .map_err(|error| format!("serialize repository base: {error}"))?;
+    }
+    // Declarations this change created, by id, so the caller can read or patch
+    // one without searching for what it just wrote.
+    let requested = crate::unit_lifecycle::requested_names(&terminal.staged_operations);
+    if !requested.is_empty() {
+        const CREATED_SAMPLE: usize = 64;
+        let created = committed
+            .change
+            .entity_deltas
+            .iter()
+            .filter_map(|delta| match delta {
+                kin_model::EntityDelta::Added { new }
+                    if requested.contains(&new.name)
+                        && new.file_origin.is_some()
+                        && !kin_model::is_file_module_surface(new) =>
+                {
+                    Some(serde_json::json!({
+                        "entity_id": new.id,
+                        "name": new.name,
+                        "kind": new.kind,
+                    }))
+                }
+                _ => None,
+            })
+            .take(CREATED_SAMPLE)
+            .collect::<Vec<_>>();
+        result["created_entities"] = serde_json::Value::Array(created);
+    }
     let json = serde_json::to_string_pretty(&result)
         .map_err(|error| format!("serialize exact MCP commit response: {error}"))?;
     Ok(kin_mcp::ToolCallResult::text(json))
+}
+
+fn queue_committed_source_enrichment(
+    state: &DaemonState,
+    change: &kin_model::SemanticChange,
+) -> Result<(), String> {
+    let mut changed_paths = BTreeSet::new();
+    for delta in &change.tree_deltas {
+        // A mode-only change preserves the source bytes and their positions.
+        // Moves, removals and content changes invalidate the old locations as
+        // well as the surviving ones. The ordinary reply's changed_file_ids
+        // intentionally returns only new paths and cannot serve retirement.
+        if let (Some(old), Some(new)) = (delta.old_state(), delta.new_state()) {
+            if old.path == new.path
+                && std::mem::discriminant(&old.entry) == std::mem::discriminant(&new.entry)
+                && old.entry.blob_identity() == new.entry.blob_identity()
+            {
+                continue;
+            }
+        }
+        for located in [delta.old_state(), delta.new_state()].into_iter().flatten() {
+            if let Some(path) = located.path.as_utf8() {
+                changed_paths.insert(path.to_owned());
+            }
+        }
+    }
+    if changed_paths.is_empty() {
+        return Ok(());
+    }
+
+    let mut changed_entities: BTreeMap<String, Vec<EntityId>> = BTreeMap::new();
+    for delta in &change.entity_deltas {
+        let entity = match delta {
+            EntityDelta::Added { new } | EntityDelta::Modified { new, .. } => new,
+            EntityDelta::Removed { .. } => continue,
+        };
+        if let Some(file) = entity.file_origin.as_ref() {
+            if changed_paths.contains(&file.0) {
+                changed_entities
+                    .entry(file.0.clone())
+                    .or_default()
+                    .push(entity.id);
+            }
+        }
+    }
+
+    // Retire durable completion before any fresh work can finish. This also
+    // retires a deleted file with no surviving entity to queue, and leaves
+    // work recoverable by a later sweep if no LSP worker is available now.
+    crate::daemon::retire_enrichment_marker_checked(
+        state,
+        &changed_paths.into_iter().collect::<Vec<_>>(),
+    )
+    .map_err(|error| format!("retire committed source LSP completion markers: {error}"))?;
+    for (file, changed_entity_ids) in changed_entities {
+        state.queue_lsp_enrichment(crate::state::LspEnrichmentRequest {
+            file_id: FilePathId::new(file),
+            changed_entity_ids,
+        });
+    }
+    Ok(())
 }
 
 fn install_authority_graph(
@@ -3342,6 +3629,7 @@ fn stabilize_layout_ids(
 
 #[cfg(test)]
 pub(crate) mod tests {
+    include!("entity_lifecycle_commit_test.rs");
     use super::*;
     use std::path::Path;
     use std::sync::OnceLock;
@@ -3349,6 +3637,27 @@ pub(crate) mod tests {
     use kin_model::{
         AuthorId, ChangeStore, EntityFilter, LocatedEntry, SemanticChangeId, Timestamp, TreeDelta,
     };
+
+    // Retained conversion-planner regressions use this test-only entry. Every
+    // production commit entry chooses CommitSurface::Semantic; no wire option
+    // can enable conversion-shaped work through MCP.
+    pub(crate) fn commit_conversion_fixture(
+        state: &Arc<DaemonState>,
+        sessions: &kin_mcp::SessionRegistry,
+        arguments: &HashMap<String, serde_json::Value>,
+        coordination: Option<&kin_mcp::CoordinationWritePreflight>,
+    ) -> kin_mcp::ToolCallResult {
+        match commit_exact_transaction_inner(
+            state,
+            sessions,
+            arguments,
+            coordination,
+            CommitSurface::Conversion,
+        ) {
+            Ok(result) => result,
+            Err(error) => kin_mcp::ToolCallResult::error(error),
+        }
+    }
 
     fn install_test_registry_override() {
         static REGISTRY_PATH: OnceLock<PathBuf> = OnceLock::new();
@@ -3475,7 +3784,8 @@ pub(crate) mod tests {
             })
             .unwrap()
             .into_iter()
-            .find(|entity| entity.name == entity_name)
+            .filter(|entity| entity.name == entity_name)
+            .max_by_key(|entity| entity.kind != kin_model::EntityKind::Module)
             .expect("source fixture must contain requested entity");
 
         let plan = crate::repository_commit::plan_native_commit(
@@ -3549,32 +3859,405 @@ pub(crate) mod tests {
         sessions
     }
 
-    fn stage_entity_edit(
-        sessions: &kin_mcp::SessionRegistry,
-        entity: &Entity,
+    fn lsp_commit_state() -> (
+        tempfile::TempDir,
+        Arc<DaemonState>,
+        tokio::sync::mpsc::Receiver<crate::state::LspEnrichmentMessage>,
+    ) {
+        let (dir, mut state) = test_state();
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        Arc::get_mut(&mut state).unwrap().lsp_enrichment_tx = Some(tx);
+        (dir, state, rx)
+    }
+
+    fn mark_commit_source_enriched(state: &DaemonState, file: &str) {
+        crate::daemon::mark_files_enriched(
+            state,
+            &[file.to_string()],
+            state.lsp_enriched_marker_epoch.load(Ordering::SeqCst),
+        );
+        assert!(crate::daemon::file_already_enriched(state, file));
+    }
+
+    fn receive_committed_enrichment(
+        rx: &mut tokio::sync::mpsc::Receiver<crate::state::LspEnrichmentMessage>,
+    ) -> crate::state::LspEnrichmentRequest {
+        match rx
+            .try_recv()
+            .expect("committed source must queue incremental work")
+        {
+            crate::state::LspEnrichmentMessage::Incremental(request) => request,
+            crate::state::LspEnrichmentMessage::Sweep => {
+                panic!("one committed source edit must not request a whole-repository sweep")
+            }
+        }
+    }
+
+    #[test]
+    fn committed_go_source_retires_old_enrichment_and_queues_the_installed_version() {
+        let (_dir, state, mut rx) = lsp_commit_state();
+        let file = "pkg/search/query.go";
+        let (entity, _) = install_exact_source(
+            &state,
+            file,
+            b"package search\n\nfunc value() string { return \"before\" }\n",
+            "value",
+        );
+        mark_commit_source_enriched(&state, file);
+        mark_commit_source_enriched(&state, "pkg/search/unchanged.go");
+        let old_epoch = state.lsp_enriched_marker_epoch.load(Ordering::SeqCst);
+        let sessions = test_sessions();
+        let (transaction_id, arguments) = stage_entity_edit(
+            &state,
+            &sessions,
+            &entity,
+            "func value() string { return \"after\" }",
+        );
+
+        let result = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_ne!(result.is_error, Some(true), "{}", result_text(&result));
+        let request = receive_committed_enrichment(&mut rx);
+        assert_eq!(request.file_id.0, file);
+        assert!(request.changed_entity_ids.contains(&entity.id));
+        assert!(rx.try_recv().is_err());
+        let installed = state.graph.get_entity(&entity.id).unwrap().unwrap();
+        assert_ne!(installed.fingerprint, entity.fingerprint);
+        let authority = load_native_commit_base(&state.layout).unwrap();
+        assert_eq!(
+            authority.graph.get_entity(&entity.id).unwrap().unwrap(),
+            installed
+        );
+        let hash = authority
+            .tree
+            .artifact_at_path(&test_path(file))
+            .unwrap()
+            .entry
+            .blob_identity()
+            .unwrap();
+        let body = load_native_source_blob(&state.layout, hash).unwrap();
+        assert_eq!(
+            body,
+            b"package search\n\nfunc value() string { return \"after\" }\n"
+        );
+        assert_eq!(
+            std::fs::read(state.layout.working_dir().join(file)).unwrap(),
+            body
+        );
+        assert!(!crate::daemon::file_already_enriched(&state, file));
+        assert!(crate::daemon::file_already_enriched(
+            &state,
+            "pkg/search/unchanged.go"
+        ));
+        let marker: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(state.layout.root().join("lsp-enriched-files.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            marker["files"],
+            serde_json::json!(["pkg/search/unchanged.go"])
+        );
+        crate::daemon::mark_files_enriched(&state, &[file.to_string()], old_epoch);
+        assert!(
+            !crate::daemon::file_already_enriched(&state, file),
+            "an old in-flight answer cannot mark the new source complete"
+        );
+
+        // A successful retry must not invalidate answers accepted after the
+        // first publication, whether the registry kept or evicted its receipt.
+        mark_commit_source_enriched(&state, file);
+        let replay = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_ne!(replay.is_error, Some(true), "{}", result_text(&replay));
+        assert!(rx.try_recv().is_err());
+        assert!(crate::daemon::file_already_enriched(&state, file));
+        state
+            .mcp_transactions
+            .lock()
+            .unwrap()
+            .remove(&transaction_id);
+        let replay = commit_exact_transaction(&state, &test_sessions(), &arguments, None);
+        assert_ne!(replay.is_error, Some(true), "{}", result_text(&replay));
+        assert!(rx.try_recv().is_err());
+        assert!(crate::daemon::file_already_enriched(&state, file));
+    }
+
+    #[test]
+    fn rejected_or_noop_go_commit_preserves_enrichment_without_queuing() {
+        for replacement in ["func value() string { return \"before\" }", "func value( {"] {
+            let (_dir, state, mut rx) = lsp_commit_state();
+            let file = "pkg/search/query.go";
+            let (entity, _) = install_exact_source(
+                &state,
+                file,
+                b"package search\n\nfunc value() string { return \"before\" }\n",
+                "value",
+            );
+            mark_commit_source_enriched(&state, file);
+            let generation = load_native_commit_base(&state.layout)
+                .unwrap()
+                .roots
+                .generation;
+            let sessions = test_sessions();
+            let (_, arguments) = stage_entity_edit(&state, &sessions, &entity, replacement);
+            let result = commit_exact_transaction(&state, &sessions, &arguments, None);
+            assert_eq!(result.is_error, Some(true), "{}", result_text(&result));
+            assert_eq!(
+                load_native_commit_base(&state.layout)
+                    .unwrap()
+                    .roots
+                    .generation,
+                generation
+            );
+            assert!(rx.try_recv().is_err());
+            assert!(crate::daemon::file_already_enriched(&state, file));
+        }
+    }
+
+    #[test]
+    fn recovered_go_publication_registers_enrichment_after_graph_install() {
+        let (_dir, state, mut rx) = lsp_commit_state();
+        let file = "pkg/search/query.go";
+        let (entity, _) = install_exact_source(
+            &state,
+            file,
+            b"package search\n\nfunc value() string { return \"before\" }\n",
+            "value",
+        );
+        mark_commit_source_enriched(&state, file);
+        let sessions = test_sessions();
+        let (_, arguments) = stage_entity_edit(
+            &state,
+            &sessions,
+            &entity,
+            "func value() string { return \"after\" }",
+        );
+        state
+            .mcp_fail_after_authority_once
+            .store(true, Ordering::SeqCst);
+        let interrupted = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_eq!(interrupted.is_error, Some(true));
+        assert!(
+            rx.try_recv().is_err(),
+            "authority publication alone is not a coherent live graph"
+        );
+        let resumed = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_ne!(resumed.is_error, Some(true), "{}", result_text(&resumed));
+        let request = receive_committed_enrichment(&mut rx);
+        assert_eq!(request.file_id.0, file);
+        assert!(request.changed_entity_ids.contains(&entity.id));
+        assert_ne!(
+            state
+                .graph
+                .get_entity(&entity.id)
+                .unwrap()
+                .unwrap()
+                .fingerprint,
+            entity.fingerprint
+        );
+        assert!(!crate::daemon::file_already_enriched(&state, file));
+    }
+
+    #[test]
+    fn deleting_committed_go_source_retires_its_marker_without_empty_work() {
+        let (_dir, state, mut rx) = lsp_commit_state();
+        let file = "pkg/search/query.go";
+        install_exact_source(
+            &state,
+            file,
+            b"package search\n\nfunc value() string { return \"before\" }\n",
+            "value",
+        );
+        mark_commit_source_enriched(&state, file);
+        let sessions = test_sessions();
+        let transaction = sessions
+            .begin_transaction(TEST_SESSION, "file:pkg/search/query.go")
+            .unwrap();
+        sessions
+            .stage_transaction(&transaction.transaction_id, vec![retired_source_file(file)])
+            .unwrap();
+        let result = commit_conversion_fixture(
+            &state,
+            &sessions,
+            &HashMap::from([(
+                "transaction_id".to_string(),
+                serde_json::json!(transaction.transaction_id),
+            )]),
+            None,
+        );
+        assert_ne!(result.is_error, Some(true), "{}", result_text(&result));
+        assert!(!crate::daemon::file_already_enriched(&state, file));
+        assert!(!state.layout.working_dir().join(file).exists());
+        assert!(state
+            .graph
+            .resolved_tree()
+            .artifact_at_path(&test_path(file))
+            .is_none());
+        assert!(
+            rx.try_recv().is_err(),
+            "no surviving entity exists to enrich"
+        );
+        let marker: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(state.layout.root().join("lsp-enriched-files.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(marker["files"], serde_json::json!([]));
+    }
+
+    /// The workspace instant a source read served now would name.
+    ///
+    /// Read from repository authority's own lease metadata, the record the
+    /// commit's source-base check compares against. Any commit to the workspace
+    /// advances it, so a base read before one is stale after it.
+    fn current_source_context(state: &Arc<DaemonState>) -> kin_mcp::source_base::SourceBaseContext {
+        let context = authority_context(state).unwrap();
+        let workspace_id = context.workspace_id();
+        let authority = context.open().unwrap();
+        let lease = authority.read_authority();
+        let current = kin_mcp::source_base::SourceBaseContext::from_workspace(
+            lease
+                .metadata()
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.workspace_id == workspace_id)
+                .expect("repository authority holds the daemon's workspace"),
+        )
+        .unwrap();
+        current
+    }
+
+    /// The source base a fresh `get_entity_source` read of `entity_id` hands out.
+    ///
+    /// Built the way the commit checks it: the entity, its artifact and its blob
+    /// come from the repository authority commit base, and the body is the exact
+    /// span of that blob in repository CAS, never the working file.
+    fn current_source_base(
+        state: &Arc<DaemonState>,
+        entity_id: EntityId,
+    ) -> kin_mcp::source_base::EntitySourceBase {
+        let authority = load_native_commit_base(&state.layout).unwrap();
+        let entity = authority
+            .graph
+            .get_entity(&entity_id)
+            .unwrap()
+            .unwrap_or_else(|| panic!("repository authority holds no entity {entity_id}"));
+        let path = &entity
+            .file_origin
+            .as_ref()
+            .unwrap_or_else(|| panic!("entity {entity_id} has no source artifact"))
+            .0;
+        let artifact = authority
+            .tree
+            .artifact_at_path(&test_path(path))
+            .unwrap_or_else(|| panic!("repository authority tracks no {path}"));
+        let TreeEntry::Blob { hash, .. } = artifact.entry else {
+            panic!("{path} is not a regular source blob");
+        };
+        let span = entity
+            .span
+            .as_ref()
+            .unwrap_or_else(|| panic!("entity {entity_id} has no exact source span"));
+        let source = load_native_source_blob(&state.layout, hash).unwrap();
+        let body = std::str::from_utf8(&source[span.start_byte..span.end_byte])
+            .expect("an entity a read can serve has a UTF-8 body");
+        kin_mcp::source_base::EntitySourceBase::from_exact_body(
+            current_source_context(state),
+            &entity,
+            artifact.artifact_id,
+            hash,
+            body,
+        )
+        .unwrap()
+    }
+
+    /// A source base built field by field over `span` of the blob repository
+    /// authority holds at `path` now, with none of the checks a read makes before
+    /// it issues one.
+    ///
+    /// Only for a caller that sends a base no read would hand out, such as one for
+    /// a derived member or over bytes that are not UTF-8.
+    fn unissued_source_base(
+        state: &Arc<DaemonState>,
+        entity_id: EntityId,
+        path: &str,
+        span: std::ops::Range<usize>,
+    ) -> kin_mcp::source_base::EntitySourceBase {
+        let authority = load_native_commit_base(&state.layout).unwrap();
+        let artifact = authority
+            .tree
+            .artifact_at_path(&test_path(path))
+            .unwrap_or_else(|| panic!("repository authority tracks no {path}"));
+        let TreeEntry::Blob { hash, .. } = artifact.entry else {
+            panic!("{path} is not a regular source blob");
+        };
+        let source = load_native_source_blob(&state.layout, hash).unwrap();
+        kin_mcp::source_base::EntitySourceBase {
+            schema: kin_mcp::source_base::SourceBaseSchema::V1,
+            context: current_source_context(state),
+            entity_id,
+            artifact_id: artifact.artifact_id,
+            source_blob_hash: hash.to_string(),
+            start_byte: span.start,
+            end_byte: span.end,
+            body_hash: kin_blobs::digest(&source[span.start..span.end]).to_string(),
+        }
+    }
+
+    /// The guarded whole-entity replacement an agent sends: the entity's UUID as
+    /// target, the source base of a fresh read as payload, and the new body.
+    fn guarded_body_update(
+        state: &Arc<DaemonState>,
+        entity_id: EntityId,
         body: &str,
+    ) -> kin_mcp::McpMutationOperation {
+        kin_mcp::McpMutationOperation {
+            verb: "update".to_string(),
+            target: entity_id.to_string(),
+            payload: Some(kin_mcp::McpMutationPayload::EntitySourceBase(
+                current_source_base(state, entity_id),
+            )),
+            body: Some(body.to_string()),
+            description: "replace exact entity body".to_string(),
+            destination: None,
+        }
+    }
+
+    /// Assert `result` is the refusal every semantic route gives a whole-entity
+    /// replacement that carries no source base.
+    fn assert_source_base_required(result: &kin_mcp::ToolCallResult) {
+        assert_eq!(result.is_error, Some(true), "{}", result_text(result));
+        assert!(
+            result_text(result).starts_with("source_base_required:"),
+            "an unguarded whole-entity replacement must be refused as source_base_required: {}",
+            result_text(result)
+        );
+    }
+
+    /// Begin a `TEST_SESSION` transaction and stage `operations` on it directly.
+    ///
+    /// This skips the stage route's own admission check on purpose. It is how
+    /// work staged before a rule existed, or restored from the durable registry,
+    /// reaches the commit, so the commit has to judge it by itself.
+    fn stage_operations(
+        sessions: &kin_mcp::SessionRegistry,
+        operations: Vec<kin_mcp::McpMutationOperation>,
     ) -> (String, HashMap<String, serde_json::Value>) {
         let transaction = sessions
             .begin_transaction(TEST_SESSION, "file:src/lib.rs")
             .unwrap();
         sessions
-            .stage_transaction(
-                &transaction.transaction_id,
-                vec![kin_mcp::McpMutationOperation {
-                    verb: "update".to_string(),
-                    target: entity.id.to_string(),
-                    payload: Some(kin_mcp::McpMutationPayload::Entity(entity.clone())),
-                    body: Some(body.to_string()),
-                    description: "replace exact entity body".to_string(),
-                    destination: None,
-                }],
-            )
+            .stage_transaction(&transaction.transaction_id, operations)
             .unwrap();
-        let arguments = HashMap::from([(
-            "transaction_id".to_string(),
-            serde_json::json!(transaction.transaction_id),
-        )]);
+        let arguments = commit_arguments(&transaction.transaction_id);
         (transaction.transaction_id, arguments)
+    }
+
+    /// Stage one guarded body edit of `entity`, read against current authority.
+    fn stage_entity_edit(
+        state: &Arc<DaemonState>,
+        sessions: &kin_mcp::SessionRegistry,
+        entity: &Entity,
+        body: &str,
+    ) -> (String, HashMap<String, serde_json::Value>) {
+        stage_operations(sessions, vec![guarded_body_update(state, entity.id, body)])
     }
 
     /// Leave one working-file edit admitted the way the live daemon leaves it.
@@ -3643,6 +4326,8 @@ pub(crate) mod tests {
             &admitted,
             OperationId::new(),
             AuthorId::new("kin-session-reconcile"),
+            &[],
+            &[],
         )?
         .expect("a moved working tree must advance workspace authority");
         state
@@ -3692,7 +4377,6 @@ pub(crate) mod tests {
         file: &str,
     ) -> crate::error::Result<()> {
         let path = RepoPath::from_utf8(file).unwrap();
-        let file_id = FilePathId::new(file);
         std::fs::remove_file(state.layout.working_dir().join(file)).unwrap();
         let artifact = state
             .graph
@@ -3700,24 +4384,22 @@ pub(crate) mod tests {
             .artifact_at_path(&path)
             .cloned()
             .expect("a pending removal takes an already admitted artifact");
-        let standing = state
-            .graph
-            .query_entities(&EntityFilter {
-                file_path: Some(file_id),
-                ..EntityFilter::default()
-            })
-            .unwrap();
+        let tree_deltas = vec![TreeDelta::Removed {
+            artifact_id: artifact.artifact_id,
+            old: artifact.located_entry(),
+        }];
+        let vacated = crate::repository_commit::VacatedPaths::from_deltas(&tree_deltas);
+        let (entity_deltas, relation_deltas) =
+            crate::repository_commit::retire_live_semantics_on_vacated(
+                state.graph.as_ref(),
+                &vacated,
+            )?;
         state
             .graph
             .apply_transaction_delta(&TransactionDelta {
-                entity_deltas: standing
-                    .into_iter()
-                    .map(|old| EntityDelta::Removed { old })
-                    .collect(),
-                tree_deltas: vec![TreeDelta::Removed {
-                    artifact_id: artifact.artifact_id,
-                    old: artifact.located_entry(),
-                }],
+                entity_deltas,
+                relation_deltas,
+                tree_deltas,
                 ..TransactionDelta::default()
             })
             .unwrap();
@@ -3766,6 +4448,170 @@ pub(crate) mod tests {
         }
     }
 
+    #[test]
+    fn semantic_module_edit_requires_an_exact_declaration_span_in_authority() {
+        let original =
+            b"pub mod defaults { pub fn inside() -> u8 { 1 } }\npub fn outside() -> u8 { 8 }\n";
+        let replacement = "pub mod defaults { pub fn inside() -> u8 { 2 } }";
+        for legacy_widening in [false, true] {
+            let (_dir, state) = test_state();
+            let (mut module, _) =
+                install_exact_source(&state, "src/defaults.rs", original, "defaults");
+            assert_eq!(module.kind, kin_model::EntityKind::Module);
+            if legacy_widening {
+                module.span.as_mut().unwrap().end_byte = original.len();
+                module.span.as_mut().unwrap().end_line = 2;
+                module.span.as_mut().unwrap().end_col = 0;
+                state.graph.upsert_entity(&module).unwrap();
+                commit_live_graph(&state, "retain legacy widened module coordinates", false);
+            }
+            let before = load_native_commit_base(&state.layout).unwrap().roots;
+            let sessions = test_sessions();
+            let (_, args) = stage_entity_edit(&state, &sessions, &module, replacement);
+            let result = commit_exact_transaction(&state, &sessions, &args, None);
+            let bytes = std::fs::read(state.layout.working_dir().join("src/defaults.rs")).unwrap();
+            if legacy_widening {
+                assert_eq!(result.is_error, Some(true));
+                assert!(
+                    result_text(&result).contains("verified independent module declaration span"),
+                    "{}",
+                    result_text(&result)
+                );
+                assert_eq!(
+                    load_native_commit_base(&state.layout).unwrap().roots,
+                    before
+                );
+                assert_eq!(bytes, original);
+            } else {
+                assert_ne!(result.is_error, Some(true), "{}", result_text(&result));
+                assert_eq!(bytes, b"pub mod defaults { pub fn inside() -> u8 { 2 } }\npub fn outside() -> u8 { 8 }\n");
+            }
+        }
+    }
+
+    #[test]
+    fn semantic_commit_refuses_inline_and_retained_file_work_without_publication() {
+        let (_dir, state) = test_state();
+        let original = b"pub fn value() -> u8 { 1 }\n";
+        install_exact_source(&state, "src/lib.rs", original, "value");
+        let sessions = test_sessions();
+        let before = load_native_commit_base(&state.layout).unwrap().roots;
+        for verb in [
+            "create",
+            "add",
+            "insert",
+            "replace",
+            "overwrite",
+            "delete",
+            "remove",
+            "rename",
+            "move",
+        ] {
+            let mut operation = new_source_file("src/lib.rs", "pub fn altered() {}\n");
+            operation.verb = verb.into();
+            if matches!(verb, "delete" | "remove" | "rename" | "move") {
+                operation.body = None;
+            }
+            if matches!(verb, "rename" | "move") {
+                operation.destination = Some("src/moved.rs".into());
+            }
+            for inline in [true, false] {
+                let tx = sessions
+                    .begin_transaction(TEST_SESSION, "entity:test")
+                    .unwrap();
+                let mut args = commit_arguments(&tx.transaction_id);
+                if inline {
+                    args.insert("operations".into(), serde_json::json!([operation]));
+                } else {
+                    sessions
+                        .stage_transaction(&tx.transaction_id, vec![operation.clone()])
+                        .unwrap();
+                }
+                let result = commit_exact_transaction(&state, &sessions, &args, None);
+                assert_eq!(result.is_error, Some(true));
+                assert!(
+                    result_text(&result).contains("semantic_operation_required"),
+                    "{}",
+                    result_text(&result)
+                );
+                let retained = sessions.get_transaction(&tx.transaction_id).unwrap();
+                assert_eq!(retained.state, "active");
+                assert_eq!(retained.staged_operations.len(), usize::from(!inline));
+                assert_eq!(
+                    load_native_commit_base(&state.layout).unwrap().roots,
+                    before
+                );
+                assert_eq!(
+                    std::fs::read(state.layout.working_dir().join("src/lib.rs")).unwrap(),
+                    original
+                );
+                // The retained draft was proved above. Release this fixture's
+                // session slot before testing the next independent request.
+                sessions.abort_transaction(&tx.transaction_id).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn semantic_commit_recovers_published_conversion_but_refuses_unpublished_fence() {
+        let (_dir, state) = test_state();
+        install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\n",
+            "value",
+        );
+        let sessions = test_sessions();
+        let op = replaced_source_file("src/lib.rs", "pub fn value() -> u8 { 2 }\n");
+        let tx = sessions
+            .begin_transaction(TEST_SESSION, "conversion:fixture")
+            .unwrap();
+        sessions
+            .stage_transaction(&tx.transaction_id, vec![op.clone()])
+            .unwrap();
+        let args = commit_arguments(&tx.transaction_id);
+        let published = commit_conversion_fixture(&state, &sessions, &args, None);
+        assert_ne!(
+            published.is_error,
+            Some(true),
+            "{}",
+            result_text(&published)
+        );
+        let after = load_native_commit_base(&state.layout).unwrap().roots;
+        let replay = commit_exact_transaction(&state, &sessions, &args, None);
+        assert_ne!(replay.is_error, Some(true), "{}", result_text(&replay));
+        assert_eq!(commit_reply(&replay)["already_applied"], true);
+        assert_eq!(load_native_commit_base(&state.layout).unwrap().roots, after);
+
+        let pending = sessions
+            .begin_transaction(TEST_SESSION, "conversion:retained")
+            .unwrap();
+        let pending = sessions
+            .stage_transaction(&pending.transaction_id, vec![op])
+            .unwrap();
+        let hash = transaction_payload_hash(&pending).unwrap();
+        sessions
+            .prepare_transaction_commit(&pending.transaction_id, &hash)
+            .unwrap();
+        let refusal = commit_exact_transaction(
+            &state,
+            &sessions,
+            &commit_arguments(&pending.transaction_id),
+            None,
+        );
+        assert_eq!(refusal.is_error, Some(true));
+        assert!(result_text(&refusal).contains("semantic_operation_required"));
+        assert_eq!(
+            sessions
+                .get_transaction(&pending.transaction_id)
+                .unwrap()
+                .staged_operations
+                .len(),
+            1
+        );
+        assert_eq!(load_native_commit_base(&state.layout).unwrap().roots, after);
+    }
+
     const NEW_UTIL_PY: &str = "def helper(value):\n    return value + 1\n";
     const NEW_APP_PY: &str =
         "from pkg.util import helper\n\n\ndef run(value):\n    return helper(value)\n";
@@ -3787,7 +4633,7 @@ pub(crate) mod tests {
     /// understands together, and because the planner has to seed its linker for
     /// it to happen at all.
     #[test]
-    fn new_source_files_created_over_mcp_enter_the_graph_and_reference_each_other() {
+    fn conversion_created_source_files_enter_the_graph_and_reference_each_other() {
         let (_dir, state) = test_state();
         let sessions = test_sessions();
 
@@ -3812,7 +4658,7 @@ pub(crate) mod tests {
             .stage_transaction(&transaction.transaction_id, operations)
             .unwrap();
 
-        let result = commit_exact_transaction(
+        let result = commit_conversion_fixture(
             &state,
             &sessions,
             &HashMap::from([(
@@ -3934,7 +4780,7 @@ pub(crate) mod tests {
             )
             .unwrap();
 
-        let result = commit_exact_transaction(
+        let result = commit_conversion_fixture(
             &state,
             &sessions,
             &HashMap::from([(
@@ -3992,7 +4838,7 @@ pub(crate) mod tests {
     /// adds enters. An entity edit refuses this case by name, since it may
     /// only change the body of the one entity it resolved.
     #[test]
-    fn replacing_a_tracked_file_over_mcp_republishes_it_and_re_derives_its_entities() {
+    fn conversion_replacement_republishes_and_re_derives_entities() {
         let (_dir, state) = test_state();
         let (before_entity, installed_change) =
             install_exact_source(&state, "src/lib.rs", TRACKED_RS.as_bytes(), "value");
@@ -4021,7 +4867,7 @@ pub(crate) mod tests {
             .stage_transaction(&transaction.transaction_id, operations)
             .unwrap();
 
-        let result = commit_exact_transaction(
+        let result = commit_conversion_fixture(
             &state,
             &sessions,
             &HashMap::from([(
@@ -4123,7 +4969,7 @@ pub(crate) mod tests {
                 vec![replaced_source_file(path, body)],
             )
             .unwrap();
-        commit_exact_transaction(
+        commit_conversion_fixture(
             state,
             sessions,
             &commit_arguments(&transaction.transaction_id),
@@ -4353,7 +5199,7 @@ pub(crate) mod tests {
                 vec![replaced_source_file("test.c", partial)],
             )
             .unwrap();
-        let result = commit_exact_transaction(
+        let result = commit_conversion_fixture(
             &state,
             &sessions,
             &HashMap::from([(
@@ -4397,7 +5243,7 @@ pub(crate) mod tests {
                 )],
             )
             .unwrap();
-        let valid = commit_exact_transaction(
+        let valid = commit_conversion_fixture(
             &state,
             &sessions,
             &HashMap::from([(
@@ -4447,7 +5293,7 @@ pub(crate) mod tests {
             )
             .unwrap();
 
-        let result = commit_exact_transaction(
+        let result = commit_conversion_fixture(
             &state,
             &sessions,
             &HashMap::from([(
@@ -4496,7 +5342,7 @@ pub(crate) mod tests {
             )
             .unwrap();
 
-        let result = commit_exact_transaction(
+        let result = commit_conversion_fixture(
             &state,
             &sessions,
             &HashMap::from([(
@@ -4524,7 +5370,7 @@ pub(crate) mod tests {
                 vec![replaced_source_file("src/lib.rs", REWRITTEN_RS)],
             )
             .unwrap();
-        let result = commit_exact_transaction(
+        let result = commit_conversion_fixture(
             &state,
             &sessions,
             &HashMap::from([(
@@ -4619,7 +5465,7 @@ pub(crate) mod tests {
     /// read those, so a retirement that left any of them standing would keep
     /// steering an agent toward a file that no longer exists.
     #[test]
-    fn retiring_a_tracked_file_over_mcp_takes_its_entities_and_its_tree_entry() {
+    fn conversion_retirement_takes_entities_and_tree_entry() {
         let (_dir, state) = test_state();
         let (entity, _) = install_exact_source(
             &state,
@@ -4654,7 +5500,7 @@ pub(crate) mod tests {
             .stage_transaction(&transaction.transaction_id, operations)
             .unwrap();
 
-        let result = commit_exact_transaction(
+        let result = commit_conversion_fixture(
             &state,
             &sessions,
             &HashMap::from([(
@@ -4793,7 +5639,7 @@ pub(crate) mod tests {
                 ],
             )
             .unwrap();
-        let created = commit_exact_transaction(
+        let created = commit_conversion_fixture(
             &state,
             &sessions,
             &HashMap::from([(
@@ -4855,7 +5701,7 @@ pub(crate) mod tests {
                 vec![retired_source_file("pkg/util.py")],
             )
             .unwrap();
-        let result = commit_exact_transaction(
+        let result = commit_conversion_fixture(
             &state,
             &sessions,
             &HashMap::from([(
@@ -4928,7 +5774,7 @@ pub(crate) mod tests {
             )
             .unwrap();
 
-        let result = commit_exact_transaction(
+        let result = commit_conversion_fixture(
             &state,
             &sessions,
             &HashMap::from([(
@@ -4986,7 +5832,7 @@ pub(crate) mod tests {
             sessions
                 .stage_transaction(&transaction.transaction_id, operations)
                 .unwrap();
-            commit_exact_transaction(
+            commit_conversion_fixture(
                 &state,
                 &sessions,
                 &HashMap::from([(
@@ -5059,7 +5905,7 @@ pub(crate) mod tests {
     /// A move that kept the entity but dropped its callers would still report a
     /// renamed function as referenced by nothing.
     #[test]
-    fn renaming_a_tracked_file_over_mcp_keeps_entity_identity_and_incoming_edges() {
+    fn conversion_relocation_keeps_entity_identity_and_incoming_edges() {
         let (_dir, state) = test_state();
         let sessions = test_sessions();
 
@@ -5077,7 +5923,7 @@ pub(crate) mod tests {
                 ],
             )
             .unwrap();
-        let created = commit_exact_transaction(
+        let created = commit_conversion_fixture(
             &state,
             &sessions,
             &HashMap::from([(
@@ -5118,7 +5964,7 @@ pub(crate) mod tests {
         sessions
             .stage_transaction(&moved.transaction_id, operations)
             .unwrap();
-        let result = commit_exact_transaction(
+        let result = commit_conversion_fixture(
             &state,
             &sessions,
             &HashMap::from([(
@@ -5231,7 +6077,7 @@ pub(crate) mod tests {
             )
             .unwrap();
 
-        let result = commit_exact_transaction(
+        let result = commit_conversion_fixture(
             &state,
             &sessions,
             &HashMap::from([(
@@ -5260,12 +6106,13 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn payload_less_target_body_update_commits_like_an_entity_payload() {
-        // Staging accepts verb `update` with a `target` (entity name or id) and a
-        // `body`, and no entity payload. The planner has to accept the same
-        // shape, or the operation is admitted at stage time and refused at
-        // commit. The target resolves against repository authority, so the span
-        // spliced is the one authority records, not one the caller supplied.
+    fn payload_less_target_body_update_is_refused_and_its_guarded_form_commits() {
+        // Verb `update` with a `target` (entity name or id) and a `body`, and no
+        // payload, names no version of the entity it replaces. The stage route
+        // refuses it, and so does the commit when the operation reaches it
+        // already staged, as retained or restored work does, so nothing moves.
+        // The same edit carrying the source base of a fresh read commits, and the
+        // span it splices is the one authority records.
         let (_dir, state) = test_state();
         let (entity, _) = install_exact_source(
             &state,
@@ -5273,10 +6120,8 @@ pub(crate) mod tests {
             b"pub fn value() -> u8 { 1 }\n",
             "value",
         );
+        let before = load_native_commit_base(&state.layout).unwrap();
         let sessions = test_sessions();
-        let transaction = sessions
-            .begin_transaction(TEST_SESSION, "file:src/lib.rs")
-            .unwrap();
         let operation = kin_mcp::McpMutationOperation {
             verb: "update".to_string(),
             // The entity's name, not its id: an agent knows the name and the new
@@ -5288,24 +6133,36 @@ pub(crate) mod tests {
             destination: None,
         };
         kin_mcp::session::validate_staged_operations(std::slice::from_ref(&operation))
-            .expect("staging must accept the payload-less target body form");
-        sessions
-            .stage_transaction(&transaction.transaction_id, vec![operation])
-            .unwrap();
+            .expect("conversion decoding still recognises the payload-less target body form");
+        let refusal =
+            kin_mcp::session::validate_semantic_operations(std::slice::from_ref(&operation))
+                .expect_err("the stage route must refuse an unguarded replacement");
+        assert!(refusal.starts_with("source_base_required:"), "{refusal}");
+        let (transaction_id, arguments) = stage_operations(&sessions, vec![operation]);
 
-        let result = commit_exact_transaction(
-            &state,
-            &sessions,
-            &HashMap::from([(
-                "transaction_id".to_string(),
-                serde_json::json!(transaction.transaction_id),
-            )]),
-            None,
+        let refused = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_source_base_required(&refused);
+        assert_eq!(
+            load_native_commit_base(&state.layout).unwrap().roots,
+            before.roots,
+            "a refused replacement must not move repository authority"
         );
+        assert_eq!(
+            std::fs::read(state.layout.working_dir().join("src/lib.rs")).unwrap(),
+            b"pub fn value() -> u8 { 1 }\n"
+        );
+        assert_eq!(
+            sessions.get_transaction(&transaction_id).unwrap().state,
+            "active"
+        );
+
+        let (_, arguments) =
+            stage_entity_edit(&state, &sessions, &entity, "pub fn value() -> u8 { 2 }");
+        let result = commit_exact_transaction(&state, &sessions, &arguments, None);
         assert_ne!(
             result.is_error,
             Some(true),
-            "payload-less target body commit failed: {}",
+            "the guarded target body commit failed: {}",
             result_text(&result)
         );
 
@@ -5356,8 +6213,10 @@ pub(crate) mod tests {
             .begin_transaction(TEST_SESSION, "file:src/lib.rs")
             .unwrap();
 
-        // The exact shape reported as lost: an entity payload plus a body,
-        // passed on the commit call with no prior kin_transaction_stage.
+        // A payload plus a body passed on the commit call with no prior
+        // kin_transaction_stage, which is the shape reported as lost. The
+        // payload is now the source base of a fresh read, the one form a
+        // whole-entity replacement is admitted in.
         let arguments = HashMap::from([
             (
                 "transaction_id".to_string(),
@@ -5368,7 +6227,7 @@ pub(crate) mod tests {
                 serde_json::json!([{
                     "verb": "update",
                     "target": entity.id.to_string(),
-                    "payload": {"Entity": entity},
+                    "payload": {"EntitySourceBase": current_source_base(&state, entity.id)},
                     "body": "pub fn value() -> u8 { 2 }",
                     "description": "inline entity body update",
                 }]),
@@ -5416,9 +6275,10 @@ pub(crate) mod tests {
         );
     }
 
-    /// The payload-less inline form has to persist too.
+    /// The payload-less inline form is refused before it is staged, and the
+    /// guarded inline form on the same transaction persists byte-exact.
     #[test]
-    fn inline_payload_less_operations_commit_persists_the_body_byte_exact() {
+    fn inline_payload_less_body_update_is_refused_and_its_guarded_form_persists_byte_exact() {
         let (_dir, state) = test_state();
         let (entity, _) = install_exact_source(
             &state,
@@ -5426,31 +6286,67 @@ pub(crate) mod tests {
             b"pub fn value() -> u8 { 1 }\n",
             "value",
         );
+        let before = load_native_commit_base(&state.layout).unwrap();
         let sessions = test_sessions();
         let transaction = sessions
             .begin_transaction(TEST_SESSION, "file:src/lib.rs")
             .unwrap();
+        let arguments = |operation: serde_json::Value| {
+            HashMap::from([
+                (
+                    "transaction_id".to_string(),
+                    serde_json::json!(transaction.transaction_id),
+                ),
+                ("operations".to_string(), serde_json::json!([operation])),
+            ])
+        };
 
-        let arguments = HashMap::from([
-            (
-                "transaction_id".to_string(),
-                serde_json::json!(transaction.transaction_id),
-            ),
-            (
-                "operations".to_string(),
-                serde_json::json!([{
-                    "verb": "update",
-                    "target": "value",
-                    "body": "pub fn value() -> u8 { 3 }",
-                    "description": "inline payload-less body update",
-                }]),
-            ),
-        ]);
-        let result = commit_exact_transaction(&state, &sessions, &arguments, None);
+        let refused = commit_exact_transaction(
+            &state,
+            &sessions,
+            &arguments(serde_json::json!({
+                "verb": "update",
+                "target": "value",
+                "body": "pub fn value() -> u8 { 3 }",
+                "description": "inline payload-less body update",
+            })),
+            None,
+        );
+        assert_source_base_required(&refused);
+        assert_eq!(
+            load_native_commit_base(&state.layout).unwrap().roots,
+            before.roots,
+            "a refused replacement must not move repository authority"
+        );
+        assert_eq!(
+            std::fs::read(state.layout.working_dir().join("src/lib.rs")).unwrap(),
+            b"pub fn value() -> u8 { 1 }\n"
+        );
+        let untouched = sessions
+            .get_transaction(&transaction.transaction_id)
+            .unwrap();
+        assert_eq!(untouched.state, "active");
+        assert!(
+            untouched.staged_operations.is_empty(),
+            "a refused inline operation must not be staged"
+        );
+
+        let result = commit_exact_transaction(
+            &state,
+            &sessions,
+            &arguments(serde_json::json!({
+                "verb": "update",
+                "target": entity.id.to_string(),
+                "payload": {"EntitySourceBase": current_source_base(&state, entity.id)},
+                "body": "pub fn value() -> u8 { 3 }",
+                "description": "inline guarded body update",
+            })),
+            None,
+        );
         assert_ne!(
             result.is_error,
             Some(true),
-            "inline payload-less commit failed: {}",
+            "the guarded inline commit failed: {}",
             result_text(&result)
         );
 
@@ -5462,6 +6358,212 @@ pub(crate) mod tests {
         let after = load_native_commit_base(&state.layout).unwrap();
         let reparsed = after.graph.get_entity(&entity.id).unwrap().unwrap();
         assert_ne!(reparsed.fingerprint, entity.fingerprint);
+    }
+
+    /// The acceptance fixture names the file `mutable.rs` and the function
+    /// `mutable`. The file-module surface shares that name. The bare name is
+    /// refused as an unguarded replacement before any name is resolved, so the
+    /// collision cannot pick the wrong entity and nothing moves. The guarded
+    /// edit a source read of the function supports, sent on the same
+    /// transaction, has to land on the function: disk, the reparsed body, and
+    /// the caller's change message.
+    #[test]
+    fn a_bare_name_shared_with_a_file_module_is_refused_and_the_guarded_function_edit_commits() {
+        let (_dir, state) = test_state();
+        let (entity, _) = install_exact_source(
+            &state,
+            "src/mutable.rs",
+            b"pub fn mutable() -> u8 {\n    7\n}\n",
+            "mutable",
+        );
+        assert_ne!(
+            entity.kind,
+            kin_model::EntityKind::Module,
+            "the named target must be the function, not the file module"
+        );
+        let same_name = state
+            .graph
+            .query_entities(&kin_model::EntityFilter {
+                name_pattern: Some("mutable".to_string()),
+                ..kin_model::EntityFilter::default()
+            })
+            .unwrap()
+            .into_iter()
+            .filter(|candidate| candidate.name == "mutable")
+            .count();
+        assert!(
+            same_name > 1,
+            "this fixture must collide the function with its file module, or it does not grade the acceptance name"
+        );
+
+        let before = load_native_commit_base(&state.layout).unwrap();
+        let sessions = test_sessions();
+        let transaction = sessions
+            .begin_transaction(TEST_SESSION, "repository")
+            .unwrap();
+        let body = "/// Set through Kin by an agent with no file tools.\npub fn mutable() -> u8 {\n    0x2c\n}";
+        let arguments = |operation: serde_json::Value| {
+            HashMap::from([
+                (
+                    "transaction_id".to_string(),
+                    serde_json::json!(transaction.transaction_id),
+                ),
+                ("session_id".to_string(), serde_json::json!(TEST_SESSION)),
+                (
+                    "message".to_string(),
+                    serde_json::json!("Raise mutable to 0x2c"),
+                ),
+                ("operations".to_string(), serde_json::json!([operation])),
+            ])
+        };
+
+        let refused = commit_exact_transaction(
+            &state,
+            &sessions,
+            &arguments(serde_json::json!({
+                "verb": "update",
+                "target": "mutable",
+                "body": body,
+                "description": "raise mutable to 0x2c",
+            })),
+            None,
+        );
+        assert_source_base_required(&refused);
+        assert_eq!(
+            load_native_commit_base(&state.layout).unwrap().roots,
+            before.roots,
+            "a refused bare name must not move repository authority"
+        );
+        assert_eq!(
+            std::fs::read(state.layout.working_dir().join("src/mutable.rs")).unwrap(),
+            b"pub fn mutable() -> u8 {\n    7\n}\n"
+        );
+
+        let result = commit_exact_transaction(
+            &state,
+            &sessions,
+            &arguments(serde_json::json!({
+                "verb": "update",
+                "target": entity.id.to_string(),
+                "payload": {"EntitySourceBase": current_source_base(&state, entity.id)},
+                "body": body,
+                "description": "raise mutable to 0x2c",
+            })),
+            None,
+        );
+        assert_ne!(
+            result.is_error,
+            Some(true),
+            "the guarded update of mutable failed: {}",
+            result_text(&result)
+        );
+
+        let disk =
+            std::fs::read_to_string(state.layout.working_dir().join("src/mutable.rs")).unwrap();
+        assert!(
+            disk.contains("0x2c"),
+            "the working file does not carry the mutation: {disk}"
+        );
+        let after = load_native_commit_base(&state.layout).unwrap();
+        let artifact = after
+            .tree
+            .artifact_at_path(&RepoPath::from_utf8("src/mutable.rs").unwrap())
+            .unwrap();
+        let published = String::from_utf8(
+            load_native_source_blob(&state.layout, artifact.entry.blob_identity().unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            published.contains("0x2c"),
+            "repository authority does not carry the mutation: {published}"
+        );
+        let reparsed = after
+            .graph
+            .query_entities(&kin_model::EntityFilter {
+                name_pattern: Some("mutable".to_string()),
+                ..kin_model::EntityFilter::default()
+            })
+            .unwrap()
+            .into_iter()
+            .find(|candidate| {
+                candidate.name == "mutable" && candidate.kind != kin_model::EntityKind::Module
+            })
+            .expect("the function must still be in the graph");
+        assert_ne!(reparsed.fingerprint, entity.fingerprint);
+
+        let reply = commit_reply(&result);
+        let change_id = reply["change_id"].as_str().unwrap().to_string();
+        let change = state
+            .graph
+            .get_entity_history(&reparsed.id)
+            .unwrap()
+            .into_iter()
+            .find(|change| change.id.to_string() == change_id)
+            .expect("the published change is reachable from the function the operation wrote");
+        assert!(
+            change.message.contains("Raise mutable to 0x2c"),
+            "the change message must carry the caller's summary: {}",
+            change.message
+        );
+    }
+
+    /// A bare name two declared functions share is refused before anything
+    /// tries to resolve it.
+    ///
+    /// Guessing between the two would write the wrong one. A bare name names no
+    /// version of either entity, so it is refused as an unguarded replacement
+    /// whatever it would resolve to, and neither file moves.
+    #[test]
+    fn a_bare_name_two_functions_share_is_refused_before_any_resolution() {
+        let (_dir, state) = test_state();
+        install_exact_source(
+            &state,
+            "src/left.rs",
+            b"pub fn mutable() -> u8 { 1 }\n",
+            "mutable",
+        );
+        install_exact_source(
+            &state,
+            "src/right.rs",
+            b"pub fn mutable() -> u8 { 2 }\n",
+            "mutable",
+        );
+        let before = load_native_commit_base(&state.layout).unwrap();
+        let sessions = test_sessions();
+        let transaction = sessions
+            .begin_transaction(TEST_SESSION, "repository")
+            .unwrap();
+        let arguments = HashMap::from([
+            (
+                "transaction_id".to_string(),
+                serde_json::json!(transaction.transaction_id),
+            ),
+            (
+                "operations".to_string(),
+                serde_json::json!([{
+                    "verb": "update",
+                    "target": "mutable",
+                    "body": "pub fn mutable() -> u8 { 3 }\n",
+                    "description": "ambiguous name",
+                }]),
+            ),
+        ]);
+        let result = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_source_base_required(&result);
+        assert_eq!(
+            load_native_commit_base(&state.layout).unwrap().roots,
+            before.roots,
+            "a refused bare name must not move repository authority"
+        );
+        assert_eq!(
+            std::fs::read(state.layout.working_dir().join("src/left.rs")).unwrap(),
+            b"pub fn mutable() -> u8 { 1 }\n"
+        );
+        assert_eq!(
+            std::fs::read(state.layout.working_dir().join("src/right.rs")).unwrap(),
+            b"pub fn mutable() -> u8 { 2 }\n"
+        );
     }
 
     /// An `operations` element carrying a key Kin does not model is refused
@@ -5541,9 +6643,12 @@ pub(crate) mod tests {
         let transaction = sessions
             .begin_transaction(TEST_SESSION, "file:src/lib.rs")
             .unwrap();
+        // Read once. The resume re-sends this exact array, source base included,
+        // even though the crashed attempt has since moved authority past it.
         let operations = serde_json::json!([{
             "verb": "update",
             "target": entity.id.to_string(),
+            "payload": {"EntitySourceBase": current_source_base(&state, entity.id)},
             "body": "pub fn value() -> u8 { 2 }",
             "description": "inline body update",
         }]);
@@ -5597,6 +6702,8 @@ pub(crate) mod tests {
         let transaction = sessions
             .begin_transaction(TEST_SESSION, "file:src/lib.rs")
             .unwrap();
+        // One read for both sends, so the two arrays differ only in their body.
+        let source_base = current_source_base(&state, entity.id);
         let arguments = |body: &str| {
             HashMap::from([
                 (
@@ -5608,6 +6715,7 @@ pub(crate) mod tests {
                     serde_json::json!([{
                         "verb": "update",
                         "target": entity.id.to_string(),
+                        "payload": {"EntitySourceBase": source_base},
                         "body": body,
                         "description": "inline body update",
                     }]),
@@ -5665,6 +6773,29 @@ pub(crate) mod tests {
         )
     }
 
+    /// Stage `operation` in a fresh transaction owned by `session_id` and commit it.
+    fn commit_one_operation(
+        state: &Arc<DaemonState>,
+        sessions: &kin_mcp::SessionRegistry,
+        session_id: &str,
+        operation: kin_mcp::McpMutationOperation,
+    ) -> kin_mcp::ToolCallResult {
+        let transaction = sessions
+            .begin_transaction(session_id, "file:src/lib.rs")
+            .unwrap();
+        sessions
+            .stage_transaction(&transaction.transaction_id, vec![operation])
+            .unwrap();
+        commit_exact_transaction(
+            state,
+            sessions,
+            &commit_arguments(&transaction.transaction_id),
+            None,
+        )
+    }
+
+    /// Commit one guarded body edit of `entity` for `session_id`, read against
+    /// current authority, so successive calls each carry a fresh source base.
     fn commit_one_entity_edit(
         state: &Arc<DaemonState>,
         sessions: &kin_mcp::SessionRegistry,
@@ -5672,31 +6803,86 @@ pub(crate) mod tests {
         entity: &Entity,
         body: &str,
     ) -> kin_mcp::ToolCallResult {
-        let transaction = sessions
-            .begin_transaction(session_id, "file:src/lib.rs")
-            .unwrap();
-        sessions
-            .stage_transaction(
-                &transaction.transaction_id,
-                vec![kin_mcp::McpMutationOperation {
-                    verb: "update".to_string(),
-                    target: entity.id.to_string(),
-                    payload: None,
-                    body: Some(body.to_string()),
-                    description: "attributed body update".to_string(),
-                    destination: None,
-                }],
-            )
-            .unwrap();
-        commit_exact_transaction(
+        commit_one_operation(
             state,
             sessions,
-            &HashMap::from([(
-                "transaction_id".to_string(),
-                serde_json::json!(transaction.transaction_id),
-            )]),
-            None,
+            session_id,
+            kin_mcp::McpMutationOperation {
+                description: "attributed body update".to_string(),
+                ..guarded_body_update(state, entity.id, body)
+            },
         )
+    }
+
+    #[test]
+    fn derived_member_edit_refusal_preserves_generator_and_siblings() {
+        let (_dir, state) = test_state();
+        let source =
+            "export const app = {}; for (const key of ['get','post']) { app[key] = () => 1; }";
+        let (candidate, _) =
+            install_exact_source(&state, "src/members.js", source.as_bytes(), "app.get");
+        assert!(candidate.span.is_none());
+        let sessions = kin_mcp::SessionRegistry::new();
+        let session = start_agent_session(&sessions, "test", "derived-member-edit");
+        // No read issues a source base for a derived member, because it has no
+        // source of its own. A caller that builds one anyway over the generator's
+        // bytes is refused by the source-base check, which points at the
+        // generator, before anything is planned.
+        let generator = kin_model::entity_derivation(&candidate)
+            .unwrap()
+            .unwrap()
+            .generator;
+        let result = commit_one_operation(
+            &state,
+            &sessions,
+            &session.session_id.to_string(),
+            kin_mcp::McpMutationOperation {
+                verb: "update".to_string(),
+                target: candidate.id.to_string(),
+                payload: Some(kin_mcp::McpMutationPayload::EntitySourceBase(
+                    unissued_source_base(
+                        &state,
+                        candidate.id,
+                        "src/members.js",
+                        generator.start_byte..generator.end_byte,
+                    ),
+                )),
+                body: Some("() => 2".to_string()),
+                description: "edit a derived member".to_string(),
+                destination: None,
+            },
+        );
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            result_text(&result).contains("generator"),
+            "{}",
+            result_text(&result)
+        );
+        assert_eq!(
+            std::fs::read_to_string(state.layout.working_dir().join("src/members.js")).unwrap(),
+            source
+        );
+        let base = load_native_commit_base(&state.layout).unwrap();
+        let mut legacy = candidate.clone();
+        let derivation = kin_model::entity_derivation(&legacy).unwrap().unwrap();
+        legacy
+            .metadata
+            .extra
+            .remove(kin_model::derivation::ENTITY_DERIVATION_KEY);
+        legacy.span = Some(derivation.generator);
+        legacy.doc_summary = Some(
+            "Derived from a loop over `keys`; no literal `app.get` assignment appears in source."
+                .into(),
+        );
+        let mut edits = BTreeMap::new();
+        let mut edited = HashSet::new();
+        assert!(
+            record_source_edit(&mut edits, &mut edited, &base, legacy, b"() => 2")
+                .unwrap_err()
+                .contains("legacy derived member")
+        );
+        assert!(edits.is_empty());
+        assert!(edited.is_empty());
     }
 
     /// An agent's commit has to be attributable afterwards, by name.
@@ -5832,7 +7018,7 @@ pub(crate) mod tests {
                 .query_audit_events(Some(&actor_id), 16)
                 .unwrap()
                 .len(),
-            1,
+            2,
             "the audit trail must be queryable by the agent that wrote it"
         );
     }
@@ -6030,15 +7216,16 @@ pub(crate) mod tests {
         );
     }
 
-    /// A payload field the commit cannot honor is refused, not dropped.
+    /// An entity payload beside a body is refused whole, whatever its fields say.
     ///
-    /// The commit publishes what reparsing the new bytes derives, so a
-    /// doc summary the caller edited by hand never lands. Committing the body
-    /// and discarding that edit reports `ops_applied: 1` for an operation only
-    /// half of which happened, which is the same defect this PR closes on the
-    /// other path, in the other half of the operation.
+    /// The commit publishes what reparsing the new bytes derives, so a doc
+    /// summary the caller edited by hand could never land, and committing the
+    /// body while discarding that edit would report `ops_applied: 1` for half an
+    /// operation. An entity payload also names no version of the source it
+    /// replaces, so the operation is refused as an unguarded replacement before
+    /// any field is compared, and neither half lands.
     #[test]
-    fn an_edited_payload_field_the_commit_cannot_honor_is_refused() {
+    fn an_edited_entity_payload_beside_a_body_is_refused_as_source_base_required() {
         let (_dir, state) = test_state();
         let (entity, _) = install_exact_source(
             &state,
@@ -6071,22 +7258,12 @@ pub(crate) mod tests {
             ),
         ]);
         let result = commit_exact_transaction(&state, &sessions, &arguments, None);
-        assert_eq!(
-            result.is_error,
-            Some(true),
-            "a metadata edit that cannot land must be refused: {}",
-            result_text(&result)
-        );
-        assert!(
-            result_text(&result).contains("doc summary"),
-            "the refusal must name the field it could not honor: {}",
-            result_text(&result)
-        );
+        assert_source_base_required(&result);
 
         let after = load_native_commit_base(&state.layout).unwrap();
         assert_eq!(
-            after.roots.generation, before.roots.generation,
-            "the body must not land on its own while the metadata half is refused"
+            after.roots, before.roots,
+            "the body must not land on its own while the operation is refused"
         );
         assert_eq!(
             std::fs::read(state.layout.working_dir().join("src/lib.rs")).unwrap(),
@@ -6094,28 +7271,27 @@ pub(crate) mod tests {
         );
     }
 
-    /// The payload an agent actually builds is what `get_entity` handed it,
-    /// decoded from the wire, and it has to commit.
+    /// The payload an agent used to build, what `get_entity` handed it decoded
+    /// from the wire plus a `body`, is refused however faithful the round trip.
     ///
-    /// This is the shape the product uses: call `get_entity`, take the returned
-    /// object whole, add a `body`, commit. It is not the same as echoing the
-    /// in-memory struct, because `entity_response_json` injects response-only keys
-    /// at top level (read_path, start_line, end_line, source_excerpt, source_state,
+    /// It is not the same as echoing the in-memory struct, because
+    /// `entity_response_json` injects response-only keys at top level
+    /// (read_path, start_line, end_line, source_excerpt, source_state,
     /// span_coherence, artifact_id, artifact_path, artifact_entry, source, plus
     /// either source_change_id for committed bytes or workspace_tree_hash /
     /// workspace_generation / base_change_id for uncommitted ones) and `Entity`
     /// does not deny unknown fields.
     ///
-    /// What this pins is that the round trip is faithful: those keys are
-    /// discarded on the way back in and land nowhere, so an echoed payload
-    /// equals what authority holds. That is worth a test because it is not
-    /// obvious. `EntityMetadata` is `#[serde(flatten)] extra: HashMap`, so it
-    /// absorbs unknown keys found inside the `metadata` object; `Entity.metadata`
-    /// is a plain named field, so top-level decorations never reach it. Flip
-    /// either of those and every field-by-field check the commit planner makes
-    /// against authority starts refusing a caller that did nothing but echo.
+    /// The round trip is still pinned: those keys are discarded on the way back
+    /// in and land nowhere, so an echoed payload equals what authority holds.
+    /// `EntityMetadata` is `#[serde(flatten)] extra: HashMap`, so it absorbs
+    /// unknown keys found inside the `metadata` object; `Entity.metadata` is a
+    /// plain named field, so top-level decorations never reach it. What the
+    /// echo lacks is the version of the source it replaces, so the commit
+    /// refuses it as an unguarded replacement and nothing moves. The same edit
+    /// carrying the source base of a fresh read commits on the same transaction.
     #[test]
-    fn a_payload_decoded_from_a_real_get_entity_response_still_commits() {
+    fn a_payload_decoded_from_a_real_get_entity_response_is_refused_without_a_source_base() {
         let (_dir, state) = test_state();
         let (entity, _) = install_exact_source(
             &state,
@@ -6129,7 +7305,7 @@ pub(crate) mod tests {
         let binding = kin_mcp::handlers::RequestRepositoryAuthority::pinned(
             state.local_repository_authority_binding().unwrap(),
         );
-        let response = kin_mcp::handlers::common::entity_response_json(
+        let mut response = kin_mcp::handlers::common::entity_response_json(
             state.graph.as_ref(),
             &entity,
             Some(&binding),
@@ -6150,10 +7326,21 @@ pub(crate) mod tests {
                 "fixture must exercise a response carrying the injected key {injected}: {response}"
             );
         }
+        // Retrieval omits derived index previews. They remain server-owned
+        // and must not be mistaken for caller metadata edits on a round trip.
+        let mut expected_metadata = entity.metadata.clone();
+        for key in [
+            "embedding_body_preview",
+            "file_import_context",
+            "file_surface_context",
+        ] {
+            response["metadata"].as_object_mut().unwrap().remove(key);
+            expected_metadata.extra.remove(key);
+        }
         let echoed: Entity = serde_json::from_value(response)
             .expect("a get_entity response must decode back into an Entity");
         assert_eq!(
-            echoed.metadata, entity.metadata,
+            echoed.metadata, expected_metadata,
             "response-only keys must be discarded on decode, not folded into metadata"
         );
         assert_eq!(
@@ -6161,31 +7348,59 @@ pub(crate) mod tests {
             "an echoed payload must carry the doc summary authority holds"
         );
 
+        let before = load_native_commit_base(&state.layout).unwrap();
         let sessions = test_sessions();
         let transaction = sessions
             .begin_transaction(TEST_SESSION, "file:src/lib.rs")
             .unwrap();
-        let arguments = HashMap::from([
-            (
-                "transaction_id".to_string(),
-                serde_json::json!(transaction.transaction_id),
-            ),
-            (
-                "operations".to_string(),
-                serde_json::json!([{
-                    "verb": "update",
-                    "target": entity.id.to_string(),
-                    "payload": {"Entity": echoed},
-                    "body": "pub fn value() -> u8 { 2 }",
-                    "description": "echo the read response back as the payload",
-                }]),
-            ),
-        ]);
-        let result = commit_exact_transaction(&state, &sessions, &arguments, None);
+        let arguments = |operation: serde_json::Value| {
+            HashMap::from([
+                (
+                    "transaction_id".to_string(),
+                    serde_json::json!(transaction.transaction_id),
+                ),
+                ("operations".to_string(), serde_json::json!([operation])),
+            ])
+        };
+        let refused = commit_exact_transaction(
+            &state,
+            &sessions,
+            &arguments(serde_json::json!({
+                "verb": "update",
+                "target": entity.id.to_string(),
+                "payload": {"Entity": echoed},
+                "body": "pub fn value() -> u8 { 2 }",
+                "description": "echo the read response back as the payload",
+            })),
+            None,
+        );
+        assert_source_base_required(&refused);
+        assert_eq!(
+            load_native_commit_base(&state.layout).unwrap().roots,
+            before.roots,
+            "an echoed payload must not move repository authority"
+        );
+        assert_eq!(
+            std::fs::read(state.layout.working_dir().join("src/lib.rs")).unwrap(),
+            b"pub fn value() -> u8 { 1 }\n"
+        );
+
+        let result = commit_exact_transaction(
+            &state,
+            &sessions,
+            &arguments(serde_json::json!({
+                "verb": "update",
+                "target": entity.id.to_string(),
+                "payload": {"EntitySourceBase": current_source_base(&state, entity.id)},
+                "body": "pub fn value() -> u8 { 2 }",
+                "description": "the same edit against a fresh source read",
+            })),
+            None,
+        );
         assert_ne!(
             result.is_error,
             Some(true),
-            "a payload echoed from a real get_entity response must commit: {}",
+            "the guarded edit must commit: {}",
             result_text(&result)
         );
         assert_eq!(
@@ -6195,13 +7410,15 @@ pub(crate) mod tests {
         );
     }
 
-    /// An unchanged payload beside a body still commits.
+    /// An unchanged entity payload beside a body is refused too, and the guarded
+    /// edit commits.
     ///
-    /// The refusal above is scoped to a field the caller edited. Echoing back
-    /// the entity exactly as it was read is the documented shape and must keep
-    /// working.
+    /// Echoing back the entity exactly as it was read used to be the documented
+    /// shape. It still names no version of the source it replaces, so a staged
+    /// one is refused as an unguarded replacement and nothing moves. The same
+    /// body carrying the source base of a fresh read commits.
     #[test]
-    fn an_unedited_payload_beside_a_body_still_commits() {
+    fn an_unedited_entity_payload_beside_a_body_is_refused_and_the_guarded_edit_commits() {
         let (_dir, state) = test_state();
         let (entity, _) = install_exact_source(
             &state,
@@ -6209,13 +7426,42 @@ pub(crate) mod tests {
             b"pub fn value() -> u8 { 1 }\n",
             "value",
         );
+        let before = load_native_commit_base(&state.layout).unwrap();
         let sessions = test_sessions();
-        let (_tx, arguments) = stage_entity_edit(&sessions, &entity, "pub fn value() -> u8 { 2 }");
+        let (transaction_id, arguments) = stage_operations(
+            &sessions,
+            vec![kin_mcp::McpMutationOperation {
+                verb: "update".to_string(),
+                target: entity.id.to_string(),
+                payload: Some(kin_mcp::McpMutationPayload::Entity(entity.clone())),
+                body: Some("pub fn value() -> u8 { 2 }".to_string()),
+                description: "replace exact entity body".to_string(),
+                destination: None,
+            }],
+        );
+        let refused = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_source_base_required(&refused);
+        assert_eq!(
+            load_native_commit_base(&state.layout).unwrap().roots,
+            before.roots,
+            "an unguarded entity payload must not move repository authority"
+        );
+        assert_eq!(
+            std::fs::read(state.layout.working_dir().join("src/lib.rs")).unwrap(),
+            b"pub fn value() -> u8 { 1 }\n"
+        );
+        assert_eq!(
+            sessions.get_transaction(&transaction_id).unwrap().state,
+            "active"
+        );
+
+        let (_, arguments) =
+            stage_entity_edit(&state, &sessions, &entity, "pub fn value() -> u8 { 2 }");
         let result = commit_exact_transaction(&state, &sessions, &arguments, None);
         assert_ne!(
             result.is_error,
             Some(true),
-            "an unedited payload must still commit: {}",
+            "the guarded edit must commit: {}",
             result_text(&result)
         );
         assert_eq!(
@@ -6260,7 +7506,7 @@ pub(crate) mod tests {
                 .query_audit_events(Some(&actor_id), 16)
                 .unwrap()
                 .len(),
-            2,
+            4,
             "each commit contributes its own attribution record"
         );
     }
@@ -6289,12 +7535,8 @@ pub(crate) mod tests {
             .stage_transaction(
                 &transaction.transaction_id,
                 vec![kin_mcp::McpMutationOperation {
-                    verb: "update".to_string(),
-                    target: entity.id.to_string(),
-                    payload: None,
-                    body: Some("pub fn value() -> u8 { 2 }".to_string()),
                     description: "attributed body update".to_string(),
-                    destination: None,
+                    ..guarded_body_update(&state, entity.id, "pub fn value() -> u8 { 2 }")
                 }],
             )
             .unwrap();
@@ -6323,7 +7565,7 @@ pub(crate) mod tests {
                 .query_audit_events(Some(&mcp_actor_id(&session_id)), 16)
                 .unwrap()
                 .len(),
-            1,
+            2,
             "one write is one attribution record, however many attempts it took"
         );
     }
@@ -6482,8 +7724,12 @@ pub(crate) mod tests {
 
         // Two lines taller than what it replaces.
         let sessions = test_sessions();
-        let (_tx, arguments) =
-            stage_entity_edit(&sessions, &first, "pub fn first() -> u8 {\n    1\n}");
+        let (_tx, arguments) = stage_entity_edit(
+            &state,
+            &sessions,
+            &first,
+            "pub fn first() -> u8 {\n    1\n}",
+        );
         let result = commit_exact_transaction(&state, &sessions, &arguments, None);
         assert_ne!(
             result.is_error,
@@ -6530,7 +7776,8 @@ pub(crate) mod tests {
             "value",
         );
         let sessions = test_sessions();
-        let (_tx, arguments) = stage_entity_edit(&sessions, &entity, "pub fn value() -> u8 { 2 }");
+        let (_tx, arguments) =
+            stage_entity_edit(&state, &sessions, &entity, "pub fn value() -> u8 { 2 }");
         let result = commit_exact_transaction(&state, &sessions, &arguments, None);
         assert_ne!(result.is_error, Some(true), "{}", result_text(&result));
 
@@ -6558,14 +7805,21 @@ pub(crate) mod tests {
                 .query_audit_events(Some(&mcp_actor_id(TEST_SESSION)), 16)
                 .unwrap()
                 .len(),
-            1
+            2
         );
     }
 
+    /// A target that names no entity fails before repository mutation, in
+    /// either shape.
+    ///
+    /// A bare name is refused as an unguarded replacement before anything tries
+    /// to resolve it. A guarded edit whose source base names an entity
+    /// authority does not hold is refused by the source-base check, which says
+    /// so. Neither moves repository authority.
     #[test]
-    fn unresolvable_target_body_update_fails_before_repository_mutation() {
+    fn a_target_naming_no_entity_fails_before_repository_mutation() {
         let (_dir, state) = test_state();
-        install_exact_source(
+        let (value, _) = install_exact_source(
             &state,
             "src/lib.rs",
             b"pub fn value() -> u8 { 1 }\n",
@@ -6573,45 +7827,52 @@ pub(crate) mod tests {
         );
         let before = load_native_commit_base(&state.layout).unwrap();
         let sessions = test_sessions();
-        let transaction = sessions
-            .begin_transaction(TEST_SESSION, "file:src/lib.rs")
-            .unwrap();
-        sessions
-            .stage_transaction(
-                &transaction.transaction_id,
-                vec![kin_mcp::McpMutationOperation {
-                    verb: "update".to_string(),
-                    target: "no_such_entity".to_string(),
-                    payload: None,
-                    body: Some("pub fn no_such_entity() {}".to_string()),
-                    description: String::new(),
-                    destination: None,
-                }],
-            )
-            .unwrap();
-
-        let result = commit_exact_transaction(
-            &state,
+        let (transaction_id, arguments) = stage_operations(
             &sessions,
-            &HashMap::from([(
-                "transaction_id".to_string(),
-                serde_json::json!(transaction.transaction_id),
-            )]),
-            None,
+            vec![kin_mcp::McpMutationOperation {
+                verb: "update".to_string(),
+                target: "no_such_entity".to_string(),
+                payload: None,
+                body: Some("pub fn no_such_entity() {}".to_string()),
+                description: String::new(),
+                destination: None,
+            }],
         );
+
+        let result = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_source_base_required(&result);
+        let after = load_native_commit_base(&state.layout).unwrap();
+        assert_eq!(after.roots.generation, before.roots.generation);
+        assert_eq!(
+            sessions.get_transaction(&transaction_id).unwrap().state,
+            "active"
+        );
+
+        let mut unknown = current_source_base(&state, value.id);
+        unknown.entity_id = EntityId::new();
+        let (transaction_id, arguments) = stage_operations(
+            &sessions,
+            vec![kin_mcp::McpMutationOperation {
+                verb: "update".to_string(),
+                target: unknown.entity_id.to_string(),
+                payload: Some(kin_mcp::McpMutationPayload::EntitySourceBase(unknown)),
+                body: Some("pub fn no_such_entity() {}".to_string()),
+                description: String::new(),
+                destination: None,
+            }],
+        );
+        let result = commit_exact_transaction(&state, &sessions, &arguments, None);
         assert_eq!(result.is_error, Some(true));
         assert!(
-            result_text(&result).contains("not found in the graph"),
-            "unresolvable target must say so: {}",
+            kin_mcp::source_base::is_source_base_conflict(result_text(&result))
+                && result_text(&result).contains("no longer exists"),
+            "a base naming no entity must be refused as a conflict that says so: {}",
             result_text(&result)
         );
         let after = load_native_commit_base(&state.layout).unwrap();
         assert_eq!(after.roots.generation, before.roots.generation);
         assert_eq!(
-            sessions
-                .get_transaction(&transaction.transaction_id)
-                .unwrap()
-                .state,
+            sessions.get_transaction(&transaction_id).unwrap().state,
             "active"
         );
     }
@@ -6632,38 +7893,38 @@ pub(crate) mod tests {
             b"pub fn value() -> u8 { 1 }\n",
             "value",
         );
+        let (other, _) = install_exact_source(
+            &state,
+            "src/other.rs",
+            b"pub fn other() -> u8 { 1 }\n",
+            "other",
+        );
         let before = load_native_commit_base(&state.layout).unwrap();
         let sessions = test_sessions();
         let transaction = sessions
             .begin_transaction(TEST_SESSION, "file:src/lib.rs")
             .unwrap();
-        let arguments = HashMap::from([(
-            "transaction_id".to_string(),
-            serde_json::json!(transaction.transaction_id),
-        )]);
+        let arguments = commit_arguments(&transaction.transaction_id);
 
-        // One bad target alongside correct work: the clear takes both, so the
+        // One bad edit alongside correct work: the clear takes both, so the
         // refusal has to name both or the caller cannot reconstruct what it
-        // lost.
+        // lost. The bad one is guarded like the good one and fails only while
+        // planning, because its body declares a second function.
         sessions
             .stage_transaction(
                 &transaction.transaction_id,
                 vec![
                     kin_mcp::McpMutationOperation {
-                        verb: "update".to_string(),
-                        target: entity.id.to_string(),
-                        payload: None,
-                        body: Some("pub fn value() -> u8 { 3 }".to_string()),
                         description: "correct work staged alongside the failure".to_string(),
-                        destination: None,
+                        ..guarded_body_update(&state, entity.id, "pub fn value() -> u8 { 3 }")
                     },
                     kin_mcp::McpMutationOperation {
-                        verb: "update".to_string(),
-                        target: "no_such_entity".to_string(),
-                        payload: None,
-                        body: Some("pub fn no_such_entity() {}".to_string()),
-                        description: String::new(),
-                        destination: None,
+                        description: "an edit that also declares a new function".to_string(),
+                        ..guarded_body_update(
+                            &state,
+                            other.id,
+                            "pub fn other() -> u8 { 1 }\n\npub fn extra() -> u8 { 2 }",
+                        )
                     },
                 ],
             )
@@ -6673,7 +7934,7 @@ pub(crate) mod tests {
         assert_eq!(failed.is_error, Some(true));
         let message = result_text(&failed);
         assert!(
-            message.contains("not found in the graph"),
+            message.contains("would create or remove source entities"),
             "the refusal keeps naming the real problem: {message}"
         );
         assert!(
@@ -6685,7 +7946,7 @@ pub(crate) mod tests {
             .expect("the refusal must list what it dropped")
             .1;
         assert!(
-            dropped.contains("update no_such_entity"),
+            dropped.contains(&format!("update {}", other.id)),
             "the refusal must name the operation that failed: {message}"
         );
         assert!(
@@ -6700,18 +7961,22 @@ pub(crate) mod tests {
                 .is_empty(),
             "a pre-authority failure must not leave its operations staged"
         );
+        assert_eq!(
+            load_native_commit_base(&state.layout)
+                .unwrap()
+                .roots
+                .generation,
+            before.roots.generation,
+            "a planning failure must not move repository authority"
+        );
 
         // The corrected operation, staged on the SAME transaction, commits.
         sessions
             .stage_transaction(
                 &transaction.transaction_id,
                 vec![kin_mcp::McpMutationOperation {
-                    verb: "update".to_string(),
-                    target: entity.id.to_string(),
-                    payload: None,
-                    body: Some("pub fn value() -> u8 { 2 }".to_string()),
                     description: "corrected retry".to_string(),
-                    destination: None,
+                    ..guarded_body_update(&state, entity.id, "pub fn value() -> u8 { 2 }")
                 }],
             )
             .unwrap();
@@ -6736,16 +8001,17 @@ pub(crate) mod tests {
         );
     }
 
-    /// An ambiguous bare name must hand back the candidates it could not choose
-    /// between, and the corrected id must commit on the transaction the caller
+    /// An ambiguous bare name is refused as an unguarded replacement before it is
+    /// staged, and the guarded retry commits on the transaction the caller
     /// already holds.
     ///
-    /// Without the candidate list the advice ("use the entity id") names an id
-    /// the caller has no way to learn, and without the clear the corrected retry
-    /// re-plans the same ambiguity forever. Both halves are needed for an
-    /// unscripted agent to recover in-session.
+    /// The refusal names the fix, a `get_entity_source` read, rather than the
+    /// candidates a name resolution would have listed, because no name is
+    /// resolved at all. Nothing is staged and nothing moves, so the retry
+    /// cannot re-plan the same refusal: both halves an unscripted agent needs to
+    /// recover in-session.
     #[test]
-    fn ambiguous_name_target_lists_candidates_and_the_id_retry_commits() {
+    fn an_ambiguous_bare_name_is_refused_as_source_base_required_and_the_guarded_retry_commits() {
         let (_dir, state) = test_state();
         let (left, _) = install_exact_source(
             &state,
@@ -6753,78 +8019,79 @@ pub(crate) mod tests {
             b"pub fn shared() -> u8 { 1 }\n",
             "shared",
         );
-        let (right, _) = install_exact_source(
+        install_exact_source(
             &state,
             "src/right.rs",
             b"pub fn shared() -> u8 { 10 }\n",
             "shared",
         );
+        let before = load_native_commit_base(&state.layout).unwrap();
         let sessions = test_sessions();
         let transaction = sessions
             .begin_transaction(TEST_SESSION, "entity:shared")
             .unwrap();
-        let arguments = HashMap::from([(
-            "transaction_id".to_string(),
-            serde_json::json!(transaction.transaction_id),
-        )]);
+        let mut bare_name = commit_arguments(&transaction.transaction_id);
+        bare_name.insert(
+            "operations".to_string(),
+            serde_json::json!([{
+                "verb": "update",
+                "target": "shared",
+                "body": "pub fn shared() -> u8 { 2 }",
+                "description": "bare name an agent would reach for first",
+            }]),
+        );
+
+        let refused = commit_exact_transaction(&state, &sessions, &bare_name, None);
+        assert_source_base_required(&refused);
+        let message = result_text(&refused);
+        assert!(
+            message.contains("get_entity_source"),
+            "the refusal must name the read that supplies the source base: {message}"
+        );
+        assert!(
+            sessions
+                .get_transaction(&transaction.transaction_id)
+                .unwrap()
+                .staged_operations
+                .is_empty(),
+            "a refused bare name must not be staged"
+        );
+        assert_eq!(
+            load_native_commit_base(&state.layout).unwrap().roots,
+            before.roots,
+            "a refused bare name must not move repository authority"
+        );
+        for (file, bytes) in [
+            ("src/left.rs", b"pub fn shared() -> u8 { 1 }\n".as_slice()),
+            ("src/right.rs", b"pub fn shared() -> u8 { 10 }\n".as_slice()),
+        ] {
+            assert_eq!(
+                std::fs::read(state.layout.working_dir().join(file)).unwrap(),
+                bytes
+            );
+        }
+
+        // The guarded edit of the entity the caller read, staged on the SAME
+        // transaction, commits.
         sessions
             .stage_transaction(
                 &transaction.transaction_id,
                 vec![kin_mcp::McpMutationOperation {
-                    verb: "update".to_string(),
-                    target: "shared".to_string(),
-                    payload: None,
-                    body: Some("pub fn shared() -> u8 { 2 }".to_string()),
-                    description: "bare name an agent would reach for first".to_string(),
-                    destination: None,
+                    description: "guarded retry".to_string(),
+                    ..guarded_body_update(&state, left.id, "pub fn shared() -> u8 { 2 }")
                 }],
             )
             .unwrap();
-
-        let ambiguous = commit_exact_transaction(&state, &sessions, &arguments, None);
-        assert_eq!(ambiguous.is_error, Some(true));
-        let message = result_text(&ambiguous);
-        assert!(
-            message.contains("is ambiguous (2 exact-name matches)"),
-            "the refusal must say what was ambiguous: {message}"
+        let committed = commit_exact_transaction(
+            &state,
+            &sessions,
+            &commit_arguments(&transaction.transaction_id),
+            None,
         );
-        for candidate in [&left, &right] {
-            assert!(
-                message.contains(&candidate.id.to_string()),
-                "candidate id {} must be listed: {message}",
-                candidate.id
-            );
-        }
-        for path in ["src/left.rs", "src/right.rs"] {
-            assert!(
-                message.contains(path),
-                "candidate file path {path} must be listed: {message}"
-            );
-        }
-        assert!(
-            message.contains("pub fn shared() -> u8"),
-            "each candidate must carry its declaration so the caller can tell them apart: {message}"
-        );
-
-        // The id the refusal named, staged on the SAME transaction, commits.
-        sessions
-            .stage_transaction(
-                &transaction.transaction_id,
-                vec![kin_mcp::McpMutationOperation {
-                    verb: "update".to_string(),
-                    target: left.id.to_string(),
-                    payload: None,
-                    body: Some("pub fn shared() -> u8 { 2 }".to_string()),
-                    description: "corrected id retry".to_string(),
-                    destination: None,
-                }],
-            )
-            .unwrap();
-        let committed = commit_exact_transaction(&state, &sessions, &arguments, None);
         assert_ne!(
             committed.is_error,
             Some(true),
-            "the id retry must commit on the same transaction: {}",
+            "the guarded retry must commit on the same transaction: {}",
             result_text(&committed)
         );
         assert_eq!(
@@ -6876,30 +8143,28 @@ pub(crate) mod tests {
                     // leading indentation included: what an agent writes back
                     // after reading the source.
                     kin_mcp::McpMutationOperation {
-                        verb: "update".to_string(),
-                        target: method.id.to_string(),
-                        payload: None,
-                        body: Some(
-                            "    pub fn set(&mut self) -> u8 {\n        2\n    }".to_string(),
-                        ),
                         description: "impl-nested method".to_string(),
-                        destination: None,
+                        ..guarded_body_update(
+                            &state,
+                            method.id,
+                            "    pub fn set(&mut self) -> u8 {\n        2\n    }",
+                        )
                     },
                     kin_mcp::McpMutationOperation {
-                        verb: "update".to_string(),
-                        target: nested.id.to_string(),
-                        payload: None,
-                        body: Some("    pub fn nested() -> u8 {\n        2\n    }".to_string()),
                         description: "module-nested function".to_string(),
-                        destination: None,
+                        ..guarded_body_update(
+                            &state,
+                            nested.id,
+                            "    pub fn nested() -> u8 {\n        2\n    }",
+                        )
                     },
                     kin_mcp::McpMutationOperation {
-                        verb: "update".to_string(),
-                        target: top_level.id.to_string(),
-                        payload: None,
-                        body: Some("pub fn plain() -> u8 {\n    2\n}".to_string()),
                         description: "top-level function".to_string(),
-                        destination: None,
+                        ..guarded_body_update(
+                            &state,
+                            top_level.id,
+                            "pub fn plain() -> u8 {\n    2\n}",
+                        )
                     },
                 ],
             )
@@ -6968,13 +8233,13 @@ pub(crate) mod tests {
             .stage_transaction(
                 &transaction.transaction_id,
                 vec![kin_mcp::McpMutationOperation {
-                    verb: "update".to_string(),
-                    target: method.id.to_string(),
-                    payload: None,
-                    // No leading indentation: the span slice, verbatim.
-                    body: Some("pub fn set(&mut self) -> u8 {\n        2\n    }".to_string()),
                     description: "span-slice body".to_string(),
-                    destination: None,
+                    // No leading indentation: the span slice, verbatim.
+                    ..guarded_body_update(
+                        &state,
+                        method.id,
+                        "pub fn set(&mut self) -> u8 {\n        2\n    }",
+                    )
                 }],
             )
             .unwrap();
@@ -7009,7 +8274,10 @@ pub(crate) mod tests {
     /// an id it could not see while the failed operation stayed staged, so every
     /// later commit on that transaction re-failed identically. Then the bodies it
     /// wrote back carried the indentation the file showed it, and the nested ones
-    /// landed at twice it.
+    /// landed at twice it. A bare name is now refused as an unguarded replacement
+    /// before anything in its attempt is staged, so resending the change with a
+    /// source base for every entity, on the same transaction, is the whole
+    /// recovery.
     ///
     /// The assertion is the whole file, byte for byte, for all three files, plus
     /// `ops_applied` and the modified-file set from the commit receipt.
@@ -7046,54 +8314,43 @@ pub(crate) mod tests {
         let transaction = sessions
             .begin_transaction(TEST_SESSION, "entity:resolve_binary")
             .unwrap();
-        let arguments = HashMap::from([(
-            "transaction_id".to_string(),
-            serde_json::json!(transaction.transaction_id),
-        )]);
+        let arguments = commit_arguments(&transaction.transaction_id);
 
-        // Attempt one: correct work alongside one bare name that cannot resolve.
-        sessions
-            .stage_transaction(
-                &transaction.transaction_id,
-                vec![
-                    kin_mcp::McpMutationOperation {
-                        verb: "update".to_string(),
-                        target: resolve_binary.id.to_string(),
-                        payload: None,
-                        body: Some(NEW_RESOLVE_BINARY.to_string()),
-                        description: "add the search_dirs parameter".to_string(),
-                        destination: None,
-                    },
-                    kin_mcp::McpMutationOperation {
-                        verb: "update".to_string(),
-                        target: preprocessor.id.to_string(),
-                        payload: None,
-                        body: Some(NEW_PREPROCESSOR.to_string()),
-                        description: "pass None".to_string(),
-                        destination: None,
-                    },
-                    kin_mcp::McpMutationOperation {
-                        verb: "update".to_string(),
-                        target: "commands".to_string(),
-                        payload: None,
-                        body: Some(NEW_COMMANDS.to_string()),
-                        description: "pass None, targeted by bare name".to_string(),
-                        destination: None,
-                    },
-                ],
-            )
-            .unwrap();
+        // Attempt one, sent with the commit: correct guarded work alongside one
+        // bare name.
+        let mut attempt_one = commit_arguments(&transaction.transaction_id);
+        attempt_one.insert(
+            "operations".to_string(),
+            serde_json::json!([
+                {
+                    "verb": "update",
+                    "target": resolve_binary.id.to_string(),
+                    "payload": {"EntitySourceBase": current_source_base(&state, resolve_binary.id)},
+                    "body": NEW_RESOLVE_BINARY,
+                    "description": "add the search_dirs parameter",
+                },
+                {
+                    "verb": "update",
+                    "target": preprocessor.id.to_string(),
+                    "payload": {"EntitySourceBase": current_source_base(&state, preprocessor.id)},
+                    "body": NEW_PREPROCESSOR,
+                    "description": "pass None",
+                },
+                {
+                    "verb": "update",
+                    "target": "commands",
+                    "body": NEW_COMMANDS,
+                    "description": "pass None, targeted by bare name",
+                },
+            ]),
+        );
 
-        let refused = commit_exact_transaction(&state, &sessions, &arguments, None);
-        assert_eq!(refused.is_error, Some(true));
+        let refused = commit_exact_transaction(&state, &sessions, &attempt_one, None);
+        assert_source_base_required(&refused);
         let message = result_text(&refused);
         assert!(
-            message.contains(&commands.id.to_string()),
-            "the refusal must name the id that resolves the ambiguity: {message}"
-        );
-        assert!(
-            message.contains("src/defaults.rs") && message.contains("src/cli.rs"),
-            "the refusal must locate every candidate: {message}"
+            message.contains("operation #2") && message.contains("commands"),
+            "the refusal must name the operation and the target it refused: {message}"
         );
         assert!(
             sessions
@@ -7112,34 +8369,22 @@ pub(crate) mod tests {
             "a refused attempt must not move repository authority"
         );
 
-        // Attempt two: the same transaction, every target an id.
+        // Attempt two: the same transaction, every operation guarded.
         sessions
             .stage_transaction(
                 &transaction.transaction_id,
                 vec![
                     kin_mcp::McpMutationOperation {
-                        verb: "update".to_string(),
-                        target: resolve_binary.id.to_string(),
-                        payload: None,
-                        body: Some(NEW_RESOLVE_BINARY.to_string()),
                         description: "add the search_dirs parameter".to_string(),
-                        destination: None,
+                        ..guarded_body_update(&state, resolve_binary.id, NEW_RESOLVE_BINARY)
                     },
                     kin_mcp::McpMutationOperation {
-                        verb: "update".to_string(),
-                        target: preprocessor.id.to_string(),
-                        payload: None,
-                        body: Some(NEW_PREPROCESSOR.to_string()),
                         description: "pass None".to_string(),
-                        destination: None,
+                        ..guarded_body_update(&state, preprocessor.id, NEW_PREPROCESSOR)
                     },
                     kin_mcp::McpMutationOperation {
-                        verb: "update".to_string(),
-                        target: commands.id.to_string(),
-                        payload: None,
-                        body: Some(NEW_COMMANDS.to_string()),
                         description: "pass None".to_string(),
-                        destination: None,
+                        ..guarded_body_update(&state, commands.id, NEW_COMMANDS)
                     },
                 ],
             )
@@ -7204,7 +8449,7 @@ pub(crate) mod tests {
 
         let sessions = test_sessions();
         let (transaction_id, _arguments) =
-            stage_entity_edit(&sessions, &value, "pub fn value() -> u8 { 2 }");
+            stage_entity_edit(&state, &sessions, &value, "pub fn value() -> u8 { 2 }");
         assert_eq!(
             sessions
                 .get_transaction(&transaction_id)
@@ -7262,30 +8507,21 @@ pub(crate) mod tests {
         let transaction = sessions
             .begin_transaction(TEST_SESSION, "file:src/lib.rs")
             .unwrap();
-        let arguments = HashMap::from([(
-            "transaction_id".to_string(),
-            serde_json::json!(transaction.transaction_id),
-        )]);
+        let arguments = commit_arguments(&transaction.transaction_id);
 
+        // Both edits are guarded and pass the source-base check. Planning refuses
+        // the second, because one transaction cannot edit one entity twice.
         sessions
             .stage_transaction(
                 &transaction.transaction_id,
                 vec![
                     kin_mcp::McpMutationOperation {
-                        verb: "update".to_string(),
-                        target: value.id.to_string(),
-                        payload: None,
-                        body: Some("pub fn value() -> u8 { 2 }".to_string()),
                         description: "correct work staged alongside the failure".to_string(),
-                        destination: None,
+                        ..guarded_body_update(&state, value.id, "pub fn value() -> u8 { 2 }")
                     },
                     kin_mcp::McpMutationOperation {
-                        verb: "update".to_string(),
-                        target: "no_such_entity".to_string(),
-                        payload: None,
-                        body: Some("pub fn no_such_entity() {}".to_string()),
-                        description: String::new(),
-                        destination: None,
+                        description: "a second edit of the same entity".to_string(),
+                        ..guarded_body_update(&state, value.id, "pub fn value() -> u8 { 3 }")
                     },
                 ],
             )
@@ -7293,6 +8529,11 @@ pub(crate) mod tests {
 
         let refused = commit_exact_transaction(&state, &sessions, &arguments, None);
         assert_eq!(refused.is_error, Some(true));
+        assert!(
+            result_text(&refused).contains("edited more than once"),
+            "{}",
+            result_text(&refused)
+        );
         let poisoned = sessions
             .get_transaction(&transaction.transaction_id)
             .unwrap();
@@ -7316,12 +8557,8 @@ pub(crate) mod tests {
                 .stage_transaction(
                     &transaction.transaction_id,
                     vec![kin_mcp::McpMutationOperation {
-                        verb: "update".to_string(),
-                        target: value.id.to_string(),
-                        payload: None,
-                        body: Some("pub fn value() -> u8 { 3 }".to_string()),
                         description: "after the abort".to_string(),
-                        destination: None,
+                        ..guarded_body_update(&state, value.id, "pub fn value() -> u8 { 3 }")
                     }],
                 )
                 .is_err(),
@@ -7372,8 +8609,8 @@ pub(crate) mod tests {
             "the refusal must spell out the accepted shapes: {message}"
         );
         assert!(
-            message.contains("\"body\""),
-            "the minimal target-body shape must be named: {message}"
+            message.contains("\"EntitySourceBase\"") && message.contains("\"body\""),
+            "the guarded whole-body shape must be named: {message}"
         );
     }
 
@@ -7402,6 +8639,9 @@ pub(crate) mod tests {
             .metadata
             .extra
             .insert("z".to_string(), serde_json::json!(1));
+        // Hashed, never committed. An entity payload beside a body is refused as
+        // unguarded now, but a fence staged before that rule still has to hash
+        // the same way for its commit to resume.
         let transaction = |payload: Entity| kin_mcp::McpTransaction {
             transaction_id: uuid::Uuid::nil().to_string(),
             session_id: "session".to_string(),
@@ -7432,7 +8672,7 @@ pub(crate) mod tests {
         let before = load_native_commit_base(&state.layout).unwrap();
         let sessions = test_sessions();
         let (transaction_id, arguments) =
-            stage_entity_edit(&sessions, &entity, "pub fn value() -> u8 { 2 }");
+            stage_entity_edit(&state, &sessions, &entity, "pub fn value() -> u8 { 2 }");
 
         let result = commit_exact_transaction(&state, &sessions, &arguments, None);
         assert_ne!(
@@ -7501,7 +8741,7 @@ pub(crate) mod tests {
 
         let sessions = test_sessions();
         let (transaction_id, arguments) =
-            stage_entity_edit(&sessions, &entity, "pub fn value() -> u8 { 2 }");
+            stage_entity_edit(&state, &sessions, &entity, "pub fn value() -> u8 { 2 }");
         let result = commit_exact_transaction(&state, &sessions, &arguments, None);
         assert_eq!(result.is_error, Some(true));
         assert!(
@@ -7534,42 +8774,43 @@ pub(crate) mod tests {
         );
         let before = load_native_commit_base(&state.layout).unwrap();
 
+        // Insertion through an entity payload. With a body it is an unguarded
+        // replacement and is refused as one before anything is planned. Without
+        // one it reaches the planner, which refuses the verb.
         let create_sessions = test_sessions();
-        let create = create_sessions
-            .begin_transaction(TEST_SESSION, "file:src/lib.rs")
-            .unwrap();
         let mut inserted = entity.clone();
         inserted.id = kin_model::EntityId::new();
         inserted.name = "inserted".to_string();
-        create_sessions
-            .stage_transaction(
-                &create.transaction_id,
-                vec![kin_mcp::McpMutationOperation {
-                    verb: "create".to_string(),
-                    target: inserted.id.to_string(),
-                    payload: Some(kin_mcp::McpMutationPayload::Entity(inserted)),
-                    body: Some("pub fn inserted() {}".to_string()),
-                    description: String::new(),
-                    destination: None,
-                }],
-            )
-            .unwrap();
-        let create_result = commit_exact_transaction(
-            &state,
+        let insertion = |body: Option<&str>| kin_mcp::McpMutationOperation {
+            verb: "create".to_string(),
+            target: inserted.id.to_string(),
+            payload: Some(kin_mcp::McpMutationPayload::Entity(inserted.clone())),
+            body: body.map(str::to_string),
+            description: String::new(),
+            destination: None,
+        };
+        let (bodied, arguments) = stage_operations(
             &create_sessions,
-            &HashMap::from([(
-                "transaction_id".to_string(),
-                serde_json::json!(create.transaction_id),
-            )]),
-            None,
+            vec![insertion(Some("pub fn inserted() {}"))],
         );
-        assert_eq!(create_result.is_error, Some(true));
-        assert!(result_text(&create_result).contains("insertion"));
+        let create_result = commit_exact_transaction(&state, &create_sessions, &arguments, None);
+        assert_source_base_required(&create_result);
         assert_eq!(
-            create_sessions
-                .get_transaction(&create.transaction_id)
-                .unwrap()
-                .state,
+            create_sessions.get_transaction(&bodied).unwrap().state,
+            "active"
+        );
+        let (bodiless, arguments) = stage_operations(&create_sessions, vec![insertion(None)]);
+        let create_result = commit_exact_transaction(&state, &create_sessions, &arguments, None);
+        assert_eq!(create_result.is_error, Some(true));
+        // The refusal names the creation form an agent should send instead.
+        assert!(
+            result_text(&create_result).contains("entity_create_required")
+                && result_text(&create_result).contains("payload.EntityCreate"),
+            "{}",
+            result_text(&create_result)
+        );
+        assert_eq!(
+            create_sessions.get_transaction(&bodiless).unwrap().state,
             "active"
         );
 
@@ -7632,42 +8873,18 @@ pub(crate) mod tests {
         commit_live_graph(&state, "install overlapping authority fixture", false);
         let overlap_before = load_native_commit_base(&state.layout).unwrap();
 
+        // Both edits carry a current source base, so both pass the source-base
+        // check and the planner meets the overlap.
         let overlap_sessions = test_sessions();
-        let overlap_tx = overlap_sessions
-            .begin_transaction(TEST_SESSION, "file:src/lib.rs")
-            .unwrap();
-        overlap_sessions
-            .stage_transaction(
-                &overlap_tx.transaction_id,
-                vec![
-                    kin_mcp::McpMutationOperation {
-                        verb: "update".to_string(),
-                        target: entity.id.to_string(),
-                        payload: Some(kin_mcp::McpMutationPayload::Entity(entity.clone())),
-                        body: Some("pub fn value() -> u8 { 2 }".to_string()),
-                        description: String::new(),
-                        destination: None,
-                    },
-                    kin_mcp::McpMutationOperation {
-                        verb: "update".to_string(),
-                        target: shadow.id.to_string(),
-                        payload: Some(kin_mcp::McpMutationPayload::Entity(shadow.clone())),
-                        body: Some("pub fn shadow() -> u8 { 3 }".to_string()),
-                        description: String::new(),
-                        destination: None,
-                    },
-                ],
-            )
-            .unwrap();
-        let overlap_result = commit_exact_transaction(
-            &state,
+        let (_, overlap_arguments) = stage_operations(
             &overlap_sessions,
-            &HashMap::from([(
-                "transaction_id".to_string(),
-                serde_json::json!(overlap_tx.transaction_id),
-            )]),
-            None,
+            vec![
+                guarded_body_update(&state, entity.id, "pub fn value() -> u8 { 2 }"),
+                guarded_body_update(&state, shadow.id, "pub fn shadow() -> u8 { 3 }"),
+            ],
         );
+        let overlap_result =
+            commit_exact_transaction(&state, &overlap_sessions, &overlap_arguments, None);
         assert_eq!(overlap_result.is_error, Some(true));
         assert!(
             result_text(&overlap_result).contains("overlap"),
@@ -7680,7 +8897,9 @@ pub(crate) mod tests {
         );
 
         // Remove the intentionally ambiguous entity, then move the exact tree
-        // to bytes that cannot be represented by an MCP UTF-8 entity body.
+        // to bytes that cannot be represented by an MCP UTF-8 entity body. The
+        // bytes keep the entity's span inside the file, so a source base can
+        // still name them.
         state
             .graph
             .apply_transaction_delta(&TransactionDelta {
@@ -7694,7 +8913,8 @@ pub(crate) mod tests {
             .artifact_at_path(&RepoPath::from_utf8("src/lib.rs").unwrap())
             .cloned()
             .unwrap();
-        let non_utf8 = [0xff, 0xfe, 0xfd];
+        let mut non_utf8 = b"pub fn value() -> u8 { 1 }\n".to_vec();
+        non_utf8[23] = 0xff;
         let digest = state.blobs.write(&non_utf8).unwrap();
         state
             .graph
@@ -7713,9 +8933,29 @@ pub(crate) mod tests {
         commit_live_graph(&state, "install non-UTF-8 exact source fixture", true);
         let non_utf8_before = load_native_commit_base(&state.layout).unwrap();
 
+        // No read serves a body that is not UTF-8, so no read issues a base for
+        // one. A base built over those bytes passes the source-base check,
+        // which compares digests, and the planner refuses to splice them.
+        let span = entity.span.as_ref().unwrap();
         let utf8_sessions = test_sessions();
-        let (_, utf8_arguments) =
-            stage_entity_edit(&utf8_sessions, &entity, "pub fn value() -> u8 { 2 }");
+        let (_, utf8_arguments) = stage_operations(
+            &utf8_sessions,
+            vec![kin_mcp::McpMutationOperation {
+                verb: "update".to_string(),
+                target: entity.id.to_string(),
+                payload: Some(kin_mcp::McpMutationPayload::EntitySourceBase(
+                    unissued_source_base(
+                        &state,
+                        entity.id,
+                        "src/lib.rs",
+                        span.start_byte..span.end_byte,
+                    ),
+                )),
+                body: Some("pub fn value() -> u8 { 2 }".to_string()),
+                description: String::new(),
+                destination: None,
+            }],
+        );
         let utf8_result = commit_exact_transaction(&state, &utf8_sessions, &utf8_arguments, None);
         assert_eq!(utf8_result.is_error, Some(true));
         assert!(
@@ -7837,7 +9077,8 @@ pub(crate) mod tests {
         std::fs::write(&retained, b"independently managed bytes\n").unwrap();
 
         let sessions = test_sessions();
-        let (_, arguments) = stage_entity_edit(&sessions, &entity, "pub fn value() -> u8 { 2 }");
+        let (_, arguments) =
+            stage_entity_edit(&state, &sessions, &entity, "pub fn value() -> u8 { 2 }");
         let result = commit_exact_transaction(&state, &sessions, &arguments, None);
         assert_ne!(
             result.is_error,
@@ -7872,7 +9113,7 @@ pub(crate) mod tests {
         let before = load_native_commit_base(&state.layout).unwrap();
         let sessions = test_sessions();
         let (transaction_id, arguments) =
-            stage_entity_edit(&sessions, &entity, "pub fn value() -> u8 { 2 }");
+            stage_entity_edit(&state, &sessions, &entity, "pub fn value() -> u8 { 2 }");
         let transaction = sessions.get_transaction(&transaction_id).unwrap();
         let payload_hash = transaction_payload_hash(&transaction).unwrap();
         sessions
@@ -7906,7 +9147,7 @@ pub(crate) mod tests {
         );
         let sessions = test_sessions();
         let (transaction_id, arguments) =
-            stage_entity_edit(&sessions, &entity, "pub fn value() -> u8 { 2 }");
+            stage_entity_edit(&state, &sessions, &entity, "pub fn value() -> u8 { 2 }");
         state
             .mcp_fail_after_authority_once
             .store(true, Ordering::SeqCst);
@@ -8037,7 +9278,7 @@ pub(crate) mod tests {
 
         let sessions = test_sessions();
         let (transaction_id, arguments) =
-            stage_entity_edit(&sessions, &entity, "pub fn value() -> u8 { 2 }");
+            stage_entity_edit(&state, &sessions, &entity, "pub fn value() -> u8 { 2 }");
         let result = commit_exact_transaction(&state, &sessions, &arguments, None);
         assert_ne!(
             result.is_error,
@@ -8142,7 +9383,8 @@ pub(crate) mod tests {
         );
 
         let sessions = test_sessions();
-        let (_, arguments) = stage_entity_edit(&sessions, &entity, "pub fn value() -> u8 { 2 }");
+        let (_, arguments) =
+            stage_entity_edit(&state, &sessions, &entity, "pub fn value() -> u8 { 2 }");
         let result = commit_exact_transaction(&state, &sessions, &arguments, None);
         assert_ne!(
             result.is_error,
@@ -8206,7 +9448,8 @@ pub(crate) mod tests {
         drop(guard);
 
         let sessions = test_sessions();
-        let (_, arguments) = stage_entity_edit(&sessions, &entity, "pub fn value() -> u8 { 2 }");
+        let (_, arguments) =
+            stage_entity_edit(&state, &sessions, &entity, "pub fn value() -> u8 { 2 }");
         let result = commit_exact_transaction(&state, &sessions, &arguments, None);
         assert_eq!(
             result.is_error,
@@ -8239,7 +9482,7 @@ pub(crate) mod tests {
         );
         let sessions = test_sessions();
         let (transaction_id, arguments) =
-            stage_entity_edit(&sessions, &entity, "pub fn value() -> u8 { 2 }");
+            stage_entity_edit(&state, &sessions, &entity, "pub fn value() -> u8 { 2 }");
         let first = commit_exact_transaction(&state, &sessions, &arguments, None);
         assert_ne!(first.is_error, Some(true), "{}", result_text(&first));
         let first_body: serde_json::Value = serde_json::from_str(result_text(&first)).unwrap();
@@ -8302,7 +9545,7 @@ pub(crate) mod tests {
         );
         let sessions = test_sessions();
         let (transaction_id, arguments) =
-            stage_entity_edit(&sessions, &entity, "pub fn value() -> u8 { 2 }");
+            stage_entity_edit(&state, &sessions, &entity, "pub fn value() -> u8 { 2 }");
 
         let first = commit_exact_transaction(&state, &sessions, &arguments, None);
         assert_ne!(first.is_error, Some(true), "{}", result_text(&first));
@@ -8357,7 +9600,7 @@ pub(crate) mod tests {
         );
         let sessions = test_sessions();
         let (transaction_id, arguments) =
-            stage_entity_edit(&sessions, &entity, "pub fn value() -> u8 { 2 }");
+            stage_entity_edit(&state, &sessions, &entity, "pub fn value() -> u8 { 2 }");
 
         state
             .mcp_fail_after_authority_once
@@ -8378,6 +9621,103 @@ pub(crate) mod tests {
             "a resume recovers a receipt an earlier attempt published: {}",
             result_text(&resumed)
         );
+    }
+
+    pub(crate) fn fence_unpublished_transaction_for_test(
+        state: &Arc<DaemonState>,
+        transaction_id: &str,
+    ) {
+        let sessions = crate::api::mcp_session_registry_snapshot(state).unwrap();
+        let tx = sessions.get_transaction(transaction_id).unwrap();
+        let digest = transaction_payload_hash(&tx).unwrap();
+        sessions
+            .prepare_transaction_commit(transaction_id, &digest)
+            .unwrap();
+        persist_registry_checked(state, &sessions).unwrap();
+    }
+
+    #[test]
+    fn revoked_owner_cannot_publish_active_or_receiptless_fenced_commit() {
+        for fenced in [false, true] {
+            let (_dir, state) = test_state();
+            let (entity, _) = install_exact_source(
+                &state,
+                "src/lib.rs",
+                b"pub fn value() -> u8 { 1 }\n",
+                "value",
+            );
+            let sessions = test_sessions();
+            let (transaction_id, arguments) =
+                stage_entity_edit(&state, &sessions, &entity, "pub fn value() -> u8 { 2 }");
+            if fenced {
+                let tx = sessions.get_transaction(&transaction_id).unwrap();
+                let digest = transaction_payload_hash(&tx).unwrap();
+                sessions
+                    .prepare_transaction_commit(&transaction_id, &digest)
+                    .unwrap();
+                persist_registry_checked(&state, &sessions).unwrap();
+            }
+            sessions.remove(TEST_SESSION).unwrap();
+            let before = serde_json::to_value(sessions.get_transaction(&transaction_id)).unwrap();
+            let roots = load_native_commit_base(&state.layout).unwrap().roots;
+            let result = commit_exact_transaction(&state, &sessions, &arguments, None);
+            assert_eq!(result.is_error, Some(true), "{}", result_text(&result));
+            assert!(
+                result_text(&result).contains("Session not found"),
+                "{}",
+                result_text(&result)
+            );
+            assert_eq!(
+                serde_json::to_value(sessions.get_transaction(&transaction_id)).unwrap(),
+                before
+            );
+            assert_eq!(load_native_commit_base(&state.layout).unwrap().roots, roots);
+            assert_eq!(
+                std::fs::read(state.layout.working_dir().join("src/lib.rs")).unwrap(),
+                b"pub fn value() -> u8 { 1 }\n"
+            );
+        }
+    }
+
+    #[test]
+    fn revoked_owner_can_recover_published_fence_and_replay_evicted_receipt() {
+        let (_dir, state) = test_state();
+        let (entity, _) = install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\n",
+            "value",
+        );
+        let sessions = test_sessions();
+        let (transaction_id, arguments) =
+            stage_entity_edit(&state, &sessions, &entity, "pub fn value() -> u8 { 2 }");
+        state
+            .mcp_fail_after_authority_once
+            .store(true, Ordering::SeqCst);
+        let crashed = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_eq!(crashed.is_error, Some(true));
+        assert_eq!(
+            sessions.get_transaction(&transaction_id).unwrap().state,
+            "committing"
+        );
+        sessions.remove(TEST_SESSION).unwrap();
+        let recovered = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_ne!(
+            recovered.is_error,
+            Some(true),
+            "{}",
+            result_text(&recovered)
+        );
+        let recovered: serde_json::Value = serde_json::from_str(result_text(&recovered)).unwrap();
+        assert_eq!(recovered["already_applied"], true);
+        let roots = load_native_commit_base(&state.layout).unwrap().roots;
+        let empty = kin_mcp::SessionRegistry::new();
+        let replay = commit_exact_transaction(&state, &empty, &arguments, None);
+        assert_ne!(replay.is_error, Some(true), "{}", result_text(&replay));
+        let replay: serde_json::Value = serde_json::from_str(result_text(&replay)).unwrap();
+        assert_eq!(replay["already_applied"], true);
+        assert_eq!(replay["change_id"], recovered["change_id"]);
+        assert_eq!(load_native_commit_base(&state.layout).unwrap().roots, roots);
     }
 
     /// An id that never named a transaction still fails closed, and says it
@@ -8432,7 +9772,8 @@ pub(crate) mod tests {
         );
 
         let sessions = test_sessions();
-        let (_, arguments) = stage_entity_edit(&sessions, &entity, "pub fn value() -> u8 { 2 }");
+        let (_, arguments) =
+            stage_entity_edit(&state, &sessions, &entity, "pub fn value() -> u8 { 2 }");
         let result = commit_exact_transaction(&state, &sessions, &arguments, None);
         assert_ne!(
             result.is_error,
@@ -8482,7 +9823,7 @@ pub(crate) mod tests {
 
         let sessions = test_sessions();
         let (transaction_id, arguments) =
-            stage_entity_edit(&sessions, &entity, "pub fn value() -> u8 { 2 }");
+            stage_entity_edit(&state, &sessions, &entity, "pub fn value() -> u8 { 2 }");
         let result = commit_exact_transaction(&state, &sessions, &arguments, None);
 
         assert_eq!(result.is_error, Some(true));
@@ -8544,7 +9885,7 @@ pub(crate) mod tests {
 
         let sessions = test_sessions();
         let (transaction_id, arguments) =
-            stage_entity_edit(&sessions, &entity, "pub fn value() -> u8 { 2 }");
+            stage_entity_edit(&state, &sessions, &entity, "pub fn value() -> u8 { 2 }");
         let result = commit_exact_transaction(&state, &sessions, &arguments, None);
 
         assert_eq!(result.is_error, Some(true));
@@ -8597,7 +9938,8 @@ pub(crate) mod tests {
         admit_pending_working_tree_edit(&state, "src/other.rs", b"pub fn other() -> u8 { 7 }\n");
 
         let sessions = test_sessions();
-        let (_, arguments) = stage_entity_edit(&sessions, &entity, "pub fn value() -> u8 { 2 }");
+        let (_, arguments) =
+            stage_entity_edit(&state, &sessions, &entity, "pub fn value() -> u8 { 2 }");
         let result = commit_exact_transaction(&state, &sessions, &arguments, None);
         assert_ne!(
             result.is_error,
@@ -8607,6 +9949,21 @@ pub(crate) mod tests {
         );
 
         let reply = commit_reply(&result);
+        let accounting = &reply["publication_accounting"];
+        assert_eq!(accounting["status"], "exact");
+        assert_eq!(accounting["source_units"]["published_total"], 2);
+        assert_eq!(accounting["source_units"]["publication_only"]["count"], 1);
+        assert_eq!(accounting["source_units"]["carried_unchanged"]["count"], 1);
+        // Pending bytes may be reparsed only during publication, independently
+        // of whether their semantic overlay was already admitted.
+        assert_eq!(
+            accounting["entities"]["published_total"],
+            reply["entity_deltas"]
+        );
+        assert_eq!(
+            accounting["relationships"]["published_total"],
+            reply["relation_deltas"]
+        );
         assert_eq!(
             reply["staged_operation_files"],
             serde_json::json!(["src/lib.rs"]),
@@ -8695,7 +10052,8 @@ pub(crate) mod tests {
         );
 
         let sessions = test_sessions();
-        let (_, arguments) = stage_entity_edit(&sessions, &entity, "pub fn value() -> u8 { 2 }");
+        let (_, arguments) =
+            stage_entity_edit(&state, &sessions, &entity, "pub fn value() -> u8 { 2 }");
         let result = commit_exact_transaction(&state, &sessions, &arguments, None);
         assert_ne!(
             result.is_error,
@@ -8742,6 +10100,176 @@ pub(crate) mod tests {
     /// commit is a declaration nobody reads, so the keys and the message have to
     /// be absent when there is nothing to declare.
     #[test]
+    fn publication_accounting_resolves_imported_base_for_first_native_edit() {
+        install_test_registry_override();
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        git(repo, &["init", "--initial-branch=main"]);
+        git(repo, &["config", "user.email", "kin@example.invalid"]);
+        git(repo, &["config", "user.name", "Kin"]);
+        git(repo, &["config", "commit.gpgsign", "false"]);
+        // init_from_git also reads repository configuration in this process.
+        // Keep host hooks and global ignore policy out of the import fixture.
+        let hooks = repo.join(".git/hooks");
+        let excludes = repo.join(".git/fixture-excludes");
+        std::fs::write(&excludes, b"").unwrap();
+        git(repo, &["config", "core.hooksPath", hooks.to_str().unwrap()]);
+        git(
+            repo,
+            &["config", "core.excludesFile", excludes.to_str().unwrap()],
+        );
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(repo.join("src/lib.rs"), b"pub fn value() -> u8 { 1 }\n").unwrap();
+        git(repo, &["add", "src/lib.rs"]);
+        git(repo, &["commit", "-s", "-m", "source import fixture"]);
+        let state =
+            Arc::new(DaemonState::open(kin_core::init_from_git(repo).unwrap().layout).unwrap());
+        let context = authority_context(&state).unwrap();
+        let authority = context.open().unwrap();
+        let lease = authority.read_authority();
+        let workspace = lease
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == context.workspace_id())
+            .unwrap();
+        assert!(
+            matches!(
+                workspace.base_target,
+                Some(kin_model::RefTarget::ExternalObject { .. })
+            ),
+            "this must exercise the first publication after real Git import"
+        );
+        drop(lease);
+        drop(authority);
+        let entity = state
+            .graph
+            .query_entities(&EntityFilter {
+                name_pattern: Some("value".into()),
+                ..Default::default()
+            })
+            .unwrap()
+            .into_iter()
+            .find(|entity| entity.name == "value")
+            .unwrap();
+        let sessions = test_sessions();
+        let (transaction_id, arguments) =
+            stage_entity_edit(&state, &sessions, &entity, "pub fn value() -> u8 { 2 }");
+        let first = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_ne!(first.is_error, Some(true), "{}", result_text(&first));
+        let first = commit_reply(&first);
+        assert_eq!(first["publication_accounting"]["status"], "exact");
+        assert_eq!(
+            first["publication_accounting"]["source_units"]["publication_only"]["count"],
+            1
+        );
+        let mut recovered = recover_native_commit(
+            &context,
+            OperationId::from_uuid(uuid::Uuid::parse_str(&transaction_id).unwrap()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            crate::publication_accounting::project(&recovered, None),
+            first["publication_accounting"]
+        );
+        recovered.resolved_publication_base = None;
+        let missing = crate::publication_accounting::project(&recovered, None);
+        assert_eq!(missing["status"], "unavailable");
+        assert!(missing.get("entities").is_none());
+        assert_eq!(
+            std::fs::read(state.layout.working_dir().join("src/lib.rs")).unwrap(),
+            b"pub fn value() -> u8 { 2 }\n"
+        );
+    }
+
+    #[test]
+    fn publication_accounting_reports_pending_overlap_within_one_source_unit() {
+        let (_dir, state) = test_state();
+        let (entity, _) = install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\npub fn sibling() -> u8 { 1 }\n",
+            "value",
+        );
+        admit_pending_working_tree_edit(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\npub fn sibling() -> u8 { 7 }\n",
+        );
+        let context = authority_context(&state).unwrap();
+        let authority = context.open().unwrap();
+        let lease = authority.read_authority();
+        let workspace = lease
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == context.workspace_id())
+            .unwrap();
+        let artifact = workspace
+            .tree
+            .artifact_at_path(&test_path("src/lib.rs"))
+            .unwrap();
+        let TreeEntry::Blob { hash, .. } = artifact.entry else {
+            panic!("source blob")
+        };
+        let source_base = kin_mcp::source_base::EntitySourceBase::from_exact_body(
+            kin_mcp::source_base::SourceBaseContext::from_workspace(workspace).unwrap(),
+            &entity,
+            artifact.artifact_id,
+            hash,
+            "pub fn value() -> u8 { 1 }",
+        )
+        .unwrap();
+        drop(lease);
+        drop(authority);
+        let sessions = test_sessions();
+        let transaction = sessions
+            .begin_transaction(TEST_SESSION, "repository")
+            .unwrap();
+        sessions
+            .stage_transaction(
+                &transaction.transaction_id,
+                vec![kin_mcp::McpMutationOperation {
+                    verb: "patch".into(),
+                    target: entity.id.to_string(),
+                    payload: Some(kin_mcp::McpMutationPayload::EntitySourcePatch(
+                        kin_mcp::source_base::EntitySourcePatch {
+                            source_base,
+                            edits: vec![kin_mcp::source_base::EntityTextEdit {
+                                old_text: "{ 1 }".into(),
+                                new_text: "{ 2 }".into(),
+                            }],
+                        },
+                    )),
+                    body: None,
+                    destination: None,
+                    description: "edit one entity".into(),
+                }],
+            )
+            .unwrap();
+        let arguments = HashMap::from([(
+            "transaction_id".into(),
+            serde_json::json!(transaction.transaction_id),
+        )]);
+        let result = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_ne!(result.is_error, Some(true), "{}", result_text(&result));
+        let reply = commit_reply(&result);
+        let accounting = &reply["publication_accounting"];
+        assert_eq!(accounting["status"], "exact");
+        assert_eq!(accounting["source_units"]["published_total"], 1);
+        assert_eq!(
+            accounting["source_units"]["pending_and_publication"]["count"],
+            1
+        );
+        assert_eq!(accounting["source_units"]["publication_only"]["count"], 0);
+        assert_eq!(
+            std::fs::read(state.layout.working_dir().join("src/lib.rs")).unwrap(),
+            b"pub fn value() -> u8 { 2 }\npub fn sibling() -> u8 { 7 }\n"
+        );
+    }
+
+    #[test]
     fn a_commit_from_a_clean_workspace_declares_no_fold_at_all() {
         let (_dir, state) = test_state();
         let (entity, _) = install_exact_source(
@@ -8753,7 +10281,7 @@ pub(crate) mod tests {
 
         let sessions = test_sessions();
         let (transaction_id, arguments) =
-            stage_entity_edit(&sessions, &entity, "pub fn value() -> u8 { 2 }");
+            stage_entity_edit(&state, &sessions, &entity, "pub fn value() -> u8 { 2 }");
         let result = commit_exact_transaction(&state, &sessions, &arguments, None);
         assert_ne!(result.is_error, Some(true), "{}", result_text(&result));
 
@@ -8805,7 +10333,7 @@ pub(crate) mod tests {
 
         let sessions = test_sessions();
         let (transaction_id, mut arguments) =
-            stage_entity_edit(&sessions, &entity, "pub fn value() -> u8 { 2 }");
+            stage_entity_edit(&state, &sessions, &entity, "pub fn value() -> u8 { 2 }");
         arguments.insert(
             "message".to_string(),
             serde_json::json!("Return two from value"),
@@ -8849,7 +10377,7 @@ pub(crate) mod tests {
 
         let sessions = test_sessions();
         let (transaction_id, mut arguments) =
-            stage_entity_edit(&sessions, &entity, "pub fn value() -> u8 { 2 }");
+            stage_entity_edit(&state, &sessions, &entity, "pub fn value() -> u8 { 2 }");
         arguments.insert("message".to_string(), serde_json::json!("   \n  "));
         let result = commit_exact_transaction(&state, &sessions, &arguments, None);
         assert_ne!(result.is_error, Some(true), "{}", result_text(&result));
@@ -8900,7 +10428,7 @@ pub(crate) mod tests {
 
         let sessions = test_sessions();
         let (transaction_id, arguments) =
-            stage_entity_edit(&sessions, &entity, "pub fn value() -> u8 { 2 }");
+            stage_entity_edit(&state, &sessions, &entity, "pub fn value() -> u8 { 2 }");
         let first = commit_exact_transaction(&state, &sessions, &arguments, None);
         assert_ne!(first.is_error, Some(true), "{}", result_text(&first));
         let first_reply = commit_reply(&first);
@@ -8931,6 +10459,37 @@ pub(crate) mod tests {
         assert_eq!(
             retry_reply["carried_pending_files"],
             serde_json::json!(["src/other.rs"])
+        );
+        assert_eq!(
+            retry_reply["publication_accounting"],
+            first_reply["publication_accounting"]
+        );
+        let mut unrelated = state
+            .graph
+            .query_audit_events(None, 1)
+            .unwrap()
+            .pop()
+            .unwrap();
+        unrelated.details = None;
+        for index in 0..=ATTRIBUTION_WINDOW {
+            unrelated.event_id = kin_model::AuditEventId(kin_blobs::digest(&index.to_le_bytes()));
+            state.graph.record_audit_event(&unrelated).unwrap();
+        }
+        let old_replay = commit_exact_transaction(&state, &retry_sessions, &arguments, None);
+        assert_ne!(
+            old_replay.is_error,
+            Some(true),
+            "{}",
+            result_text(&old_replay)
+        );
+        let old_reply = commit_reply(&old_replay);
+        assert_eq!(
+            old_reply["publication_accounting"],
+            first_reply["publication_accounting"]
+        );
+        assert_eq!(
+            old_reply["publication_accounting"]["source_units"]["carried_unchanged"]["count"],
+            1
         );
     }
 
@@ -8973,7 +10532,8 @@ pub(crate) mod tests {
         admit_pending_working_tree_edit(&state, "src/other.rs", b"pub fn other() -> u8 { 7 }\n");
 
         let sessions = test_sessions();
-        let (_, arguments) = stage_entity_edit(&sessions, &entity, "pub fn value() -> u8 { 2 }");
+        let (_, arguments) =
+            stage_entity_edit(&state, &sessions, &entity, "pub fn value() -> u8 { 2 }");
         let result = commit_exact_transaction(&state, &sessions, &arguments, None);
         assert_ne!(result.is_error, Some(true), "{}", result_text(&result));
         let reply = commit_reply(&result);
@@ -9089,7 +10649,7 @@ pub(crate) mod tests {
                 })
                 .unwrap()
                 .into_iter()
-                .find(|entity| entity.name == parsed.name);
+                .find(|entity| entity.name == parsed.name && entity.kind == parsed.kind);
             let Some(held) = held else {
                 return Some(format!(
                     "{file}: the published bytes declare {} and the store holds no entity by that \
@@ -9159,7 +10719,8 @@ pub(crate) mod tests {
         admit_pending_working_tree_edit(&state, "src/other.rs", b"pub fn other() -> u8 { 100 }\n");
 
         let sessions = test_sessions();
-        let (_, arguments) = stage_entity_edit(&sessions, &entity, "pub fn value() -> u8 { 2 }");
+        let (_, arguments) =
+            stage_entity_edit(&state, &sessions, &entity, "pub fn value() -> u8 { 2 }");
         let result = commit_exact_transaction(&state, &sessions, &arguments, None);
         assert_ne!(result.is_error, Some(true), "{}", result_text(&result));
         let reply = commit_reply(&result);
@@ -9217,7 +10778,8 @@ pub(crate) mod tests {
         admit_pending_working_tree_edit(&state, "src/other.rs", AFTER);
 
         let sessions = test_sessions();
-        let (_, arguments) = stage_entity_edit(&sessions, &entity, "pub fn value() -> u8 { 2 }");
+        let (_, arguments) =
+            stage_entity_edit(&state, &sessions, &entity, "pub fn value() -> u8 { 2 }");
         let result = commit_exact_transaction(&state, &sessions, &arguments, None);
         assert_ne!(result.is_error, Some(true), "{}", result_text(&result));
         let reply = commit_reply(&result);
@@ -9285,7 +10847,8 @@ pub(crate) mod tests {
         let state = Arc::new(DaemonState::open(layout).unwrap());
 
         let sessions = test_sessions();
-        let (_, arguments) = stage_entity_edit(&sessions, &entity, "pub fn value() -> u8 { 2 }");
+        let (_, arguments) =
+            stage_entity_edit(&state, &sessions, &entity, "pub fn value() -> u8 { 2 }");
         let result = commit_exact_transaction(&state, &sessions, &arguments, None);
         assert_ne!(result.is_error, Some(true), "{}", result_text(&result));
         let reply = commit_reply(&result);
@@ -9335,7 +10898,8 @@ pub(crate) mod tests {
         admit_pending_working_tree_edit(&state, "src/other.rs", b"pub fn other() -> u8 { 7 }\n");
 
         let sessions = test_sessions();
-        let (_, arguments) = stage_entity_edit(&sessions, &entity, "pub fn value() -> u8 { 2 }");
+        let (_, arguments) =
+            stage_entity_edit(&state, &sessions, &entity, "pub fn value() -> u8 { 2 }");
         let result = commit_exact_transaction(&state, &sessions, &arguments, None);
         assert_ne!(
             result.is_error,
@@ -9446,7 +11010,8 @@ pub(crate) mod tests {
         admit_pending_working_tree_file(&state, "src/added.rs", b"pub fn added() -> u8 { 5 }\n");
 
         let sessions = test_sessions();
-        let (_, arguments) = stage_entity_edit(&sessions, &entity, "pub fn value() -> u8 { 2 }");
+        let (_, arguments) =
+            stage_entity_edit(&state, &sessions, &entity, "pub fn value() -> u8 { 2 }");
         let result = commit_exact_transaction(&state, &sessions, &arguments, None);
         assert_ne!(result.is_error, Some(true), "{}", result_text(&result));
         let reply = commit_reply(&result);
@@ -9592,7 +11157,7 @@ pub(crate) mod tests {
 
         let sessions = test_sessions();
         let (transaction_id, arguments) =
-            stage_entity_edit(&sessions, &entity, "pub fn value() -> u8 { 2 }");
+            stage_entity_edit(&state, &sessions, &entity, "pub fn value() -> u8 { 2 }");
         let result = commit_exact_transaction(&state, &sessions, &arguments, None);
 
         assert_eq!(
@@ -9611,7 +11176,8 @@ pub(crate) mod tests {
             "the refusal must say what is wrong with it: {message}"
         );
         assert!(
-            message.contains("'replace'") && message.contains("'delete'"),
+            message.contains("conversion/reconciliation boundary")
+                && message.contains("restore the prior working content"),
             "the refusal must say what to do about it: {message}"
         );
         assert_eq!(
@@ -9697,7 +11263,7 @@ pub(crate) mod tests {
 
         let sessions = test_sessions();
         let (transaction_id, arguments) =
-            stage_entity_edit(&sessions, &entity, "pub fn value() -> u8 { 2 }");
+            stage_entity_edit(&state, &sessions, &entity, "pub fn value() -> u8 { 2 }");
         let result = commit_exact_transaction(&state, &sessions, &arguments, None);
 
         assert_eq!(
@@ -9716,7 +11282,8 @@ pub(crate) mod tests {
             "the refusal must say what the path became: {message}"
         );
         assert!(
-            message.contains("'replace'") && message.contains("'delete'"),
+            message.contains("conversion/reconciliation boundary")
+                && message.contains("restore the prior working content"),
             "the refusal must say what to do about it: {message}"
         );
         assert_eq!(
@@ -9766,7 +11333,8 @@ pub(crate) mod tests {
         publish_pending_workspace_tree(&state);
 
         let sessions = test_sessions();
-        let (_, arguments) = stage_entity_edit(&sessions, &entity, "pub fn value() -> u8 { 2 }");
+        let (_, arguments) =
+            stage_entity_edit(&state, &sessions, &entity, "pub fn value() -> u8 { 2 }");
         let result = commit_exact_transaction(&state, &sessions, &arguments, None);
         assert_ne!(
             result.is_error,
@@ -9980,6 +11548,15 @@ pub(crate) mod tests {
         use tower::ServiceExt;
 
         let (_dir, state) = test_state();
+        // The session route publishes under the real runtime owner, so a bare
+        // router cannot arm it. Register the same owner the daemon registers.
+        let singleton = crate::lifecycle::acquire_singleton_lock(state.layout.root())
+            .unwrap()
+            .expect("fixture owns the real daemon singleton");
+        let runtime = state
+            .prepared_publication
+            .register(&singleton, state.layout.root())
+            .unwrap();
         state
             .is_initialized
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -10053,7 +11630,9 @@ pub(crate) mod tests {
         assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
         assert_carried_move_identity(&state, &moved, artifact, &incoming);
         drop(app);
+        drop(runtime);
         drop(state);
+        drop(singleton);
 
         let state = Arc::new(DaemonState::open(layout.clone()).unwrap());
         assert_carried_move_identity(&state, &moved, artifact, &incoming);
@@ -10061,7 +11640,8 @@ pub(crate) mod tests {
             .await
             .unwrap();
         let sessions = test_sessions();
-        let (_, arguments) = stage_entity_edit(&sessions, &caller, "pub fn value() -> u8 { 2 }");
+        let (_, arguments) =
+            stage_entity_edit(&state, &sessions, &caller, "pub fn value() -> u8 { 2 }");
         let result = commit_exact_transaction(&state, &sessions, &arguments, None);
         assert_ne!(result.is_error, Some(true), "{}", result_text(&result));
         let reply = commit_reply(&result);

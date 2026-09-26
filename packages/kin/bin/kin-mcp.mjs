@@ -34,8 +34,8 @@ try {
 }
 
 if (!binary) {
-  // The error message is already complete and actionable (e.g. a declined
-  // downgrade names the binary that IS present) — printing the generic
+  // The error message is already complete and actionable (a failed download
+  // names the URL and the status it got), so printing the generic
   // not-provisioned message on top of it would contradict it.
   if (provisionError) {
     process.stderr.write(`kin-mcp: provisioning failed: ${provisionError.message}\n`);

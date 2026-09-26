@@ -29,8 +29,8 @@ use kin_index::{
 };
 use kin_model::review::{RiskLevel, RiskSummary};
 use kin_model::{
-    ArtifactId, Entity, FileLayout, FilePathId, GraphNodeId, Hash256, ImportSection,
-    ParseCompleteness, RelationKind, RepoPath, ResolvedArtifact, ResolvedTree, TreeEntry,
+    ArtifactId, Entity, FileLayout, FilePathId, GraphNodeId, ImportSection, ParseCompleteness,
+    RelationKind, RepoPath, ResolvedArtifact, ResolvedTree, TreeEntry,
 };
 use kin_parser::{is_call_extraction_incomplete_marker, LanguageAdapter, PythonAdapter};
 use kin_review::{
@@ -50,7 +50,15 @@ fn parse_python_bytes_allow_incomplete(
     let entities: Vec<Entity> = output
         .entities
         .into_iter()
-        .map(|e| e.into_entity_with_source(adapter.language_id(), &file_id, Some(bytes)))
+        .map(|e| {
+            let mut entity =
+                e.into_entity_with_source(adapter.language_id(), &file_id, Some(bytes));
+            entity.metadata.extra.insert(
+                "blob_hash".into(),
+                kin_blobs::digest(bytes).to_string().into(),
+            );
+            entity
+        })
         .collect();
     (
         FileParseData {
@@ -125,18 +133,18 @@ fn link_parsed_files_into_graph_with_completeness(
     // Persist entities and edges into a real graph store, exactly as ingest does.
     let mut admitted = artifact_ids.iter().collect::<Vec<_>>();
     admitted.sort_by(|(left, _), (right, _)| left.cmp(right));
-    let resolved_tree = ResolvedTree::from_artifacts(admitted.into_iter().enumerate().map(
-        |(index, (path, artifact_id))| {
-            let identity_byte =
-                u8::try_from(index + 1).expect("call-shape fixture has fewer than 256 files");
+    let resolved_tree =
+        ResolvedTree::from_artifacts(admitted.into_iter().map(|(path, artifact_id)| {
+            let file = files.iter().find(|file| &file.file_path == path).unwrap();
+            let digest = kin_index::unanimous_entity_source_digest(&file.entities)
+                .expect("real-parser call-shape fixtures carry source digests");
             ResolvedArtifact::new(
                 *artifact_id,
                 RepoPath::from_utf8(path).expect("valid test repository path"),
-                TreeEntry::blob(Hash256::from_bytes([identity_byte; 32]), false),
+                TreeEntry::blob(digest, false),
             )
-        },
-    ))
-    .expect("unique admitted test artifacts");
+        }))
+        .expect("unique admitted test artifacts");
     let mut snapshot = kin_db::GraphSnapshot::empty();
     snapshot.resolved_tree = resolved_tree;
     let graph = InMemoryGraph::from_snapshot(snapshot).expect("open admitted test graph");
@@ -161,7 +169,71 @@ fn link_parsed_files_into_graph_with_completeness(
     for rel in &relations {
         graph.upsert_relation(rel).expect("upsert relation");
     }
+    establish_checked_binding_history(&graph);
     (files, relations, graph)
+}
+
+/// Give the linked fixture graph the checked binding history that rename
+/// neutralization requires.
+///
+/// `analyze_impact` will not certify a rename as positional-safe unless
+/// `call_shape_binding_prerequisites_complete` holds, and that refuses while
+/// the graph's binding history reads `Unproven`. A graph opened from
+/// `GraphSnapshot::empty()` can only read `Unproven`, so before this the
+/// neutralization half of this suite was asserting against a gate that was
+/// closed for a reason the fixture never modelled, while the blocking half
+/// passed for the wrong reason.
+///
+/// The prerequisite cannot be minted: `qualify_graph_derivation` extends an
+/// existing verified history and returns nothing without one. So establish a
+/// real native genesis, then qualify this fixture's own mutation batch through
+/// the same verifier live admission uses. An unborn native repository holds no
+/// prior local binding, so the transition carries no obligation to retain and
+/// the verifier qualifies it on its own terms; nothing here relaxes the
+/// contract, and a fixture that stopped meeting it would fail this assertion
+/// rather than silently fall back to `Unproven`.
+///
+/// Every semantic write revokes the capability, so this has to be the last
+/// mutation of the graph.
+fn establish_checked_binding_history(graph: &InMemoryGraph) {
+    let root = tempfile::tempdir().expect("fixture repository root");
+    // `kin init` stages the unpublished layout in the repository root's PARENT
+    // and reports every staging directory it finds there but cannot prove
+    // unused. Initializing one level down keeps that parent private to this
+    // fixture, so parallel tests do not report each other's in-flight stages.
+    let repository = root.path().join("repository");
+    std::fs::create_dir(&repository).expect("fixture repository directory");
+    let initialized = kin_core::init(&repository).expect("native genesis");
+    let authority = kin_db::RepositoryAuthorityManager::open(
+        initialized.repository_id,
+        std::sync::Arc::new(kin_db::LocalFileBackend::new(
+            initialized.layout.kindb_dir(),
+        )),
+    )
+    .expect("open the genesis authority");
+    let genesis = authority
+        .read_authority()
+        .workspace_graph_snapshot(&initialized.workspace_id)
+        .expect("read the genesis workspace")
+        .expect("the genesis workspace carries a graph");
+    assert!(
+        graph
+            .qualify_binding_history_derivation(
+                &genesis,
+                &kin_index::binding_history::LocalBindingHistoryVerifier,
+                &|digest| authority.load_source_blob(digest),
+            )
+            .expect("qualify the fixture derivation from genesis"),
+        "the fixture graph must carry checked binding history, or the \
+         rename-neutralization gate is never reached"
+    );
+    assert!(
+        matches!(
+            <InMemoryGraph as EntityStore>::binding_history_observation(graph),
+            kin_model::BindingHistoryObservation::Checked { .. }
+        ),
+        "qualification must leave the graph reading Checked"
+    );
 }
 
 fn shadow_verdict(graph: &InMemoryGraph, diff: SemanticDiff) -> ShadowGateVerdict {
@@ -270,7 +342,14 @@ fn same_caller_shadow_evidence(
         1,
         "one caller entity must produce one logical Calls edge"
     );
-    (verdict, inbound[0].evidence.clone())
+    // These assertions count original call shapes, not the span-free authority
+    // records. Validate the extension before excluding it from that census.
+    let evidence = kin_index::occurrence::original_evidence(inbound[0])
+        .expect("valid occurrence metadata")
+        .into_iter()
+        .cloned()
+        .collect();
+    (verdict, evidence)
 }
 
 /// Build old and new entities from their real source declarations, rather than
@@ -1303,10 +1382,13 @@ fn e2e_fully_omitted_call_in_incomplete_file_cannot_neutralize_rename() {
             relation.kind == RelationKind::Calls && relation.dst == GraphNodeId::Entity(target.id)
         })
         .expect("the complete positional caller still links");
-    assert!(inbound.evidence.iter().all(|evidence| {
-        evidence.parser_rule.as_deref() == Some(CALL_SHAPE_EVIDENCE_AGGREGATION_V1)
-            && evidence.call_shape.is_some()
-    }));
+    assert!(kin_index::occurrence::original_evidence(inbound)
+        .expect("valid occurrence metadata")
+        .iter()
+        .all(|evidence| {
+            evidence.parser_rule.as_deref() == Some(CALL_SHAPE_EVIDENCE_AGGREGATION_V1)
+                && evidence.call_shape.is_some()
+        }));
     assert!(relations
         .iter()
         .any(|relation| relation.evidence.iter().any(|evidence| {

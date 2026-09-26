@@ -751,19 +751,25 @@ NODE
 
   stopDaemons("before MCP startup");
 
+  const searchArgs = { query: "hello", compact: true, limit: 5 };
+  // The call takes the shape the launched entry's profile serves: a
+  // routed profile lists one `kin` tool, and search goes through it.
+  // Any other profile lists `semantic_search` and is called by name.
+  // tools/list must serve the tool the call names, so the listing
+  // check below follows the same profile.
+  const searchCall = (profile) => (
+    typeof profile === "string" && profile.startsWith("agent-routed")
+      ? { name: "kin", arguments: { command: "search", args: searchArgs } }
+      : { name: "semantic_search", arguments: searchArgs }
+  );
+  // What a failure calls the search it made.
+  const searchLabel = (call) => (
+    call.name === "kin" ? `kin ${call.arguments.command}` : call.name
+  );
   const requests = [
     { jsonrpc: "2.0", id: 1, method: "initialize", params: {} },
     { jsonrpc: "2.0", method: "notifications/initialized", params: {} },
     { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} },
-    {
-      jsonrpc: "2.0",
-      id: 3,
-      method: "tools/call",
-      params: {
-        name: "semantic_search",
-        arguments: { query: "hello", compact: true, limit: 5 },
-      },
-    },
   ];
 
   const configPath = path.join(process.cwd(), ".agents", "mcp_config.json");
@@ -771,6 +777,9 @@ NODE
   if (!entry || typeof entry.command !== "string" || !Array.isArray(entry.args) || typeof entry.cwd !== "string") {
     throw new Error(`${configPath}: captured MCP launch entry is missing`);
   }
+  const launchProfile = entry.env?.KIN_MCP_TOOL_PROFILE;
+  const launchCall = searchCall(launchProfile);
+  const launchLabel = searchLabel(launchCall);
   const stripVerbatim = (p) => (typeof p === "string" && p.startsWith("\\\\?\\") ? p.slice(4) : p);
   const child = spawn(entry.command, entry.args, {
     cwd: stripVerbatim(entry.cwd),
@@ -819,20 +828,17 @@ NODE
         if (!line.trim().startsWith("{")) continue;
         const message = JSON.parse(line);
         if (message.id === 3 && !revivalRequested) {
-          validateSearch(message, "initial MCP semantic_search");
+          validateSearch(message, `initial MCP ${launchLabel}`);
           stopDaemons("between MCP calls");
           revivalRequested = true;
           child.stdin.write(`${JSON.stringify({
             jsonrpc: "2.0",
             id: 4,
             method: "tools/call",
-            params: {
-              name: "semantic_search",
-              arguments: { query: "hello", compact: true, limit: 5 },
-            },
+            params: launchCall,
           })}\n`);
         } else if (message.id === 4) {
-          validateSearch(message, "revived MCP semantic_search");
+          validateSearch(message, `revived MCP ${launchLabel}`);
           child.stdin.end();
         }
       }
@@ -854,16 +860,26 @@ NODE
         .map((line) => JSON.parse(line));
       const byId = new Map(messages.filter((message) => message.id != null).map((message) => [message.id, message]));
       if (!byId.get(1)?.result) throw new Error("MCP initialize response missing");
-      if (!JSON.stringify(byId.get(2)?.result ?? {}).includes("semantic_search")) {
-        throw new Error("MCP tools/list omitted semantic_search");
+      const listedTools = byId.get(2)?.result?.tools;
+      if (!Array.isArray(listedTools) || !listedTools.some((tool) => tool?.name === launchCall.name)) {
+        throw new Error(
+          `MCP tools/list omitted ${launchCall.name}, the tool the launched ` +
+          `${launchProfile ?? "default"} profile serves`
+        );
       }
-      validateSearch(byId.get(3), "initial MCP semantic_search");
+      validateSearch(byId.get(3), `initial MCP ${launchLabel}`);
       if (!revivalRequested) throw new Error("MCP daemon revival was not exercised");
-      validateSearch(byId.get(4), "revived MCP semantic_search");
+      validateSearch(byId.get(4), `revived MCP ${launchLabel}`);
       finish();
     } catch (error) {
       finish(error);
     }
+  });
+  requests.push({
+    jsonrpc: "2.0",
+    id: 3,
+    method: "tools/call",
+    params: launchCall,
   });
   child.stdin.write(`${requests.map((request) => JSON.stringify(request)).join("\n")}\n`);
 NODE

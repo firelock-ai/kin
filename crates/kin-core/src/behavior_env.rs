@@ -54,6 +54,7 @@ pub const BEHAVIOR_ENV_VARS: &[&str] = &[
     "KIN_DAEMON_MEMORY_BUDGET_BYTES",
     "KIN_COCHANGE_MAX_FAN_OUT",
     "KIN_GCS_ENDPOINT",
+    "KIN_LANGUAGE_TOOL_SEARCH",
     "EMBED_MAX_SEQ_LEN",
     "STORAGE_EMULATOR_HOST",
 ];
@@ -255,6 +256,19 @@ mod tests {
                 "daemon health must report the storage endpoint lever {name}"
             );
         }
+    }
+
+    #[test]
+    fn the_language_tool_search_lever_is_reported() {
+        // The daemon puts the recorded and usual language-server directories
+        // on its PATH once, at process start, and only when this lever leaves
+        // the search on. A command that sets it against a running daemon
+        // changes nothing about which servers that daemon finds, so the
+        // mismatch has to be reportable like every other start-time lever.
+        assert!(
+            BEHAVIOR_ENV_VARS.contains(&crate::tool_prefix::LANGUAGE_TOOL_SEARCH_ENV),
+            "daemon health must report whether it searched beyond its inherited PATH"
+        );
     }
 
     #[test]

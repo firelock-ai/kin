@@ -25,10 +25,9 @@ can be satisfied by a broken tool:
      budget's name, and leaves no group empty
   6  a row whose inline source the budget took says so on the row
   7  `kin context` names the same cut in its lines and in its `--json`
-  9  each granularity names the literal collection it answers with, and the
-     count it publishes for it matches the array it ships
- 10  a file page is a window over the file ranking rather than the whole
-     roll-up re-emitted under an advancing cursor
+  9  entity granularity names and counts its answer; file granularity refuses
+ 10  an entity page is a window over the ranking rather than the whole
+     collection re-emitted under an advancing cursor
  11  an entity page that ranked nothing still ships its primary as an empty
      array and counts it zero, with a populated page as the control
 
@@ -179,6 +178,50 @@ class Result(object):
             "status": self.status,
             "detail": self.detail,
         }
+
+
+def cleanup_result(status, detail):
+    result = Result("cleanup", None, "fixture workers stopped and endpoints retired")
+    (result.ok if status == PASS else result.bad)(detail)
+    return result
+
+
+def stop_confirmed(rc, report):
+    """A successful exit alone does not prove that a worker was retired."""
+    if not isinstance(report, dict):
+        return False
+    stopped = report.get("stopped")
+    return (rc == 0 and isinstance(stopped, list)
+            and report.get("schema") == "kin.daemon-stop.v1"
+            and report.get("scope") == "current-repo"
+            and report.get("all_stopped") is True
+            and report.get("endpoints_retired", not stopped) is True
+            and all(isinstance(row, dict)
+                    and row.get("result") in ("stopped", "not-running")
+                    and "preserved_endpoint" not in row for row in stopped))
+
+
+def finish_run_root(workdir, results, keep, explicit=False):
+    """Only a successful, stopped, disposable run may lose its fixtures."""
+    reasons = []
+    if keep:
+        reasons.append("--keep")
+    if explicit:
+        reasons.append("caller-owned workdir")
+    if not results or any(result.status != PASS for result in results):
+        reasons.append("failed or unreadable check or cleanup")
+    if not reasons:
+        try:
+            shutil.rmtree(workdir)
+        except OSError as error:
+            removal = cleanup_result(FAIL, "fixture removal failed: %s" % error)
+            removal.id = "cleanup-root"
+            results.append(removal)
+            reasons.append("fixture removal failed; remaining evidence retained")
+    if reasons:
+        print("fixtures kept at %s (%s)" % (workdir, "; ".join(reasons)))
+    return {"run_root": workdir, "run_root_retained": bool(reasons),
+            "run_root_retention_reason": "; ".join(reasons) if reasons else "successful disposable run"}
 
 
 def grade_cut_walk(payload):
@@ -579,6 +622,41 @@ class Suite(object):
         if daemon:
             self.env["KIN_DAEMON_BIN"] = os.path.abspath(daemon)
         self.repo = None
+        self.owned_repos = set()
+
+    def shutdown(self):
+        """Stop only this run's repositories, including a failed initialization."""
+        records = []
+        errors = []
+        for repo in sorted(self.owned_repos):
+            record = {"repo": repo}
+            records.append(record)
+            # Never let discovery walk upward and select an unrelated repository.
+            if not os.path.isfile(os.path.join(repo, ".kin", "manifest.json")):
+                record["error"] = "fixture manifest missing; stop was not attempted"
+                errors.append("%s: %s" % (repo, record["error"]))
+                continue
+            try:
+                proc = subprocess.run(
+                    [self.kin, "daemon", "stop", "--json"], cwd=repo, env=self.env,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True,
+                    timeout=60)
+                rc, out, err = proc.returncode, proc.stdout, proc.stderr
+                record.update({"returncode": rc, "stdout": out, "stderr": err})
+                report = json.loads(out) if rc == 0 else None
+                if not stop_confirmed(rc, report):
+                    record["error"] = "worker stop and endpoint retirement were not confirmed"
+                    errors.append("%s: %s" % (repo, record["error"]))
+            except Exception as error:
+                record["error"] = "%s: %s" % (type(error).__name__, error)
+                errors.append("%s: %s" % (repo, record["error"]))
+        evidence = os.path.join(self.workdir, "daemon-cleanup.json")
+        with open(evidence, "w") as handle:
+            json.dump(records, handle, indent=2)
+            handle.write("\n")
+        detail = ("; ".join(errors) + "; see " + evidence if errors else
+                  "%d owned fixture workers stopped and endpoints retired" % len(records))
+        return cleanup_result(FAIL if errors else PASS, detail)
 
     def run(self, args, cwd=None, timeout=900):
         proc = subprocess.run(
@@ -607,6 +685,7 @@ class Suite(object):
             shutil.rmtree(repo)
         os.makedirs(os.path.join(repo, "src"))
         os.makedirs(os.path.join(repo, "tests"))
+        self.owned_repos.add(repo)
 
         # Only the depth-eight trace needs long signatures. Optional parameters
         # make its returned records exceed 12,000 characters without changing calls.
@@ -710,7 +789,7 @@ class Suite(object):
             raise SetupError("kin init failed: %s" % proc.stderr.decode("utf-8", "replace")[-1000:])
         return repo
 
-    def mcp(self, method, params, timeout=600):
+    def mcp(self, method, params, timeout=600, raw_result=False):
         """One MCP request against a fresh stdio server, returning its payload.
 
         `tools/list` returns the raw result. A `tools/call` pierces
@@ -778,7 +857,7 @@ class Suite(object):
         if "error" in response:
             raise McpError("%s error: %s" % (method, json.dumps(response["error"])[:300]))
         result = response.get("result") or {}
-        if method == "tools/list":
+        if method == "tools/list" or raw_result:
             return result
         content = result.get("content") or []
         if not content or "text" not in content[0]:
@@ -1130,6 +1209,7 @@ def check_6(suite):
             {
                 "entity_id": focal,
                 "compact": False,
+                "neighbor_bodies": True,
                 "include_traffic": False,
                 "token_budget": 200000,
                 "max_chars": 12000,
@@ -1362,51 +1442,49 @@ def grade_primary_declaration(payload, allowed):
     return problems
 
 
-def grade_file_window(page1, page2, page_size):
-    """Problems with a file-granularity page that has to be a window.
+def entity_rows(payload):
+    named = declared_primary(payload)
+    return payload.get(named) if named in ENTITY_PRIMARIES else None
 
-    A continuation that re-emits the whole roll-up hands back the same answer
-    while advancing a cursor, which reads as paging and is not. Pass `page2` as
-    None when the first page minted no cursor.
-    """
+
+def grade_entity_window(page1, page2, page_size):
+    """Each page carries a bounded, disjoint window of stable entity identities."""
     problems = []
-    rows = page1.get("files")
-    if not isinstance(rows, list):
-        problems.append("the first file page carries no `files` array")
-        return problems
-    if len(rows) > page_size:
-        problems.append(
-            "a page_size of %d returned %d file rows, so the page is not a window"
-            % (page_size, len(rows))
-        )
+    identities = []
     pages = [("page 1", page1)] + ([("page 2", page2)] if page2 is not None else [])
     for label, page in pages:
-        for key in ENTITY_PRIMARIES:
-            carried = page.get(key)
-            if isinstance(carried, list) and carried:
-                problems.append(
-                    "%s of a file answer carries %d `%s` rows, so the entity ranking rides "
-                    "along with the file one" % (label, len(carried), key)
-                )
-    if page2 is None:
-        return problems
-    second = page2.get("files")
-    if not isinstance(second, list):
-        problems.append("the continuation carries no `files` array")
-        return problems
-    first_paths = [row.get("path") for row in rows]
-    second_paths = [row.get("path") for row in second]
-    if first_paths and first_paths == second_paths:
-        problems.append(
-            "the continuation repeated the first page verbatim: %r" % (first_paths,)
-        )
-    overlap = sorted(set(first_paths) & set(second_paths))
-    if overlap:
-        problems.append(
-            "the continuation repeated %d path(s) the first page already carried: %r"
-            % (len(overlap), overlap)
-        )
+        problems.extend("%s: %s" % (label, problem)
+                        for problem in grade_primary_declaration(page, ENTITY_PRIMARIES))
+        rows = entity_rows(page)
+        if not isinstance(rows, list):
+            continue
+        if len(rows) > page_size:
+            problems.append("%s exceeds page_size %d with %d entities"
+                            % (label, page_size, len(rows)))
+        ids = [row.get("entity_id") or row.get("id") for row in rows]
+        if any(not isinstance(ident, str) or not ident for ident in ids):
+            problems.append("%s carries an entity without a stable identity" % label)
+        valid = [ident for ident in ids if isinstance(ident, str) and ident]
+        if len(set(valid)) != len(valid):
+            problems.append("%s repeats an entity identity" % label)
+        identities.append(set(valid))
+        if page.get("files"):
+            problems.append("%s carries a file catalog beside its entity window" % label)
+    if len(identities) == 2 and identities[0] & identities[1]:
+        problems.append("the continuation repeats entity identities: %r"
+                        % sorted(identities[0] & identities[1]))
     return problems
+
+
+def grade_file_granularity_refusal(result):
+    """Require the specific semantic boundary refusal, not any tool failure."""
+    texts = [item.get("text", "") for item in result.get("content", [])
+             if isinstance(item, dict)]
+    if result.get("isError") is not True or not any(
+        "semantic_locate accepts only entity granularity" in text for text in texts
+    ):
+        return ["file granularity did not return its explicit semantic boundary refusal"]
+    return []
 
 
 def grade_empty_primary(payload):
@@ -1465,52 +1543,34 @@ def secondary_rows(payload):
 
 
 def check_9(suite):
-    res = Result(
-        "9", "FIR-2814", "each granularity names the literal collection it answers with"
-    )
+    res = Result("9", "entity locate", "entity answers name their collection; file granularity refuses")
     try:
         entity = suite.mcp(
             "semantic_locate",
             {"query": "hop", "granularity": "entity", "limit": 5, "include_snippet": False},
         )
-        files = suite.mcp(
-            "semantic_locate", {"query": "hop", "granularity": "file", "limit": 5}
+        refused = suite.mcp(
+            "semantic_locate", {"query": "hop", "granularity": "file", "limit": 5},
+            raw_result=True,
         )
     except McpError as exc:
         res.unknown("semantic_locate unreadable: %s" % exc)
         return res
     for problem in grade_primary_declaration(entity, ENTITY_PRIMARIES):
         res.bad("entity granularity: %s" % problem)
-    for problem in grade_primary_declaration(files, ("files",)):
-        res.bad("file granularity: %s" % problem)
-    # Both halves together, because a server answering `files` to everything
-    # satisfies the file half alone and a server answering `entities` to
-    # everything satisfies the entity half alone.
+    for problem in grade_file_granularity_refusal(refused):
+        res.bad(problem)
     if not res.failed:
-        res.ok(
-            "entity granularity named `%s` with %s rows and file granularity named `%s` "
-            "with %s rows"
-            % (
-                declared_primary(entity),
-                declared_rows(entity),
-                declared_primary(files),
-                declared_rows(files),
-            )
-        )
+        res.ok("entity granularity named `%s` with %s rows; file granularity explicitly refused"
+               % (declared_primary(entity), declared_rows(entity)))
     return res
 
 
 def check_10(suite):
-    res = Result("10", "FIR-2814", "a file page is a window, not the whole roll-up")
+    res = Result("10", "entity paging", "an entity page is a bounded window over the ranking")
     page_size = 1
-    # The continuation case needs a ranking wider than one page, and which query
-    # reaches two files is a property of the fixture rather than of the rule
-    # under test. So the query is chosen by measuring, and the sizes each one
-    # reached are reported when none of them does.
-    # `return` is measured rather than guessed: on this fixture it is the one
-    # token both source modules carry, so it ranks two files where every other
-    # candidate ranks one. The others stay as fallbacks in case the fixture
-    # grows.
+    # Exercise a real continuation with multiple ranked entities. Record every
+    # measured candidate if this fixture cannot supply that case.
     seen = []
     first = None
     query = None
@@ -1520,7 +1580,7 @@ def check_10(suite):
                 "semantic_locate",
                 {
                     "query": candidate,
-                    "granularity": "file",
+                    "granularity": "entity",
                     "page_size": page_size,
                     "limit": 20,
                 },
@@ -1534,7 +1594,7 @@ def check_10(suite):
             break
     if first is None:
         res.unknown(
-            "no fixture query ranked more than %d file(s), so the continuation case was "
+            "no fixture query ranked more than %d entity/entities, so the continuation case was "
             "not reached: %r" % (page_size, seen)
         )
         return res
@@ -1542,25 +1602,25 @@ def check_10(suite):
     cursor = first.get("next_cursor")
     if not cursor:
         res.bad(
-            "a %d-row file ranking returned %d row(s) and no cursor, so the rest is "
-            "unreachable" % (total, len(first.get("files") or []))
+            "a %d-row entity ranking returned %d row(s) and no cursor, so the rest is "
+            "unreachable" % (total, len(entity_rows(first) or []))
         )
         return res
     try:
         second = suite.mcp(
-            "semantic_locate", {"query": query, "granularity": "file", "cursor": cursor}
+            "semantic_locate", {"query": query, "granularity": "entity", "cursor": cursor}
         )
     except McpError as exc:
-        res.unknown("the file continuation was unreadable: %s" % exc)
+        res.unknown("the entity continuation was unreadable: %s" % exc)
         return res
-    for problem in grade_file_window(first, second, page_size):
+    for problem in grade_entity_window(first, second, page_size):
         res.bad(problem)
     if not res.failed:
         res.ok(
-            "page 1 carried %r and page 2 carried %r out of %d ranked files"
+            "page 1 carried %r and page 2 carried %r out of %d ranked entities"
             % (
-                [row.get("path") for row in first["files"]],
-                [row.get("path") for row in second["files"]],
+                [row.get("entity_id") or row.get("id") for row in entity_rows(first)],
+                [row.get("entity_id") or row.get("id") for row in entity_rows(second)],
                 total,
             )
         )
@@ -2379,52 +2439,35 @@ def self_test():
         True,
     )
 
-    def file_page(paths, **over):
+    def entity_page(ids, **over):
         page = {
-            "query": "hop",
-            "granularity": "file",
-            "routing": "fused-v1",
-            "files": [{"path": path} for path in paths],
-            "_kin": {"response": {"primary_collection": "files", "primary_rows": len(paths)}},
+            "query": "hop", "granularity": "entity", "routing": "fused-v1",
+            "entities": [{"entity_id": ident} for ident in ids],
+            "_kin": {"response": {"primary_collection": "entities", "primary_rows": len(ids)}},
         }
         page.update(over)
         return page
 
-    expect(
-        "two disjoint single-row file pages grade clean",
-        grade_file_window(file_page(["a.py"]), file_page(["b.py"]), 1),
-        [],
-    )
-    expect(
-        "a continuation that repeats the first page is caught",
-        len(grade_file_window(file_page(["a.py"]), file_page(["a.py"]), 1)) >= 1,
-        True,
-    )
-    expect(
-        "a continuation that overlaps the first page is caught",
-        len(grade_file_window(file_page(["a.py"]), file_page(["a.py", "b.py"]), 2)) >= 1,
-        True,
-    )
-    expect(
-        "a page wider than the page size is caught",
-        len(grade_file_window(file_page(["a.py", "b.py"]), file_page(["c.py"]), 1)) >= 1,
-        True,
-    )
-    expect(
-        "a file page carrying entity rows is caught",
-        len(
-            grade_file_window(
-                file_page(["a.py"], entities=[{"name": "hop_0"}]), file_page(["b.py"]), 1
-            )
-        )
-        >= 1,
-        True,
-    )
-    expect(
-        "a first file page with no cursor still grades what it can",
-        grade_file_window(file_page(["a.py"]), None, 1),
-        [],
-    )
+    expect("disjoint single-row entity pages", grade_entity_window(entity_page(["a"]), entity_page(["b"]), 1), [])
+    for label, first, second, size in [
+        ("repeated page", entity_page(["a"]), entity_page(["a"]), 1),
+        ("overlapping continuation", entity_page(["a"]), entity_page(["a", "b"]), 2),
+        ("first page too wide", entity_page(["a", "b"]), entity_page(["c"]), 1),
+        ("second page too wide", entity_page(["a"]), entity_page(["b", "c"]), 1),
+        ("duplicate identity", entity_page(["a", "a"]), None, 2),
+        ("missing identity", entity_page([None]), None, 1),
+        ("file catalog", entity_page(["a"], files=[{"path": "a.py"}]), entity_page(["b"]), 1),
+    ]:
+        expect(label, bool(grade_entity_window(first, second, size)), True)
+    expect("one page without continuation", grade_entity_window(entity_page(["a"]), None, 1), [])
+    refusal = {"isError": True, "content": [{"text": "semantic_locate accepts only entity granularity"}]}
+    expect("explicit file granularity refusal", grade_file_granularity_refusal(refusal), [])
+    for label, result in [
+        ("successful file answer", {"content": [{"text": "file rows"}]}),
+        ("unrelated failure", {"isError": True, "content": [{"text": "daemon unavailable"}]}),
+        ("refusal words in a successful answer", dict(refusal, isError=False)),
+    ]:
+        expect(label, bool(grade_file_granularity_refusal(result)), True)
 
     empty_page = locate_page(rows=0)
     expect(
@@ -2502,6 +2545,8 @@ def main(argv):
         help="path to the kin-daemon binary the server should spawn",
     )
     parser.add_argument("--workdir", default=None, help="where to build the fixture")
+    parser.add_argument("--keep", action="store_true",
+                        help="keep the run root whatever the result")
     parser.add_argument("--json", default=None, help="write the report here")
     parser.add_argument("--label", default="", help="label recorded in the report")
     parser.add_argument("--verbose", action="store_true")
@@ -2523,11 +2568,32 @@ def main(argv):
     if not os.path.isdir(workdir):
         os.makedirs(workdir)
     suite = Suite(kin, os.path.abspath(workdir), opts.verbose, opts.daemon)
+    print("run root: %s" % suite.workdir)
+
+    def settle(rows):
+        """Stop what this run owns, whatever happened, then keep or remove its root.
+
+        A root the caller named with --workdir is never removed.
+        """
+        try:
+            rows.append(suite.shutdown())
+        except Exception as error:
+            rows.append(cleanup_result(FAIL, "cleanup raised: %s" % error))
+        return finish_run_root(suite.workdir, rows, opts.keep, explicit=bool(opts.workdir))
+
     try:
         suite.fixture()
     except (SetupError, subprocess.TimeoutExpired) as exc:
         sys.stderr.write("setup failed: %s\n" % exc)
+        unbuilt = Result("setup", None, "the fixture was built")
+        unbuilt.unknown("setup failed: %s" % exc)
+        settle([unbuilt])
         return 3
+    except BaseException:
+        unbuilt = Result("setup", None, "the fixture was built")
+        unbuilt.unknown("setup raised before it finished")
+        settle([unbuilt])
+        raise
 
     results = []
     for ident, check in CHECKS:
@@ -2536,9 +2602,19 @@ def main(argv):
         except subprocess.TimeoutExpired as exc:
             res = Result(ident, "FIR-2600", "check %s" % ident)
             res.unknown("timed out: %s" % exc)
+        except BaseException:
+            # A check that escaped still leaves nothing running.
+            escaped = Result(ident, None, "check %s" % ident)
+            escaped.unknown("the check raised before it answered")
+            settle(results + [escaped])
+            raise
         marker = res.status
         print("CHECK %s %s %s %s" % (res.id, res.ticket, marker, res.detail))
         results.append(res)
+
+    retention = settle(results)
+    for res in results[len(CHECKS):]:
+        print("CHECK %s - %s %s" % (res.id, res.status, res.detail))
 
     failed = [r for r in results if r.status == FAIL]
     unread = [r for r in results if r.status == UNREADABLE]
@@ -2550,17 +2626,14 @@ def main(argv):
         directory = os.path.dirname(os.path.abspath(opts.json))
         if directory and not os.path.isdir(directory):
             os.makedirs(directory)
+        payload = {
+            "label": opts.label,
+            "tree_sha": tree_sha(),
+            "results": [r.row() for r in results],
+        }
+        payload.update(retention)
         with open(opts.json, "w") as handle:
-            json.dump(
-                {
-                    "label": opts.label,
-                    "tree_sha": tree_sha(),
-                    "results": [r.row() for r in results],
-                },
-                handle,
-                indent=2,
-                sort_keys=True,
-            )
+            json.dump(payload, handle, indent=2, sort_keys=True)
             handle.write("\n")
     if failed:
         return 1

@@ -17,6 +17,56 @@ use crate::publication::{
     SpineRolloutFenceCommit, SpineRolloutFenceEvidence,
 };
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// The reads one durable store has made, counted the way Firestore bills them.
+///
+/// Firestore charges one read per document a request returns, and at least one
+/// per request even when nothing comes back: a get of a missing document and a
+/// query that matches nothing each cost one. `document_reads` follows that
+/// rule, so it is the number to set beside the "Cloud Firestore Read Ops" line
+/// of a bill. A request that failed without an answer is not counted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DurableReadStats {
+    /// Read requests that got an answer: document gets, list pages and queries.
+    pub requests: u64,
+    /// Billable document reads under the rule above.
+    pub document_reads: u64,
+}
+
+impl DurableReadStats {
+    /// What was read between an earlier snapshot and this one.
+    pub fn since(self, earlier: DurableReadStats) -> DurableReadStats {
+        DurableReadStats {
+            requests: self.requests.saturating_sub(earlier.requests),
+            document_reads: self.document_reads.saturating_sub(earlier.document_reads),
+        }
+    }
+}
+
+/// Counts a store's reads. Two relaxed adds per request, so it stays on in
+/// production: the whole point is to watch what the hosted spine costs.
+#[derive(Debug, Default)]
+pub struct DurableReadMeter {
+    requests: AtomicU64,
+    document_reads: AtomicU64,
+}
+
+impl DurableReadMeter {
+    /// Record one answered read request that returned `documents` documents.
+    pub fn record(&self, documents: usize) {
+        self.requests.fetch_add(1, Ordering::Relaxed);
+        let billed = u64::try_from(documents.max(1)).unwrap_or(u64::MAX);
+        self.document_reads.fetch_add(billed, Ordering::Relaxed);
+    }
+
+    pub fn snapshot(&self) -> DurableReadStats {
+        DurableReadStats {
+            requests: self.requests.load(Ordering::Relaxed),
+            document_reads: self.document_reads.load(Ordering::Relaxed),
+        }
+    }
+}
 
 /// A repo's persisted entity set together with its graph root hash.
 #[derive(Debug, Clone)]
@@ -335,6 +385,12 @@ impl PreparedStorePublication {
 /// legacy row methods remain only for migration inspection and must not be used
 /// as an authority publication path.
 pub trait SpineStore: Send + Sync {
+    /// The reads this store has made so far, when it counts them. `None` means
+    /// the store keeps no count, which is not the same as having read nothing.
+    fn read_stats(&self) -> Option<DurableReadStats> {
+        None
+    }
+
     /// Load the active fleet rollout fence and its exact durable revision.
     /// Hosted publication and hydration fail loudly when it is absent.
     fn load_rollout_fence(&self) -> Result<Option<LoadedSpineRolloutFence>, SpineError> {

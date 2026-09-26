@@ -155,6 +155,7 @@ where
     let tree = graph.resolved_tree();
     let mut bodies = HashMap::<FilePathId, String>::new();
     let target = resolve_target(graph, request, &tree, &mut bodies, &mut load_source)?;
+    kin_model::require_independent_source(&target).map_err(anyhow::Error::msg)?;
     if target.name == request.new_name {
         bail!("rename target already has name '{}'", request.new_name);
     }
@@ -560,6 +561,9 @@ fn prove_repository_occurrence_accounting(
     let mut expected = HashMap::<EntityId, usize>::new();
     for entity in snapshot.entities.values() {
         if entity_leaf(&entity.name) == target.name {
+            if entity.kind == EntityKind::Module && target.kind != EntityKind::Module {
+                continue;
+            }
             expected.insert(entity.id, 1);
         }
     }
@@ -731,12 +735,23 @@ impl ReferenceGroup {
 fn relation_occurrence_split(
     relation: &Relation,
 ) -> Result<(usize, Vec<(kin_model::SourceSpan, usize)>)> {
-    if relation.evidence.is_empty() {
+    // The linker follows each parser site with a span-free occurrence
+    // certificate that counts no occurrence. Certificates are proofs about the
+    // sites, not sites, so the split reads the producer records, and only once
+    // every certificate validates against them.
+    let originals = kin_index::occurrence::original_evidence(relation).ok_or_else(|| {
+        anyhow::anyhow!(
+            "rename relation {} carries occurrence certificates that do not validate \
+             against its sites",
+            relation.id
+        )
+    })?;
+    if originals.is_empty() {
         return Ok((1, Vec::new()));
     }
     let mut unspanned = 0_usize;
     let mut spanned = Vec::new();
-    for evidence in &relation.evidence {
+    for evidence in originals {
         let count = usize::try_from(evidence.occurrence_count)
             .context("rename relation occurrence count does not fit usize")?;
         if count == 0 {
@@ -825,6 +840,12 @@ where
         ..EntityFilter::default()
     })?;
     matches.retain(|entity| entity.name == request.symbol || entity.name == leaf);
+    if matches
+        .iter()
+        .any(|entity| entity.kind != EntityKind::Module)
+    {
+        matches.retain(|entity| entity.kind != EntityKind::Module);
+    }
     if let Some(file) = request.file.as_deref() {
         let normalized = normalize_repo_hint(file);
         if let Some(user_line) = request.line {
@@ -1382,5 +1403,70 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("zero occurrence"));
+    }
+
+    /// A parser call edge as the linker writes it: each site followed by its
+    /// span-free occurrence certificate.
+    fn linked_call_edge() -> Relation {
+        let source = b"fn target() {}\nfn caller() { target(); target(); }\n";
+        kin_index::IndexPipeline::new()
+            .index_file_content_with_tests(
+                &FilePathId::new("src/lib.rs"),
+                source,
+                kin_blobs::digest(source),
+            )
+            .expect("the fixture parses")
+            .indexed_file
+            .relations
+            .into_iter()
+            .find(|relation| relation.kind == RelationKind::Calls)
+            .expect("the fixture holds a call")
+    }
+
+    #[test]
+    fn occurrence_certificates_are_not_counted_as_rename_occurrences() {
+        let relation = linked_call_edge();
+        assert!(
+            relation
+                .evidence
+                .iter()
+                .any(|record| record.occurrence_count == 0 && record.source_span.is_none()),
+            "the linker stamps certificates, which this control is about: {relation:?}"
+        );
+        let (unspanned, spanned) = relation_occurrence_split(&relation).unwrap();
+        let counted = unspanned + spanned.iter().map(|(_, count)| count).sum::<usize>();
+        assert_eq!(counted, 2, "both calls and nothing else: {relation:?}");
+    }
+
+    #[test]
+    fn an_orphaned_certificate_refuses_the_rename() {
+        let mut relation = linked_call_edge();
+        let site = relation
+            .evidence
+            .iter()
+            .position(|record| record.source_span.is_some())
+            .expect("a site");
+        // The site goes and its certificate stays, proving an occurrence the
+        // relation no longer carries.
+        relation.evidence.remove(site);
+        assert!(relation_occurrence_split(&relation)
+            .unwrap_err()
+            .to_string()
+            .contains("do not validate"));
+    }
+
+    #[test]
+    fn a_certificate_that_does_not_validate_refuses_the_rename() {
+        let mut relation = linked_call_edge();
+        let certificate = relation
+            .evidence
+            .iter_mut()
+            .find(|record| record.source_span.is_none() && record.occurrence_count == 0)
+            .expect("a certificate");
+        certificate.token = Some("{}".to_string());
+        assert!(relation_occurrence_split(&relation)
+            .unwrap_err()
+            .to_string()
+            .contains("do not validate"));
     }
 }

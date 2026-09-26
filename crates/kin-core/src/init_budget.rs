@@ -50,6 +50,16 @@
 //! behaviour this module replaces. The refusal is therefore drawn at the
 //! ceiling rather than past it: see [`REFUSE_MULTIPLE`], which used to allow
 //! half a machine of slack and no longer needs to.
+//!
+//! # Two refusals
+//!
+//! The forecast above walks HEAD's history, because that is cheap enough to
+//! ask before anything is captured. The capture takes every ref under `refs/`,
+//! so a repository whose other branches and tags carry history of their own
+//! admits more than that forecast counted. Once the plan holds what the capture
+//! actually took, [`project_import`] judges it against the memory still free
+//! and refuses before semantic history is derived, which is the phase that
+//! spends it.
 
 use std::path::Path;
 
@@ -185,13 +195,15 @@ const BYTES_PER_SOURCE_BYTE: u64 = 33;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HistorySurvey {
     /// Commits reachable from HEAD. One set of semantic deltas is derived and
-    /// held for each.
+    /// held for each of these, and for every commit only another ref reaches,
+    /// which this count does not see.
     pub commits: u64,
     /// Artifacts the index tracks, which is the width of the tree the
     /// conversion parses whole.
     pub tracked_artifacts: u64,
-    /// Bytes of every distinct blob reachable from HEAD, which is every file
-    /// version the enrichment reads and the volume the store carries.
+    /// Bytes of every distinct blob reachable from HEAD. The enrichment reads
+    /// these, and also every file version only another ref reaches, which
+    /// this count does not see.
     pub history_bytes: u64,
 }
 
@@ -305,6 +317,20 @@ pub enum BudgetVerdict {
 }
 
 impl BudgetVerdict {
+    /// The history survey this verdict was judged from, when one ran.
+    ///
+    /// Read by the disk check after this one, so a conversion walks its
+    /// history once rather than once per question asked about it.
+    pub fn survey(&self) -> Option<HistorySurvey> {
+        match self {
+            Self::Fits { survey, .. }
+            | Self::Tight { survey, .. }
+            | Self::DaemonAllowance { survey, .. }
+            | Self::Exceeds { survey, .. } => Some(*survey),
+            Self::Unmeasured { .. } | Self::InvalidCeilingOverride { .. } => None,
+        }
+    }
+
     /// Whether the conversion must not start.
     pub fn refuses(&self) -> bool {
         matches!(
@@ -596,6 +622,13 @@ fn ceiling() -> Ceiling {
 /// before a conversion has committed to anything, so a repository shape neither
 /// read understands must leave the conversion exactly as it was rather than
 /// refuse it: every error here becomes [`BudgetVerdict::Unmeasured`].
+///
+/// This is HEAD's history, not the capture's. A conversion captures every ref
+/// under `refs/` and a detached HEAD, so on a repository whose other branches
+/// and tags carry history of their own it admits more than this counts, and on
+/// a clone with many refs this can be a small part of it. The coefficients
+/// above were read against this count, so it stays what it is, and the rest is
+/// judged at phase 4 by [`project_import`], over what the capture really took.
 pub fn survey_history(source: &Path) -> Result<HistorySurvey, String> {
     // Opened the way capture opens it, not the way a convenience helper would.
     // `gix::open` honours ambient Git configuration and replacement objects, so
@@ -651,10 +684,15 @@ pub fn survey_history(source: &Path) -> Result<HistorySurvey, String> {
 /// reads it, so a well-known empty tree the repository does not actually hold
 /// is not fabricated.
 ///
-/// The closure is the one reachable from HEAD, not from every ref, which is
-/// what `survey_history` walks. A repository whose unmerged branches are large
-/// is therefore forecast from less than `kin init` will go on to admit, and
-/// the forecast stays a floor because it counts fewer bytes rather than more.
+/// The closure is the one reachable from HEAD, which is what `survey_history`
+/// walks, and not the one the capture takes from every ref. On a repository
+/// whose other branches and tags carry history of their own this counts fewer
+/// bytes than `kin init` goes on to admit, so the forecast it feeds is a floor
+/// on part of the conversion rather than a bound on the whole of it. Measured
+/// on a clone of firelock-ai/kin carrying 1,227 refs: 3,853 commits and
+/// 2,057,063,712 blob bytes from HEAD, against 6,763 commits and
+/// 3,091,481,623 blob bytes captured. [`project_import`] judges that gap once
+/// the capture has been taken.
 fn reachable_history_bytes(
     repo: &gix::Repository,
     commit_ids: &[gix::ObjectId],
@@ -835,16 +873,26 @@ pub fn verdict_for_with_allowance_under(
 /// phase 4 the plan holds the head tree it is going to admit and a size for
 /// every object it captured, so the bytes of the tree are finally a number
 /// rather than a guess. Both are needed: the survey refuses a deep history
-/// before capture spends minutes on it, and this one describes the shape the
-/// survey is blind to.
+/// before capture spends minutes on it, and this one judges what the survey is
+/// blind to, a wide tree's bytes and every commit and object that only a ref
+/// other than HEAD reaches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ImportSurvey {
-    /// Changes the plan carries, one per admitted commit.
+    /// Changes the plan carries, one per captured commit, from every ref.
     pub commits: u64,
     /// Artifacts in the head tree the workspace seed admits.
     pub head_artifacts: u64,
-    /// Bytes of captured Git objects the plan records.
+    /// Bytes of captured Git objects the plan records: every commit, tree,
+    /// blob and tag the capture took, from every ref.
     pub object_bytes: u64,
+    /// References the capture took, every ref under `refs/`, symbolic ones
+    /// included.
+    ///
+    /// The phase-1 survey walks HEAD alone, and this says how much wider the
+    /// capture was. A refusal names it because the remedy for history only
+    /// other refs reach is a clone carrying fewer of them, and without the
+    /// count nothing tells an operator that the refs are the size.
+    pub refs: u64,
 }
 
 impl ImportSurvey {
@@ -880,7 +928,8 @@ pub enum ImportProjection {
         projected_bytes: u64,
         available_bytes: u64,
     },
-    /// The projection is larger than what the machine still has.
+    /// The projection is larger than what the machine still has. The
+    /// conversion refuses here, before it derives semantic history.
     Short {
         survey: ImportSurvey,
         projected_bytes: u64,
@@ -890,47 +939,109 @@ pub enum ImportProjection {
 }
 
 impl ImportProjection {
-    /// The line an operator sees, or `None` when there is nothing to say.
+    /// Whether the conversion must stop before deriving semantic history.
     ///
-    /// Silent unless the projection is short, because a memory line on a
-    /// conversion with room to spare is the noise that trains an operator to
-    /// skip the line that matters.
+    /// This used to warn and carry on, on the reasoning that phase 1 owns the
+    /// refusal and a completed capture is too dear to spend on this
+    /// projection's thinner calibration. But phase 1 walks HEAD alone and the
+    /// capture takes every ref, so on a repository whose other refs carry
+    /// history of their own, phase 1 judges part of the conversion and this is
+    /// the first check that sees the rest. A clone of firelock-ai/kin carrying
+    /// 1,227 refs was forecast at 34.5 GiB by phase 1 against a 128 GiB machine
+    /// and passed in silence, was projected here at 96.4 GiB against 68.5 GiB
+    /// free, and went on into the phase that spends it with nothing but a
+    /// warning.
     ///
-    /// It warns and does not refuse. Phase 1 already owns the refusal, decided
-    /// against a ceiling with a documented calibration and an environment
-    /// variable to override it. This runs four phases later on a conversion
-    /// that has already been admitted and captured, and its own coefficients
-    /// are calibrated on far fewer subjects, so turning it into a second
-    /// refusal would spend a user's completed capture on the least-tested
-    /// number in the module.
-    pub fn advisory_line(&self) -> Option<String> {
+    /// The capture a refusal here gives up cost seconds to minutes, and the
+    /// phase it stops before is the one that holds the memory. Past it a Linux
+    /// kernel ends the run with no message, and macOS pages until the machine
+    /// stops answering. The cost is stated rather than hidden: the bytes term
+    /// was calibrated on one-commit snapshots and reads a deep history high, so
+    /// a conversion refused here may have fitted. The refusal names
+    /// [`INIT_MEMORY_CEILING_ENV`], the same one lever phase 1 offers, and an
+    /// operator who disagrees gets past both with it.
+    pub fn refuses(&self) -> bool {
+        matches!(self, Self::Short { .. })
+    }
+
+    /// The refusal, as the lines an operator reads.
+    ///
+    /// Empty for every verdict that does not refuse, which is also every
+    /// verdict that has room: a memory line on a conversion with room to spare
+    /// is the noise that trains an operator to skip the line that matters.
+    pub fn refusal_lines(&self) -> Vec<String> {
         let Self::Short {
             survey,
             projected_bytes,
-            source,
             available_bytes,
+            source,
         } = self
         else {
-            return None;
+            return Vec::new();
         };
-        // Names the head tree rather than the history, because that is what
-        // drove the number, and because the remedy differs. A deep history is
-        // helped by a shallow clone. This is not: the measured subject WAS a
-        // shallow clone, one commit deep, and it still needed sixteen
-        // gigabytes. Telling that operator to clone shallower would send them
-        // round a loop they are already standing in.
-        Some(format!(
-            "  this conversion is projected to hold about {}, and this {} has about {} left, \
-             because {} files over {} of source is a wide tree. A shallower clone will not help: \
-             the tree is the size, not the history. It will probably not finish; to be sure, give \
-             it more than {} or convert a smaller subtree",
-            human_bytes(*projected_bytes),
+        let mut lines = vec![format!(
+            "this conversion needs more memory than this {} has left: it is projected to hold \
+             about {}, and about {} is free",
             source.as_str(),
-            human_bytes(*available_bytes),
-            survey.head_artifacts,
-            human_bytes(survey.object_bytes),
             human_bytes(*projected_bytes),
-        ))
+            human_bytes(*available_bytes),
+        )];
+        // Which of two causes, because the remedies are opposite. A wide tree
+        // is the size whatever the history, so a shallower clone sends that
+        // reader round a loop: the measured subject WAS one commit deep and
+        // still needed sixteen gigabytes. A history is helped by carrying less
+        // of it, and history the capture took from refs HEAD does not reach is
+        // the case phase 1 cannot see at all. The tree decides only when it is
+        // one commit deep or its width is the term that set the projection.
+        let tree_decides = survey.commits <= 1
+            || survey
+                .head_artifacts
+                .saturating_mul(BYTES_PER_HEAD_ARTIFACT)
+                >= *projected_bytes;
+        if tree_decides {
+            lines.push(format!(
+                "  {} files over {} of source is a wide tree, and deriving its semantics is the \
+                 phase this stops before",
+                survey.head_artifacts,
+                human_bytes(survey.object_bytes),
+            ));
+            lines.push(format!(
+                "  give it more than {} free, or convert a smaller subtree. A shallower clone will \
+                 not help: the tree is the size, not the history",
+                human_bytes(*projected_bytes),
+            ));
+        } else {
+            lines.push(format!(
+                "  it captured {} commits and {} of Git objects from {} refs, because a conversion \
+                 takes every branch, tag and other ref under refs/ and not only the history HEAD \
+                 reaches, which is all the forecast before capture counted. Deriving their \
+                 semantics is the phase this stops before",
+                survey.commits,
+                human_bytes(survey.object_bytes),
+                survey.refs,
+            ));
+            lines.push(format!(
+                "  give it more than {} free, or convert a clone that carries only the history \
+                 you need, such as one made with `git clone --single-branch --no-tags`. A `git \
+                 clone --depth` clone is not that: Kin refuses a shallow boundary, because a \
+                 history whose oldest commits have absent parents cannot be captured losslessly",
+                human_bytes(*projected_bytes),
+            ));
+        }
+        lines.push(format!(
+            "  if this {} really has more memory than Kin could read, or you have judged this \
+             projection wrong for your repository, set {} to a ceiling in bytes that leaves more \
+             than {} beyond what is already in use, and run again",
+            source.as_str(),
+            INIT_MEMORY_CEILING_ENV,
+            human_bytes(*projected_bytes),
+        ));
+        lines.push(
+            "  nothing was published: the capture this run took is removed as it stops, and no \
+             .kin was written"
+                .to_string(),
+        );
+        lines
     }
 }
 
@@ -1047,6 +1158,7 @@ mod tests {
             commits: 1,
             head_artifacts,
             object_bytes,
+            refs: 1,
         }
     }
 
@@ -1064,7 +1176,8 @@ mod tests {
             matches!(projection, ImportProjection::Short { .. }),
             "expected a short projection, got {projection:?}"
         );
-        assert!(projection.advisory_line().is_some());
+        assert!(projection.refuses());
+        assert!(!projection.refusal_lines().is_empty());
     }
 
     /// Phase 1 sees a wide tree by its file count; phase 4 adds its bytes.
@@ -1107,7 +1220,8 @@ mod tests {
     fn a_projection_that_fits_says_nothing() {
         let projection = projection_for(snapshot(1_857, 21_264_703), 64 * 1024 * 1024 * 1024);
         assert!(matches!(projection, ImportProjection::Fits { .. }));
-        assert_eq!(projection.advisory_line(), None);
+        assert!(!projection.refuses());
+        assert!(projection.refusal_lines().is_empty());
     }
 
     /// The remedy has to be one the reader is not already standing in.
@@ -1115,22 +1229,30 @@ mod tests {
     /// The phase-1 refusal offers `git clone --depth`, which is right for a
     /// deep history and useless here: the measured subject WAS one commit deep
     /// and still needed sixteen gigabytes. A line that sent that operator to
-    /// clone shallower would send them round a loop.
+    /// clone shallower would send them round a loop, and one that sent them to
+    /// a single-branch clone would send them round the same loop by another
+    /// name.
     #[test]
-    fn the_advisory_names_the_tree_and_does_not_offer_a_shallower_clone() {
-        let line = projection_for(snapshot(18_508, 531_828_795), 16 * 1000 * 1000 * 1000)
-            .advisory_line()
-            .expect("a short projection states itself");
-        assert!(line.contains("18508 files"), "line was: {line}");
-        assert!(line.contains("wide tree"), "line was: {line}");
+    fn the_refusal_names_the_tree_and_does_not_offer_a_shallower_clone() {
+        let text = projection_for(snapshot(18_508, 531_828_795), 16 * 1000 * 1000 * 1000)
+            .refusal_lines()
+            .join("\n");
+        assert!(text.contains("needs more memory"), "text was:\n{text}");
+        assert!(text.contains("18508 files"), "text was:\n{text}");
+        assert!(text.contains("wide tree"), "text was:\n{text}");
         assert!(
-            line.contains("shallower clone will not help"),
-            "the one remedy that cannot work here has to be ruled out by name: {line}"
+            text.contains("shallower clone will not help"),
+            "the one remedy that cannot work here has to be ruled out by name: {text}"
         );
         assert!(
-            line.contains("smaller subtree"),
-            "a warning with no remedy is most of the way back to silence: {line}"
+            text.contains("smaller subtree"),
+            "a refusal with no remedy is most of the way back to silence: {text}"
         );
+        assert!(
+            !text.contains("--single-branch"),
+            "a one-commit snapshot was told to clone fewer refs: {text}"
+        );
+        assert!(text.contains(INIT_MEMORY_CEILING_ENV), "text was:\n{text}");
     }
 
     /// Every subject the coefficients were read off is still floored by them.
@@ -1170,6 +1292,7 @@ mod tests {
                 commits,
                 head_artifacts: tracked,
                 object_bytes: 0,
+                refs: 1,
             }
             .projected_peak_bytes();
             assert!(
@@ -1194,12 +1317,14 @@ mod tests {
             commits: 1,
             head_artifacts: 100_000_000_000_000,
             object_bytes: 0,
+            refs: 1,
         };
         assert_eq!(by_artifact_count.projected_peak_bytes(), u64::MAX);
         let by_source_bytes = ImportSurvey {
             commits: 1,
             head_artifacts: 0,
             object_bytes: 1_000_000_000_000_000_000,
+            refs: 1,
         };
         assert_eq!(by_source_bytes.projected_peak_bytes(), u64::MAX);
         assert!(matches!(
@@ -1221,7 +1346,7 @@ mod tests {
         let machine = headroom_for(Ceiling::Bytes(16 * 1000 * 1000 * 1000), 0)
             .expect("a readable ceiling has a headroom");
         assert!(
-            projection_for(survey, machine).advisory_line().is_some(),
+            projection_for(survey, machine).refuses(),
             "this subject has to be short against the machine before an override can matter"
         );
         let raised = headroom_for(
@@ -1230,10 +1355,9 @@ mod tests {
         )
         .expect("an operator's ceiling has a headroom");
         assert_eq!(raised, 56 * 1024 * 1024 * 1024);
-        assert_eq!(
-            projection_for(survey, raised).advisory_line(),
-            None,
-            "an operator who raised the ceiling past this projection is still being warned by it"
+        assert!(
+            !projection_for(survey, raised).refuses(),
+            "an operator who raised the ceiling past this projection is still being refused by it"
         );
     }
 
@@ -1261,12 +1385,79 @@ mod tests {
     fn an_unreadable_ceiling_projects_nothing() {
         assert!(headroom_for(Ceiling::Unreadable("no ceiling here".to_string()), 0).is_err());
         assert!(headroom_for(Ceiling::Invalid("twelve".to_string()), 0).is_err());
+        let unmeasured = ImportProjection::Unmeasured {
+            reason: "no ceiling here".to_string(),
+        };
+        assert!(!unmeasured.refuses());
+        assert!(unmeasured.refusal_lines().is_empty());
+    }
+
+    /// The conversion that turned this projection into a refusal, in its own
+    /// numbers.
+    ///
+    /// A clone of firelock-ai/kin carrying 1,227 refs, on a 128 GiB host with
+    /// 68.5 GiB free. Phase 1 walked HEAD: 3,853 commits over 1,455 tracked
+    /// files and 2,057,063,712 bytes of history, a 34.5 GiB forecast the
+    /// machine holds without a word. The capture took every ref: 6,763 commits
+    /// and 3,135,900,819 bytes of objects, 3,091,481,623 of them blobs. Phase 4
+    /// projected 96.4 GiB from those and only warned, and the run went on into
+    /// the phase that spends it.
+    ///
+    /// Phase 1 walked over every captured ref would still have been silent
+    /// here, because on a bare host it judges the whole machine rather than
+    /// what is free. That is why the refusal sits at phase 4, where the
+    /// capture's own counts meet the memory actually left.
+    #[test]
+    fn a_capture_wider_than_head_is_refused_where_phase_one_was_silent() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let machine = 128 * GIB;
+        for (scope, survey) in [
+            ("HEAD", history(3_853, 1_455, 2_057_063_712)),
+            ("every captured ref", history(6_763, 1_455, 3_091_481_623)),
+        ] {
+            let verdict = verdict_for(survey, machine);
+            assert!(
+                matches!(verdict, BudgetVerdict::Fits { .. }),
+                "phase 1 over {scope} on a 128 GiB machine was {verdict:?}"
+            );
+        }
+
+        let captured = ImportSurvey {
+            commits: 6_763,
+            head_artifacts: 1_455,
+            object_bytes: 3_135_900_819,
+            refs: 1_227,
+        };
         assert_eq!(
-            ImportProjection::Unmeasured {
-                reason: "no ceiling here".to_string(),
-            }
-            .advisory_line(),
-            None
+            captured.projected_peak_bytes(),
+            103_484_727_027,
+            "the projection that run printed as 96.4 GiB"
+        );
+        let free = 68_500 * GIB / 1_000;
+        let projection = projection_for(captured, free);
+        assert!(projection.refuses(), "got {projection:?}");
+        let text = projection.refusal_lines().join("\n");
+        for phrase in [
+            "needs more memory",
+            "96.4 GiB",
+            "68.5 GiB is free",
+            "6763 commits",
+            "from 1227 refs",
+            "every branch, tag and other ref",
+            "--single-branch --no-tags",
+            "git clone --depth",
+            INIT_MEMORY_CEILING_ENV,
+            "nothing was published",
+        ] {
+            assert!(
+                text.contains(phrase),
+                "the refusal omits {phrase:?}:\n{text}"
+            );
+        }
+        assert!(
+            !text.contains("wide tree") && !text.contains("shallower clone will not help"),
+            "a history taken from 1,227 refs was diagnosed as a wide tree, which is the advice \
+             that run was given:\n{text}"
         );
     }
 

@@ -7,6 +7,11 @@
 //! `s.Run()` emit Calls edges keyed on the *simple* rightmost name
 //! (`Println`, `Run`) rather than the full dotted form. Dotted dst_names
 //! break name-based edge resolution elsewhere in the graph.
+//!
+//! The one exception is a call on the enclosing method's own declared
+//! receiver, which carries the owner-qualified name and the receiver
+//! identifier so the linker's receiver-aware tiers can resolve it against the
+//! owner-qualified name the method entity is stored under.
 
 use kin_model::{FilePathId, RelationKind};
 use kin_parser::{ExtractedRelation, GoAdapter, LanguageAdapter};
@@ -309,5 +314,110 @@ fn fixture_calls_all_carry_a_site() {
     assert!(
         siteless.is_empty(),
         "every Calls edge must name its call expression, these do not: {siteless:?}"
+    );
+}
+
+/// A method calling another method of its own type through its declared
+/// receiver has to leave the adapter owner-qualified and receiver-tagged, or
+/// the linker's receiver-aware tiers never see it.
+///
+/// This is the `cli/cli` shape the gap was hand-checked on: two sites inside
+/// one file call `cs.fetchCodespaces(...)` on the receiver of the enclosing
+/// method, and both resolved to nothing while the identical syntax resolved
+/// cross-file and for plain functions. A bare `dst_name` with no receiver
+/// cannot be matched against the owner-qualified name the method entity is
+/// stored under, and the bare-leaf fallback excludes the same file by design.
+///
+/// Every other callee shape in the same body must be untouched: a plain
+/// function call, a call to a name this file does not declare, and a call
+/// through a struct field rather than the receiver identifier all stay bare
+/// and receiverless.
+#[test]
+fn same_type_receiver_calls_carry_the_owner_and_the_receiver() {
+    let source = r#"
+package codespace
+
+type CodespaceSelector struct {
+	api           apiClient
+	codespaceName string
+}
+
+func (cs *CodespaceSelector) Select(ctx context.Context) (*Codespace, error) {
+	codespaces, err := cs.fetchCodespaces(ctx)
+	if err != nil {
+		return nil, err
+	}
+	normalize(cs.codespaceName)
+	formatError(err)
+	return cs.chooseCodespace(ctx, codespaces)
+}
+
+func (cs *CodespaceSelector) fetchCodespaces(ctx context.Context) ([]*Codespace, error) {
+	return cs.api.ListCodespaces(ctx)
+}
+
+func (cs *CodespaceSelector) chooseCodespace(ctx context.Context, in []*Codespace) (*Codespace, error) {
+	return in[0], nil
+}
+
+func normalize(name string) string { return name }
+"#;
+    let rels = parse_and_extract(source);
+    let from_select: Vec<&ExtractedRelation> = rels
+        .iter()
+        .filter(|r| r.kind == RelationKind::Calls && r.src_name == "CodespaceSelector.Select")
+        .collect();
+
+    // The two calls on the enclosing method's own receiver.
+    for method in ["fetchCodespaces", "chooseCodespace"] {
+        let dotted = format!("CodespaceSelector.{method}");
+        let edge = from_select
+            .iter()
+            .find(|r| r.dst_name == dotted)
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected a Calls edge to {dotted}, got {:?}",
+                    from_select
+                        .iter()
+                        .map(|r| (&r.dst_name, &r.receiver))
+                        .collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(
+            edge.receiver.as_deref(),
+            Some("cs"),
+            "{dotted} must name the receiver it was called on: {edge:?}"
+        );
+        assert!(
+            edge.site.is_some(),
+            "{dotted} must still name its call expression: {edge:?}"
+        );
+    }
+
+    // A plain function call in the same file, a call to a name this file does
+    // not declare, and a call through a struct field are all unchanged.
+    for bare in ["normalize", "formatError"] {
+        let edge = from_select
+            .iter()
+            .find(|r| r.dst_name == bare)
+            .unwrap_or_else(|| panic!("expected a bare Calls edge to {bare}: {from_select:?}"));
+        assert_eq!(
+            edge.receiver, None,
+            "{bare} is not a receiver call: {edge:?}"
+        );
+    }
+    let through_field = rels
+        .iter()
+        .find(|r| r.kind == RelationKind::Calls && r.dst_name == "ListCodespaces")
+        .expect("the field selector call keeps its simple name");
+    assert_eq!(
+        through_field.receiver, None,
+        "`cs.api.ListCodespaces` dispatches on a field, not on the receiver: {through_field:?}"
+    );
+    assert!(
+        !rels.iter().any(|r| r.kind == RelationKind::Calls
+            && r.dst_name.contains('.')
+            && r.receiver.is_none()),
+        "only a declared-receiver call may carry a dotted dst_name: {rels:?}"
     );
 }

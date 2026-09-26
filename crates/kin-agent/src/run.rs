@@ -3,7 +3,7 @@
 
 //! The agent loop.
 
-use crate::belt::{self, Belt, LocalTool, Route};
+use crate::belt::{self, Belt, Route};
 use crate::context::{self, ContextMeter, CountSource};
 use crate::mcp::{McpClient, McpError, McpTool, ToolOutcome};
 use crate::parse::{self, Turn};
@@ -14,7 +14,7 @@ use crate::repeat;
 use crate::transcript::{now_iso, TranscriptWriter};
 use crate::{AgentConfig, ExitStatus, RunOutcome};
 use serde_json::{json, Map, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -36,27 +36,47 @@ mcp__kin__semantic_search to find things by meaning, use mcp__kin__get_context_p
 mcp__kin__get_entity_source to read exact source, and use mcp__kin__find_references or \
 mcp__kin__trace_data_flow to follow relationships.
 
+Reach for mcp__kin__lexical_lookup when the question names an exact identifier, string, or \
+symbol to find, or when mcp__kin__find_references or mcp__kin__trace_data_flow answered with \
+an inconclusive verdict for the entity you asked about. Resolve the entity first as usual, \
+then call mcp__kin__lexical_lookup with that bare token, not a sentence describing it: it \
+matches stored graph fields literally. A hit there is lexical evidence, never a \
+resolved reference, so mcp__kin__find_references stays the answer of record whenever it \
+certifies.
+
 When a Kin result is empty, read what Kin says about that emptiness. If it reports the \
 absence cannot be trusted, the honest answer is that you do not know, and you should say \
 what the gap is. Never turn an untrusted absence into a claim that something does not exist.
 
-To change code, name the entity you are changing. mcp__kin__kin_mutate takes an operations \
-array and stages and commits it in one call: for an entity the graph already holds, one \
-operation with verb 'update', target set to the entity id mcp__kin__semantic_locate or \
-mcp__kin__find_references handed you (a name works only when it is unique), body set to \
-that entity's complete new source text, and description saying what that one operation \
-does. Pass a summary too: one sentence in your own words saying what the whole change does, \
-which becomes the subject a human reads in history. Read the entity's exact current source \
-with mcp__kin__get_entity_source first and send the whole body back, not a fragment: the \
-body replaces the entity's entire span. A body that came back marked '... [truncated]' is \
-not the entity's source and staging one is refused. A file the graph has never seen is verb \
-'create' with target set to its repository-relative path, and a tracked file you are \
-rewriting whole is verb 'replace' with the same. If mcp__kin__kin_mutate refuses, the reason \
-comes back in the result: fix what it names and call it again.
+To change code, name the entity you are changing by its UUID, the id \
+mcp__kin__semantic_locate, mcp__kin__find_references and mcp__kin__get_entity_source hand \
+you, and read it with mcp__kin__get_entity_source first. mcp__kin__kin_mutate takes an \
+operations array and stages and commits it in one call. Prefer verb 'patch' with target \
+set to that UUID and an EntitySourcePatch payload: the exact source_base \
+mcp__kin__get_entity_source returned, unchanged, and edits, each an old_text that occurs \
+exactly once in the entity's body with the new_text that takes its place. The source_base \
+names the version you read, so a change to an entity that has moved since is refused \
+rather than applied over the newer text. When the change rewrites most of the entity, use \
+verb 'update' with target set to its UUID, an EntitySourceBase payload holding that same \
+exact source_base, and body set to its complete new source text. Every update must carry that \
+EntitySourceBase, and one without it is refused: send the whole body back, not a fragment, \
+because the body takes the entity's entire span. A body that came back marked '... [truncated]' is not the entity's source and \
+staging one is refused. To add a top-level function, use verb 'create' with target set to \
+an existing function's UUID and an EntityCreate payload: that function's source_base as the \
+anchor, the new function's name, kind 'function', its one declaration as body, and \
+placement 'sibling_after' or 'new_source_unit'. To delete one, use verb 'remove' with its \
+UUID and an EntityRemove payload holding its source_base. Use only these operations, as the \
+mcp__kin__kin_mutate schema describes them. Give every operation a description saying what \
+it does, and pass a summary too: one sentence in your own words saying what the whole \
+change does, which becomes the subject a human reads in history. Your session is already \
+open: this run opened it once and sends it with every change, so do not start another. If \
+mcp__kin__kin_mutate refuses, the reason comes back in the result: fix what it names and \
+call it again.
 
-Your tools are the ones on your belt and no others. If edit_file or write_file are among \
-them you may use them, and if they are not, they do not exist for you: this repository is a \
-graph, and a change to it is a change to an entity.
+Your tools are the ones on your belt and no others: this repository is a graph, and a change \
+to it is a change to an entity. Every change goes through mcp__kin__kin_mutate, including a \
+new entity if its operations offer one; there is no file creation. If the change needs \
+something kin_mutate cannot make, stop and say so.
 
 Work in small steps. Call one or two tools, read what came back, then decide. When you have \
 the answer, say it in plain text without calling a tool.";
@@ -64,22 +84,6 @@ the answer, say it in plain text without calling a tool.";
 /// Where the code-changing paragraph of [`DEFAULT_SYSTEM_PROMPT`] starts and ends.
 const CHANGE_PARAGRAPH_START: &str = "To change code, name the entity";
 const CHANGE_PARAGRAPH_END: &str = "Work in small steps.";
-
-/// The code-changing paragraph for a belt with file tools and no `kin_mutate`.
-const FILE_TOOLS_PARAGRAPH: &str = "\
-To change code, use edit_file for a surgical change to an existing file and write_file to \
-create a new one. Read the exact current text through Kin first so your edit matches byte \
-for byte. You never open, stage or commit a transaction yourself, and those tools are not \
-on your belt on purpose. The harness does it around every call you make: a file you create \
-with write_file is staged as Kin's create operation, carrying the repository-relative path \
-and the full body, and committed with provenance naming this agent. An edit to a file Kin \
-already tracks is staged as Kin's replace operation, carrying that path and the file's \
-complete new text as your edit left it, and committed the same way.
-
-Your tools are the mcp__kin__ ones named above plus edit_file and write_file. You have no \
-others.
-
-";
 
 /// The code-changing paragraph for a belt that carries no write tool at all.
 const READ_ONLY_PARAGRAPH: &str = "\
@@ -92,12 +96,12 @@ Your tools are the mcp__kin__ ones named above. You have no others.
 
 /// The built-in system prompt for this belt.
 ///
-/// The paragraph about changing code has to describe the write tools the model
+/// The paragraph about changing code has to describe the write tool the model
 /// actually has, because a prompt that names a tool the belt does not carry is a
 /// false instruction: under `--tool-profile agent-query` the server serves no
 /// `kin_mutate`, and a model told to call it spends its turns being refused.
-/// `kin_mutate` on the belt keeps the entity paragraph; file tools without it get
-/// the file paragraph; a belt with neither is told the run is read-only.
+/// `kin_mutate` on the belt keeps the entity paragraph, and a belt without it is
+/// told the run is read-only.
 pub fn system_prompt_for(belt: &Belt) -> String {
     if belt.has_kin_tool("kin_mutate") {
         return DEFAULT_SYSTEM_PROMPT.to_string();
@@ -108,15 +112,10 @@ pub fn system_prompt_for(belt: &Belt) -> String {
     ) else {
         return DEFAULT_SYSTEM_PROMPT.to_string();
     };
-    let paragraph = if belt.has_file_tools() {
-        FILE_TOOLS_PARAGRAPH
-    } else {
-        READ_ONLY_PARAGRAPH
-    };
     format!(
         "{}{}{}",
         &DEFAULT_SYSTEM_PROMPT[..start],
-        paragraph,
+        READ_ONLY_PARAGRAPH,
         &DEFAULT_SYSTEM_PROMPT[end..]
     )
 }
@@ -124,8 +123,8 @@ pub fn system_prompt_for(belt: &Belt) -> String {
 /// One attached graph server and the repository it serves.
 ///
 /// A run holds one of these per repository. Everything that has to reach a particular
-/// graph goes through the server that owns the path, which is what keeps a two-repository
-/// run from committing one repository's change into the other's graph.
+/// graph goes through the server whose prefix the call names, which is what keeps a
+/// two-repository run from committing one repository's change into the other's graph.
 struct Server {
     /// `None` for a single-server run, whose tools keep the historical `mcp__kin__`
     /// prefix. `Some(label)` once several are attached and they must be told apart.
@@ -153,25 +152,6 @@ impl Server {
     fn declares(&self, tool: &str) -> bool {
         self.declared.iter().any(|declared| declared.name == tool)
     }
-}
-
-/// What the model is told about paths once a run attaches several repositories.
-fn repo_path_note(repos: &[std::path::PathBuf]) -> String {
-    let primary = repos
-        .first()
-        .map(|repo| repo.display().to_string())
-        .unwrap_or_default();
-    let others: Vec<String> = repos
-        .iter()
-        .skip(1)
-        .map(|repo| repo.display().to_string())
-        .collect();
-    format!(
-        "This run has {} repositories attached. A relative path is read inside the primary \
-         repository at {primary}. To change a file in {}, give its absolute path.",
-        repos.len(),
-        others.join(" or ")
-    )
 }
 
 /// What one tool cost a run, summed over every call to it.
@@ -225,12 +205,7 @@ impl AccountingMode {
 struct Counters {
     tool_calls: u32,
     kin_calls: u32,
-    local_calls: u32,
     refused_calls: u32,
-    /// Changes the model asked for that repository authority did not publish. A run holding
-    /// one of these landed nothing for that change, whatever its closing paragraph says,
-    /// which must not read as a success.
-    unpublished_changes: u32,
     repairs: u32,
     unsafe_absence_events: u32,
     unreadable_results: u32,
@@ -264,19 +239,12 @@ struct Counters {
     /// under the name the model invented rather than under nothing.
     by_tool: BTreeMap<String, ToolCost>,
     api_ms: u128,
-    edits: Vec<String>,
-    /// Entities the model named to `kin_mutate`, in the order it named them.
+    /// Entities the model named to `kin_mutate`, in the order it named them,
+    /// published as `entities_changed`.
     ///
-    /// Kept apart from `edits` rather than folded into it, because the two are
-    /// different kinds of thing and a reader downstream cannot tell them apart
-    /// once they are in one list. `edits` holds repository-relative (or, with
-    /// several repositories attached, absolute) file paths and is published as
-    /// `files_changed`, which `loop_integration` asserts is a path. An entity
-    /// target is a UUID or a name and resolves against the graph, not the
-    /// filesystem, so putting one in that list would publish a path that is not
-    /// a path. On a pure-Kin belt `files_changed` is empty and this is the list
-    /// with the work in it, which is the shape the thesis wants: the run
-    /// records which entity changed, and the file it landed in is derived.
+    /// An entity target is a UUID or a name and resolves against the graph, not
+    /// the filesystem, which is the shape the thesis wants: the run records which
+    /// entity changed, and the file it landed in is derived.
     entity_edits: Vec<String>,
     /// Every row `find_references` returned in this run, keyed by (focal
     /// entity id, referenced entity id) so a second call in the same run
@@ -306,9 +274,7 @@ impl Counters {
         Counters {
             tool_calls: 0,
             kin_calls: 0,
-            local_calls: 0,
             refused_calls: 0,
-            unpublished_changes: 0,
             repairs: 0,
             unsafe_absence_events: 0,
             unreadable_results: 0,
@@ -328,7 +294,6 @@ impl Counters {
             exact_admissions: 0,
             by_tool: BTreeMap::new(),
             api_ms: 0,
-            edits: Vec::new(),
             entity_edits: Vec::new(),
             reference_rows: BTreeMap::new(),
         }
@@ -518,9 +483,7 @@ impl Counters {
             "stop_detail": stop.detail,
             "tool_calls": self.tool_calls,
             "kin_calls": self.kin_calls,
-            "local_calls": self.local_calls,
             "refused_calls": self.refused_calls,
-            "unpublished_changes": self.unpublished_changes,
             "repairs": self.repairs,
             "unsafe_absence_events": self.unsafe_absence_events,
             "unreadable_results": self.unreadable_results,
@@ -528,7 +491,6 @@ impl Counters {
             "withheld_results": self.withheld_results,
             "skipped_calls": self.skipped_calls,
             "session_heartbeats": self.session_heartbeats,
-            "files_changed": self.edits,
             "entities_changed": self.entity_edits,
             "reference_rows": self.reference_rows.values().cloned().collect::<Vec<_>>(),
         })
@@ -566,6 +528,75 @@ pub(crate) fn with_harness_session(arguments: &Value, tool: &str, session: Optio
         map.insert("session_id".into(), Value::String(session.to_string()));
     }
     arguments
+}
+
+/// The first line `kin_mutate` puts on a refusal that started nothing.
+///
+/// kin-mcp's `mutate_through` writes it only when the begin was refused because the
+/// session it named no longer exists, and follows it with a JSON object naming the stage,
+/// the refusal and that session. Mirrored rather than imported because kin-agent takes no
+/// kin-mcp dependency.
+const MUTATE_NOT_STARTED: &str = "kin_mutate_not_started: ";
+
+/// Whether a refused Kin call is sent once more under a fresh session.
+///
+/// Only a `kin_mutate` whose first line is the not-started marker, for the begin stage,
+/// refused because the session is gone, naming the session this run sent. A session the
+/// model named itself is the model's to correct, and a call carrying a `request_id`
+/// belongs to the durable protocol, which retries under its own identity.
+///
+/// The retry cannot apply a change twice, because the marker exists only where nothing
+/// was started. An unkeyed `kin_mutate` is a begin followed by a commit that carries the
+/// operations, and `kin_mcp::handlers::sessions::mutate_through` writes the marker only in
+/// the branch where the begin itself was refused, before any commit is sent. A gone
+/// session found later, by the commit or by the abort after an unanswered commit, can
+/// arrive after a change was published, so its words may appear in the text, but never
+/// on the first line as the marker, and this reads nothing else.
+///
+/// A Kin server hands its refusal over inside the envelope, which wraps text that is not
+/// JSON as `{"_kin": …, "message": <text>}`, so the marker is the first line of `message`
+/// there and the first line of the text only from a server that does not wrap.
+pub(crate) fn retry_under_fresh_session(
+    tool: &str,
+    sent_by_model: &Value,
+    outcome: &ToolOutcome,
+    harness_session: Option<&str>,
+) -> bool {
+    let named = |key: &str| {
+        sent_by_model
+            .get(key)
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+    };
+    if tool != "kin_mutate" || !outcome.is_error || named("session_id") || named("request_id") {
+        return false;
+    }
+    let Some(harness_session) = harness_session else {
+        return false;
+    };
+    let Some(marker) = refusal_text(&outcome.text)
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix(MUTATE_NOT_STARTED))
+        .and_then(|marker| serde_json::from_str::<Value>(marker).ok())
+    else {
+        return false;
+    };
+    marker["stage"] == "begin"
+        && marker["refusal"] == "session_not_found"
+        && marker["session_id"] == harness_session
+}
+
+/// The refusal a Kin tool result carries: the envelope's `message` when the server
+/// wrapped text that is not JSON in it, and the text itself otherwise.
+fn refusal_text(text: &str) -> String {
+    match serde_json::from_str::<Value>(text.trim()) {
+        Ok(Value::Object(payload)) => match payload.get("message") {
+            Some(Value::String(message)) => message.clone(),
+            _ => text.to_string(),
+        },
+        _ => text.to_string(),
+    }
 }
 
 /// Why a run stopped, as the result record states it.
@@ -693,6 +724,12 @@ pub fn run_with_accounting(
 /// Run with a chosen counting contract and optional output reserve. Invalid overrides
 /// fail before creating a transcript, attaching a graph server, or contacting the model.
 pub fn run_with_options(config: AgentConfig, options: RunOptions) -> anyhow::Result<RunOutcome> {
+    // `KIN_AGENT_PURE_KIN=false` used to put the local file tools on the belt.
+    // They are retired, so the value is refused by name here, before any run I/O,
+    // rather than ignored: a run that quietly dropped it would not be the run the
+    // operator asked for, and nothing would say so.
+    belt::refuse_file_tools(std::env::var("KIN_AGENT_PURE_KIN").ok().as_deref())
+        .map_err(anyhow::Error::msg)?;
     if let Some(reserve) = options.output_reserve_tokens {
         anyhow::ensure!(
             reserve > 0 && reserve < config.context.tokens,
@@ -707,13 +744,6 @@ pub fn run_with_options(config: AgentConfig, options: RunOptions) -> anyhow::Res
     let started = Instant::now();
     // Validate the provider dialect before transcript or MCP I/O. Construction sends no request.
     let provider = Provider::new(config.provider.clone())?;
-    // Which belt this run has, resolved once so the trace header and the belt
-    // below cannot disagree: the config's explicit choice, else the
-    // `KIN_AGENT_PURE_KIN` default, which is Kin tools only.
-    let pure_kin = match config.belt_file_tools {
-        Some(file_tools) => !file_tools,
-        None => belt::Belt::pure_kin_default(),
-    };
     let session_id = uuid::Uuid::new_v4().to_string();
     let mut writer = TranscriptWriter::create(&config.out_dir, &session_id)?;
     let mut counters = Counters::new();
@@ -737,12 +767,12 @@ pub fn run_with_options(config: AgentConfig, options: RunOptions) -> anyhow::Res
         "context_accounting": match accounting { RequestAccounting::Heuristic => "heuristic", RequestAccounting::LlamaCpp => "llama_cpp" },
         "max_result_bytes": result_ceiling,
         "tool_profile": config.tool_profile.clone().unwrap_or_else(|| "server-default".into()),
-        // Which belt this run actually had, recorded beside the server profile
-        // because they are different settings and a reader of one run's
-        // provenance has no other way to tell them apart. On a pure-Kin belt
-        // there is no edit_file and no write_file at all, so a change in that
-        // run went through Kin or it did not happen.
-        "belt": if pure_kin { "pure-kin" } else { "kin-plus-file-tools" },
+        // Which belt this run had, recorded beside the server profile because
+        // they are different settings. The belt is Kin tools only, so a change
+        // in this run went through Kin or it did not happen; the field stays so
+        // a run reads the same way as the ones recorded before the file tools
+        // were retired.
+        "belt": "pure-kin",
         "belt_profile": belt_profile.as_str(),
         "policy": "no-shell-no-file-search",
         "mcp_command": config.mcp_command.join(" "),
@@ -852,25 +882,8 @@ pub fn run_with_options(config: AgentConfig, options: RunOptions) -> anyhow::Res
         }
     }
     belt::fold_traversal(&mut kin_tools);
-    // `KIN_AGENT_PURE_KIN` is the whole switch, read once here so the trace
-    // above and the belt below cannot disagree about which one this run had.
-    //
-    // Deliberately not `--tool-profile pure-kin`. That flag names the MCP
-    // SERVER'S surface and `kin agent run` forwards it verbatim to `kin mcp
-    // start`, whose accepted tokens are agent-default, agent-query,
-    // agent-search, full and benchmark. A value none of those match falls back
-    // to the curated default, so overloading it would ask for a belt and
-    // quietly reconfigure the server as well: two settings moved by one word,
-    // one of them not the one the operator meant.
-    let belt = if pure_kin {
-        Belt::pure_kin(kin_tools)
-    } else {
-        Belt::with_file_tools(kin_tools)
-    };
-    let repo_roots: Vec<std::path::PathBuf> =
-        servers.iter().map(|server| server.repo.clone()).collect();
-    let repo_note = multi.then(|| repo_path_note(&repo_roots));
-    let specs = belt.to_specs(repo_note.as_deref());
+    let belt = Belt::new(kin_tools);
+    let specs = belt.to_specs();
     let tool_names: Vec<String> = belt.names().iter().cloned().collect();
 
     writer.init(
@@ -882,9 +895,9 @@ pub fn run_with_options(config: AgentConfig, options: RunOptions) -> anyhow::Res
         agent_meta,
     )?;
 
-    // Open a Kin session per server, so every mutation this run makes names this agent
-    // rather than an anonymous file write. A server without the tool is not an error; it
-    // just means the provenance bracket is unavailable there and the trace says so.
+    // Open a Kin session per server, so every mutation this run makes names this agent.
+    // A server without the tool is not an error; it just means the session is unavailable
+    // there and the trace says so.
     for server in servers.iter_mut() {
         let session = start_kin_session(server, &config, &mut writer)?;
         server.session = session;
@@ -897,16 +910,16 @@ pub fn run_with_options(config: AgentConfig, options: RunOptions) -> anyhow::Res
     // The repository roots are a fact about this run that the model cannot infer, and
     // without them it cannot address the second repository at all, so the note is appended
     // to an operator-supplied prompt as well as to the built-in one.
-    if let Some(note) = repo_note.as_deref() {
-        let roots = repo_roots
+    if multi {
+        let roots = servers
             .iter()
-            .map(|repo| repo.display().to_string())
+            .map(|server| server.repo.display().to_string())
             .collect::<Vec<_>>()
             .join(", ");
         system_prompt.push_str(&format!(
             "\n\nThe repositories attached to this run are: {roots}. Each has its own Kin \
              graph, and its tools carry that repository's own prefix, so read the tool names \
-             you were given and call the one belonging to the repository you mean. {note}"
+             you were given and call the one belonging to the repository you mean."
         ));
     }
     // The first request carries the system prompt, the task and every tool spec, and the
@@ -1198,7 +1211,7 @@ pub fn run_with_options(config: AgentConfig, options: RunOptions) -> anyhow::Res
                             "tool_use_id": call.id,
                             "surface": "policy",
                             "tool": call.name,
-                            "args": redact_content(&call.arguments),
+                            "args": call.arguments,
                             "policy": "skipped",
                             "reason": why,
                             "is_error": true,
@@ -1233,18 +1246,7 @@ pub fn run_with_options(config: AgentConfig, options: RunOptions) -> anyhow::Res
                     // stays well formed.
                     let guarded = match &route {
                         Route::Kin { tool, .. } => repeat_guard.before(tool, &routed_arguments),
-                        // The belt's replacement tool is the one local call a refusal
-                        // can be about the model's own bytes, and the guard counts those
-                        // per target: a run that keeps sending bytes the file does not
-                        // hold spends its whole budget one refusal at a time otherwise.
-                        Route::Local(LocalTool::Edit) => repeat_guard.before_change(
-                            &call.name,
-                            routed_arguments
-                                .get("path")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default(),
-                        ),
-                        _ => repeat::Verdict::Allow,
+                        Route::Refused(_) => repeat::Verdict::Allow,
                     };
                     if guarded != repeat::Verdict::Allow {
                         let (text, ends_run) = match guarded {
@@ -1263,7 +1265,7 @@ pub fn run_with_options(config: AgentConfig, options: RunOptions) -> anyhow::Res
                             "tool_use_id": call.id,
                             "surface": "policy",
                             "tool": call.name,
-                            "args": redact_content(&call.arguments),
+                            "args": call.arguments,
                             "policy": "repeat_guard",
                             "verdict": if ends_run.is_some() { "exhausted" } else { "redirected" },
                             "reason": repeat_guard.reasons().last(),
@@ -1296,8 +1298,8 @@ pub fn run_with_options(config: AgentConfig, options: RunOptions) -> anyhow::Res
                         }
                         continue;
                     }
-                    // A local tool's answer says whether a change landed, which the model must
-                    // hear, and it is small; only a Kin answer is ever withheld for size.
+                    // A refusal is small and the model must hear it; only a Kin answer is
+                    // ever withheld for size.
                     let from_kin = matches!(route, Route::Kin { .. });
                     let (result_text, is_error) = match route {
                         Route::Refused(message) => {
@@ -1343,13 +1345,66 @@ pub fn run_with_options(config: AgentConfig, options: RunOptions) -> anyhow::Res
                                 }
                                 Ok(()) => {
                                     let session = servers[server_index].session.clone();
-                                    let arguments = with_harness_session(
+                                    let mut arguments = with_harness_session(
                                         &routed_arguments,
                                         &name,
                                         session.as_deref(),
                                     );
-                                    let outcome =
+                                    let mut outcome =
                                         servers[server_index].client.call_tool(&name, &arguments);
+                                    // A daemon that restarted mid-run no longer holds the
+                                    // session this run opened. When the begin is refused
+                                    // for that, nothing was started, and the refusal says
+                                    // so on its first line; the run opens a new session and
+                                    // sends the same call once more under it.
+                                    let gone = match &outcome {
+                                        Ok(refused)
+                                            if retry_under_fresh_session(
+                                                &name,
+                                                &routed_arguments,
+                                                refused,
+                                                session.as_deref(),
+                                            ) =>
+                                        {
+                                            Some((
+                                                refused.wall_ms,
+                                                refusal_text(&refused.text)
+                                                    .chars()
+                                                    .take(300)
+                                                    .collect::<String>(),
+                                            ))
+                                        }
+                                        _ => None,
+                                    };
+                                    if let Some((wall_ms, detail)) = gone {
+                                        writer.trace(json!({
+                                            "tool_use_id": call.id,
+                                            "surface": "kin",
+                                            "server": server_name,
+                                            "tool": name,
+                                            "args": arguments,
+                                            "wall_ms": wall_ms as u64,
+                                            "is_error": true,
+                                            "policy": "allowed",
+                                            "event": "session_gone",
+                                            "detail": detail,
+                                        }))?;
+                                        if let Some(fresh) = start_kin_session(
+                                            &mut servers[server_index],
+                                            &config,
+                                            &mut writer,
+                                        )? {
+                                            servers[server_index].session = Some(fresh.clone());
+                                            arguments = with_harness_session(
+                                                &routed_arguments,
+                                                &name,
+                                                Some(&fresh),
+                                            );
+                                            outcome = servers[server_index]
+                                                .client
+                                                .call_tool(&name, &arguments);
+                                        }
+                                    }
                                     match outcome {
                                         Err(err) => {
                                             // The server died or stopped answering. Nothing
@@ -1460,21 +1515,17 @@ pub fn run_with_options(config: AgentConfig, options: RunOptions) -> anyhow::Res
                                                 "result_bytes": result_bytes,
                                                 "shown_bytes": shown_bytes,
                                             }))?;
-                                            // What a Kin-only run changed, read
-                                            // off the call the model made. The
+                                            // What the run changed, read off
+                                            // the call the model made. The
                                             // graph is the record of the change
                                             // itself; this is the run's own
-                                            // account of what it asked for, and
-                                            // without it a pure-Kin run reports
-                                            // no edits at all, because the two
-                                            // local tools are what used to fill
-                                            // that list and this belt has
-                                            // neither. Only a call that came
-                                            // back clean counts: a refused
-                                            // mutate changed nothing, and a run
-                                            // that listed its refusals as edits
-                                            // would overstate itself in exactly
-                                            // the place a reader checks.
+                                            // account of what it asked for.
+                                            // Only a call that came back clean
+                                            // counts: a refused mutate changed
+                                            // nothing, and a run that listed its
+                                            // refusals as edits would overstate
+                                            // itself in exactly the place a
+                                            // reader checks.
                                             if name == "kin_mutate" && !outcome.is_error {
                                                 if let Some(ops) = call
                                                     .arguments
@@ -1503,215 +1554,6 @@ pub fn run_with_options(config: AgentConfig, options: RunOptions) -> anyhow::Res
                                                 }
                                             }
                                             (annotated, outcome.is_error)
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        Route::Local(tool) => {
-                            match check_arguments(&belt, &call.name, &call.arguments) {
-                                Err(problem) => {
-                                    counters.repairs += 1;
-                                    writer.trace(json!({
-                                        "tool_use_id": call.id,
-                                        "surface": "local",
-                                        "tool": call.name,
-                                        "args": redact_content(&call.arguments),
-                                        "policy": "repaired",
-                                        "problem": problem,
-                                        "is_error": true,
-                                    }))?;
-                                    (
-                                        format!(
-                                            "The call was not run because its arguments were \
-                                             rejected: {problem}. Send the call again with that \
-                                             corrected."
-                                        ),
-                                        true,
-                                    )
-                                }
-                                Ok(()) => {
-                                    counters.local_calls += 1;
-                                    let started_call = Instant::now();
-                                    // Which repository owns the path decides which graph
-                                    // the change is staged into, so it is resolved before
-                                    // anything is written. A path that belongs to no
-                                    // attached repository runs nothing at all.
-                                    let raw_path = call
-                                        .arguments
-                                        .get("path")
-                                        .and_then(Value::as_str)
-                                        .unwrap_or("");
-                                    match belt::resolve_across_repos(&repo_roots, raw_path) {
-                                        Err(problem) => {
-                                            writer.trace(json!({
-                                                "tool_use_id": call.id,
-                                                "surface": "local",
-                                                "tool": call.name,
-                                                "args": redact_content(&call.arguments),
-                                                "policy": "allowed",
-                                                "call_shape": call.shape.as_str(),
-                                                "problem": problem,
-                                                "is_error": true,
-                                            }))?;
-                                            (problem, true)
-                                        }
-                                        Ok((index, resolved)) => {
-                                            let repo = servers[index].repo.clone();
-                                            let session = servers[index].session.clone();
-                                            let server_name = servers[index].name();
-                                            // The plan is made before the tool runs,
-                                            // because `write_file` is what makes a new
-                                            // path exist and afterwards nothing can tell a
-                                            // create from an overwrite.
-                                            let plan = plan_stage(&repo, tool, &call.arguments);
-                                            let mut bracket = begin_transaction(
-                                                &mut servers[index],
-                                                &config,
-                                                session.as_deref(),
-                                                &call.arguments,
-                                                &plan,
-                                                &mut writer,
-                                            )?;
-                                            // A gone session is re-opened inside the
-                                            // bracket, so the stage below names the
-                                            // session the transaction was begun under.
-                                            let session = servers[index].session.clone();
-                                            // Repository authority writes a created file
-                                            // itself as part of publishing the change, so
-                                            // a create is published FIRST and is never
-                                            // written locally: writing it here first
-                                            // leaves an untracked path sitting on the
-                                            // exact workspace target, which
-                                            // `validate_reconciliation_targets` refuses,
-                                            // and every commit fails on the harness's own
-                                            // file.
-                                            let publish_first = bracket.transaction_id.is_some()
-                                                && matches!(plan, StagePlan::Create { .. });
-                                            // An edit is published first too, with no local
-                                            // fallback: its new text is computed from the
-                                            // file's current text and staged whole, and the
-                                            // commit's projection writes the file. Written to
-                                            // the working copy ahead of the commit, the edit
-                                            // read to the daemon as drift from the prior tree
-                                            // and was refused over its own bytes, and every
-                                            // refusal left it on disk with the graph still
-                                            // holding the old text.
-                                            let publish_edit = bracket.transaction_id.is_some()
-                                                && matches!(plan, StagePlan::Replace { .. });
-                                            let (outcome, provenance) = if publish_edit {
-                                                publish_planned_edit(
-                                                    &mut servers[index],
-                                                    bracket,
-                                                    session.as_deref(),
-                                                    &plan,
-                                                    &repo,
-                                                    &call.arguments,
-                                                    &mut counters,
-                                                    &mut writer,
-                                                )?
-                                            } else if publish_first {
-                                                let staged = stage_planned_operation(
-                                                    &mut servers[index],
-                                                    &mut bracket,
-                                                    session.as_deref(),
-                                                    &plan,
-                                                    None,
-                                                    &mut writer,
-                                                )?;
-                                                let provenance = close_transaction(
-                                                    &mut servers[index],
-                                                    bracket,
-                                                    staged,
-                                                    &mut writer,
-                                                )?;
-                                                if published_by_authority(&provenance) {
-                                                    (
-                                                        belt::published_create(&call.arguments),
-                                                        provenance,
-                                                    )
-                                                } else {
-                                                    // Nothing was published and nothing is
-                                                    // written: the path stays as it was on
-                                                    // disk and in the graph. The refused
-                                                    // content goes back to the model in the
-                                                    // tool result, which is where the model
-                                                    // keeps its work; a local copy was a
-                                                    // file the graph did not hold.
-                                                    counters.unpublished_changes += 1;
-                                                    let reason = unpublished_reason(&provenance);
-                                                    let provenance = abort_refused_commit(
-                                                        &mut servers[index],
-                                                        provenance,
-                                                        &mut writer,
-                                                    )?;
-                                                    (
-                                                        belt::unpublished_create(
-                                                            &call.arguments,
-                                                            &reason,
-                                                        ),
-                                                        provenance,
-                                                    )
-                                                }
-                                            } else {
-                                                // Kin is attached and no transaction opened,
-                                                // so nothing is written: a local write here is
-                                                // a change on disk the graph never hears about,
-                                                // the state a refused commit used to leave.
-                                                counters.unpublished_changes += 1;
-                                                let reason =
-                                                    bracket.reason.clone().unwrap_or_else(|| {
-                                                        "no reason was given".to_string()
-                                                    });
-                                                let provenance = close_transaction(
-                                                    &mut servers[index],
-                                                    bracket,
-                                                    false,
-                                                    &mut writer,
-                                                )?;
-                                                (
-                                                    belt::unbracketed_refusal(
-                                                        &call.arguments,
-                                                        &reason,
-                                                    ),
-                                                    provenance,
-                                                )
-                                            };
-                                            // Counted before the trace, so the run record
-                                            // and the guard agree about how many times this
-                                            // target was refused over its own bytes.
-                                            if outcome.retry_with_bytes {
-                                                repeat_guard.record_refusal(&call.name, raw_path);
-                                            }
-                                            if let Some(path) = outcome.changed.clone() {
-                                                // With several repositories attached the
-                                                // same relative path exists in more than
-                                                // one, so the record is absolute or it
-                                                // names nothing in particular.
-                                                let recorded = if multi {
-                                                    resolved.display().to_string()
-                                                } else {
-                                                    path
-                                                };
-                                                if !counters.edits.contains(&recorded) {
-                                                    counters.edits.push(recorded);
-                                                }
-                                            }
-                                            writer.trace(json!({
-                                                "tool_use_id": call.id,
-                                                "surface": "local",
-                                                "server": server_name,
-                                                "repo": repo.display().to_string(),
-                                                "tool": call.name,
-                                                "args": redact_content(&call.arguments),
-                                                "wall_ms": started_call.elapsed().as_millis() as u64,
-                                                "is_error": outcome.is_error,
-                                                "policy": "allowed",
-                                                "call_shape": call.shape.as_str(),
-                                                "changed": outcome.changed,
-                                                "provenance": provenance,
-                                            }))?;
-                                            (outcome.text, outcome.is_error)
                                         }
                                     }
                                 }
@@ -1943,21 +1785,6 @@ fn negative_summary(outcome: &ToolOutcome) -> Value {
             Value::Object(map)
         }
     }
-}
-
-/// Keep a whole written file out of the trace row; the transcript already carries it.
-fn redact_content(arguments: &Value) -> Value {
-    let Some(object) = arguments.as_object() else {
-        return arguments.clone();
-    };
-    let mut copy = object.clone();
-    for key in ["content", "replace", "find"] {
-        if let Some(Value::String(text)) = copy.get(key) {
-            let len = text.len();
-            copy.insert(key.into(), Value::String(format!("<{len} bytes>")));
-        }
-    }
-    Value::Object(copy)
 }
 
 fn check_arguments(belt: &Belt, name: &str, arguments: &Value) -> Result<(), String> {
@@ -2361,7 +2188,7 @@ fn start_kin_session(
             "server": server_name,
             "policy": "allowed",
             "event": "session_unavailable",
-            "detail": "the server does not expose kin_session_start; local writing tools will refuse changes",
+            "detail": "the server does not expose kin_session_start, so a change this run makes carries no agent session",
         }))?;
         return Ok(None);
     }
@@ -2433,490 +2260,6 @@ fn end_kin_session(server: &mut Server, writer: &mut TranscriptWriter) -> anyhow
     Ok(())
 }
 
-/// What the harness will stage inside the bracket for one local tool call.
-///
-/// `kin_transaction_stage` admits several disjoint shapes (`crates/kin-mcp/src/tools.rs`),
-/// and two of them are keyed on a repository-relative path plus the file's whole text: the
-/// new source file, verb `create`, and the rewritten one, verb `replace`. Between them they
-/// cover both local tools, because a path and a complete body is exactly what a local write
-/// or edit leaves the harness holding. The entity-keyed `update` shape resolves its target
-/// against repository authority as an entity uuid or an exact entity name
-/// (`kin_mcp::handlers::sessions::resolve_target_entity`), which a text splice does not
-/// know, so the harness never plans that one. A transaction with nothing in it is refused
-/// by design, so an unstageable call opens no transaction at all and the trace says why.
-enum StagePlan {
-    /// Admit the file at this repository-relative path with this body. Repository
-    /// authority refuses it by name if it already tracks the path.
-    Create { target: String, body: String },
-    /// Rewrite the tracked file at this repository-relative path from its complete new
-    /// text. The body is deliberately not carried here: an edit's new text does not exist
-    /// until the edit has run, and this plan is made before it, so the body is read from
-    /// the file the harness just wrote. Repository authority refuses the operation by name
-    /// if it does not already track the path.
-    Replace { target: String },
-    /// Nothing the stage surface admits fits this call, and this is the reason.
-    Unstageable { reason: String },
-}
-
-/// Decide what to stage for one local tool call.
-///
-/// Whether the path is new is repository authority's question, not the filesystem's, and
-/// the two answers differ: a path can sit on disk untracked, or be tracked with nothing on
-/// disk yet. So the harness plans the create for a write and the replace for an edit, and
-/// lets the daemon refuse either by name when the graph disagrees about whether it holds
-/// that path, which is the rule both verbs document. Probing the disk here would put a
-/// filesystem heuristic on the runtime path to answer a question the graph owns.
-fn plan_stage(repo: &Path, tool: LocalTool, arguments: &Value) -> StagePlan {
-    let raw_path = arguments.get("path").and_then(Value::as_str).unwrap_or("");
-    match tool {
-        LocalTool::Edit => {
-            let path = match belt::resolve_in_repo(repo, raw_path) {
-                Ok(path) => path,
-                Err(problem) => return StagePlan::Unstageable { reason: problem },
-            };
-            match repository_relative(repo, &path) {
-                Some(target) => StagePlan::Replace { target },
-                None => StagePlan::Unstageable {
-                    reason: "the path did not reduce to a repository-relative target".into(),
-                },
-            }
-        }
-        LocalTool::Write => {
-            let content = arguments
-                .get("content")
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            if content.trim().is_empty() {
-                return StagePlan::Unstageable {
-                    reason: "the create operation requires a non-empty body".into(),
-                };
-            }
-            let path = match belt::resolve_in_repo(repo, raw_path) {
-                Ok(path) => path,
-                Err(problem) => return StagePlan::Unstageable { reason: problem },
-            };
-            match repository_relative(repo, &path) {
-                Some(target) => StagePlan::Create {
-                    target,
-                    body: content.to_string(),
-                },
-                None => StagePlan::Unstageable {
-                    reason: "the path did not reduce to a repository-relative target".into(),
-                },
-            }
-        }
-    }
-}
-
-/// The repository-relative form of a resolved path, with `/` separators on every platform
-/// because that is what repository authority stores.
-fn repository_relative(repo: &Path, resolved: &Path) -> Option<String> {
-    let relative = resolved.strip_prefix(repo).ok()?;
-    let parts: Vec<String> = relative
-        .components()
-        .filter_map(|component| match component {
-            std::path::Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
-            _ => None,
-        })
-        .collect();
-    (!parts.is_empty()).then(|| parts.join("/"))
-}
-
-/// An open provenance bracket around one local edit.
-struct Bracket {
-    transaction_id: Option<String>,
-    reason: Option<String>,
-    /// What the harness staged into this transaction, and whether the server took it.
-    staged: Option<Value>,
-}
-
-impl Bracket {
-    fn unopened(reason: impl Into<String>) -> Self {
-        Bracket {
-            transaction_id: None,
-            reason: Some(reason.into()),
-            staged: None,
-        }
-    }
-}
-
-/// Whether a refused `kin_transaction_begin` says the session it named no longer exists.
-///
-/// A session lives in the daemon that registered it, so a daemon that stops and is started
-/// again for the same repository answers every later call with "session not found" while
-/// the harness still holds the old id. Both the daemon and the MCP session registry word
-/// the refusal this way.
-fn session_is_gone(refusal: &str) -> bool {
-    refusal.to_ascii_lowercase().contains("session not found")
-}
-
-fn begin_transaction(
-    server: &mut Server,
-    config: &AgentConfig,
-    session: Option<&str>,
-    arguments: &Value,
-    plan: &StagePlan,
-    writer: &mut TranscriptWriter,
-) -> anyhow::Result<Bracket> {
-    // A transaction the harness cannot stage into can only end in the daemon's refusal of
-    // an empty commit, so it is not opened. The reason travels into the provenance record.
-    if let StagePlan::Unstageable { reason } = plan {
-        return Ok(Bracket::unopened(reason.clone()));
-    }
-    let Some(session) = session else {
-        return Ok(Bracket::unopened("no Kin session was open"));
-    };
-    for required in [
-        "kin_transaction_begin",
-        "kin_transaction_stage",
-        "kin_transaction_commit",
-        "kin_transaction_abort",
-    ] {
-        if !server.declares(required) {
-            return Ok(Bracket::unopened(format!(
-                "the server does not expose {required}"
-            )));
-        }
-    }
-    let server_name = server.name();
-    let scope = arguments
-        .get("path")
-        .and_then(Value::as_str)
-        .unwrap_or("repository")
-        .to_string();
-    let mut session = session.to_string();
-    let mut reopened = false;
-    loop {
-        match server.client.call_tool(
-            "kin_transaction_begin",
-            &json!({ "session_id": session, "scope": scope }),
-        ) {
-            Ok(outcome) if !outcome.is_error => {
-                let transaction_id = extract_id(&outcome, &["transaction_id", "id"]);
-                writer.trace(json!({
-                    "surface": "kin",
-                    "server": server_name,
-                    "tool": "kin_transaction_begin",
-                    "policy": "allowed",
-                    "event": "transaction_begin",
-                    "scope": scope,
-                    "wall_ms": outcome.wall_ms as u64,
-                    "is_error": false,
-                    "transaction_id": transaction_id.clone(),
-                }))?;
-                return Ok(Bracket {
-                    reason: transaction_id
-                        .is_none()
-                        .then(|| "the server returned no transaction id".to_string()),
-                    transaction_id,
-                    staged: None,
-                });
-            }
-            Ok(outcome) => {
-                // The envelope comes first in every answer and is longer than the budget, so
-                // it is stripped, or the refusal's own words never reach the trace.
-                let detail = close_detail(&outcome.text);
-                writer.trace(json!({
-                    "surface": "kin",
-                    "server": server_name,
-                    "tool": "kin_transaction_begin",
-                    "policy": "allowed",
-                    "event": "transaction_begin",
-                    "scope": scope,
-                    "is_error": true,
-                    "detail": detail.clone(),
-                }))?;
-                // When the session is gone, re-open once and retry begin, so an edit made
-                // after the daemon was restarted still goes through a transaction.
-                if !reopened && session_is_gone(&outcome.text) {
-                    reopened = true;
-                    if let Some(fresh) = start_kin_session(server, config, writer)? {
-                        server.session = Some(fresh.clone());
-                        session = fresh;
-                        continue;
-                    }
-                }
-                return Ok(Bracket::unopened(detail));
-            }
-            Err(err) => return Ok(Bracket::unopened(err.to_string())),
-        }
-    }
-}
-
-/// Stage the operation the harness just performed, inside the open bracket.
-///
-/// Returns whether the transaction now holds something committable. A bracket that was
-/// never opened, or a plan with nothing the stage surface admits, stages nothing and says
-/// so, which is what keeps the commit below from claiming a provenance it did not get.
-fn stage_planned_operation(
-    server: &mut Server,
-    bracket: &mut Bracket,
-    session: Option<&str>,
-    plan: &StagePlan,
-    produced: Option<&str>,
-    writer: &mut TranscriptWriter,
-) -> anyhow::Result<bool> {
-    let server_name = server.name();
-    let Some(transaction_id) = bracket.transaction_id.clone() else {
-        return Ok(false);
-    };
-    // A create carries the body the model sent, because the file does not exist yet and
-    // repository authority is what writes it. A replace carries the file's complete new
-    // text, which only exists once the edit has run, so it comes from the tool that just
-    // ran rather than from the plan that was made before it.
-    let (verb, target, body) = match plan {
-        StagePlan::Create { target, body } => ("create", target.clone(), body.clone()),
-        StagePlan::Replace { target } => match produced {
-            Some(body) if !body.is_empty() => ("replace", target.clone(), body.to_string()),
-            _ => {
-                // Nothing is staged, so the bracket aborts rather than committing an empty
-                // transaction, and the provenance says so instead of going quiet.
-                let detail = format!("the edit of {target} produced no text to admit to the graph");
-                writer.trace(json!({
-                    "surface": "kin",
-                    "server": server_name,
-                    "tool": "kin_transaction_stage",
-                    "policy": "allowed",
-                    "event": "transaction_stage",
-                    "transaction_id": transaction_id,
-                    "verb": "replace",
-                    "target": target,
-                    "is_error": true,
-                    "detail": detail.clone(),
-                }))?;
-                bracket.staged = Some(json!({
-                    "verb": "replace",
-                    "target": target,
-                    "accepted": false,
-                    "detail": detail,
-                }));
-                return Ok(false);
-            }
-        },
-        StagePlan::Unstageable { .. } => return Ok(false),
-    };
-    let operation = json!({
-        "verb": verb,
-        "target": target,
-        "body": body,
-        "description": match verb {
-            "replace" => format!("kin agent rewrote {target}"),
-            _ => format!("kin agent created {target}"),
-        },
-    });
-    let mut arguments = json!({
-        "transaction_id": transaction_id,
-        "operations": [operation],
-    });
-    if let Some(session) = session {
-        arguments["session_id"] = Value::String(session.to_string());
-    }
-    let outcome = server.client.call_tool("kin_transaction_stage", &arguments);
-    let (is_error, detail) = match &outcome {
-        Ok(outcome) => (outcome.is_error, close_detail(&outcome.text)),
-        Err(err) => (true, err.to_string()),
-    };
-    writer.trace(json!({
-        "surface": "kin",
-        "server": server_name,
-        "tool": "kin_transaction_stage",
-        "policy": "allowed",
-        "event": "transaction_stage",
-        "transaction_id": transaction_id,
-        "verb": verb,
-        "target": target,
-        "body_bytes": body.len(),
-        "is_error": is_error,
-        "detail": detail,
-    }))?;
-    bracket.staged = Some(json!({
-        "verb": verb,
-        "target": target,
-        "body_bytes": body.len(),
-        "accepted": !is_error,
-        "detail": if is_error { Value::String(detail) } else { Value::Null },
-    }));
-    Ok(!is_error)
-}
-
-/// Close the bracket. The recorded provenance says what actually happened, including a
-/// refusal, so a run never claims a provenance it did not get.
-fn close_transaction(
-    server: &mut Server,
-    bracket: Bracket,
-    succeeded: bool,
-    writer: &mut TranscriptWriter,
-) -> anyhow::Result<Value> {
-    let server_name = server.name();
-    let Some(transaction_id) = bracket.transaction_id else {
-        return Ok(json!({
-            "bracketed": false,
-            "staged": bracket.staged,
-            "reason": bracket.reason,
-        }));
-    };
-    let tool = if succeeded {
-        "kin_transaction_commit"
-    } else {
-        "kin_transaction_abort"
-    };
-    let outcome = server
-        .client
-        .call_tool(tool, &json!({ "transaction_id": transaction_id }));
-    let (is_error, detail) = match &outcome {
-        Ok(outcome) => (outcome.is_error, close_detail(&outcome.text)),
-        Err(err) => (true, err.to_string()),
-    };
-    writer.trace(json!({
-        "surface": "kin",
-        "server": server_name,
-        "tool": tool,
-        "policy": "allowed",
-        "event": if succeeded { "transaction_commit" } else { "transaction_abort" },
-        "transaction_id": transaction_id,
-        "is_error": is_error,
-        "detail": detail,
-    }))?;
-    Ok(json!({
-        "bracketed": true,
-        "staged": bracket.staged,
-        "transaction_id": transaction_id,
-        "closed_with": tool,
-        "closed_cleanly": !is_error,
-        // The server's own answer to the close, kept whether it accepted or refused, so a
-        // run's evidence is what the daemon said rather than the harness's summary of it.
-        "response": detail.clone(),
-        "detail": if is_error { Value::String(detail) } else { Value::Null },
-    }))
-}
-
-/// Publish one `edit_file` call through repository authority before anything touches the
-/// working copy.
-///
-/// The edit is resolved against the file's current text, its complete new text is staged as
-/// the `replace` operation, and the commit publishes it; repository authority's projection is
-/// what writes the file. When authority does not publish, nothing was written: the transaction
-/// is aborted so the model's retry opens a clean one, and the model is told the edit did not
-/// land and why. An edit that cannot be applied to the current text stages nothing and aborts
-/// the bracket, because an empty transaction is refused by design.
-#[allow(clippy::too_many_arguments)]
-fn publish_planned_edit(
-    server: &mut Server,
-    mut bracket: Bracket,
-    session: Option<&str>,
-    plan: &StagePlan,
-    repo: &Path,
-    arguments: &Value,
-    counters: &mut Counters,
-    writer: &mut TranscriptWriter,
-) -> anyhow::Result<(belt::LocalOutcome, Value)> {
-    let planned = match belt::plan_edit(repo, arguments) {
-        Ok(planned) => planned,
-        Err(refusal) => {
-            let provenance = close_transaction(server, bracket, false, writer)?;
-            return Ok((refusal, provenance));
-        }
-    };
-    let staged = stage_planned_operation(
-        server,
-        &mut bracket,
-        session,
-        plan,
-        Some(&planned.updated),
-        writer,
-    )?;
-    let provenance = close_transaction(server, bracket, staged, writer)?;
-    if published_by_authority(&provenance) {
-        return Ok((belt::published_edit(planned), provenance));
-    }
-    counters.unpublished_changes += 1;
-    let reason = unpublished_reason(&provenance);
-    let provenance = abort_refused_commit(server, provenance, writer)?;
-    Ok((belt::unpublished_edit(&planned, &reason), provenance))
-}
-
-/// Abort a transaction whose commit repository authority refused.
-///
-/// A refused commit leaves the transaction open on the server, its staged set cleared or its
-/// commit fence reset, and nothing here can reuse it: the model's retry is a new call that
-/// opens a new bracket. Left open, every refusal holds one of the session's unfinished
-/// transaction slots until the session ends, so a model that keeps correcting and retrying is
-/// eventually refused a bracket at all. A bracket that closed by aborting has nothing left to
-/// release.
-fn abort_refused_commit(
-    server: &mut Server,
-    mut provenance: Value,
-    writer: &mut TranscriptWriter,
-) -> anyhow::Result<Value> {
-    if provenance["closed_with"] != json!("kin_transaction_commit") {
-        return Ok(provenance);
-    }
-    let Some(transaction_id) = provenance["transaction_id"].as_str().map(str::to_string) else {
-        return Ok(provenance);
-    };
-    let server_name = server.name();
-    let outcome = server.client.call_tool(
-        "kin_transaction_abort",
-        &json!({ "transaction_id": transaction_id }),
-    );
-    let (is_error, detail) = match &outcome {
-        Ok(outcome) => (outcome.is_error, close_detail(&outcome.text)),
-        Err(err) => (true, err.to_string()),
-    };
-    writer.trace(json!({
-        "surface": "kin",
-        "server": server_name,
-        "tool": "kin_transaction_abort",
-        "policy": "allowed",
-        "event": "transaction_abort",
-        "transaction_id": transaction_id,
-        "is_error": is_error,
-        "detail": detail,
-    }))?;
-    provenance["aborted_after_refusal"] = json!({
-        "closed_cleanly": !is_error,
-        "detail": if is_error { Value::String(detail) } else { Value::Null },
-    });
-    Ok(provenance)
-}
-
-/// Whether repository authority actually published this bracket.
-///
-/// A clean close is not enough on its own: an abort closes cleanly too, and a run that
-/// read `closed_cleanly` alone would score an aborted transaction as a landed change.
-fn published_by_authority(provenance: &Value) -> bool {
-    provenance["closed_with"] == json!("kin_transaction_commit")
-        && provenance["closed_cleanly"] == json!(true)
-}
-
-/// What the server said when it declined to publish, in one line fit for the model.
-fn unpublished_reason(provenance: &Value) -> String {
-    for key in ["detail", "response", "reason"] {
-        if let Some(text) = provenance.get(key).and_then(Value::as_str) {
-            if !text.trim().is_empty() {
-                return text.to_string();
-            }
-        }
-    }
-    "the server gave no reason".to_string()
-}
-
-/// Truncate a server answer for the trace, keeping the part that says what happened.
-///
-/// Every Kin answer carries a `_kin` envelope longer than the old 300-character budget, so
-/// truncating the raw text spent the whole budget on the envelope and dropped the `message`
-/// key entirely. The envelope is graph freshness, which the trace records elsewhere; the
-/// failure reason is the thing a reader cannot reconstruct.
-fn close_detail(text: &str) -> String {
-    match serde_json::from_str::<Value>(text.trim()) {
-        Ok(Value::Object(mut payload)) => {
-            payload.remove("_kin");
-            truncate(&Value::Object(payload).to_string(), 300)
-        }
-        _ => truncate(text, 300),
-    }
-}
-
 fn extract_id(outcome: &ToolOutcome, keys: &[&str]) -> Option<String> {
     let payload: Value = serde_json::from_str(outcome.text.trim()).ok()?;
     let object = payload.as_object()?;
@@ -2938,11 +2281,160 @@ fn extract_id(outcome: &ToolOutcome, keys: &[&str]) -> Option<String> {
     None
 }
 
-fn truncate(text: &str, limit: usize) -> String {
-    if text.chars().count() <= limit {
-        return text.to_string();
+/// Resolution tiers meaning Kin bound this row to a real entity rather than
+/// a same-name guess. Both are a real reference: an import line is exactly
+/// that, not a lesser hit, so `import_scoped` counts on the same footing as
+/// `type_resolved`. An unresolved `name_only` guess is not in this set.
+fn is_resolved_reference(resolution: Option<&str>) -> bool {
+    matches!(resolution, Some("type_resolved") | Some("import_scoped"))
+}
+
+/// Every `path:line` this run's `find_references` calls actually resolved,
+/// across every recorded row and every line in a row's `reference_lines`,
+/// deduplicated and in a stable order.
+///
+/// A study task found the belt keeping four of the six rows Kin resolved for
+/// a symbol and dropping exactly the two aliased-import lines, both
+/// attributed to a `Module`-kind entity, while an unrelated pair of
+/// `Module`-kind test-file rows survived. Nothing here reads `kind` or
+/// `role`: a resolved row counts on the same footing regardless of the
+/// referencing entity's kind, so an import line stays with every other one.
+fn resolved_reference_lines(reference_rows: &BTreeMap<(String, String), Value>) -> Vec<String> {
+    let mut lines = BTreeSet::new();
+    for row in reference_rows.values() {
+        if !is_resolved_reference(row.get("resolution").and_then(Value::as_str)) {
+            continue;
+        }
+        let Some(file_path) = row.get("file_path").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(reference_lines) = row.get("reference_lines").and_then(Value::as_array) else {
+            continue;
+        };
+        for line in reference_lines {
+            if let Some(line) = line.as_u64() {
+                lines.insert(format!("{file_path}:{line}"));
+            }
+        }
     }
-    text.chars().take(limit).collect::<String>() + "..."
+    lines.into_iter().collect()
+}
+
+/// Whether `position` (a `path:line` string) is already in `text` as
+/// itself, not merely as a prefix of a longer line number: `ssg.ts:2` must
+/// not read as present because `ssg.ts:26` is in the text. A match counts
+/// unless the character right after it is another ASCII digit.
+fn contains_position(text: &str, position: &str) -> bool {
+    text.match_indices(position)
+        .any(|(start, _)| !text[start + position.len()..].starts_with(|c: char| c.is_ascii_digit()))
+}
+
+/// A line that is nothing but the literal word `ANSWER`, case-insensitive,
+/// once whitespace, any wrapping backticks, and one trailing colon are
+/// stripped. This is the shape both a fenced ANSWER block's opening line and
+/// a standalone `ANSWER:` line take, so one check finds either.
+fn is_answer_marker_line(line: &str) -> bool {
+    let trimmed = line.trim().trim_matches('`').trim();
+    let trimmed = trimmed.strip_suffix(':').unwrap_or(trimmed).trim();
+    trimmed.eq_ignore_ascii_case("answer")
+}
+
+/// A bare fenced block's opening line: three backticks and nothing else.
+/// Checked only once [`is_answer_marker_line`] has ruled out an ANSWER
+/// fence. A fence carrying a language tag reads as a deliberate example
+/// rather than an untitled answer, so it is left alone.
+fn is_bare_fence_open_line(line: &str) -> bool {
+    line.trim() == "```"
+}
+
+/// A line ending in a colon followed by one or more ASCII digits: the shape
+/// every position a caller of this run keys on takes (`path:line`). Used
+/// only to decide whether an answer with no marker is a position list that
+/// should get one. A plain conversational or diagnostic line has no such
+/// shape and is left alone.
+fn looks_like_a_position_line(line: &str) -> bool {
+    let line = line.trim().trim_matches('`');
+    let Some(colon) = line.rfind(':') else {
+        return false;
+    };
+    let (head, tail) = (&line[..colon], &line[colon + 1..]);
+    !head.is_empty() && !tail.is_empty() && tail.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// Guarantee this run's reported answer always carries a literal `ANSWER`
+/// marker a caller can key off, and that every reference `find_references`
+/// actually resolved in this run is named somewhere in it, even when the
+/// model's own prose dropped one.
+///
+/// This applies two repairs together, found on the same study, because
+/// either alone leaves a caller "recording the answer" empty-handed:
+///
+/// - A task where Kin's data was perfect and the model's own answer held
+///   every gold row, but inside a bare fence with no `ANSWER` token anywhere
+///   in the output, so a caller parsing for the marker got nothing even
+///   though the list underneath it was exactly right.
+/// - The task described on [`resolved_reference_lines`], where the marker
+///   was present but two resolved rows were missing from it.
+///
+/// Neither repair removes anything the model wrote. An answer that already
+/// carries the marker and already names every resolved row is returned
+/// unchanged, and so is a plain answer with nothing missing, no marker, and
+/// no line shaped like a position: an ordinary conversational reply is not
+/// forced into a fence it never needed. This does not parse nested fences.
+/// Relabelling stops at the first bare, tagless fence found, which is the
+/// shape the evidenced case took.
+fn compose_final_answer(
+    model_text: &str,
+    reference_rows: &BTreeMap<(String, String), Value>,
+) -> String {
+    let missing: Vec<String> = resolved_reference_lines(reference_rows)
+        .into_iter()
+        .filter(|position| !contains_position(model_text, position))
+        .collect();
+    let lines: Vec<&str> = model_text.lines().collect();
+    let marker_at = lines.iter().copied().position(is_answer_marker_line);
+    let trimmed_empty = model_text.trim().is_empty();
+
+    if !trimmed_empty
+        && missing.is_empty()
+        && (marker_at.is_some() || !lines.iter().copied().any(looks_like_a_position_line))
+    {
+        return model_text.to_string();
+    }
+
+    // Extend an existing marker line in place, or relabel the first bare
+    // fence if there is one, so injected rows land inside the same block a
+    // caller's parser will read rather than after it.
+    let insert_at = marker_at.or_else(|| lines.iter().copied().position(is_bare_fence_open_line));
+
+    if let Some(index) = insert_at {
+        let mut composed = String::new();
+        for (i, line) in lines.iter().enumerate() {
+            if i == index && marker_at.is_none() {
+                composed.push_str("```ANSWER");
+            } else {
+                composed.push_str(line);
+            }
+            composed.push('\n');
+            if i == index {
+                for extra in &missing {
+                    composed.push_str(extra);
+                    composed.push('\n');
+                }
+            }
+        }
+        return composed;
+    }
+
+    let mut body = model_text.trim().to_string();
+    if body.is_empty() {
+        body = "(empty: this run produced no final answer text)".to_string();
+    }
+    for extra in &missing {
+        body.push('\n');
+        body.push_str(extra);
+    }
+    format!("```ANSWER\n{body}\n```")
 }
 
 fn finish(
@@ -2954,15 +2446,7 @@ fn finish(
     started: Instant,
     meter: Option<&ContextMeter>,
 ) -> anyhow::Result<RunOutcome> {
-    // A run that wrote files repository authority never published landed nothing, whatever
-    // the model's closing paragraph says. Downgrading here rather than at each exit path
-    // means no future exit can forget it. A run that stopped for its own reason keeps that
-    // reason, which is more specific than this one.
-    let status = if stop.status == ExitStatus::Success && counters.unpublished_changes > 0 {
-        ExitStatus::ChangesUnpublished
-    } else {
-        stop.status
-    };
+    let status = stop.status;
     let mut agent = counters.to_json(status.code(), &stop);
     agent["max_result_bytes"] = json!(config.result_ceiling());
     // What the run spent, in one object, so a cost claim about a run is read off the
@@ -2971,13 +2455,17 @@ fn finish(
     // The budget as it stood when the run stopped, so a context stop can be read against
     // the numbers that decided it.
     agent["context"] = meter.map_or(Value::Null, ContextMeter::to_json);
+    // The model's own text, completed: any resolved reference row it left
+    // out is added, and a literal ANSWER marker is guaranteed, so a caller
+    // recording this run's answer never comes back with nothing under it.
+    let final_text = compose_final_answer(final_text, &counters.reference_rows);
     let record = writer.result(
         status.subtype(),
         status != ExitStatus::Success,
         counters.turns,
         started.elapsed().as_millis(),
         counters.api_ms,
-        final_text,
+        &final_text,
         counters.usage_json(),
         agent,
     )?;
@@ -2987,7 +2475,7 @@ fn finish(
     )?;
     Ok(RunOutcome {
         status,
-        final_text: final_text.to_string(),
+        final_text,
         transcript_path: config.out_dir.join("transcript.jsonl"),
         trace_path: config.out_dir.join("kin-trace.jsonl"),
         result: record,
@@ -3193,6 +2681,128 @@ mod reference_rows_tests {
 }
 
 #[cfg(test)]
+mod final_answer_tests {
+    use super::*;
+
+    /// A minimal `find_references` result: four resolved rows, two of them
+    /// aliased-import lines (`kind: "Module"`), the same shape and the same
+    /// line numbers a study task handed the belt. Line 2 and line 26 on the
+    /// same path are deliberately both present, so a naive substring check
+    /// for "is line 2 already in the text" would wrongly match inside "26".
+    /// This fixture doubles as a regression guard for that.
+    const FOUR_RESOLVED_ROWS: &str = r#"{
+        "focal_entity": {"id": "9407382b-fdc1-42b6-a0b8-3944d23daed1", "name": "toSSG"},
+        "references": [
+            {"entity_id": "ade70b82-85aa-4f01-8291-b5f1955f094d", "file_path": "src/adapter/bun/ssg.ts", "kind": "Module", "name": "ssg", "reference_lines": [2], "resolution": "type_resolved", "role": "source"},
+            {"entity_id": "84ef6563-5c14-41da-9a96-3a962c025845", "file_path": "src/adapter/bun/ssg.ts", "kind": "Function", "name": "toSSG", "reference_lines": [26], "resolution": "type_resolved", "role": "source"},
+            {"entity_id": "dee91665-f43c-4025-a5c4-19f9ee5ac89a", "file_path": "src/adapter/deno/ssg.ts", "kind": "Module", "name": "ssg", "reference_lines": [1], "resolution": "type_resolved", "role": "source"},
+            {"entity_id": "f7d3013b-7853-4f2f-8509-4880542c0f65", "file_path": "src/adapter/deno/ssg.ts", "kind": "Function", "name": "toSSG", "reference_lines": [26], "resolution": "type_resolved", "role": "source"}
+        ]
+    }"#;
+
+    /// The exact defect: the belt kept the two `Function`-kind rows and
+    /// dropped the two `Module`-kind aliased-import rows, even though
+    /// `find_references` resolved all four with equal confidence. The
+    /// composed answer must carry all four, not just the two the model's
+    /// own prose kept: an import line is a reference like any other.
+    #[test]
+    fn missing_resolved_rows_including_import_lines_are_added_to_the_answer() {
+        let mut counters = Counters::new();
+        counters.record_reference_rows("find_references", FOUR_RESOLVED_ROWS);
+        let model_text = "```ANSWER\nsrc/adapter/bun/ssg.ts:26\nsrc/adapter/deno/ssg.ts:26\n```";
+
+        let composed = compose_final_answer(model_text, &counters.reference_rows);
+
+        let rows: Vec<&str> = composed
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !is_answer_marker_line(line) && *line != "```")
+            .collect();
+        assert_eq!(rows.len(), 4, "expected four answer rows, got: {rows:?}");
+        for expected in [
+            "src/adapter/bun/ssg.ts:2",
+            "src/adapter/bun/ssg.ts:26",
+            "src/adapter/deno/ssg.ts:1",
+            "src/adapter/deno/ssg.ts:26",
+        ] {
+            assert!(
+                rows.contains(&expected),
+                "the answer must carry {expected}, an import line is a reference like any \
+                 other: {composed}"
+            );
+        }
+    }
+
+    /// A run whose model produced no final text at all still reports an
+    /// answer a caller can find: the block is emitted and says plainly that
+    /// the run had nothing to put in it.
+    #[test]
+    fn an_empty_model_answer_still_carries_the_answer_block() {
+        let counters = Counters::new();
+        let composed = compose_final_answer("", &counters.reference_rows);
+        assert!(
+            composed.lines().any(is_answer_marker_line),
+            "an empty answer must still carry the marker: {composed:?}"
+        );
+        assert!(
+            composed.to_ascii_lowercase().contains("empty"),
+            "an empty answer must say so inside the block: {composed:?}"
+        );
+    }
+
+    /// The exact other defect: the model wrote the complete, correct row
+    /// list inside a bare fence with no literal `ANSWER` token anywhere, so
+    /// a caller parsing for the marker found nothing even though the rows
+    /// underneath were exactly right.
+    #[test]
+    fn a_bare_fenced_list_gains_the_marker_without_losing_its_rows() {
+        let counters = Counters::new();
+        let model_text = "The method is referenced in the following places:\n\n\
+                           ```\ntests/test_blueprints.py:899\ntests/test_blueprints.py:900\n```";
+
+        let composed = compose_final_answer(model_text, &counters.reference_rows);
+
+        assert!(
+            composed.lines().any(is_answer_marker_line),
+            "a bare fenced list must gain the marker: {composed:?}"
+        );
+        for expected in [
+            "tests/test_blueprints.py:899",
+            "tests/test_blueprints.py:900",
+        ] {
+            assert!(
+                composed.contains(expected),
+                "relabelling the fence must not lose {expected}: {composed}"
+            );
+        }
+    }
+
+    /// The no-op path: an answer that already carries the marker and
+    /// already names every resolved row is returned byte-for-byte
+    /// unchanged, and so is an ordinary conversational answer with no
+    /// marker, nothing missing, and no line shaped like a position. A plain
+    /// reply is never forced into a fence it never needed.
+    #[test]
+    fn an_already_complete_answer_and_plain_prose_are_left_unchanged() {
+        let mut counters = Counters::new();
+        counters.record_reference_rows("find_references", FOUR_RESOLVED_ROWS);
+        let complete = "```ANSWER\nsrc/adapter/bun/ssg.ts:2\nsrc/adapter/bun/ssg.ts:26\n\
+                         src/adapter/deno/ssg.ts:1\nsrc/adapter/deno/ssg.ts:26\n```";
+        assert_eq!(
+            compose_final_answer(complete, &counters.reference_rows),
+            complete
+        );
+
+        let empty_counters = Counters::new();
+        let prose = "greet is defined in src/greet.py and now carries a docstring.";
+        assert_eq!(
+            compose_final_answer(prose, &empty_counters.reference_rows),
+            prose
+        );
+    }
+}
+
+#[cfg(test)]
 mod reserve_tests {
     use super::parse_output_reserve;
     #[test]
@@ -3201,5 +2811,256 @@ mod reserve_tests {
             assert!(parse_output_reserve(value).is_err(), "{value}");
         }
         assert_eq!(parse_output_reserve("32768").unwrap(), 32768);
+    }
+}
+
+#[cfg(test)]
+mod guidance_tests {
+    use super::*;
+
+    fn kin_tool(bare: &str) -> belt::KinTool {
+        belt::KinTool {
+            folded: false,
+            server: 0,
+            bare: bare.to_string(),
+            exposed: format!("{}{bare}", belt::KIN_TOOL_PREFIX),
+            description: format!("test tool {bare}"),
+            schema: json!({ "type": "object" }),
+        }
+    }
+
+    /// The change guidance addresses the entity by its UUID, carries the source_base Kin
+    /// returned, prefers the anchored patch over a whole body, offers only the lifecycle
+    /// `kin_mutate` serves, and leaves the session to the harness that opened it.
+    #[test]
+    fn the_change_guidance_is_entity_addressed_and_source_bound() {
+        let prompt = DEFAULT_SYSTEM_PROMPT;
+        for expected in [
+            "name the entity you are changing by its UUID",
+            "Prefer verb 'patch' with target set to that UUID",
+            "EntitySourcePatch payload: the exact source_base",
+            "use verb 'update' with target set to its UUID, an EntitySourceBase payload holding \
+             that same exact source_base, and body set to its complete new source text",
+            "Every update must carry that EntitySourceBase, and one without it is refused",
+            "verb 'create' with target set to an existing function's UUID and an EntityCreate \
+             payload",
+            "verb 'remove' with its UUID and an EntityRemove payload holding its source_base",
+            "Use only these operations, as the mcp__kin__kin_mutate schema describes them.",
+            "Your session is already open",
+            "there is no file creation",
+            "If the change needs something kin_mutate cannot make, stop and say so.",
+        ] {
+            assert!(prompt.contains(expected), "the prompt lost {expected:?}");
+        }
+        let patch = prompt.find("Prefer verb 'patch'").unwrap();
+        let update = prompt.find("verb 'update'").unwrap();
+        assert!(
+            patch < update,
+            "the patch comes first and the whole body second"
+        );
+        // The session tools are the harness's and never on the belt, so the prompt must
+        // not send the model looking for one.
+        assert!(!prompt.contains("kin_session_start"));
+    }
+
+    /// A model that reaches for a retired file tool is given the same guidance.
+    #[test]
+    fn a_file_tool_refusal_carries_the_entity_guidance() {
+        let belt = Belt::new(vec![kin_tool("kin_mutate"), kin_tool("get_entity_source")]);
+        for name in ["edit_file", "write_file"] {
+            let Route::Refused(refusal) = belt.route(name) else {
+                panic!("{name} must be refused");
+            };
+            for expected in [
+                "`mcp__kin__kin_mutate`, naming the entity by its UUID",
+                "the exact source_base `mcp__kin__get_entity_source` returned",
+                "Prefer verb 'patch' with an EntitySourcePatch",
+                "verb 'create' and an EntityCreate payload",
+                "verb 'remove' and an EntityRemove payload",
+                "There is no file creation.",
+                "stop and say so",
+            ] {
+                assert!(
+                    refusal.contains(expected),
+                    "{name}: lost {expected:?}: {refusal}"
+                );
+            }
+            assert!(
+                !refusal.contains("complete new source body"),
+                "{name}: the whole body is no longer the first advice: {refusal}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod session_retry_tests {
+    use super::*;
+
+    fn refused(text: &str) -> ToolOutcome {
+        ToolOutcome {
+            text: text.to_string(),
+            is_error: true,
+            envelope: None,
+            negative: None,
+            unreadable: false,
+            wall_ms: 1,
+        }
+    }
+
+    fn marked(stage: &str, refusal: &str, session: &str) -> ToolOutcome {
+        refused(&format!(
+            "kin_mutate_not_started: {}\nSession not found: {session}. It was ended.",
+            json!({ "stage": stage, "refusal": refusal, "session_id": session })
+        ))
+    }
+
+    /// The text as a Kin server delivers a refusal: inside the envelope.
+    fn enveloped(text: &str) -> ToolOutcome {
+        refused(
+            &json!({
+                "_kin": { "envelope_version": 2, "runtime": "repo-daemon" },
+                "message": text,
+            })
+            .to_string(),
+        )
+    }
+
+    /// The marker reaches the run inside the envelope's `message`, which is how the begin
+    /// refusal arrived after a real daemon restart, and it is read from there by the same
+    /// rules. The envelope never lends the marker anything the raw text would not.
+    #[test]
+    fn a_marker_inside_the_envelope_message_is_read_by_the_same_rules() {
+        let unsessioned = json!({ "operations": [] });
+        let gone = marked("begin", "session_not_found", "sess-1");
+        assert!(retry_under_fresh_session(
+            "kin_mutate",
+            &unsessioned,
+            &enveloped(&gone.text),
+            Some("sess-1")
+        ));
+
+        let note = "connection reset by peer\n\nkin_mutate could not abort transaction txn-1 \
+                    after its commit failed (Session not found: sess-1. It was ended.), so that \
+                    transaction is still open.";
+        let late = "refused\nkin_mutate_not_started: {\"stage\":\"begin\",\"refusal\":\
+                    \"session_not_found\",\"session_id\":\"sess-1\"}";
+        for outcome in [
+            enveloped(&marked("begin", "session_not_found", "sess-9").text),
+            enveloped(&marked("commit", "session_not_found", "sess-1").text),
+            enveloped(note),
+            enveloped(late),
+            // The marker in some other field of the payload is not the refusal's first line.
+            refused(
+                &json!({ "_kin": { "envelope_version": 2 }, "detail": gone.text.clone() })
+                    .to_string(),
+            ),
+        ] {
+            assert!(
+                !retry_under_fresh_session("kin_mutate", &unsessioned, &outcome, Some("sess-1")),
+                "{}",
+                outcome.text
+            );
+        }
+        // A model-named session stays the model's, enveloped or not.
+        let named = json!({ "operations": [], "session_id": "sess-1" });
+        assert!(!retry_under_fresh_session(
+            "kin_mutate",
+            &named,
+            &enveloped(&gone.text),
+            Some("sess-1")
+        ));
+    }
+
+    /// Only an unkeyed `kin_mutate` the harness sessioned, whose first line marks a begin
+    /// refused because the harness's own session is gone, is sent again.
+    #[test]
+    fn only_a_begin_marked_not_started_for_this_session_is_retried() {
+        let unsessioned = json!({ "operations": [] });
+        let gone = marked("begin", "session_not_found", "sess-1");
+        assert!(retry_under_fresh_session(
+            "kin_mutate",
+            &unsessioned,
+            &gone,
+            Some("sess-1")
+        ));
+        // A blank session is no session, so the harness supplied the one that went.
+        let blank = json!({ "operations": [], "session_id": "  " });
+        assert!(retry_under_fresh_session(
+            "kin_mutate",
+            &blank,
+            &gone,
+            Some("sess-1")
+        ));
+
+        // The model named the session or keyed the call; the run holds no session; the
+        // marker names another session, another stage or another refusal.
+        let named = json!({ "operations": [], "session_id": "sess-1" });
+        let keyed = json!({ "operations": [], "request_id": "req-1" });
+        for (sent, outcome, session) in [
+            (&named, &gone, Some("sess-1")),
+            (&keyed, &gone, Some("sess-1")),
+            (&unsessioned, &gone, None),
+            (
+                &unsessioned,
+                &marked("begin", "session_not_found", "sess-9"),
+                Some("sess-1"),
+            ),
+            (
+                &unsessioned,
+                &marked("commit", "session_not_found", "sess-1"),
+                Some("sess-1"),
+            ),
+            (
+                &unsessioned,
+                &marked("begin", "read_only_session", "sess-1"),
+                Some("sess-1"),
+            ),
+        ] {
+            assert!(
+                !retry_under_fresh_session("kin_mutate", sent, outcome, session),
+                "{sent} {} {session:?}",
+                outcome.text
+            );
+        }
+
+        // The words anywhere but as the first-line marker are never enough: the abort
+        // note after an unanswered commit, a commit refusal, or the marker after a line.
+        for text in [
+            "connection reset by peer\n\nkin_mutate could not abort transaction txn-1 after \
+             its commit failed (Session not found: sess-1. It was ended.), so that transaction \
+             is still open.",
+            "Session not found: sess-1. It was ended or expired after its idle timeout.",
+            "refused\nkin_mutate_not_started: {\"stage\":\"begin\",\"refusal\":\
+             \"session_not_found\",\"session_id\":\"sess-1\"}",
+        ] {
+            assert!(
+                !retry_under_fresh_session(
+                    "kin_mutate",
+                    &unsessioned,
+                    &refused(text),
+                    Some("sess-1")
+                ),
+                "{text}"
+            );
+        }
+
+        // Any other tool, or a clean answer, is left as it is.
+        assert!(!retry_under_fresh_session(
+            "get_entity_source",
+            &unsessioned,
+            &gone,
+            Some("sess-1")
+        ));
+        let clean = ToolOutcome {
+            is_error: false,
+            ..marked("begin", "session_not_found", "sess-1")
+        };
+        assert!(!retry_under_fresh_session(
+            "kin_mutate",
+            &unsessioned,
+            &clean,
+            Some("sess-1")
+        ));
     }
 }

@@ -186,12 +186,19 @@ fn semver_impact_is_derived_from_published_entity_change_classes() {
     // over. Both endpoints carry a private function and the file container on
     // top of it, so reporting the endpoint's total entity count here would
     // describe a different population than the one the changes came from.
+    //
+    // The file's own module surface is published, so it is inside this count:
+    // three public functions plus the module, against a private function and
+    // the file container outside it. Python's module entity has counted here
+    // for as long as it has existed; Rust's joined it when the languages that
+    // minted no entity-level import edge got the surface such an edge is
+    // sourced at.
     assert_eq!(
-        report["base_api_entities"], 4,
+        report["base_api_entities"], 5,
         "base endpoint must count only its published API surface: {report}"
     );
     assert_eq!(
-        report["head_api_entities"], 4,
+        report["head_api_entities"], 5,
         "head endpoint must count only its published API surface: {report}"
     );
     assert!(
@@ -215,7 +222,11 @@ fn semver_impact_is_derived_from_published_entity_change_classes() {
     );
     assert_eq!(report["summary"]["major"], 2);
     assert_eq!(report["summary"]["minor"], 1);
-    assert_eq!(report["summary"]["patch"], 1);
+    // Two patches: the rebodied function, and the file's own module surface,
+    // whose fingerprint is the whole file and therefore moves whenever any body
+    // inside it does. Its declaration is unchanged, which is what keeps it a
+    // patch rather than anything stronger.
+    assert_eq!(report["summary"]["patch"], 2);
 
     // The same endpoints in the same order always derive the same answer: the
     // impact is a function of graph state, not of when it was asked.

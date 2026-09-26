@@ -18,12 +18,11 @@ async fn mcp_mutate_source_base_replays_old_success_but_retains_new_stale_work()
     assert_eq!(original["ops_applied"], 1);
 
     let later_body = "pub fn value() -> u8 { 3 }";
-    source_base_commit_operation(
+    source_base_commit_fresh(
         &state,
-        serde_json::json!({
-            "verb": "update", "target": source["id"], "body": later_body,
-            "description": "Intervening authored work"
-        }),
+        &source["id"],
+        later_body,
+        "Intervening authored work",
     )
     .await;
     let later_roots = source_base_roots(&state);

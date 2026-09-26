@@ -513,12 +513,97 @@ def run_refusal(kin, env, work, port, timeout=180):
     return got.returncode, got.stdout + got.stderr
 
 
+def cleanup_result(status, detail):
+    result = Result("cleanup", "fixture workers stopped and endpoints retired")
+    (result.ok if status == PASS else result.bad)(detail)
+    return result
+
+
+def stop_confirmed(rc, report):
+    """A successful exit alone does not prove that a worker was retired."""
+    if not isinstance(report, dict):
+        return False
+    stopped = report.get("stopped")
+    return (rc == 0 and isinstance(stopped, list)
+            and report.get("schema") == "kin.daemon-stop.v1"
+            and report.get("scope") == "current-repo"
+            and report.get("all_stopped") is True
+            and report.get("endpoints_retired", not stopped) is True
+            and all(isinstance(row, dict)
+                    and row.get("result") in ("stopped", "not-running")
+                    and "preserved_endpoint" not in row for row in stopped))
+
+
+def finish_run_root(workdir, results, keep, explicit=False):
+    """Only a successful, stopped, disposable run may lose its fixtures."""
+    reasons = []
+    if keep:
+        reasons.append("--keep")
+    if explicit:
+        reasons.append("caller-owned workdir")
+    if not results or any(result.status != PASS for result in results):
+        reasons.append("failed or unreadable check or cleanup")
+    if not reasons:
+        try:
+            shutil.rmtree(workdir)
+        except OSError as error:
+            removal = cleanup_result(FAIL, "fixture removal failed: %s" % error)
+            removal.id = "cleanup-root"
+            results.append(removal)
+            reasons.append("fixture removal failed; remaining evidence retained")
+    if reasons:
+        print("fixtures kept at %s (%s)" % (workdir, "; ".join(reasons)))
+    return {"run_root": workdir, "run_root_retained": bool(reasons),
+            "run_root_retention_reason": "; ".join(reasons) if reasons else "successful disposable run"}
+
+
+def shutdown(kin, owned, workdir):
+    """Stop only this run's owned repositories, including a failed initialization.
+
+    `owned` maps each repository to the environment its kin ran under. Arms B
+    and C stop their own stores before they read them; Arm A's store is
+    stopped here.
+    """
+    records = []
+    errors = []
+    for repo in sorted(owned):
+        record = {"repo": str(repo)}
+        records.append(record)
+        # Never let discovery walk upward and select an unrelated repository.
+        if not (Path(repo) / ".kin" / "manifest.json").is_file():
+            record["error"] = "fixture manifest missing; stop was not attempted"
+            errors.append("%s: %s" % (repo, record["error"]))
+            continue
+        try:
+            proc = subprocess.run(
+                [str(kin), "daemon", "stop", "--json"], cwd=str(repo), env=owned[repo],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60)
+            rc, out, err = proc.returncode, proc.stdout, proc.stderr
+            record.update({"returncode": rc, "stdout": out, "stderr": err})
+            report = json.loads(out) if rc == 0 else None
+            if not stop_confirmed(rc, report):
+                record["error"] = "worker stop and endpoint retirement were not confirmed"
+                errors.append("%s: %s" % (repo, record["error"]))
+        except Exception as error:
+            record["error"] = "%s: %s" % (type(error).__name__, error)
+            errors.append("%s: %s" % (repo, record["error"]))
+    evidence = os.path.join(workdir, "daemon-cleanup.json")
+    with open(evidence, "w") as handle:
+        json.dump(records, handle, indent=2)
+        handle.write("\n")
+    detail = ("; ".join(errors) + "; see " + evidence if errors else
+              "%d owned fixture workers stopped and endpoints retired" % len(records))
+    return cleanup_result(FAIL if errors else PASS, detail)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--kin", default=os.environ.get("KIN_BIN"))
     parser.add_argument("--daemon", default=os.environ.get("KIN_DAEMON_BIN"))
     parser.add_argument("--json", dest="json_path", default=None)
     parser.add_argument("--label", default=None)
+    parser.add_argument("--keep", action="store_true",
+                        help="keep the run root whatever the result")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--self-test", action="store_true", dest="self_test")
     args = parser.parse_args()
@@ -539,7 +624,11 @@ def main():
     local_arm = Result(6, "that draw came from the local arm, not a daemon")
     results = [drawn, population, refuses, names_path, local_draw, local_arm]
 
-    with tempfile.TemporaryDirectory() as raw:
+    raw = tempfile.mkdtemp(prefix="kin-graph-viz-")
+    print("run root: %s" % raw)
+    owned = {}
+    finished = False
+    try:
         tmp = Path(raw)
 
         # Arm A: a real store, served, read over HTTP.
@@ -547,6 +636,8 @@ def main():
         home_a.mkdir()
         work_a = tmp / "work-a"
         env_a = suite_env(home_a, daemon)
+        # Owned before its init, so a store whose init failed is still stopped.
+        owned[work_a] = env_a
         init_a = build_store(kin, env_a, work_a)
         if init_a.returncode != 0:
             note = "kin init failed on the fixture: %s" % (
@@ -592,6 +683,7 @@ def main():
         home_b.mkdir()
         work_b = tmp / "work-b"
         env_b = suite_env(home_b, daemon)
+        owned[work_b] = dict(env_b)
         init_b = build_store(kin, env_b, work_b)
         if init_b.returncode != 0:
             note = "kin init failed on the refusal fixture: %s" % (
@@ -646,6 +738,7 @@ def main():
         home_c.mkdir()
         work_c = tmp / "work-c"
         env_c = suite_env(home_c, daemon)
+        owned[work_c] = dict(env_c)
         init_c = build_store(kin, env_c, work_c)
         if init_c.returncode != 0:
             note = "kin init failed on the local-draw fixture: %s" % (
@@ -702,16 +795,31 @@ def main():
                         "init just admitted; this is the reported defect exactly"
                         % node_count
                     )
+        finished = True
+    finally:
+        # Stopped whatever happened, and a stop that raised is a cleanup FAIL.
+        try:
+            results.append(shutdown(kin, owned, raw))
+        except Exception as error:
+            results.append(cleanup_result(FAIL, "cleanup raised: %s" % error))
+        if finished:
+            retention = finish_run_root(raw, results, args.keep)
+        else:
+            stopped = Result("run", "the run graded every arm")
+            stopped.unknown("the run stopped before every arm was graded")
+            finish_run_root(raw, results + [stopped], args.keep)
 
     for result in results:
         print(
-            "CHECK %d %s %s %s" % (result.id, TICKET, result.status, result.detail),
+            "CHECK %s %s %s %s" % (result.id, TICKET, result.status, result.detail),
             flush=True,
         )
 
     if args.json_path:
+        payload = report_payload(results, args.label)
+        payload.update(retention)
         with open(args.json_path, "w") as handle:
-            json.dump(report_payload(results, args.label), handle, indent=2)
+            json.dump(payload, handle, indent=2)
 
     if any(r.status == FAIL for r in results):
         return 1

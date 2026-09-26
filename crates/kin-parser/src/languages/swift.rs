@@ -57,6 +57,27 @@ impl LanguageAdapter for SwiftAdapter {
             }
         }
 
+        // The file module owns entity-level import edges, and it has to sit
+        // first so `module_entity_by_file` reads it rather than a declaration
+        // that happens to sit above the rest. A file that declared nothing and
+        // imported nothing contributes no entity: minting the synthetic module
+        // there reported the file as parsed, which is what kept a comment-only
+        // or unreadable file out of the parse-coverage census.
+        if !entities.is_empty() || !imports.is_empty() {
+            if let Some(module_name) = crate::adapter::file_module_surface_name(None, file_id) {
+                entities.insert(
+                    0,
+                    crate::adapter::file_module_surface_entity(
+                        module_name,
+                        format!("module {}", file_id.0),
+                        &root,
+                        source,
+                        file_id,
+                    ),
+                );
+            }
+        }
+
         // Build import lookup: local_name -> module_path
         let import_map: std::collections::HashMap<&str, &str> = imports
             .iter()
@@ -99,6 +120,7 @@ impl LanguageAdapter for SwiftAdapter {
         }
 
         Ok(ParseOutput {
+            derived_members: Vec::new(),
             entities,
             relations,
             imports,
@@ -797,6 +819,18 @@ fn extract_swift_import(node: &tree_sitter::Node, source: &[u8]) -> Option<FileI
         .unwrap_or(&module_path)
         .to_string();
 
+    // The module coordinate as a node, for the specifier's own span. Swift's
+    // path is read out of the statement's text rather than out of a grammar
+    // field, so the node is recovered by matching that text back: the named
+    // child whose text IS the coordinate. A form that exposes no such child
+    // leaves the specifier unanchored and the statement's span answers, which
+    // is what every Swift import reported before.
+    let path_site = node
+        .children(&mut node.walk())
+        .filter(|child| child.is_named())
+        .find(|child| child.utf8_text(source).map(str::trim) == Ok(module_path.as_str()))
+        .map(|child| crate::adapter::site_from_node(&child));
+
     Some(FileImport {
         site: crate::adapter::site_from_node(node),
         module_path,
@@ -804,6 +838,7 @@ fn extract_swift_import(node: &tree_sitter::Node, source: &[u8]) -> Option<FileI
             local_name,
             original_name: None,
             is_default: false,
+            site: path_site,
         }],
     })
 }
@@ -964,5 +999,63 @@ mod tests {
 
         let internal_fn = funcs.iter().find(|f| f.name == "internalFunc").unwrap();
         assert_eq!(internal_fn.visibility, Visibility::Internal);
+    }
+
+    /// A file whose bytes declare nothing mints no module surface.
+    ///
+    /// The surface is synthetic: it stands for the file, not for anything the
+    /// file wrote. Minting it unconditionally made a comment-only or unreadable
+    /// file count as parsed, so the parse-coverage census read a clean row for a
+    /// repository holding a hole and could not name the file. Rust carried this
+    /// rule already; these adapters did not.
+    #[test]
+    fn comment_only_swift_file_mints_no_module_surface() {
+        let adapter = SwiftAdapter;
+        let source = b"// nothing is declared here\n";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("lib/Silent.swift");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        // A comment is valid source, not a broken file. The census separates
+        // the two, and only a file that parses clean and declares nothing is
+        // the case this rule is about.
+        assert!(matches!(output.parse_state, ParseState::Valid));
+        assert!(
+            output.entities.is_empty(),
+            "expected no entity, got {:?}",
+            output
+                .entities
+                .iter()
+                .map(|e| (e.kind, e.name.as_str()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn swift_file_with_one_declaration_mints_the_module_surface() {
+        let adapter = SwiftAdapter;
+        let source = b"func add() {}\n";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("lib/math.swift");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let modules: Vec<_> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Module)
+            .collect();
+        assert_eq!(modules.len(), 1);
+        assert_eq!(modules[0].name, "math");
+        assert_eq!(output.entities[0].kind, EntityKind::Module);
+    }
+
+    /// An import alone is a surface too, and the edge is sourced at the module.
+    #[test]
+    fn swift_file_with_only_an_import_mints_the_module_surface() {
+        let adapter = SwiftAdapter;
+        let source = b"import Foundation\n";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("lib/math.swift");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        assert!(!output.imports.is_empty());
+        assert_eq!(output.entities[0].kind, EntityKind::Module);
     }
 }

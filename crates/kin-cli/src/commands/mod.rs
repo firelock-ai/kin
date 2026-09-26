@@ -4,6 +4,8 @@
 pub mod absence_qualifier;
 pub mod admit;
 pub mod agent;
+pub mod agent_exec;
+pub mod agent_exec_go;
 pub mod allow;
 pub mod approvals;
 pub mod assistant;
@@ -38,6 +40,7 @@ pub mod git;
 pub mod graph;
 pub mod graph_export;
 pub mod graph_health;
+pub mod graph_owed;
 pub mod graph_viz;
 pub mod health;
 pub mod history;
@@ -83,6 +86,7 @@ pub mod resolve;
 pub mod resources;
 pub mod review;
 pub mod rollback;
+pub mod routed_words;
 pub mod scope;
 pub mod search;
 pub mod secret;
@@ -108,9 +112,11 @@ pub mod trace_data_flow;
 pub mod traffic;
 pub mod transfer;
 pub mod update;
+pub mod upgrade;
 pub mod verify;
 pub mod work;
 pub mod workspace_tip;
+pub mod write_back;
 pub mod xref;
 
 /// Discover the Kin repository a command is bound to, or refuse by naming the
@@ -120,8 +126,35 @@ pub mod xref;
 /// cannot drift per command. Running a repository command from the wrong
 /// directory is an ordinary first mistake, and a refusal that only states the
 /// absence leaves the caller to guess the remedy.
+///
+/// Run from a folder inside a repository rather than at its root, it first
+/// says which repository answers, on stderr, once per process: the folder has
+/// no repository of its own, so the answer can name code outside it.
 pub(crate) fn require_repository_layout() -> anyhow::Result<kin_core::KinLayout> {
-    require_repository_layout_at(&std::env::current_dir()?)
+    let cwd = std::env::current_dir()?;
+    let layout = require_repository_layout_at(&cwd)?;
+    if let Some(note) = answering_repository_note(&layout, &cwd) {
+        static ANNOUNCED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !ANNOUNCED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!("kin: {note}");
+        }
+    }
+    Ok(layout)
+}
+
+/// What a command run from `cwd` says before it answers from `layout`, or
+/// `None` when `cwd` is the repository's own root.
+///
+/// It is the sentence an MCP answer on such a folder opens with, so the CLI and
+/// the MCP server say one thing: which repository answered, that the folder has
+/// no repository of its own, and how to have another Kin repository answer.
+/// Both paths come from the process's working directory, which the OS reports
+/// resolved, so they compare as given.
+pub(crate) fn answering_repository_note(
+    layout: &kin_core::KinLayout,
+    cwd: &std::path::Path,
+) -> Option<String> {
+    kin_mcp::first_contact::repository_identity(layout.working_dir(), Some(cwd)).warning
 }
 
 /// Discover the Kin repository containing `start`, refusing the same way.
@@ -197,7 +230,38 @@ pub(crate) fn incompatible_store_refusal(
 
 #[cfg(test)]
 mod repository_refusal_tests {
-    use super::{require_repository_layout_at, NOT_A_KIN_REPOSITORY};
+    use super::{answering_repository_note, require_repository_layout_at, NOT_A_KIN_REPOSITORY};
+
+    /// A command run from a folder inside a repository, with no repository of
+    /// its own, says first which repository answers; run from the root, it
+    /// answers as it always has.
+    #[test]
+    fn a_nested_folder_is_told_which_repository_answers_and_the_root_is_not() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = dir.path().join("repo");
+        let nested = repo.join("packages").join("app");
+        std::fs::create_dir_all(repo.join(".kin")).unwrap();
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let layout = require_repository_layout_at(&nested).expect("the enclosing repository");
+        assert_eq!(layout.working_dir(), repo.as_path());
+        let note = answering_repository_note(&layout, &nested).expect("a nested folder is told");
+        assert!(
+            note.starts_with(&format!(
+                "This answer comes from the Kin repository at {}, not from {}",
+                repo.display(),
+                nested.display()
+            )),
+            "{note}"
+        );
+        assert!(note.contains("no Kin repository of its own"), "{note}");
+        assert!(note.contains("mcp start --repo`"), "{note}");
+        assert!(!note.contains("git init"), "{note}");
+        assert!(!note.contains('\u{2014}'), "{note}");
+
+        let at_root = require_repository_layout_at(&repo).expect("the repository");
+        assert_eq!(answering_repository_note(&at_root, &repo), None);
+    }
 
     #[test]
     fn incompatible_stores_preserve_native_work_even_with_git_history() {

@@ -17,7 +17,7 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use crate::enrichment::{deterministic_relation_id, enrich_entity_calls, EntityIndex, EntityRef};
-use crate::error::{LspError, Result};
+use crate::error::{LspError, QueryErrorClass, Result};
 use crate::lifecycle::LspServer;
 use crate::protocol;
 use kin_model::{EntityId, GraphNodeId, Relation, RelationKind, RelationOrigin};
@@ -28,6 +28,83 @@ pub struct FileEnrichmentResult {
     pub relations: Vec<Relation>,
     pub definitions_resolved: usize,
     pub positions_queried: usize,
+    /// Queries in this pass that failed or could not be asked without ending
+    /// it: an identifier whose answer timed out (it was skipped), an entity's
+    /// call hierarchy (that entity contributed no `Calls` edges here), a
+    /// member join candidate whose own name could not be located, or a server
+    /// that stopped answering (the pass stopped where it was). Every relation
+    /// in `relations` stands on its own answer. Nonzero means the pass did not
+    /// finish the file, so the caller must not record the file as enriched.
+    pub failed_queries: usize,
+    /// Queries the server declined as not applying where they were asked. An
+    /// answer with nothing in it: counted, and never a reason to hold the file.
+    pub declined_queries: usize,
+    /// What the first failed query was, for the record of files still owed.
+    pub first_failure: Option<String>,
+}
+
+/// How many language-server queries in a row may time out before a file pass
+/// stops asking. One slow answer is load; several in a row is a server that is
+/// not answering, and every further question would only spend the pass's
+/// budget.
+const TIMEOUTS_BEFORE_STOPPING: usize = 3;
+
+/// What a file pass does after a query that produced no answer.
+enum AfterRefusal {
+    /// Skip that position or declaration and keep going.
+    Skip,
+    /// Several timeouts in a row: stop asking and keep what was proven.
+    Stop,
+    /// The server can answer nothing more: the pass ends with this error.
+    End(LspError),
+}
+
+/// A file pass's count of the queries that produced no answer, kept by the
+/// one classification in [`LspError::class`].
+#[derive(Default)]
+struct Refusals {
+    failed: usize,
+    declined: usize,
+    consecutive_timeouts: usize,
+    first_failure: Option<String>,
+}
+
+impl Refusals {
+    fn answered(&mut self) {
+        self.consecutive_timeouts = 0;
+    }
+
+    fn refused(&mut self, asked: &str, error: LspError) -> AfterRefusal {
+        match error.class() {
+            QueryErrorClass::SessionEnded => AfterRefusal::End(error),
+            QueryErrorClass::TimedOut => {
+                self.fail(asked, &error);
+                self.consecutive_timeouts += 1;
+                if self.consecutive_timeouts >= TIMEOUTS_BEFORE_STOPPING {
+                    AfterRefusal::Stop
+                } else {
+                    AfterRefusal::Skip
+                }
+            }
+            QueryErrorClass::Declined => {
+                self.declined += 1;
+                self.consecutive_timeouts = 0;
+                AfterRefusal::Skip
+            }
+            QueryErrorClass::Failed => {
+                tracing::debug!(asked, %error, "a query in the file pass failed; the file's other relations stand");
+                self.fail(asked, &error);
+                self.consecutive_timeouts = 0;
+                AfterRefusal::Skip
+            }
+        }
+    }
+
+    fn fail(&mut self, asked: &str, error: &LspError) {
+        self.failed += 1;
+        self.first_failure
+            .get_or_insert_with(|| format!("{asked} got no answer: {error}"));
+    }
 }
 
 /// Return the starting columns for identifier-like tokens in a single line.
@@ -116,9 +193,14 @@ fn identifier_at(line_text: &str, col: u32) -> String {
 /// container's own `Contains` edge already carries in the other direction.
 /// Every edge between entities that do not contain one another is left exactly
 /// as it was.
+///
+/// `dst_name_col` is the byte column the destination's name starts at on
+/// `dst.name_line`, read from the source when the caller holds it, since the
+/// signature-derived `dst.name_col` misses it on a decorated declaration.
 fn lands_inside_container_without_naming_it(
     source: &EntityRef,
     dst: &EntityRef,
+    dst_name_col: u32,
     queried: &str,
     target_line: u32,
     target_col: u32,
@@ -139,9 +221,9 @@ fn lands_inside_container_without_naming_it(
     if target_line != dst.name_line {
         return true;
     }
-    // `name_col` is where the name STARTS; the token runs its own length.
-    let width = simple_name.chars().count() as u32;
-    target_col < dst.name_col || target_col >= dst.name_col.saturating_add(width)
+    // `dst_name_col` is where the name STARTS; the token runs its own length.
+    let width = simple_name.len() as u32;
+    target_col < dst_name_col || target_col >= dst_name_col.saturating_add(width)
 }
 
 /// Enrich a file by querying textDocument/definition at every identifier position.
@@ -164,22 +246,34 @@ pub async fn enrich_file_definitions(
         .to_string_lossy()
         .to_string();
 
+    let positions = crate::source_positions::SourcePositions::new(&rel_path, file_content);
+
     // Deduplicate: (source_entity_id, target_entity_id, kind) → only emit once.
     let mut seen: HashSet<(EntityId, EntityId, &'static str)> = HashSet::new();
     let mut relations = Vec::new();
     let mut definitions_resolved = 0usize;
     let mut positions_queried = 0usize;
+    let mut refusals = Refusals::default();
     let mut scoped_documents = crate::enrichment::ScopedDocuments::new(server, documents);
+    scoped_documents.remember(&rel_path, file_content);
+
+    // A server that stops answering inside this pass ends it with what was
+    // already proven rather than with nothing. The budget around the pass
+    // abandons a pass that runs over it, and an abandoned pass keeps no
+    // relation at all, so waiting out every remaining identifier on a slow
+    // server throws away the ones that did answer. One slow answer skips its
+    // identifier; several in a row stop the pass.
+    let mut timed_out = false;
 
     let result = async {
         // Unsupported definition queries contribute no positions; independent
         // call hierarchy support still runs below.
         if server.has_definition() {
             // Scan each line for identifier positions.
-            for (line_num, line_text) in file_content.lines().enumerate() {
+            'lines: for (line_num, line_text) in file_content.lines().enumerate() {
                 let line = line_num as u32;
-                let positions = identifier_positions_in_line(line_text);
-                positions_queried += positions.len();
+                let identifiers = identifier_positions_in_line(line_text);
+                positions_queried += identifiers.len();
 
                 // The relation source depends only on the line (never the column), and
                 // every relation emitted below requires it to be Some. Lines outside any
@@ -190,7 +284,7 @@ pub async fn enrich_file_definitions(
                     continue;
                 };
 
-                for col in positions {
+                for col in identifiers {
                     // A member expression on a MODULE receiver is answered by its
                     // member. Asked at the receiver, the server returns the module, and
                     // `find_at` turns that into whichever entity holds the line, so
@@ -206,18 +300,74 @@ pub async fn enrich_file_definitions(
                     if let Some((_receiver, member_col, member_name)) =
                         crate::enrichment::member_expression_at(line_text, col)
                     {
-                        let receiver_definitions = crate::enrichment::locations_at(
+                        let receiver_definitions = match crate::enrichment::locations_at(
                             server,
                             "textDocument/definition",
                             &uri,
                             line,
-                            col,
+                            positions.scalar_position(line, col)?.character,
                         )
-                        .await?;
+                        .await
+                        {
+                            Ok(locations) => {
+                                refusals.answered();
+                                locations
+                            }
+                            Err(error) => {
+                                match refusals.refused("a receiver's definition", error) {
+                                    AfterRefusal::Skip => continue,
+                                    AfterRefusal::Stop => {
+                                        timed_out = true;
+                                        break 'lines;
+                                    }
+                                    AfterRefusal::End(error) => return Err(error),
+                                }
+                            }
+                        };
+                        // An imported value (`current_app` in
+                        // `current_app.config`) also answers from another file,
+                        // at its own declaration. That answer is the reference,
+                        // minted here from the answer just proven rather than
+                        // from a second request, and the member is left to its
+                        // own turn of this loop.
                         if crate::enrichment::receiver_names_a_module(
                             &receiver_definitions,
+                            entity_index,
                             &rel_path,
                         ) {
+                            if let Some(values) = crate::enrichment::receiver_declared_values(
+                                &receiver_definitions,
+                                entity_index,
+                                &identifier_at(line_text, col),
+                            ) {
+                                for value in values {
+                                    if source.id == value.id
+                                        || !seen.insert((source.id, value.id, "cross_file"))
+                                    {
+                                        continue;
+                                    }
+                                    definitions_resolved += 1;
+                                    relations.push(Relation {
+                                        id: deterministic_relation_id(
+                                            RelationKind::References,
+                                            source.id,
+                                            value.id,
+                                        ),
+                                        kind: RelationKind::References,
+                                        src: GraphNodeId::Entity(source.id),
+                                        dst: GraphNodeId::Entity(value.id),
+                                        confidence: 0.95,
+                                        origin: RelationOrigin::Lsp,
+                                        created_in: None,
+                                        import_source: None,
+                                        evidence: crate::enrichment::query_position_evidence(
+                                            "lsp_definition",
+                                            positions.token(line, col)?,
+                                        ),
+                                    });
+                                }
+                                continue;
+                            }
                             // Declining alone was not enough, and assuming otherwise is
                             // what left a named export unreferenced. This pass used to
                             // drop the receiver here reasoning that "the member's own
@@ -233,7 +383,7 @@ pub async fn enrich_file_definitions(
                             // The same equivalence join the UsesType arm uses supplies
                             // the right edge: two independently proven server answers
                             // naming the same place, never a name match.
-                            for candidate in crate::enrichment::member_export_bindings(
+                            let bindings = match crate::enrichment::member_export_bindings(
                                 server,
                                 entity_index,
                                 workspace_root,
@@ -241,12 +391,37 @@ pub async fn enrich_file_definitions(
                                 &rel_path,
                                 &uri,
                                 line,
-                                col,
-                                member_col,
+                                positions.scalar_position(line, col)?.character,
+                                positions.scalar_position(line, member_col)?.character,
                                 &member_name,
                             )
-                            .await?
+                            .await
                             {
+                                Ok(bindings) => {
+                                    refusals.answered();
+                                    refusals.failed += bindings.unasked;
+                                    if bindings.unasked > 0 {
+                                        refusals.first_failure.get_or_insert_with(|| {
+                                            format!(
+                                                "a member's export binding could not locate {} candidate declaration(s)",
+                                                bindings.unasked
+                                            )
+                                        });
+                                    }
+                                    bindings.bound
+                                }
+                                Err(error) => {
+                                    match refusals.refused("a member's export binding", error) {
+                                        AfterRefusal::Skip => continue,
+                                        AfterRefusal::Stop => {
+                                            timed_out = true;
+                                            break 'lines;
+                                        }
+                                        AfterRefusal::End(error) => return Err(error),
+                                    }
+                                }
+                            };
+                            for candidate in bindings {
                                 if source.id == candidate.id
                                     || !seen.insert((source.id, candidate.id, "member_on_module"))
                                 {
@@ -268,17 +443,7 @@ pub async fn enrich_file_definitions(
                                     import_source: None,
                                     evidence: crate::enrichment::query_position_evidence(
                                         "lsp_member_on_module",
-                                        &rel_path,
-                                        &protocol::Range {
-                                            start: protocol::Position {
-                                                line,
-                                                character: member_col,
-                                            },
-                                            end: protocol::Position {
-                                                line,
-                                                character: member_col,
-                                            },
-                                        },
+                                        positions.token(line, member_col)?,
                                     ),
                                 });
                                 tracing::debug!(
@@ -302,16 +467,28 @@ pub async fn enrich_file_definitions(
                                 text_document: protocol::TextDocumentIdentifier {
                                     uri: uri.clone(),
                                 },
-                                position: protocol::Position {
-                                    line,
-                                    character: col,
-                                },
+                                position: positions.scalar_position(line, col)?,
                             },
                         ),
                     )
                     .await;
 
-                    let value = def_result.map_err(|_| LspError::Timeout)??;
+                    // The pass's own two-second bound is a timeout like the
+                    // client's, and both go through the one classification.
+                    let value = match def_result.unwrap_or(Err(LspError::Timeout)) {
+                        Ok(value) => {
+                            refusals.answered();
+                            value
+                        }
+                        Err(error) => match refusals.refused("a definition", error) {
+                            AfterRefusal::Skip => continue,
+                            AfterRefusal::Stop => {
+                                timed_out = true;
+                                break 'lines;
+                            }
+                            AfterRefusal::End(error) => return Err(error),
+                        },
+                    };
                     let locations = crate::enrichment::decode_locations(value)?;
                     {
                         for location in &locations {
@@ -325,12 +502,32 @@ pub async fn enrich_file_definitions(
                                 continue;
                             }
 
+                            // A Python answer inside an entity's body, or an
+                            // empty one naming a module, is not about the entity
+                            // `find_at` placed it in.
+                            if !crate::enrichment::answer_names_entity(dst, &location.range) {
+                                continue;
+                            }
+
+                            let (dst_name_col, target_col) = if source.file_path == dst.file_path {
+                                (
+                                    positions
+                                        .name_column(dst)
+                                        .ok()
+                                        .flatten()
+                                        .unwrap_or(dst.name_col),
+                                    positions.byte_column(&location.range.start)?,
+                                )
+                            } else {
+                                (dst.name_col, 0)
+                            };
                             if lands_inside_container_without_naming_it(
                                 source,
                                 dst,
+                                dst_name_col,
                                 &identifier_at(line_text, col),
                                 target_line,
-                                location.range.start.character,
+                                target_col,
                             ) {
                                 continue;
                             }
@@ -371,17 +568,7 @@ pub async fn enrich_file_definitions(
                                 // round trip.
                                 evidence: crate::enrichment::query_position_evidence(
                                     "lsp_definition",
-                                    &rel_path,
-                                    &protocol::Range {
-                                        start: protocol::Position {
-                                            line,
-                                            character: col,
-                                        },
-                                        end: protocol::Position {
-                                            line,
-                                            character: col,
-                                        },
-                                    },
+                                    positions.token(line, col)?,
                                 ),
                             });
                         }
@@ -393,11 +580,50 @@ pub async fn enrich_file_definitions(
         // Add entity-level call hierarchy for every entity in this file. The
         // daemon already performs a per-entity pass, so we keep the relation IDs
         // deterministic to make repeated discovery idempotent.
-        if server.has_call_hierarchy() {
+        //
+        // One entity's call hierarchy that fails, or whose answer cannot be
+        // proven, is that entity's failure and not the file's. It used to end
+        // the pass with `?`, which threw away every definition relation the
+        // loop above had already proven. On Flask 67 of 83 files lost their
+        // definitions pass that way: a decorated method or the module surface
+        // was asked at a column its own line does not have, and the file's
+        // imports, calls and references went with it. The failure is counted,
+        // so the file is still not recorded as enriched.
+        if server.has_call_hierarchy() && !timed_out {
+            refusals.answered();
             for entity in entity_index.entities_in_file(&rel_path) {
-                let call_relations =
-                    enrich_entity_calls(server, entity, entity_index, workspace_root).await?;
-                relations.extend(call_relations);
+                match enrich_entity_calls(
+                    server,
+                    entity,
+                    entity_index,
+                    workspace_root,
+                    Some(&|file| {
+                        if file == rel_path {
+                            Some(file_content.to_owned())
+                        } else {
+                            documents.and_then(|provider| provider(file))
+                        }
+                    }),
+                )
+                .await
+                {
+                    Ok(call_relations) => {
+                        refusals.answered();
+                        relations.extend(call_relations);
+                    }
+                    // One declaration's call hierarchy is that declaration's,
+                    // not the file's: a decline is skipped, a failure is
+                    // counted and the file's other relations stand, several
+                    // timeouts in a row stop asking and keep what was proven,
+                    // and only a server that can answer nothing ends the pass.
+                    Err(error) => match refusals
+                        .refused(&format!("the call hierarchy of {}", entity.name), error)
+                    {
+                        AfterRefusal::Skip => {}
+                        AfterRefusal::Stop => break,
+                        AfterRefusal::End(error) => return Err(error),
+                    },
+                }
             }
         }
 
@@ -405,6 +631,9 @@ pub async fn enrich_file_definitions(
             relations,
             definitions_resolved,
             positions_queried,
+            failed_queries: refusals.failed,
+            declined_queries: refusals.declined,
+            first_failure: refusals.first_failure.take(),
         })
     }
     .await;
@@ -442,6 +671,8 @@ mod tests {
                 end_line: 5,
                 name_line: 0,
                 name_col: 3,
+                declares_name: true,
+                kind: kin_model::EntityKind::Function,
             },
             EntityRef {
                 id: EntityId::new(),
@@ -452,9 +683,11 @@ mod tests {
                 end_line: 25,
                 name_line: 20,
                 name_col: 3,
+                declares_name: true,
+                kind: kin_model::EntityKind::Function,
             },
         ];
-        let index = EntityIndex::new(entities);
+        let index = EntityIndex::new(entities, std::path::Path::new("/project"));
 
         // Inside an entity span → queried (find_at is Some).
         for line in [0u32, 3, 5, 20, 25] {
@@ -503,6 +736,8 @@ mod tests {
             end_line: 70,
             name_line: 3,
             name_col,
+            declares_name: true,
+            kind: kin_model::EntityKind::Function,
         };
         let member = EntityRef {
             id: EntityId::new(),
@@ -513,6 +748,8 @@ mod tests {
             end_line: 18,
             name_line: 12,
             name_col: 2,
+            declares_name: true,
+            kind: kin_model::EntityKind::Function,
         };
 
         // `add(method: string, path: string, handler: T)` resolves `T` to the
@@ -521,6 +758,7 @@ mod tests {
             super::lands_inside_container_without_naming_it(
                 &member,
                 &class,
+                class.name_col,
                 "T",
                 class.name_line,
                 type_param_col,
@@ -534,6 +772,7 @@ mod tests {
             super::lands_inside_container_without_naming_it(
                 &member,
                 &class,
+                class.name_col,
                 "this",
                 class.name_line,
                 name_col,
@@ -547,6 +786,7 @@ mod tests {
             !super::lands_inside_container_without_naming_it(
                 &member,
                 &class,
+                class.name_col,
                 "SmartRouter",
                 class.name_line,
                 name_col,
@@ -557,6 +797,7 @@ mod tests {
         assert!(!super::lands_inside_container_without_naming_it(
             &member,
             &class,
+            class.name_col,
             "SmartRouter",
             class.name_line,
             name_col + "SmartRouter".len() as u32 - 1,
@@ -573,9 +814,18 @@ mod tests {
             end_line: 40,
             name_line: 15,
             name_col: 13,
+            declares_name: true,
+            kind: kin_model::EntityKind::Function,
         };
         assert!(
-            !super::lands_inside_container_without_naming_it(&member, &sibling, "this", 15, 99),
+            !super::lands_inside_container_without_naming_it(
+                &member,
+                &sibling,
+                sibling.name_col,
+                "this",
+                15,
+                99
+            ),
             "an edge between entities that do not contain one another must be left alone"
         );
     }

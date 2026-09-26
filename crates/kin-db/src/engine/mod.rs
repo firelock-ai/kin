@@ -10,6 +10,8 @@ mod traverse;
 pub use graph::VectorSalvageStats;
 pub use graph::{
     EmbeddingStatus, InMemoryGraph, PersistenceEpoch, ProducedSemanticSearch,
-    ProducedSemanticSearchBatch, ResolvedRetrievalItem,
+    ProducedSemanticSearchBatch, ResolvedRetrievalItem, SourceDerivationFacts,
+    SourceDerivationLimit, SourceDerivationLimits, SourceDerivationUnavailable,
+    SourceEntityBinding, SourceLayoutFact, SourceOpaqueFact, SourceReservedRelation,
 };
 pub use incremental::{compute_diff, IncrementalDiff};

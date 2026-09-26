@@ -1,11 +1,12 @@
 # Kin Quickstart Guide
 
-This is the recommended first-run path for Kin. One flow works on macOS, Linux, and
-Windows. On native Windows the support boundary is narrower, and WSL2 remains the
-recommended path for the full Kin experience. See step 1.
+This is the recommended first-run path for Kin. The npm setup command works on macOS,
+Linux, WSL2, and native Windows x64. Native Windows has a narrower support boundary;
+WSL2 remains the recommended Windows route. See step 1 for those limits and the
+PowerShell alternative when Node.js is unavailable.
 
-1. **Install** with `npx -y @kinlab/kin setup`. One command on every platform: it
-   downloads the binaries and runs the setup wizard in the same call.
+1. **Install** with `npx -y @kinlab/kin setup`. One command on the supported platforms:
+   it downloads the binaries and runs the setup wizard in the same call.
 2. **`kin setup`** asks a couple of questions, and the guided wizard configures your
    shell, PATH, daemon, and AI clients. Step 1 already ran it; call it again by name
    whenever you want to change an answer.
@@ -24,14 +25,15 @@ in the [CLI reference](cli-reference.md).
 
 ## 1. Install
 
-### Every platform
+### One command on macOS, Linux, WSL2, and Windows x64
 
 ```sh
 npx -y @kinlab/kin setup
 ```
 
 This is the command the install page and the README lead with, and it is the same string on
-macOS, Linux, Windows and WSL. It needs Node.js 20 or newer. The launcher downloads the
+macOS, Linux, WSL2, and native Windows x64. It needs Node.js 20 or newer. On Windows
+without Node.js, use the PowerShell installer [below](#windows). The launcher downloads the
 matching `kin` and `kin-daemon` release, verifies its published SHA-256, installs both under
 `~/.kin/bin`, adds that directory to your shell profile for new sessions, and then runs the
 `kin setup` wizard. It needs no writable npm prefix and no administrator rights. For an
@@ -40,8 +42,9 @@ agent with nobody at the keyboard, add `--intent agent --no-interactive`.
 Open a new terminal when it finishes, and `kin --version` then answers by bare name. The
 shell it ran in does not pick up the new PATH entry.
 
-Everything below is an alternative: a machine with no Node, native Windows PowerShell, or a
-team that already standardises on a package manager.
+Everything below is an alternative for a machine without Node.js or a team that
+standardises on a package manager. The native Windows ARM64 and projection limits
+are described in the [Windows section](#windows).
 
 ### macOS and Linux
 
@@ -126,11 +129,14 @@ On native Windows, use PowerShell:
 irm https://get.kinlab.dev/install.ps1 | iex
 ```
 
-Native Windows x86_64 support is early. Repository admission works: `kin init` imports a Git repository and publishes graph authority, and graph, lexical, and daemon-backed queries answer natively. Transparent filesystem projection is not shipped on Windows, and the end-to-end install proof does not yet cover MCP or review workflows there, so WSL2 remains the recommended path for the full Kin experience.
-The PowerShell installer prints that boundary before downloading anything. Native
-Windows ARM64 has no release archive; an x64 PowerShell process may use the x86_64
-archive under Windows emulation, but WSL2 is the recommended path. Follow the Linux
-flow inside WSL2; see [windows-wsl2.md](./windows-wsl2.md).
+Native Windows x86_64 support is early. Repository admission works: `kin init` imports a Git repository and publishes graph authority, and graph, lexical, and daemon-backed queries answer natively. The end-to-end install proof also runs agent setup on native Windows and gets graph-backed answers from the installed MCP server. Transparent filesystem projection is not shipped on Windows, and review workflows are not yet tested there, so WSL2 remains the recommended path for the full Kin experience.
+The PowerShell installer prints that boundary before downloading anything. It installs
+`kin` and `kin-daemon` and does not run `kin setup`, so it connects no AI coding tools on
+native Windows. Run `kin setup` afterwards to configure them, or use
+`npx -y @kinlab/kin setup` to install and run setup in one call.
+Native Windows ARM64 has no release archive; an x64 PowerShell process may
+use the x86_64 archive under Windows emulation, but WSL2 is the recommended path. Follow
+the Linux flow inside WSL2; see [windows-wsl2.md](./windows-wsl2.md).
 
 Git for Windows sets `core.autocrlf=true` in its system config, which rewrites line
 endings on checkout. `kin init` admits the committed tree, so a repository cloned that
@@ -175,8 +181,8 @@ and `install.ps1` unless noted):
 - `KIN_DIR`: compatibility alias for `KIN_HOME`.
 - `KIN_NO_SETUP=1`: on macOS and Linux, skip the `kin setup` wizard after the
   binaries are installed (run `kin setup` yourself when ready).
-  Native Windows always skips repository setup because the install proof does not yet cover MCP or review workflows there.
-  `KIN_NO_SETUP` is accepted there only for CI compatibility and selects the
+  The PowerShell installer always installs without starting the wizard; run
+  `kin setup` afterwards. It accepts `KIN_NO_SETUP` only for CI compatibility and selects the
   CI-oriented skip message.
 - `KIN_BASE_URL`: install from a mirror or local path instead of GitHub releases
   (offline / airgapped installs and CI smoke tests).
@@ -185,9 +191,11 @@ and `install.ps1` unless noted):
 
 ## 2. Guided setup (`kin setup`)
 
-On macOS and Linux, `kin setup` is the guided wizard the installer launches for you
-(run it again any time). Native Windows does not launch repository setup; use the
-Linux flow inside WSL2. The wizard opens with **"What do you want Kin for?"** and asks
+`kin setup` is the guided wizard. The recommended `npx -y @kinlab/kin setup` command
+launches it on macOS, Linux, WSL2, and native Windows x64. After using the PowerShell
+installer, run `kin setup` yourself. WSL2 remains the recommended Windows route for
+the full experience; see the [native Windows limits](#windows). You can run the wizard
+again any time. It opens with **"What do you want Kin for?"** and asks
 for your **intent** rather than a bag of independent toggles:
 
 | Intent | What it configures |
@@ -271,7 +279,10 @@ publication.
 
 *Flags:*
 - `--json`: report the exact committed repository/workspace authority result,
-  including the semantic enrichment admission produced.
+  including the semantic enrichment admission produced and, under
+  `cross_file_enrichment`, whether the cross-file sweep that follows admission
+  produced its edges or left them owed, and why. The
+  [CLI reference](./cli-reference.md#kin-init) lists the reasons.
 
 ### How long admission takes, and what it prints
 
@@ -601,7 +612,7 @@ Use Kin to explore this codebase: run semantic_locate to find the
 main entry point, then get_context_pack on that file.
 ```
 
-The wizard writes this entry to each client:
+For Claude Code the wizard writes this entry:
 
 ```json
 {
@@ -614,6 +625,10 @@ The wizard writes this entry to each client:
   }
 }
 ```
+
+Cursor, Gemini CLI, Windsurf and LM Studio get it with `agent-routed` as the profile. Codex
+CLI and Antigravity get that `agent-routed` entry, and the Grok CLI this one, bound to one
+repository with `--repo`, as [Advanced configuration](#9-advanced-configuration) shows.
 
 `KIN_MCP_TOOL_PROFILE=agent-default` names the small curated tool surface. That is also
 what an unconfigured `kin mcp start` serves, so a hand-wired entry gets the same surface;

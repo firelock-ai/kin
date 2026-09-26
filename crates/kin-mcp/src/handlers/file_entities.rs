@@ -46,7 +46,7 @@ use crate::handlers::common::{
     entity_presentation_end_line, entity_presentation_start_line, recorded_span_source_digest,
 };
 use crate::types::ToolCallResult;
-use crate::working_copy::WorkingCopySurface;
+use crate::working_copy::{HostEntryReading, WorkingCopySurface};
 
 /// The tool's registered name, spelled once so the registry, the dispatcher,
 /// the budget table and the negative registry cannot drift from each other.
@@ -77,13 +77,21 @@ therefore cannot say what it left out, this returns the whole set the graph owns
 and reports whether that set is whole. Give it `path`, such as \"lib/express.js\". Each row \
 carries the `id` every other tool here takes (`get_entity_source`, `get_context_pack`, \
 `find_references`, `graph_neighborhood`), plus `name`, `kind`, `language`, `role`, \
-`visibility`, `signature`, and the defining span as both lines and bytes. \
+`visibility`, `signature`, and the defining span as both lines and bytes. A member is named \
+by its owner, so `name` reads `Scaffold.get`; `member_name` carries the bare `get` on every \
+row and `owner` carries `Scaffold` when there is one, so match a bare name against \
+`member_name` and address the entity by `id`. \
 `file_coverage` says what the graph knows about the file itself: `parsed` is `full` when a \
 language adapter parsed it completely, `partial` or `failed` when it did not, and `absent` \
 when no adapter parsed it at all. When `absent` is because no adapter claims the file's type \
 at all -- Kin admits such a file, hashes it and stores a preview, and extracts nothing -- \
 `content_opaque` is true and `opaque_reason` names the extension, so a file that produced \
-zero entities by design is never read as one whose parse failed. Only a `full` parse licenses reading this list as the file's \
+zero entities by design is never read as one whose parse failed. In JavaScript/TypeScript, a \
+loop that bulk-assigns computed members (`methods.forEach(function (method) { app[method] = \
+...; })`) mints the members Kin can read the list of and, when part of that list is not \
+statically knowable, sets `dynamic_members_disclosed` and names the loop in \
+`dynamic_members_note` rather than certifying a short list as whole. Only a `full` parse with \
+no such disclosure licenses reading this list as the file's \
 whole surface, and `_kin.completeness` and `negative.safe_to_conclude_absent` are computed \
 from that fact rather than from store-wide health. A path the graph does not track is refused \
 by name instead of answered with an empty list, because those two answers are \
@@ -101,6 +109,17 @@ them carries `next_cursor`, which you pass back as `cursor` for the next page.";
 pub struct FileEntityRow {
     pub id: kin_model::EntityId,
     pub name: String,
+    /// The member segment of `name` for an owner's member (a method, field or
+    /// enum variant): `get` for `Scaffold.get`. The whole name for anything
+    /// else, so a file module named `app.py` publishes `app.py`, not `py`. The
+    /// graph names a member by its owner and a caller usually holds only the
+    /// bare name, so this is the field a bare name is matched against; the
+    /// entity is still addressed by `id`.
+    pub member_name: String,
+    /// The owner of an owner's member, `Scaffold` for `Scaffold.get`. Absent
+    /// for anything that is not one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
     pub kind: EntityKind,
     pub language: LanguageId,
     pub role: EntityRole,
@@ -112,20 +131,44 @@ pub struct FileEntityRow {
     pub end_byte: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub doc_summary: Option<String>,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub derivation: Option<serde_json::Value>,
+    pub independently_editable: bool,
 }
 
 impl From<Entity> for FileEntityRow {
     fn from(entity: Entity) -> Self {
-        let start_line = entity_presentation_start_line(&entity);
-        let end_line = entity_presentation_end_line(&entity);
+        let mut derivation = super::common::derived_member_fields(&entity);
+        let independently_editable = derivation.is_none() && entity.span.is_some();
+        let start_line = derivation
+            .is_none()
+            .then(|| entity_presentation_start_line(&entity))
+            .flatten();
+        let end_line = derivation
+            .is_none()
+            .then(|| entity_presentation_end_line(&entity))
+            .flatten();
         let (start_byte, end_byte) = entity
             .span
             .as_ref()
+            .filter(|_| derivation.is_none())
             .map(|span| (Some(span.start_byte), Some(span.end_byte)))
             .unwrap_or((None, None));
+        if let Some(fields) = derivation
+            .as_mut()
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            for key in ["independently_editable", "start_line", "end_line"] {
+                fields.remove(key);
+            }
+        }
+        let member_name = kin_ranking::entity_ranking::lookup_member_name(&entity).to_string();
+        let owner = kin_ranking::entity_ranking::member_owner(&entity).map(str::to_string);
         Self {
             id: entity.id,
             name: entity.name,
+            member_name,
+            owner,
             kind: entity.kind,
             language: entity.language,
             role: entity.role,
@@ -136,6 +179,8 @@ impl From<Entity> for FileEntityRow {
             start_byte,
             end_byte,
             doc_summary: entity.doc_summary,
+            derivation,
+            independently_editable,
         }
     }
 }
@@ -249,6 +294,39 @@ impl SpanProvenance {
     pub fn permits_certification(self) -> bool {
         !matches!(self, Self::Stale { .. })
     }
+}
+
+/// Whether this file's own extraction disclosed a bulk computed-member
+/// assignment loop it could not read the members of, and the sentence to
+/// surface when it did.
+///
+/// The JavaScript adapter writes this on the file's `Module` entity when a
+/// loop such as `methods.forEach(function (method) { app[method] = ...; })`
+/// assigns computed members Kin could not statically enumerate
+/// (`kin_parser::DYNAMIC_MEMBERS_DISCLOSURE_PREFIX`). A resolved site mints
+/// real entities instead and needs no disclosure here; this only fires for
+/// the part of the file, if any, a loop's own list could not be read
+/// statically, which is why a file can mint members from one site and still
+/// carry this disclosure for another.
+///
+/// Reads the entity set the store returned rather than the graph itself: this
+/// is disclosure the extractor already computed once, not a fact this handler
+/// re-derives from source, which this tool never reads.
+fn dynamic_members_disclosure(entities: &[Entity]) -> Option<String> {
+    if entities.iter().any(|e| {
+        kin_model::is_derived_member(e)
+            || e.metadata
+                .extra
+                .contains_key(kin_model::derivation::MEMBER_COVERAGE_KEY)
+    }) {
+        return Some("Computed member candidates and unresolved write sites are recorded; runtime enumeration is not complete.".into());
+    }
+    entities
+        .iter()
+        .find(|entity| entity.kind == EntityKind::Module)
+        .and_then(|module| module.doc_summary.as_deref())
+        .filter(|summary| summary.starts_with(kin_parser::DYNAMIC_MEMBERS_DISCLOSURE_PREFIX))
+        .map(str::to_string)
 }
 
 /// Decide [`SpanProvenance`] for one file's entities against the blob the tree
@@ -534,55 +612,104 @@ fn sort_key(entity: &Entity) -> (usize, String, String) {
     )
 }
 
-/// Enumerate the entities the graph holds for one file.
+/// What graph truth holds about one file as a conversion source: whether and
+/// how completely an adapter read it, the tier it is tracked at, and how many
+/// entities of each kind it produced.
 ///
-/// `host` is the working copy this repository's graph is supposed to be level
-/// with, as the calling layer understands it. It qualifies the answer and never
-/// produces any part of it: see [`crate::working_copy`].
-pub fn handle_list_file_entities<G: GraphStore>(
-    args: &HashMap<String, serde_json::Value>,
+/// Typed facts rather than a payload, so the retired enumeration below and the
+/// operator's conversion diagnostic (`kin doctor --conversion-source`) read one
+/// computation and cannot come to disagree about a file. The enumeration
+/// serializes these into its own [`FILE_COVERAGE_KEY`] object beside its rows;
+/// the diagnostic serializes the facts alone.
+///
+/// No entity row leaves through this type. `counts_by_kind` is the one reading
+/// of the entity set it carries, because a count is a fact about what the
+/// conversion produced and a row is a catalog of the file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileCoverage {
+    /// The path as the graph stores it, after the same normalization every
+    /// caller's spelling goes through.
+    pub path: String,
+    /// Whether the repository tree admits the path.
+    pub tracked_in_graph: bool,
+    /// The one tracking tier the graph holds this file at.
+    pub tier: &'static str,
+    /// The extension no adapter claims, when the file's type is why it holds
+    /// nothing. `None` when its type is not the reason.
+    pub opaque_reason: Option<String>,
+    pub parsed: ParsedState,
+    /// The adapter's own reason for a partial or failed parse.
+    pub parse_detail: Option<String>,
+    /// The layout's entity-region count, an independent reading of the file.
+    pub layout_entity_regions: Option<usize>,
+    /// Whether the graph holds language-server-derived edges for the file's
+    /// entities: `present`, `absent` or `unknown`.
+    pub enriched: &'static str,
+    pub span_provenance: SpanProvenance,
+    /// What the working copy holds at the path, relative to graph truth.
+    pub host_bytes: HostEntryReading,
+    /// The extractor's disclosure of a bulk computed-member loop it could not
+    /// read the members of, when it left one.
+    pub dynamic_members: Option<String>,
+    /// How many entities the graph holds for the file.
+    pub total: usize,
+    /// The same entities counted by kind. Sums to `total`.
+    pub counts_by_kind: HashMap<EntityKind, usize>,
+}
+
+impl FileCoverage {
+    /// Whether the file's type is the reason it holds nothing.
+    pub fn content_opaque(&self) -> bool {
+        self.opaque_reason.is_some()
+    }
+
+    /// Whether these facts license reading the file's entity set as whole.
+    ///
+    /// Every term of the enumeration's `certifies_enumeration` that is about
+    /// the file rather than about one page of it. The enumeration adds its
+    /// paging terms on top, so a page that holds the whole file certifies
+    /// exactly when this does, and a reader with no page certifies on this
+    /// alone.
+    pub fn certifies_enumeration(&self) -> bool {
+        self.parsed.certifies_enumeration()
+            && self.span_provenance.permits_certification()
+            && self.host_bytes.permits_certification()
+            && self.dynamic_members.is_none()
+    }
+}
+
+/// Read one file's coverage from graph truth.
+///
+/// `raw_path` is a caller's spelling of a repository-relative path, normalized
+/// and validated by the rule every Kin path takes. `host` is the working copy
+/// this repository's graph is supposed to be level with, exactly as
+/// [`handle_list_file_entities`] takes it: it qualifies the reading and never
+/// produces any part of it.
+///
+/// A path with no admitted identity, no facet at any tier and no entities is
+/// refused as a graph gap rather than answered, for the reason the enumeration
+/// refuses it: an empty reading about a file the graph has never seen says the
+/// file holds nothing, which nobody measured.
+pub fn read_file_coverage<G: GraphStore>(
     store: &G,
     host: WorkingCopySurface<'_>,
-) -> Result<ToolCallResult> {
-    let cursor = match args.get("cursor").and_then(serde_json::Value::as_str) {
-        Some(token) if !token.trim().is_empty() => {
-            Some(PageCursor::decode(token).ok_or_else(|| {
-                McpError::InvalidParams(
-                    "invalid cursor: pass back a `next_cursor` this tool returned, unedited, or \
-                     omit `cursor` to start a fresh enumeration"
-                        .to_string(),
-                )
-            })?)
-        }
-        _ => None,
-    };
+    raw_path: &str,
+) -> Result<FileCoverage> {
+    read_file(store, host, raw_path).map(|(coverage, _)| coverage)
+}
 
-    // The cursor carries the path it was minted for, so a caller that pages one
-    // file with another file's cursor is refused rather than served a window
-    // into a list it never asked for.
-    let raw_path = match (
-        args.get("path").and_then(serde_json::Value::as_str),
-        cursor.as_ref(),
-    ) {
-        (Some(path), Some(cursor)) if normalize_path(path) != cursor.path => {
-            return Err(McpError::InvalidParams(format!(
-                "cursor was minted for {:?} but `path` names {:?}; page one file at a time",
-                cursor.path,
-                normalize_path(path)
-            )));
-        }
-        (Some(path), _) => path.to_string(),
-        (None, Some(cursor)) => cursor.path.clone(),
-        (None, None) => {
-            return Err(McpError::InvalidParams(
-                "missing required parameter: path (a repository-relative path such as \
-                 \"lib/express.js\")"
-                    .to_string(),
-            ))
-        }
-    };
-
-    let path = normalize_path(&raw_path);
+/// [`read_file_coverage`], with the entity set it was read from, in
+/// enumeration order.
+///
+/// Private on purpose. The retired enumeration in this module is the one
+/// reader that serves rows, and keeping the row-carrying form beside it means
+/// no other surface can reach a row through the shared reading.
+fn read_file<G: GraphStore>(
+    store: &G,
+    host: WorkingCopySurface<'_>,
+    raw_path: &str,
+) -> Result<(FileCoverage, Vec<Entity>)> {
+    let path = normalize_path(raw_path);
     if path.is_empty() {
         return Err(McpError::InvalidParams(
             "invalid parameter: path must not be empty; name a repository-relative path such as \
@@ -607,12 +734,6 @@ pub fn handle_list_file_entities<G: GraphStore>(
              slash, no \"..\", and no Kin or Git control component"
         ))
     })?;
-
-    let page_size = args
-        .get("page_size")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(DEFAULT_PAGE_SIZE)
-        .clamp(1, MAX_PAGE_SIZE) as usize;
 
     let file_id = FilePathId::new(path.clone());
     let mut entities = store
@@ -682,8 +803,8 @@ pub fn handle_list_file_entities<G: GraphStore>(
     if !tracked_in_graph && tier == "none" && total_in_file == 0 {
         return Err(McpError::Context(format!(
             "graph gap: {path:?} is not tracked by this graph at any tier, so Kin cannot say what \
-             entities it holds. This is not a claim that the file has no entities. Check the path \
-             spelling against `kin_artifact_list`, or run a reconcile if the file is new."
+             entities it holds. This is not a claim that the file has no entities. Complete \
+             conversion or reconcile before checking repository membership again."
         )));
     }
 
@@ -699,6 +820,113 @@ pub fn handle_list_file_entities<G: GraphStore>(
     let host_entry = host.observe(&repo_path, tree_entry.as_ref());
 
     let enriched = language_server_edges(store, &entities)?;
+    // Read from the whole set rather than from any page of it: the disclosure,
+    // when the extractor left one, rides on the file's own Module entity, which
+    // a page of this file might have paged past.
+    let dynamic_members = dynamic_members_disclosure(&entities);
+    let mut counts_by_kind: HashMap<EntityKind, usize> = HashMap::new();
+    for entity in &entities {
+        *counts_by_kind.entry(entity.kind).or_insert(0) += 1;
+    }
+
+    Ok((
+        FileCoverage {
+            path,
+            tracked_in_graph,
+            tier,
+            opaque_reason,
+            parsed,
+            parse_detail,
+            layout_entity_regions,
+            enriched,
+            span_provenance: provenance,
+            host_bytes: host_entry,
+            dynamic_members,
+            total: total_in_file,
+            counts_by_kind,
+        },
+        entities,
+    ))
+}
+
+/// Enumerate the entities the graph holds for one file.
+///
+/// `host` is the working copy this repository's graph is supposed to be level
+/// with, as the calling layer understands it. It qualifies the answer and never
+/// produces any part of it: see [`crate::working_copy`].
+///
+/// The file's coverage is [`read_file_coverage`]'s reading, the same one the
+/// conversion diagnostic reports; this adds the page of rows and the paging
+/// terms of its certification.
+pub fn handle_list_file_entities<G: GraphStore>(
+    args: &HashMap<String, serde_json::Value>,
+    store: &G,
+    host: WorkingCopySurface<'_>,
+) -> Result<ToolCallResult> {
+    let cursor = match args.get("cursor").and_then(serde_json::Value::as_str) {
+        Some(token) if !token.trim().is_empty() => {
+            Some(PageCursor::decode(token).ok_or_else(|| {
+                McpError::InvalidParams(
+                    "invalid cursor: pass back a `next_cursor` this tool returned, unedited, or \
+                     omit `cursor` to start a fresh enumeration"
+                        .to_string(),
+                )
+            })?)
+        }
+        _ => None,
+    };
+
+    // The cursor carries the path it was minted for, so a caller that pages one
+    // file with another file's cursor is refused rather than served a window
+    // into a list it never asked for.
+    let raw_path = match (
+        args.get("path").and_then(serde_json::Value::as_str),
+        cursor.as_ref(),
+    ) {
+        (Some(path), Some(cursor)) if normalize_path(path) != cursor.path => {
+            return Err(McpError::InvalidParams(format!(
+                "cursor was minted for {:?} but `path` names {:?}; page one file at a time",
+                cursor.path,
+                normalize_path(path)
+            )));
+        }
+        (Some(path), _) => path.to_string(),
+        (None, Some(cursor)) => cursor.path.clone(),
+        (None, None) => {
+            return Err(McpError::InvalidParams(
+                "missing required parameter: path (a repository-relative path such as \
+                 \"lib/express.js\")"
+                    .to_string(),
+            ))
+        }
+    };
+
+    let page_size = args
+        .get("page_size")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(DEFAULT_PAGE_SIZE)
+        .clamp(1, MAX_PAGE_SIZE) as usize;
+
+    // Path validation, the graph-gap refusal and the host observation all live
+    // in the shared reading, so this surface and the conversion diagnostic
+    // refuse and qualify one path by one rule.
+    let (coverage, entities) = read_file(store, host, &raw_path)?;
+    let file_certifies = coverage.certifies_enumeration();
+    let FileCoverage {
+        path,
+        tracked_in_graph,
+        tier,
+        opaque_reason,
+        parsed,
+        parse_detail,
+        layout_entity_regions,
+        enriched,
+        span_provenance: provenance,
+        host_bytes: host_entry,
+        dynamic_members,
+        total: total_in_file,
+        counts_by_kind: _,
+    } = coverage;
 
     let offset = cursor.as_ref().map(|cursor| cursor.offset).unwrap_or(0);
     // A cursor minted against a different-sized enumeration is describing a file
@@ -793,9 +1021,20 @@ pub fn handle_list_file_entities<G: GraphStore>(
             // truth, and does not.
             "host_bytes": host_entry.wire(),
             "whole_file_in_response": whole_file_in_response,
-            "certifies_enumeration": parsed.certifies_enumeration()
-                && provenance.permits_certification()
-                && host_entry.permits_certification()
+            // Whether the extractor disclosed a bulk computed-member
+            // assignment loop (`obj[loopVar] = ...`) it could not read the
+            // members of. `true` refuses certification below the same way a
+            // stale span or an unadmitted host does: express's own
+            // `methods.forEach(function (method) { app[method] = ...; })`
+            // used to certify 21 statically-assigned methods as the file's
+            // whole surface while creating 35 more this enumeration never
+            // saw. A resolved site mints real entities instead and sets no
+            // disclosure, so it never reaches here.
+            "dynamic_members_disclosed": dynamic_members.is_some(),
+            "dynamic_members_note": dynamic_members.clone(),
+            // The file's own terms, read once in the shared coverage, and the
+            // two that are about this page rather than the file.
+            "certifies_enumeration": file_certifies
                 && whole_file_in_response
                 && !enumeration_shifted,
         },
@@ -855,6 +1094,16 @@ mod tests {
             created_in: None,
             superseded_by: None,
         }
+    }
+
+    /// A `Module`-kind entity for `file`, carrying `doc_summary` verbatim --
+    /// the exact shape [`dynamic_members_disclosure`] reads its signal off,
+    /// the way the JavaScript adapter writes one.
+    fn module_entity(file: &str, doc_summary: Option<&str>) -> Entity {
+        let mut entity = entity_at("module", file, 900);
+        entity.kind = EntityKind::Module;
+        entity.doc_summary = doc_summary.map(str::to_string);
+        entity
     }
 
     fn layout_for(file: &str, completeness: ParseCompleteness, regions: usize) -> FileLayout {
@@ -1183,6 +1432,144 @@ mod tests {
         assert!(!ParsedState::Absent.certifies_enumeration());
     }
 
+    /// Express's own case: `methods.forEach(function (method) { app[method]
+    /// = ...; })` used to certify 21 statically-assigned methods as the
+    /// file's whole surface while creating 35 more this enumeration never
+    /// saw. A `full` parse alone must no longer be enough once the adapter
+    /// has disclosed a bulk computed-member loop it could not read the list
+    /// of.
+    #[test]
+    fn a_dynamic_members_disclosure_floors_the_enumeration() {
+        let store = store_with(2, Some(ParseCompleteness::Full));
+        let disclosure = format!(
+            "{}members are created at runtime from `methods`; the enumeration is not complete",
+            kin_parser::DYNAMIC_MEMBERS_DISCLOSURE_PREFIX
+        );
+        store
+            .upsert_entity(&module_entity(FILE, Some(&disclosure)))
+            .unwrap();
+
+        let payload = call(&store, &[("path", serde_json::json!(FILE))]).unwrap();
+        let coverage = &payload[FILE_COVERAGE_KEY];
+        assert_eq!(
+            coverage["dynamic_members_disclosed"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            coverage["dynamic_members_note"],
+            serde_json::json!(disclosure)
+        );
+        assert_eq!(
+            coverage["certifies_enumeration"],
+            serde_json::json!(false),
+            "a disclosed dynamic-members site must refuse certification: {coverage}"
+        );
+    }
+
+    #[test]
+    fn parsed_for_in_members_remain_uncertified_after_snapshot_restore() {
+        use kin_parser::{JavaScriptAdapter, LanguageAdapter};
+
+        for (source, certifies) in [
+            (
+                "for (const key in ['get', 'post']) { app[key] = function () {}; }",
+                false,
+            ),
+            (
+                "function install(registry) { for (const key in registry) { if (enabled) app[key] = function () {}; router[key] = function () {}; } }",
+                false,
+            ),
+            ("app.ready = function () { return true; };", true),
+        ] {
+            let adapter = JavaScriptAdapter;
+            let tree = adapter.parse(source.as_bytes()).unwrap();
+            let parsed = adapter
+                .extract(&tree, source.as_bytes(), &FilePathId::new(FILE))
+                .unwrap();
+            let store = store_with(0, Some(ParseCompleteness::Full));
+            for entity in parsed.entities {
+                store
+                    .upsert_entity(&entity.into_entity_with_source(
+                        LanguageId::JavaScript,
+                        &FilePathId::new(FILE),
+                        Some(source.as_bytes()),
+                    ))
+                    .unwrap();
+            }
+            let restored = InMemoryGraph::from_snapshot_without_text_index(store.to_snapshot())
+                .expect("the parsed entities and their coverage survive graph restoration");
+            for graph in [&store, &restored] {
+                let payload = call(graph, &[("path", serde_json::json!(FILE))]).unwrap();
+                let coverage = &payload[FILE_COVERAGE_KEY];
+                assert_eq!(coverage["parsed"], serde_json::json!("full"), "{payload}");
+                assert_eq!(
+                    coverage["dynamic_members_disclosed"],
+                    serde_json::json!(!certifies),
+                    "{payload}"
+                );
+                assert_eq!(
+                    coverage["certifies_enumeration"],
+                    serde_json::json!(certifies),
+                    "{payload}"
+                );
+                let annotated = crate::envelope::finalize(
+                    ToolCallResult::text(serde_json::to_string(&payload).unwrap()),
+                    structural_authoritative_envelope(),
+                    TOOL_NAME,
+                );
+                let crate::types::ContentBlock::Text { text } = &annotated.content[0];
+                let value: serde_json::Value = serde_json::from_str(text).unwrap();
+                assert_eq!(
+                    value["_kin"]["verdict"]["state"] == serde_json::json!("certified"),
+                    certifies,
+                    "{value}"
+                );
+            }
+        }
+    }
+
+    /// The control for the check above: a module entity that carries no
+    /// disclosure at all -- the ordinary state of every file this feature
+    /// does not touch -- must certify exactly as it did before this feature
+    /// existed.
+    #[test]
+    fn a_module_entity_with_no_dynamic_members_disclosure_still_certifies() {
+        let store = store_with(2, Some(ParseCompleteness::Full));
+        store.upsert_entity(&module_entity(FILE, None)).unwrap();
+
+        let payload = call(&store, &[("path", serde_json::json!(FILE))]).unwrap();
+        let coverage = &payload[FILE_COVERAGE_KEY];
+        assert_eq!(
+            coverage["dynamic_members_disclosed"],
+            serde_json::json!(false)
+        );
+        assert_eq!(coverage["dynamic_members_note"], serde_json::json!(null));
+        assert_eq!(coverage["certifies_enumeration"], serde_json::json!(true));
+    }
+
+    /// A real file-overview doc comment must not be mistaken for the
+    /// disclosure just because it is non-null prose on the module entity: the
+    /// gate matches the adapter's exact reserved prefix, not "any doc
+    /// summary at all".
+    #[test]
+    fn an_ordinary_module_doc_summary_is_not_mistaken_for_a_disclosure() {
+        let store = store_with(2, Some(ParseCompleteness::Full));
+        store
+            .upsert_entity(&module_entity(
+                FILE,
+                Some("The application's HTTP surface."),
+            ))
+            .unwrap();
+
+        let payload = call(&store, &[("path", serde_json::json!(FILE))]).unwrap();
+        let coverage = &payload[FILE_COVERAGE_KEY];
+        assert_eq!(
+            coverage["dynamic_members_disclosed"],
+            serde_json::json!(false)
+        );
+        assert_eq!(coverage["certifies_enumeration"], serde_json::json!(true));
+    }
+
     /// The ticket's own case: a file with N entities enumerates exactly N, and a
     /// name that is not in it is absent.
     ///
@@ -1217,6 +1604,61 @@ mod tests {
             serde_json::json!(true)
         );
         assert_eq!(payload["next_cursor"], serde_json::Value::Null);
+    }
+
+    /// A member is named by its owner, so a caller holding only the bare name
+    /// matched no row: the pallets/flask benchmark's bare-name arm looked for
+    /// `get` among rows named `Scaffold.get` and resolved 53 of 102 subjects.
+    /// Every row now carries the bare member name and, when there is one, the
+    /// owner, while `name` keeps the graph's own spelling and `id` stays the
+    /// exact address.
+    #[test]
+    fn every_row_carries_its_member_name_and_its_owner() {
+        let store = InMemoryGraph::new();
+        admit(&store, FILE);
+        let method = |name: &str, start_byte: usize| {
+            let mut entity = entity_at(name, FILE, start_byte);
+            entity.kind = EntityKind::Method;
+            entity
+        };
+        store.upsert_entity(&method("Scaffold.get", 0)).unwrap();
+        store.upsert_entity(&method("Router::route", 100)).unwrap();
+        store
+            .upsert_entity(&entity_at("get_db", FILE, 200))
+            .unwrap();
+        // An incidental last segment is not a member name: a module named like
+        // a file publishes its whole name and no owner.
+        let mut module = entity_at("app.py", FILE, 300);
+        module.kind = EntityKind::Module;
+        store.upsert_entity(&module).unwrap();
+        store
+            .upsert_file_layout(&layout_for(FILE, ParseCompleteness::Full, 4))
+            .unwrap();
+
+        let payload = call(&store, &[("path", serde_json::json!(FILE))]).unwrap();
+        let rows = payload["entities"].as_array().expect("entities array");
+        let row = |name: &str| {
+            rows.iter()
+                .find(|row| row["name"] == name)
+                .unwrap_or_else(|| panic!("no row named {name}: {payload}"))
+        };
+
+        assert_eq!(row("Scaffold.get")["member_name"], "get");
+        assert_eq!(row("Scaffold.get")["owner"], "Scaffold");
+        assert_eq!(row("Router::route")["member_name"], "route");
+        assert_eq!(row("Router::route")["owner"], "Router");
+        // A free function is its own member name and has no owner.
+        assert_eq!(row("get_db")["member_name"], "get_db");
+        assert!(row("get_db").get("owner").is_none(), "{payload}");
+        assert_eq!(row("app.py")["member_name"], "app.py");
+        assert!(row("app.py").get("owner").is_none(), "{payload}");
+        // The bare name the v1 arm filtered on now finds exactly the member.
+        let by_member: Vec<&str> = rows
+            .iter()
+            .filter(|row| row["member_name"] == "get")
+            .map(|row| row["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(by_member, vec!["Scaffold.get"]);
     }
 
     /// A leading `./` is the one path spelling a caller reliably types that the
@@ -2207,6 +2649,272 @@ mod tests {
                 .and_then(serde_json::Value::as_str)
                 .is_some(),
             "the reading rides every answer: {payload}"
+        );
+    }
+
+    /// One store holding every coverage shape the conversion diagnostic reports:
+    /// a complete parse with several kinds, a partial parse, a parsed empty
+    /// file, a disclosed dynamic-members site, and the two opaque routes.
+    fn coverage_shapes() -> InMemoryGraph {
+        let store = InMemoryGraph::new();
+        admit(&store, "src/thing.py");
+        for (name, start, kind) in [
+            ("alpha", 0, EntityKind::Function),
+            ("beta", 100, EntityKind::Function),
+            ("Thing", 200, EntityKind::Class),
+        ] {
+            let mut entity = entity_at(name, "src/thing.py", start);
+            entity.kind = kind;
+            store.upsert_entity(&entity).unwrap();
+        }
+        store
+            .upsert_file_layout(&layout_for("src/thing.py", ParseCompleteness::Full, 3))
+            .unwrap();
+        admit(&store, "src/broken.py");
+        store
+            .upsert_entity(&entity_at("delta", "src/broken.py", 0))
+            .unwrap();
+        store
+            .upsert_file_layout(&layout_for(
+                "src/broken.py",
+                ParseCompleteness::Partial("2 parse error range(s)".into()),
+                1,
+            ))
+            .unwrap();
+        admit(&store, "src/empty.py");
+        store
+            .upsert_file_layout(&layout_for("src/empty.py", ParseCompleteness::Full, 0))
+            .unwrap();
+        admit(&store, "lib/app.js");
+        store
+            .upsert_entity(&module_entity(
+                "lib/app.js",
+                Some(&format!(
+                    "{}members are created at runtime from `methods`",
+                    kin_parser::DYNAMIC_MEMBERS_DISCLOSURE_PREFIX
+                )),
+            ))
+            .unwrap();
+        store
+            .upsert_file_layout(&layout_for("lib/app.js", ParseCompleteness::Full, 1))
+            .unwrap();
+        admit_opaque(&store, "README.md");
+        admit(&store, "NOTES.md");
+        store
+    }
+
+    const COVERAGE_SHAPE_PATHS: [&str; 6] = [
+        "src/thing.py",
+        "src/broken.py",
+        "src/empty.py",
+        "lib/app.js",
+        "README.md",
+        "NOTES.md",
+    ];
+
+    /// The shared reading IS what the enumeration reports, field by field, over
+    /// every coverage shape and every working-copy standing.
+    ///
+    /// This is the join that lets `kin doctor --conversion-source` stand in for
+    /// the retired catalog at the conversion boundary: if the two could disagree
+    /// about a file, the diagnostic would be proving something the enumeration
+    /// never said. `counts_by_kind` is checked against the served rows' own
+    /// `kind` words, so a count cannot drift from the set it counts.
+    ///
+    /// The last two assertions are what let this fail on a reading that agrees
+    /// with itself by being constant: across these files certification and
+    /// opacity each take both values.
+    #[test]
+    fn the_shared_coverage_is_the_reading_the_enumeration_reports() {
+        let store = coverage_shapes();
+        let mut certifications = std::collections::BTreeSet::new();
+        let mut opacities = std::collections::BTreeSet::new();
+        for surface in [
+            WorkingCopySurface::NotApplicable,
+            WorkingCopySurface::Unchecked,
+        ] {
+            for path in COVERAGE_SHAPE_PATHS {
+                let facts = read_file_coverage(&store, surface, path).expect("the file is tracked");
+                let payload =
+                    call_over_surface(&store, &[("path", serde_json::json!(path))], surface)
+                        .unwrap();
+                let coverage = &payload[FILE_COVERAGE_KEY];
+                let expected = serde_json::json!({
+                    "path": facts.path,
+                    "tracked_in_graph": facts.tracked_in_graph,
+                    "tier": facts.tier,
+                    "content_opaque": facts.content_opaque(),
+                    "opaque_reason": facts.opaque_reason,
+                    "parsed": facts.parsed.wire(),
+                    "parse_detail": facts.parse_detail,
+                    "layout_entity_regions": facts.layout_entity_regions,
+                    "enriched": facts.enriched,
+                    "span_provenance": facts.span_provenance.wire(),
+                    "stale_spans": facts.span_provenance.stale_entities(),
+                    "host_bytes": facts.host_bytes.wire(),
+                    "dynamic_members_disclosed": facts.dynamic_members.is_some(),
+                    "dynamic_members_note": facts.dynamic_members,
+                    "certifies_enumeration": facts.certifies_enumeration(),
+                });
+                for (key, value) in expected.as_object().expect("an object") {
+                    assert_eq!(
+                        &coverage[key], value,
+                        "{path} over {surface:?}: `{key}` disagrees with the shared reading: \
+                         {coverage}"
+                    );
+                }
+                assert_eq!(payload["total_in_file"], serde_json::json!(facts.total));
+                let mut rows: HashMap<EntityKind, usize> = HashMap::new();
+                for row in payload["entities"].as_array().expect("entities array") {
+                    let kind: EntityKind =
+                        serde_json::from_value(row["kind"].clone()).expect("a kind word");
+                    *rows.entry(kind).or_insert(0) += 1;
+                }
+                assert_eq!(rows, facts.counts_by_kind, "{path}: counts by kind");
+                assert_eq!(
+                    facts.counts_by_kind.values().sum::<usize>(),
+                    facts.total,
+                    "{path}: the counts sum to the total"
+                );
+                certifications.insert(facts.certifies_enumeration());
+                opacities.insert(facts.content_opaque());
+            }
+        }
+        assert_eq!(
+            certifications.into_iter().collect::<Vec<_>>(),
+            vec![false, true],
+            "certification must differ between these files, or agreement proves nothing"
+        );
+        assert_eq!(
+            opacities.into_iter().collect::<Vec<_>>(),
+            vec![false, true],
+            "opacity must differ between these files, or agreement proves nothing"
+        );
+        let thing =
+            read_file_coverage(&store, WorkingCopySurface::NotApplicable, "src/thing.py").unwrap();
+        assert_eq!(
+            thing.counts_by_kind,
+            HashMap::from([(EntityKind::Function, 2), (EntityKind::Class, 1)])
+        );
+    }
+
+    /// The retired enumeration kept its published shape when its coverage moved
+    /// into the shared reading: the same top-level keys, the same
+    /// `file_coverage` keys, and the paging terms still refusing a page that is
+    /// not the whole file even where the file itself certifies.
+    ///
+    /// Daemon and CLI tests read [`FILE_COVERAGE_KEY`] off this payload, so a
+    /// key the extraction dropped or added would change what they grade.
+    #[test]
+    fn the_enumeration_payload_keeps_its_published_shape() {
+        let store = coverage_shapes();
+        let payload = call(&store, &[("path", serde_json::json!("src/thing.py"))]).unwrap();
+        let keys = |value: &serde_json::Value| {
+            let mut keys: Vec<String> = value
+                .as_object()
+                .expect("an object")
+                .keys()
+                .cloned()
+                .collect();
+            keys.sort();
+            keys
+        };
+        let sorted = |names: &[&str]| {
+            let mut names: Vec<String> = names.iter().map(|name| name.to_string()).collect();
+            names.sort();
+            names
+        };
+        assert_eq!(
+            keys(&payload),
+            sorted(&[
+                "path",
+                "entities",
+                "returned",
+                "total_in_file",
+                "page_size",
+                "offset",
+                "next_cursor",
+                "truncated",
+                "enumeration_shifted",
+                FILE_COVERAGE_KEY,
+            ])
+        );
+        assert_eq!(
+            keys(&payload[FILE_COVERAGE_KEY]),
+            sorted(&[
+                "path",
+                "tracked_in_graph",
+                "tier",
+                "content_opaque",
+                "opaque_reason",
+                "parsed",
+                "parse_detail",
+                "layout_entity_regions",
+                "enriched",
+                "embedded",
+                "span_provenance",
+                "stale_spans",
+                "host_bytes",
+                "whole_file_in_response",
+                "dynamic_members_disclosed",
+                "dynamic_members_note",
+                "certifies_enumeration",
+            ])
+        );
+        assert_eq!(
+            payload[FILE_COVERAGE_KEY]["certifies_enumeration"],
+            serde_json::json!(true),
+            "the control: the whole file on one page certifies"
+        );
+
+        let first_page = call(
+            &store,
+            &[
+                ("path", serde_json::json!("src/thing.py")),
+                ("page_size", serde_json::json!(1)),
+            ],
+        )
+        .unwrap();
+        assert!(
+            read_file_coverage(&store, WorkingCopySurface::NotApplicable, "src/thing.py")
+                .unwrap()
+                .certifies_enumeration(),
+            "the file itself certifies"
+        );
+        assert_eq!(
+            first_page[FILE_COVERAGE_KEY]["certifies_enumeration"],
+            serde_json::json!(false),
+            "and one page of it still does not: {first_page}"
+        );
+    }
+
+    /// The shared reading refuses exactly what the enumeration refuses, with the
+    /// same words: a path the graph has never seen is a named graph gap, and a
+    /// path no Kin path rule admits is refused by name. The control is a tracked
+    /// path both answer.
+    #[test]
+    fn the_shared_reading_refuses_what_the_enumeration_refuses() {
+        let store = coverage_shapes();
+        for path in ["lib/nonexistent.js", "../escape.py", "", "./"] {
+            let shared = read_file_coverage(&store, WorkingCopySurface::NotApplicable, path)
+                .expect_err("the shared reading must refuse");
+            let served = call(&store, &[("path", serde_json::json!(path))])
+                .expect_err("the enumeration must refuse");
+            assert_eq!(shared.to_string(), served.to_string(), "{path:?}");
+        }
+        let gap = read_file_coverage(
+            &store,
+            WorkingCopySurface::NotApplicable,
+            "lib/nonexistent.js",
+        )
+        .expect_err("an untracked path refuses");
+        assert!(
+            matches!(&gap, McpError::Context(message) if message.starts_with("graph gap: ")),
+            "the refusal names the gap: {gap}"
+        );
+        assert!(
+            read_file_coverage(&store, WorkingCopySurface::NotApplicable, "src/empty.py").is_ok(),
+            "the control: a parsed empty file answers rather than refusing"
         );
     }
 }

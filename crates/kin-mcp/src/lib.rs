@@ -8,17 +8,27 @@ pub mod command_shape;
 pub mod daemon_delegate;
 pub mod edge_coverage;
 pub mod entity_drafts;
+pub mod entity_lifecycle;
+pub mod entity_lines;
 pub mod envelope;
 pub mod error;
+pub mod first_contact;
 pub mod handlers;
+pub mod input_contract;
 pub mod negative;
 pub mod outside_graph;
 pub mod query_tokens;
 pub mod remediation;
+pub mod repository_init;
+pub mod routed;
 pub mod server;
 pub mod session;
+pub mod session_exec;
 pub mod source_base;
+pub mod source_derivation;
+pub mod source_unit;
 pub mod startup_binding;
+pub(crate) mod tool_invocation;
 pub mod tools;
 pub mod types;
 pub mod verdict;
@@ -42,6 +52,7 @@ pub use error::{McpError, Result};
 pub use handlers::LocalRepositoryAuthorityBinding;
 pub use negative::NEGATIVE_KEY;
 pub use outside_graph::OUTSIDE_GRAPH_KEY;
+pub use repository_init::{InitOutcome, RepoInitializer};
 pub use server::{
     process_daemon_message, process_message, run_stdio, run_stdio_daemon, BoundRepo,
     McpServerConfig, RepoBinder, SessionAuthorityMode, WorkspaceBinding,
@@ -54,9 +65,10 @@ pub use session::{
 };
 pub use startup_binding::{StartupBindingState, StartupDaemonBinding};
 pub use tools::{
-    agent_default_tool_names, agent_query_tool_names, agent_search_tool_names,
-    benchmark_tool_names, context_bench_tool_names, name_set as tool_name_set, served_tools_list,
-    tool_definitions, AGENT_SEARCH_LIST_CEILING_BYTES,
+    agent_default_tool_names, agent_query_tool_names, agent_routed_tool_names,
+    agent_search_tool_names, benchmark_tool_names, context_bench_tool_names,
+    name_set as tool_name_set, served_tools_list, tool_definitions, AGENT_QUERY_LIST_CEILING_BYTES,
+    AGENT_SEARCH_LIST_CEILING_BYTES,
 };
 pub use types::{
     ContentBlock, JsonRpcRequest, JsonRpcResponse, ToolCallParams, ToolCallResult, ToolDefinition,

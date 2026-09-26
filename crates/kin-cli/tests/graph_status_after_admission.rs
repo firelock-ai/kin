@@ -223,6 +223,8 @@ fn graph_status_at(
         &Default::default(),
         &Default::default(),
         kin_root,
+        // Status reads no working copy; only the conversion-source request does.
+        kin_mcp::WorkingCopySurface::NotApplicable,
     )
     .expect("run graph status")
 }
@@ -1038,36 +1040,44 @@ fn graph_status_publishes_per_language_parse_coverage_without_a_verdict() {
         ),
         "the section prints: {lines}"
     );
-    // The denominator assertion moves to the rust row, and it has to: every one
-    // of the four JavaScript files now produces an entity, so a javascript row
-    // reading 4/4 could not tell a correct denominator from one that had been
-    // subtracted down to the numerator. The rust row is 0 of 3, where the two
-    // counts differ and the subtraction bug this guards would show.
+    // The denominator assertion lives on the C row. It is 0 of 3, the row where
+    // the two counts differ most, so a denominator subtracted down to the
+    // numerator shows there first.
     let row = response
         .lines
         .iter()
-        .find(|line| line.trim_start().starts_with("rust:"))
-        .unwrap_or_else(|| panic!("no rust row in:\n{lines}"));
+        .find(|line| line.trim_start().starts_with("c:"))
+        .unwrap_or_else(|| panic!("no c row in:\n{lines}"));
     assert!(
         row.contains("/3"),
-        "the denominator is every admitted rust file, not the ones that produced an \
+        "the denominator is every admitted C file, not the ones that produced an \
          entity: {row}"
     );
     assert!(
-        lines.contains("no_entity:") && lines.contains("unreadable0.rs"),
+        lines.contains("no_entity:") && lines.contains("unreadable0.c"),
         "the silent files are named so a reader can open them: {lines}"
     );
-    // And the other half of what FIR-2675 changed, pinned rather than implied:
-    // JavaScript can no longer be silent, so its row is whole.
+    // The same rule in the other language here. The module surface is minted
+    // only for a file that produced a declaration or an import, so
+    // lib/quiet.js, which parses clean and declares nothing, holds no entity at
+    // all: the javascript row counts it in the denominator only, and the census
+    // names it. A row reading 5/5 is an adapter minting the surface for bytes
+    // that declare nothing, which is how a hole read as a full row.
     let js_row = response
         .lines
         .iter()
         .find(|line| line.trim_start().starts_with("javascript:"))
         .unwrap_or_else(|| panic!("no javascript row in:\n{lines}"));
     assert!(
-        js_row.contains("5/5"),
-        "every javascript file carries at least its module entity since FIR-2675, including \
-         lib/quiet.js, which declares nothing and would have been silent before it: {js_row}"
+        js_row.contains("4/5"),
+        "lib/quiet.js declares nothing, so it holds no entity, not even a module surface, \
+         and the javascript row counts it without crediting it: {js_row}"
+    );
+    assert!(
+        response.lines.iter().any(|line| line.contains("no_entity:")
+            && line.contains("admitted javascript files produced no entity")
+            && line.contains("lib/quiet.js")),
+        "the silent javascript file is named the way the silent C files are: {lines}"
     );
 
     // The control, and the half that can fail. A count is not a defect, so this
@@ -1096,8 +1106,8 @@ fn graph_status_publishes_per_language_parse_coverage_without_a_verdict() {
     );
 }
 
-/// A repository of four parseable JavaScript modules plus `silent` files that
-/// produce no entity.
+/// A repository of four parseable JavaScript modules, one comment-only
+/// JavaScript file and `silent` C files, the last two kinds producing no entity.
 fn seed_mixed_language_repository(repo: &Path, silent: usize) {
     fs::create_dir_all(repo.join("lib")).expect("create lib directory");
     run_git(repo, &["init", "--initial-branch=main"]);
@@ -1110,33 +1120,26 @@ fn seed_mixed_language_repository(repo: &Path, silent: usize) {
         )
         .expect("write a parseable module");
     }
-    // A comment-only JavaScript file, which is the shape that used to be silent
-    // and no longer is. It exists so the javascript row below can tell the port
-    // working from the four parseable modules merely parsing: those four produce
-    // entities from their own functions with or without a module entity, so a
-    // row reading 4/4 says nothing about FIR-2675 at all. With this file the row
-    // is 5/5, and it falls to 4/5 the moment JavaScript stops emitting modules.
+    // A comment-only JavaScript file. It exists so the javascript row below can
+    // tell the module-surface rule holding from the rule being dropped: the four
+    // modules above produce entities from their own functions whether or not a
+    // surface is minted, so without this file the row reads 4/4 either way. With
+    // it the row is 4/5, and it rises to 5/5 the moment JavaScript mints a
+    // surface for a file that declares and imports nothing.
     fs::write(
         repo.join("lib/quiet.js"),
         b"// nothing is declared here either\n" as &[u8],
     )
-    .expect("write a formerly-silent javascript module");
+    .expect("write a silent javascript module");
     for index in 0..silent {
-        // The silent files are RUST, and they used to be JavaScript. FIR-2675
-        // made every JavaScript and TypeScript file emit a Module entity, so a
-        // comment-only `.js` file now produces one and is no longer silent:
-        // measured at 1 entity for exactly these bytes, against 0 before. That
-        // is the port working, and it deleted this fixture's silent case as a
-        // side effect, which is what this test caught.
-        //
-        // Rust carries no per-file module entity, so a comment-only `.rs` file
-        // still produces nothing: measured at 0. It is the same honest shape the
-        // old comment said, bytes an adapter is registered for, admitted as
-        // source, holding no entity. NUL bytes would route the file to the
-        // opaque facet instead, which is a different state wearing the same
-        // numbers.
+        // The silent files are C, whose adapter emits no module entity at all,
+        // so a comment-only `.c` file produces nothing: bytes an adapter is
+        // registered for, admitted as source, holding no entity. NUL bytes would
+        // route the file to the opaque facet instead, which is a different state
+        // wearing the same numbers. If C ever produces an entity for such a
+        // file, move this fixture rather than weakening the assertion.
         fs::write(
-            repo.join(format!("lib/unreadable{index}.rs")),
+            repo.join(format!("lib/unreadable{index}.c")),
             b"// nothing is declared here\n" as &[u8],
         )
         .expect("write a silent module");

@@ -7,6 +7,8 @@ pub mod go;
 pub mod hcl;
 pub mod java;
 pub mod javascript;
+mod javascript_dynamic;
+mod javascript_imported_receiver;
 pub mod kotlin;
 pub mod php;
 pub mod python;
@@ -17,10 +19,10 @@ pub mod typescript;
 
 pub use c_lang::CAdapter;
 pub use cpp_lang::CppAdapter;
-pub use go::{attach_go_command_effect_contract_metadata, GoAdapter};
+pub use go::{attach_go_command_effect_contract_metadata, attach_go_package_metadata, GoAdapter};
 pub use hcl::HclAdapter;
 pub use java::JavaAdapter;
-pub use javascript::JavaScriptAdapter;
+pub use javascript::{JavaScriptAdapter, DYNAMIC_MEMBERS_DISCLOSURE_PREFIX};
 // Crate-private: the module-identity rule these two spell is the one
 // `crate::scope` derives a module specifier from, so both surfaces stay one rule.
 pub(crate) use javascript::{js_module_identity, TS_SUFFIXES};

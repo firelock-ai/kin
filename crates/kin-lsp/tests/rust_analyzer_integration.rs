@@ -56,6 +56,7 @@ async fn start_and_initialize_rust_analyzer() {
         &[],
         &workspace,
         adapter.initialization_options(&workspace),
+        None,
     )
     .await;
 
@@ -102,6 +103,7 @@ async fn query_definition_on_rust_file() {
         &[],
         &workspace,
         adapter.initialization_options(&workspace),
+        None,
     )
     .await
     {
@@ -213,6 +215,7 @@ async fn enrich_call_hierarchy_produces_relations() {
         &[],
         &workspace,
         adapter.initialization_options(&workspace),
+        None,
     )
     .await
     {
@@ -272,6 +275,8 @@ async fn enrich_call_hierarchy_produces_relations() {
         end_line: init_line + 60,
         name_line: init_line,
         name_col: init_col,
+        declares_name: true,
+        kind: kin_model::EntityKind::Function,
     };
 
     // Build index with some other entities that init() might call.
@@ -291,14 +296,22 @@ async fn enrich_call_hierarchy_produces_relations() {
         end_line: build_genesis_line + 20,
         name_line: build_genesis_line,
         name_col: 7,
+        declares_name: true,
+        kind: kin_model::EntityKind::Function,
     };
 
-    let index = EntityIndex::new(vec![init_entity.clone(), genesis_entity]);
+    let index = EntityIndex::new(vec![init_entity.clone(), genesis_entity], &workspace);
 
     // Enrich: query call hierarchy for init() function.
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(15),
-        enrich_entity_calls(&server, &init_entity, &index, &workspace),
+        enrich_entity_calls(
+            &server,
+            &init_entity,
+            &index,
+            &workspace,
+            Some(&|file| (file == init_entity.file_path).then(|| file_content.clone())),
+        ),
     )
     .await;
 

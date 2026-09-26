@@ -184,9 +184,12 @@ pub async fn build_impact_response(
             signature: request.signature.clone(),
         },
     )?;
-    // An id names one entity as surely as an exact name does, so a structured
-    // caller that passed one is not refused as ambiguous.
-    let exact_name = resolution.exact_name() || resolution.addressed_by_id();
+    // An id names one entity as surely as an exact name does, and so does a
+    // member name only one owner carries when nothing is named it exactly
+    // (`dispatch_request` for the one method `Flask.dispatch_request`), so a
+    // structured caller that passed either is not refused as ambiguous.
+    let exact_name =
+        resolution.exact_name() || resolution.addressed_by_id() || resolution.member_name();
     let matches = &resolution.candidates;
     // The structured listing keeps its identity order, which is what a caller
     // comparing two answers diffs; the answer itself is chosen by the ranking.
@@ -253,8 +256,17 @@ pub async fn build_impact_response(
     // the count and the candidate identities: the caller learns what to ask for
     // next instead of being told the graph holds nothing (FIR-2478).
     if request.require_unique && (matches.len() != 1 || !exact_name) {
+        let lines = if resolution.member_name() {
+            crate::entity_identity::name_candidate_lines(
+                &resolution.reference.name,
+                kin_ranking::entity_ranking::CandidateReason::SharedMemberName,
+                matches,
+            )
+        } else {
+            ambiguous_resolution_guidance(graph, &request.entity, exact_name, matches)
+        };
         return Ok(ImpactResponse {
-            lines: ambiguous_resolution_guidance(graph, &request.entity, exact_name, matches),
+            lines,
             schema_version: IMPACT_RESPONSE_SCHEMA_VERSION.to_string(),
             resolution: "ambiguous".to_string(),
             query,
@@ -486,16 +498,34 @@ fn impact_absence_verdict(
     target: &kin_model::Entity,
     envelope: &kin_mcp::Envelope,
 ) -> Option<serde_json::Value> {
+    let payload = impact_absence_payload(graph, target);
+    kin_mcp::negative::negative_for("impact_analysis", &payload, envelope, &[])
+}
+
+/// The observations an empty impact answer's verdict is computed from: the
+/// cross-file classes `impact_analysis` declares, and the caller-arrival
+/// reading for the target, which is the one entity this answer reports with no
+/// consumers.
+///
+/// The arrival reading is what `impact_analysis` publishes over MCP for every
+/// such entity, so the terminal and the tool refuse the same zero over the same
+/// graph. Built once for the machine field and the rendered sentence, which
+/// must not disagree about one store.
+fn impact_absence_payload(
+    graph: &kin_db::InMemoryGraph,
+    target: &kin_model::Entity,
+) -> serde_json::Value {
     let coverage = kin_mcp::edge_coverage::observe_cross_file_reference_coverage_for_languages(
         graph,
         &[target.language],
         &kin_mcp::handlers::review::IMPACT_REFERENCE_KINDS,
     );
-    let payload = serde_json::json!({
+    serde_json::json!({
         "entity_impacts": [],
         kin_mcp::EDGE_COVERAGE_KEY: coverage,
-    });
-    kin_mcp::negative::negative_for("impact_analysis", &payload, envelope, &[])
+        kin_mcp::caller_arrival::CALLER_ARRIVAL_KEY:
+            kin_mcp::caller_arrival::observe_impact_arrival(graph, &[target.id]),
+    })
 }
 
 /// The absence qualifier for an empty impact answer.
@@ -509,15 +539,7 @@ fn impact_absence_qualifier(
     target: &kin_model::Entity,
     envelope: &kin_mcp::Envelope,
 ) -> Vec<String> {
-    let coverage = kin_mcp::edge_coverage::observe_cross_file_reference_coverage_for_languages(
-        graph,
-        &[target.language],
-        &kin_mcp::handlers::review::IMPACT_REFERENCE_KINDS,
-    );
-    let payload = serde_json::json!({
-        "entity_impacts": [],
-        kin_mcp::EDGE_COVERAGE_KEY: coverage,
-    });
+    let payload = impact_absence_payload(graph, target);
     crate::commands::absence_qualifier::qualify("impact_analysis", &payload, envelope, "  ")
 }
 
@@ -903,16 +925,9 @@ mod tests {
         let rendered = response.lines.join("\n");
 
         // What the MCP surface would say about this same daemon and this same
-        // empty answer. Not a re-implementation: the identical entry point.
-        let coverage = kin_mcp::edge_coverage::observe_cross_file_reference_coverage_for_languages(
-            &graph,
-            &[target.language],
-            &kin_mcp::handlers::review::IMPACT_REFERENCE_KINDS,
-        );
-        let payload = serde_json::json!({
-            "entity_impacts": [],
-            kin_mcp::EDGE_COVERAGE_KEY: coverage,
-        });
+        // empty answer. Not a re-implementation: the identical entry point, over
+        // the observations the route itself hands it.
+        let payload = super::impact_absence_payload(&graph, &target);
         let mcp = kin_mcp::negative::negative_for("impact_analysis", &payload, &degraded, &[])
             .expect("impact_analysis always qualifies");
         assert_eq!(
@@ -1003,11 +1018,15 @@ mod tests {
     };
 
     fn entity(name: &str, file: &str) -> Entity {
+        entity_in(name, file, LanguageId::Rust)
+    }
+
+    fn entity_in(name: &str, file: &str, language: LanguageId) -> Entity {
         Entity {
             id: EntityId::from_content(file, name, "function", 1),
             kind: EntityKind::Function,
             name: name.to_string(),
-            language: LanguageId::Rust,
+            language,
             fingerprint: SemanticFingerprint {
                 algorithm: FingerprintAlgorithm::V1TreeSitter,
                 ast_hash: Hash256::from_bytes([0; 32]),
@@ -1303,9 +1322,13 @@ mod tests {
     #[tokio::test]
     async fn a_short_graph_on_a_degraded_daemon_renders_both_reasons() {
         let graph = kin_db::InMemoryGraph::new();
-        let target = entity("orphan", "src/orphan.rs");
-        let caller = entity("caller", "src/a.rs");
-        let callee = entity("callee", "src/b.rs");
+        // C, because the build-gap sentence this case reads needs a language
+        // whose adapter emits no module entity and so can source no
+        // entity-level import edge. Rust carried that role until it started
+        // minting them.
+        let target = entity_in("orphan", "src/orphan.c", LanguageId::C);
+        let caller = entity_in("caller", "src/a.c", LanguageId::C);
+        let callee = entity_in("callee", "src/b.c", LanguageId::C);
         for e in [&target, &caller, &callee] {
             graph.upsert_entity(e).unwrap();
         }
@@ -1339,7 +1362,7 @@ mod tests {
         let rendered = response.lines.join("\n");
 
         let build_gap = rendered
-            .find("mints no entity-level import edge for Rust")
+            .find("mints no entity-level import edge for C")
             .unwrap_or_else(|| panic!("the class no build mints must be named: {rendered}"));
         let class_gap = rendered
             .find("holds no cross-file reference edges")
@@ -1352,7 +1375,7 @@ mod tests {
             "the structural gaps lead and the run degradation follows: {rendered}"
         );
         // `unproduced` carries two reasons and only one of them is about the
-        // source. This build mints no entity-level import edge for Rust at all,
+        // source. This build mints no entity-level import edge for C at all,
         // so there is no resolved site to blame, and rendering the linker's
         // sentence over this class would be a claim about code the observation
         // never made.
@@ -2635,15 +2658,7 @@ mod tests {
         );
         // The payload's verdict is the MCP surface's own object, not a second
         // opinion computed here.
-        let coverage = kin_mcp::edge_coverage::observe_cross_file_reference_coverage_for_languages(
-            &graph,
-            &[target.language],
-            &kin_mcp::handlers::review::IMPACT_REFERENCE_KINDS,
-        );
-        let payload = serde_json::json!({
-            "entity_impacts": [],
-            kin_mcp::EDGE_COVERAGE_KEY: coverage,
-        });
+        let payload = super::impact_absence_payload(&graph, &target);
         assert_eq!(
             refused.negative,
             kin_mcp::negative::negative_for("impact_analysis", &payload, &degraded, &[]),
@@ -2684,6 +2699,85 @@ mod tests {
             "a certified absence prints no refusal: {:?}",
             certified.lines
         );
+    }
+
+    /// The terminal's half of the arrival gate. `src/user.rs` imports the
+    /// target's file and parsed more call sites than became edges, so a call to
+    /// `orphan` may be among the ones the linker dropped, and the empty answer
+    /// refuses in prose and payload alike, naming the gap. The control is the
+    /// same store with every parsed site accounted for, which certifies, so the
+    /// gate cannot pass by refusing every empty answer.
+    #[tokio::test]
+    async fn an_empty_answer_a_caller_may_not_have_reached_refuses_in_prose_and_payload() {
+        for (parsed_call_sites, refuses) in [(2u64, true), (1u64, false)] {
+            let graph = kin_db::InMemoryGraph::new();
+            let target = entity("orphan", "src/orphan.rs");
+            // The target's file as the importer names it. The import lands on
+            // this module rather than on `orphan`, so the target itself keeps no
+            // inbound edge and the answer stays empty.
+            let mut target_module = entity("orphan_mod", "src/orphan.rs");
+            target_module.kind = EntityKind::Module;
+            let mut importer = entity("use_orphan", "src/user.rs");
+            importer.metadata.extra.insert(
+                kin_parser::FILE_PARSED_CALL_SITES_KEY.into(),
+                serde_json::json!(parsed_call_sites),
+            );
+            let caller = entity("caller", "src/a.rs");
+            let callee = entity("callee", "src/b.rs");
+            for e in [&target, &target_module, &importer, &caller, &callee] {
+                graph.upsert_entity(e).unwrap();
+            }
+            healthy_cross_file_coverage(&graph, &caller, &callee);
+            links(&graph, &importer, &target_module, RelationKind::Imports);
+            // The one call site of the importer's that did become an edge.
+            calls(&graph, &importer, &callee);
+
+            let dir = tempfile::tempdir().unwrap();
+            let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
+            let response = build_impact_response(
+                &layout,
+                &graph,
+                &ImpactRequest {
+                    entity: "orphan".to_string(),
+                    depth: 3,
+                    file: None,
+                    kind: None,
+                    signature: None,
+                    require_unique: true,
+                    dispatch_candidates: false,
+                },
+                &healthy_test_envelope(),
+            )
+            .await
+            .unwrap();
+            let verdict = response
+                .negative
+                .as_ref()
+                .expect("an empty impact answer publishes its verdict");
+            let rendered = response.lines.join("\n");
+            assert_eq!(
+                verdict["safe_to_conclude_absent"],
+                serde_json::json!(!refuses),
+                "{parsed_call_sites} parsed call site(s), one edge: {verdict}"
+            );
+            let reason = verdict["trust_reason"].as_str().unwrap_or_default();
+            assert_eq!(
+                reason.contains(kin_mcp::caller_arrival::UNRESOLVED_ARRIVAL_LIMITING_FACTOR),
+                refuses,
+                "the payload names the gap exactly when it refuses: {reason}"
+            );
+            assert_eq!(
+                rendered.contains(crate::commands::absence_qualifier::QUALIFIER_MARK),
+                refuses,
+                "prose and payload refuse together: {rendered}"
+            );
+            if refuses {
+                assert!(
+                    rendered.contains("src/user.rs"),
+                    "the refusal names the file a caller may be in: {rendered}"
+                );
+            }
+        }
     }
 
     /// One bound, both walks. `rank_impact` stops at

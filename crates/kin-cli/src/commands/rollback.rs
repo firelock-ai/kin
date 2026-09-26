@@ -10,7 +10,10 @@
 //! target already had, so no source is rewritten and no CAS entry is created.
 
 use anyhow::Result;
-use kin_model::{AuthorId, OperationId, RefName, RepositoryId, SemanticChangeId};
+use kin_model::{
+    AuthorId, Hash256, OperationId, RefName, RepositoryId, RootBundle, SemanticChangeId,
+    WorkspaceId,
+};
 use serde::{Deserialize, Serialize};
 
 pub const ROLLBACK_SCHEMA: &str = "kin.rollback.v1";
@@ -22,6 +25,35 @@ pub struct RollbackRequest {
     pub change_id: String,
     pub operation_id: OperationId,
     pub actor: AuthorId,
+    /// The exact repository/workspace state whose restoration was previewed.
+    pub expected: RollbackExpectation,
+    /// Consent to replacing the current content with an earlier complete state.
+    #[serde(default)]
+    pub discard_later: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RollbackExpectation {
+    pub repository_id: RepositoryId,
+    pub roots: RootBundle,
+    pub workspace_id: WorkspaceId,
+    pub workspace_generation: u64,
+    pub head_change_id: SemanticChangeId,
+}
+
+impl RollbackExpectation {
+    pub fn from_log(report: &crate::commands::log::LogReport) -> Result<Self> {
+        Ok(Self {
+            repository_id: report.repository_id.clone(),
+            roots: report.roots.clone(),
+            workspace_id: report.workspace_id,
+            workspace_generation: report.workspace_generation,
+            head_change_id: report.start_change.ok_or_else(|| {
+                anyhow::anyhow!("this workspace has no published change to roll back")
+            })?,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -297,10 +329,12 @@ async fn resolve_work_item_changes(work_id: &str) -> Result<Vec<SemanticChangeId
         .collect())
 }
 
-async fn resolve_feature_target(work_id: &str) -> Result<String> {
+async fn resolve_feature_target(
+    layout: &kin_core::KinLayout,
+    work_id: &str,
+) -> Result<(String, crate::commands::log::LogReport)> {
     let recorded = resolve_work_item_changes(work_id).await?;
-    let layout = crate::commands::require_repository_layout()?;
-    let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout)?;
+    let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(layout)?;
     let report = crate::commands::log::inspect(&binding, WORK_ITEM_HISTORY_WINDOW)?;
     let line = first_parent_line(&report);
     match plan_work_item_rollback(&line, report.truncated, &recorded) {
@@ -311,17 +345,98 @@ async fn resolve_feature_target(work_id: &str) -> Result<String> {
                 plan.reverted.len()
             );
             println!("Restoring the content of change {}.", plan.target);
-            Ok(plan.target.to_string())
+            Ok((plan.target.to_string(), report))
         }
         Err(refusal) => anyhow::bail!("cannot roll back work item {work_id}: {refusal}"),
     }
 }
 
-pub async fn run(change_id: Option<String>, feature: Option<String>) -> Result<()> {
+/// How far back the current branch line is read to preview what a rollback
+/// would set aside, the same bound `--feature` resolution already reads by.
+const DISCARD_PREVIEW_WINDOW: usize = 4096;
+
+/// How many discarded ids a refusal or a proceeding rollback names before
+/// summarizing the rest by count alone.
+const DISCARD_ID_SAMPLE: usize = 20;
+
+/// Later changes visible on the bounded first-parent line. `None` means
+/// the count is unknown, never that restoring the target is safe.
+fn discard_preview(
+    report: &crate::commands::log::LogReport,
+    target: &SemanticChangeId,
+) -> Option<Vec<SemanticChangeId>> {
+    let line = first_parent_line(report);
+    line.iter()
+        .position(|entry| &entry.change == target)
+        .map(|index| line[..index].iter().map(|entry| entry.change).collect())
+}
+
+/// Render up to [`DISCARD_ID_SAMPLE`] discarded ids plus a "+N more" suffix
+/// for the rest, so a large discard set never floods the terminal.
+fn render_discard_sample(discarded: &[SemanticChangeId]) -> String {
+    let sample: Vec<String> = discarded
+        .iter()
+        .take(DISCARD_ID_SAMPLE)
+        .map(SemanticChangeId::to_string)
+        .collect();
+    let mut rendered = sample.join(", ");
+    if discarded.len() > DISCARD_ID_SAMPLE {
+        rendered.push_str(&format!(" (+{} more)", discarded.len() - DISCARD_ID_SAMPLE));
+    }
+    rendered
+}
+
+/// Consent is required for every target other than the previewed tip,
+/// including a target whose distance the bounded history walk cannot prove.
+fn guard_discard_later(
+    report: &crate::commands::log::LogReport,
+    target: &str,
+    discard_later: bool,
+) -> Result<RollbackExpectation> {
+    let target_id = SemanticChangeId::from_hash(Hash256::from_hex(target)?);
+    let expected = RollbackExpectation::from_log(report)?;
+    if target_id == expected.head_change_id {
+        return Ok(expected);
+    }
+    let description = match discard_preview(report, &target_id) {
+        Some(discarded) => format!(
+            "{} later change(s) on the first-parent line: {}",
+            discarded.len(), render_discard_sample(&discarded)
+        ),
+        None => "an unknown number of later changes (the target is outside the bounded first-parent preview)".to_string(),
+    };
+    if !discard_later {
+        anyhow::bail!(
+            "restoring {target} would replace the complete working content, setting aside {description}; \
+             pass --discard-later to accept that. History keeps every change. The current tip is {}; \
+             after restoration, `kin rollback {} --discard-later` restores its content with another new change",
+            expected.head_change_id, expected.head_change_id
+        );
+    }
+    println!("Setting aside {description}; publishing a new change restoring the target's complete content.");
+    Ok(expected)
+}
+
+/// The one-sentence redirect a stranger's Git habit meets: `revert` does not
+/// exist because rollback is not a single-change undo.
+pub fn refuse_revert() -> Result<()> {
+    anyhow::bail!(
+        "kin has no single-change revert: rollback publishes a new change restoring an earlier \
+         change\'s complete content, setting aside later changes from the working view while keeping \
+         all history; run `kin rollback <change-id>` to preview the restoration"
+    )
+}
+
+pub async fn run(
+    change_id: Option<String>,
+    feature: Option<String>,
+    discard_later: bool,
+) -> Result<()> {
     // Clap refuses both arms below before dispatch, with a usage block and
     // exit 2. They stay as the backstop for any other caller, and because they
     // name the remedy and the command that supplies the missing value.
-    let change_id = match (change_id, feature) {
+    let layout = crate::commands::require_repository_layout()?;
+    let (change_id, report) = match (change_id, feature) {
         (Some(_), Some(_)) => {
             anyhow::bail!("name a change to roll back to, or a work item with --feature, not both")
         }
@@ -329,10 +444,16 @@ pub async fn run(change_id: Option<String>, feature: Option<String>) -> Result<(
             "name the change to roll back to, or the work item whose changes to roll back with \
              --feature <work-id>; `kin log` lists the changes on this line"
         ),
-        (Some(change_id), None) => change_id,
-        (None, Some(work_id)) => resolve_feature_target(&work_id).await?,
+        (Some(change_id), None) => {
+            let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout)?;
+            (
+                change_id,
+                crate::commands::log::inspect(&binding, DISCARD_PREVIEW_WINDOW)?,
+            )
+        }
+        (None, Some(work_id)) => resolve_feature_target(&layout, &work_id).await?,
     };
-    let layout = crate::commands::require_repository_layout()?;
+    let expected = guard_discard_later(&report, &change_id, discard_later)?;
     let daemon_url = crate::daemon_client::resolve_daemon_url(&layout)
         .await?
         .ok_or_else(|| crate::daemon_client::daemon_required_error("rollback", &layout))?;
@@ -342,6 +463,8 @@ pub async fn run(change_id: Option<String>, feature: Option<String>) -> Result<(
             change_id,
             operation_id: OperationId::new(),
             actor: crate::commands::require_commit_author()?,
+            expected,
+            discard_later,
         })
         .await?;
     for line in response.lines {
@@ -353,7 +476,7 @@ pub async fn run(change_id: Option<String>, feature: Option<String>) -> Result<(
 pub fn render_lines(report: &RollbackReport) -> Vec<String> {
     vec![
         format!(
-            "Rolled {} back to change {}{}",
+            "Restored {} to the content of change {}{}",
             report.branch,
             report.target_change_id,
             if report.idempotent {
@@ -378,6 +501,10 @@ pub fn render_lines(report: &RollbackReport) -> Vec<String> {
             "Authority generation {} (workspace generation {})",
             report.authority_generation, report.workspace_generation
         ),
+        format!(
+            "History keeps every change; `kin rollback {} --discard-later` restores the previous tip\'s content with another new change",
+            report.previous_change_id
+        ),
     ]
 }
 
@@ -399,6 +526,93 @@ mod tests {
                 parents: changes.get(index + 1).copied().into_iter().collect(),
             })
             .collect()
+    }
+
+    fn preview_report(line: Vec<LineChange>, truncated: bool) -> crate::commands::log::LogReport {
+        let root = tempfile::tempdir().unwrap();
+        let init = kin_core::init(root.path()).unwrap();
+        let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&init.layout).unwrap();
+        let mut report = crate::commands::log::inspect(&binding, DISCARD_PREVIEW_WINDOW).unwrap();
+        report.start_change = line.first().map(|entry| entry.change);
+        report.truncated = truncated;
+        report.entries = line
+            .into_iter()
+            .map(|entry| crate::commands::log::LogEntry {
+                change_id: entry.change,
+                parents: entry.parents,
+                depth: 0,
+                origin: kin_model::ChangeOrigin::Native,
+                timestamp: kin_model::Timestamp::now(),
+                author: AuthorId::new("rollback-preview-test"),
+                message: String::new(),
+                entity_delta_count: 0,
+                entity_deltas_unchanged: 0,
+                relation_delta_count: 0,
+                tree_delta_count: 0,
+                admission_policy_changed: false,
+            })
+            .collect();
+        report
+    }
+
+    #[test]
+    fn rollback_guard_requires_consent_beyond_the_preview_window() {
+        let id = |index: u64| {
+            let mut bytes = [0; 32];
+            bytes[..8].copy_from_slice(&index.to_be_bytes());
+            SemanticChangeId::from_hash(Hash256::from_bytes(bytes))
+        };
+        let line = (3..(DISCARD_PREVIEW_WINDOW as u64 + 3))
+            .rev()
+            .map(|index| LineChange {
+                change: id(index),
+                parents: vec![id(index - 1)],
+            })
+            .collect();
+        let report = preview_report(line, true);
+        let target = id(1).to_string();
+        let refusal = guard_discard_later(&report, &target, false)
+            .unwrap_err()
+            .to_string();
+        assert!(refusal.contains("unknown number"), "{refusal}");
+        assert!(refusal.contains("--discard-later"), "{refusal}");
+        let expected = guard_discard_later(&report, &target, true).unwrap();
+        assert_eq!(expected.head_change_id, report.start_change.unwrap());
+        assert_eq!(expected.roots, report.roots);
+    }
+
+    #[test]
+    fn rollback_guard_requires_consent_for_a_reachable_second_parent() {
+        let report = preview_report(
+            vec![
+                LineChange {
+                    change: change(4),
+                    parents: vec![change(2), change(3)],
+                },
+                LineChange {
+                    change: change(2),
+                    parents: vec![change(1)],
+                },
+                LineChange {
+                    change: change(3),
+                    parents: vec![change(1)],
+                },
+                LineChange {
+                    change: change(1),
+                    parents: vec![],
+                },
+            ],
+            false,
+        );
+        let target = change(3).to_string();
+        let refusal = guard_discard_later(&report, &target, false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            refusal.contains("outside the bounded first-parent preview"),
+            "{refusal}"
+        );
+        assert!(guard_discard_later(&report, &target, true).is_ok());
     }
 
     /// The newest run of the line is the only shape rollback can restore as a

@@ -335,3 +335,68 @@ async fn an_uncontended_first_contact_is_a_live_point_in_time_sample() {
         "a live sample carries this graph's own counters"
     );
 }
+
+/// A status call made while the first embedding batch builds its embedder
+/// samples live.
+///
+/// The first batch a daemon runs builds the embedder, and on a machine that has
+/// never embedded that fetches the model from Hugging Face. The fetch used to
+/// run inside the batch, under the lock this call samples under, so for as long
+/// as it took every status call replayed the reading settled before it began,
+/// and a commit made in that window still read as uncommitted work. A local
+/// run of `live_graph_durability_disclosure` sampled its daemon in exactly that
+/// state: the batch was inside the model download, and every status read after
+/// the commit, for over a minute, was a replay.
+///
+/// Driven through the production batch seam with the build held open, so the
+/// assertion is about where the build runs relative to the lock and not about
+/// how long a real fetch takes.
+#[tokio::test]
+async fn status_samples_live_while_the_first_batch_builds_its_embedder() {
+    let (_dir, state) = daemon_at_first_contact();
+    admit_two_entities(&state);
+
+    let (building_tx, building_rx) = std::sync::mpsc::sync_channel::<()>(0);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(0);
+    let batch_state = Arc::clone(&state);
+    let batch = std::thread::spawn(move || {
+        crate::daemon::run_background_embedding_batch(
+            &batch_state,
+            true,
+            move |_| {
+                // Stands in for the model fetch: held until the status call
+                // below has answered.
+                building_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(())
+            },
+            |_| Ok(0),
+        )
+    });
+    building_rx.recv().unwrap();
+
+    let result = graph_status_over_mcp(Arc::clone(&state)).await;
+    release_tx.send(()).unwrap();
+    let outcome = batch.join().unwrap();
+
+    assert_ne!(result.is_error, Some(true), "{}", result_text(&result));
+    let report = parse_report(&result);
+    assert_eq!(
+        report.sampling,
+        kin_mcp::handlers::entities::GraphStatusSampling::PointInTimeSelectedGraph,
+        "building the embedder holds nothing status samples under, so the answer is live: \
+         {report:?}"
+    );
+    assert!(
+        report.stale.is_none(),
+        "a live sample carries no staleness disclosure: {report:?}"
+    );
+    assert_eq!(report.entity_count, state.graph.entity_count());
+    assert!(
+        matches!(
+            outcome,
+            crate::daemon::BackgroundEmbeddingBatchOutcome::Completed(0)
+        ),
+        "the batch still runs once the embedder is built: {outcome:?}"
+    );
+}

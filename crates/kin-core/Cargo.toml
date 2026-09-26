@@ -15,7 +15,7 @@ doctest = false
 [features]
 # Test-only fixtures other workspace crates consume from their dev-dependencies.
 # Never enabled by a product dependency edge.
-test-support = []
+test-support = ["kin-db/test-support"]
 
 [dependencies]
 which = "8"
@@ -65,4 +65,3 @@ winapi-util = "0.1"
 kin-git = { workspace = true, features = ["test-support"] }
 pretty_assertions = { workspace = true }
 tracing-subscriber = { workspace = true }
-

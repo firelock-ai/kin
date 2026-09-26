@@ -9,9 +9,10 @@
 //! envelope and the `negative` verdict instead of reimplementing them.
 //!
 //! The policy the loop enforces is the product's own thesis: repository questions are
-//! answered from the graph. There is no shell tool, no file-search tool and no file-read
-//! tool in the belt, so there is nothing to fall back to, and the router refuses by name
-//! anything the model invents. Enforcement lives in this process rather than in a vendor's
+//! answered from the graph, and code changes through the entities it holds. The belt
+//! carries Kin tools only, with no shell tool and no file-search, file-read or file-write
+//! tool, so there is nothing to fall back to, and the router refuses by name anything the
+//! model invents. Enforcement lives in this process rather than in a vendor's
 //! permission layer, which is what makes it hold on every model rather than on one CLI.
 
 pub mod belt;
@@ -44,9 +45,6 @@ pub enum ExitStatus {
     Deadline,
     EndpointError,
     McpError,
-    /// The run produced changes that repository authority never published. The task text
-    /// may read like a success, but nothing landed, so this must never pool with Success.
-    ChangesUnpublished,
     /// The conversation reached the model's context window, so the agent was asked for its
     /// answer before the next request could overflow it. A budget spent, like the tool-call
     /// cap, but a different budget, so it is named apart.
@@ -62,7 +60,6 @@ impl ExitStatus {
             ExitStatus::Deadline => 3,
             ExitStatus::EndpointError => 4,
             ExitStatus::McpError => 5,
-            ExitStatus::ChangesUnpublished => 6,
             ExitStatus::ContextBudget => 7,
         }
     }
@@ -75,7 +72,6 @@ impl ExitStatus {
             ExitStatus::Deadline => "deadline",
             ExitStatus::EndpointError => "endpoint_error",
             ExitStatus::McpError => "mcp_error",
-            ExitStatus::ChangesUnpublished => "changes_unpublished",
             ExitStatus::ContextBudget => "context_budget",
         }
     }
@@ -84,8 +80,8 @@ impl ExitStatus {
 /// One graph server and the repository it serves.
 ///
 /// A run attaches one of these per repository. The agent's own tools are named per server,
-/// and every write is routed to the server that owns the path, so a two-repository run
-/// cannot commit one repository's change into the other's graph.
+/// and every call, a change included, goes to the server whose prefix the model named, so a
+/// two-repository run cannot commit one repository's change into the other's graph.
 #[derive(Debug, Clone)]
 pub struct ServerSpec {
     pub repo: PathBuf,
@@ -97,8 +93,8 @@ pub struct ServerSpec {
 pub struct AgentConfig {
     pub task: String,
     pub system_prompt: Option<String>,
-    /// The primary repository: the process working directory, the default for a relative
-    /// path, and the repository the transcript names.
+    /// The primary repository: the process working directory, and the repository the
+    /// transcript names.
     pub repo: PathBuf,
     pub out_dir: PathBuf,
     pub provider: ProviderConfig,
@@ -118,10 +114,6 @@ pub struct AgentConfig {
     /// the context window.
     pub max_result_bytes: Option<usize>,
     pub tool_profile: Option<String>,
-    /// Whether the belt carries the two local file tools, `edit_file` and `write_file`.
-    /// `None` reads `KIN_AGENT_PURE_KIN`, whose default keeps the belt Kin-only, so the
-    /// one write tool is `kin_mutate` and a change names the entity it touches.
-    pub belt_file_tools: Option<bool>,
 }
 
 impl AgentConfig {

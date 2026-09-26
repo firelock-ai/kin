@@ -1301,7 +1301,21 @@ impl StorageBackend for GcsBackend {
         data: &[u8],
         expected_gen: Generation,
     ) -> Result<Generation, KinDbError> {
-        let _snapshot = crate::storage::format::GraphSnapshot::from_bytes(data)?;
+        let snapshot = crate::storage::format::GraphSnapshot::from_bytes(data)?;
+        // Owed derivation work is receiver-local bookkeeping about one
+        // replica's own workspace trees, like binding history. Hosted storage
+        // never holds it, so a snapshot that carries some is refused here
+        // rather than published for every reader of the bucket.
+        if snapshot
+            .repository_authority
+            .as_ref()
+            .is_some_and(|authority| !authority.owed_derivations.is_empty())
+        {
+            return Err(KinDbError::StorageError(format!(
+                "refusing GCS full-snapshot commit for repo {repo_id}: its repository authority \
+                 carries receiver-local owed derivation work, which hosted storage does not hold"
+            )));
+        }
         let deltas = self.list_delta_objects(repo_id)?;
         if !deltas.is_empty() {
             return Err(KinDbError::StorageError(format!(
@@ -2927,6 +2941,113 @@ pub(crate) mod tests {
             final_recovery.snapshot.resolved_tree,
             after_reopen.resolved_tree
         );
+    }
+
+    /// Hosted storage never holds a replica's owed derivation work. A commit
+    /// that would record some is refused at the GCS writer and moves nothing,
+    /// and the same publication without owed work is hosted as before.
+    #[test]
+    fn gcs_refuses_a_snapshot_that_carries_owed_derivation_work() {
+        let store = Arc::new(VersionedMemoryStore::new());
+        let repository_id = RepositoryId::new("gcs-owed-derivations").unwrap();
+        let backend = Arc::new(GcsBackend::from_store(
+            Box::new(Arc::clone(&store)),
+            "fixture",
+        ));
+        let manager =
+            RepositoryAuthorityManager::open(repository_id.clone(), Arc::clone(&backend)).unwrap();
+        let workspace_id = WorkspaceId::new();
+        manager
+            .commit_repository_transaction(unborn_authority_transaction(
+                &manager,
+                &repository_id,
+                workspace_id,
+                true,
+            ))
+            .unwrap();
+        let body = b"pub fn hosted() {}\n";
+        let body_hash = kin_model::Hash256::from_bytes(source_digest(body));
+        manager.save_source_blob(body_hash, body).unwrap();
+        let path = kin_model::RepoPath::from_utf8("src/lib.rs").unwrap();
+        let publication = |manager: &RepositoryAuthorityManager<GcsBackend>| {
+            let lease = manager.read_authority();
+            let workspace = lease.metadata().workspaces[0].clone();
+            let tree_deltas = vec![kin_model::TreeDelta::Added {
+                artifact_id: kin_model::ArtifactId::new(),
+                new: kin_model::LocatedEntry::new(
+                    path.clone(),
+                    kin_model::TreeEntry::blob(body_hash, false),
+                ),
+            }];
+            let tree = workspace.tree.apply(&tree_deltas).unwrap();
+            let transaction = RepositoryTransaction {
+                schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+                operation_id: OperationId::new(),
+                repository_id: repository_id.clone(),
+                expected_generation: lease.roots().generation,
+                expected_roots: lease.roots().clone(),
+                actor: AuthorId::new("gcs-authority-test"),
+                reason: "publish a source file into the hosted workspace".to_string(),
+                external_objects: Vec::new(),
+                git_authority_delta: None,
+                changes: Vec::new(),
+                aliases: Vec::new(),
+                ref_mutations: Vec::new(),
+                default_ref_mutation: None,
+                workspace_mutation: Some(WorkspaceMutation {
+                    workspace_id,
+                    expected: WorkspaceExpectation::MustEqual {
+                        generation: workspace.generation,
+                        head: workspace.head.clone(),
+                        base_target: workspace.base_target.clone(),
+                        base_tree_hash: workspace.base_tree_hash,
+                        tree_hash: workspace.tree_hash,
+                        semantic_overlay_hash: workspace.semantic_overlay_hash,
+                        admission_policy: workspace.admission_policy,
+                    },
+                    new_generation: workspace.generation + 1,
+                    new_head: workspace.head.clone(),
+                    new_base_target: workspace.base_target.clone(),
+                    new_base_tree_hash: workspace.base_tree_hash,
+                    tree_deltas,
+                    new_tree_hash: compute_resolved_tree_hash(&tree).unwrap(),
+                    semantic_delta: WorkspaceSemanticDelta::default(),
+                    new_shared_admission_policy: workspace.shared_admission_policy.clone(),
+                    new_admission_policy: workspace.admission_policy,
+                }),
+                local_overlay_delta: None,
+                merge_transaction_delta: None,
+                sealed_observation: None,
+                collaboration_delta: None,
+            };
+            drop(lease);
+            transaction
+        };
+        let before = manager.read_authority().roots().clone();
+        let error = manager
+            .commit_repository_transaction_owing(
+                publication(&manager),
+                &crate::storage::derivation_ledger::OwedDerivationUpdate::owe(
+                    workspace_id,
+                    vec![(path.clone(), body_hash)],
+                    Vec::new(),
+                ),
+            )
+            .expect_err("hosted storage must refuse owed derivation work");
+        assert!(
+            error.to_string().contains("owed derivation work"),
+            "the refusal must name what hosted storage does not hold: {error}"
+        );
+        assert_eq!(manager.read_authority().roots(), &before);
+
+        manager
+            .commit_repository_transaction(publication(&manager))
+            .expect("the same publication without owed work is hosted");
+        assert!(manager
+            .read_authority()
+            .metadata()
+            .owed_derivations
+            .is_empty());
     }
 
     #[test]

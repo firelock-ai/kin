@@ -4,10 +4,10 @@
 //! Leave Kin through one exact repository-v6 to Git projection.
 //!
 //! Eject never restores an initialization snapshot and never treats working
-//! files or an ambient `.git/` directory as repository authority. It captures
-//! one repository-v6 generation, proves the graph-owned workspace projection
-//! against repository source CAS, builds and verifies a complete replacement
-//! Git repository off to the side, stops graph projection, reopens the same
+//! files or an ambient `.git/` directory as repository authority. It stops graph
+//! projection, captures one repository-v6 generation, proves the graph-owned
+//! workspace projection against repository source CAS, builds and verifies a
+//! complete replacement Git repository off to the side, reopens the same
 //! authority roots, proves the workspace again, and only then detaches `.kin/`.
 
 use std::ffi::{OsStr, OsString};
@@ -39,6 +39,15 @@ pub async fn run(yes: bool) -> Result<()> {
     let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout)?;
     refuse_live_vfs(&layout)?;
 
+    // The daemon is the only long-lived writer allowed to observe this
+    // workspace, and it publishes on its own schedule: enrichment a commit set
+    // off, and whatever it settles on the way down. Stop it before the
+    // generation is captured, so the roots this command proves and stages are
+    // the roots it freezes, rather than racing a publish it cannot see coming.
+    crate::commands::daemon::stop(false, false, false, false)
+        .await
+        .context("stop repository daemon before eject")?;
+
     let authority = ActiveRepositoryAuthority::open(&binding)?;
     let captured = capture_export_snapshot(&authority)?;
     let proof = WorkspaceProjectionProof::build(&authority, &captured.workspace.tree)?;
@@ -62,11 +71,6 @@ pub async fn run(yes: bool) -> Result<()> {
         return Ok(());
     }
 
-    // The daemon is the only long-lived writer allowed to observe this
-    // workspace. Stop it before the final root comparison and namespace swap.
-    crate::commands::daemon::stop(false, false, false)
-        .await
-        .context("stop repository daemon before eject")?;
     drop(authority);
 
     // Lock order is projection then repository authority everywhere that needs

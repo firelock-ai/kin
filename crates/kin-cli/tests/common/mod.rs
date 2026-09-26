@@ -1032,6 +1032,7 @@ impl IsolatedDaemonRuntime {
             inner: Some(command),
             runtime: Some(self),
             intentional_env: Vec::new(),
+            path_prefix: Vec::new(),
         }
     }
 
@@ -1373,6 +1374,9 @@ pub struct Command<'runtime> {
     inner: Option<std::process::Command>,
     runtime: Option<&'runtime IsolatedDaemonRuntime>,
     intentional_env: Vec<(OsString, Option<OsString>)>,
+    /// Fixture directories put ahead of the host `PATH` at launch. See
+    /// [`Command::fixture_path_prefix`].
+    path_prefix: Vec<PathBuf>,
 }
 
 impl Command<'static> {
@@ -1386,6 +1390,7 @@ impl Command<'static> {
             inner: Some(inner),
             runtime: None,
             intentional_env: Vec::new(),
+            path_prefix: Vec::new(),
         }
     }
 }
@@ -1451,6 +1456,53 @@ fn fixture_git_commands_prepend_maintenance_suppression() {
     assert!(
         Command::new("sh").inner_ref().get_args().next().is_none(),
         "a non-Git fixture command was given Git configuration arguments"
+    );
+}
+
+/// A fixture's own executables reach the child through `fixture_path_prefix`,
+/// and an explicit `PATH` does not, because launch rebinds `PATH` to the
+/// host's. Both halves are asserted: the second is the trap the first exists to
+/// get around, and a harness that stopped rebinding would make the first pass
+/// for the wrong reason.
+#[test]
+fn a_fixture_path_prefix_survives_the_host_path_rebinding() {
+    let fixture_bin = std::env::temp_dir().join("kin-fixture-path-prefix-probe");
+    let explicit = PathBuf::from("/kin-fixture-explicit-path");
+    let mut command = Command::new("sh");
+    command
+        .env("PATH", &explicit)
+        .fixture_path_prefix(&fixture_bin);
+    let launched = |command: &Command| -> Vec<PathBuf> {
+        let path = command
+            .configured_env_for_test(OsStr::new("PATH"))
+            .flatten()
+            .expect("launch preparation sets PATH");
+        std::env::split_paths(&path).collect()
+    };
+
+    command.prepare_for_launch_for_test();
+    let entries = launched(&command);
+    assert_eq!(
+        entries.first(),
+        Some(&fixture_bin),
+        "the fixture directory must lead the launched PATH: {entries:?}"
+    );
+    assert!(
+        !entries.contains(&explicit),
+        "an explicit PATH is rebound to the host's at launch, which is why the prefix exists: \
+         {entries:?}"
+    );
+
+    // Bounded launch prepares again after a test has inspected the command, so
+    // preparation must not stack the prefix.
+    command.prepare_for_launch_for_test();
+    assert_eq!(
+        launched(&command)
+            .iter()
+            .filter(|entry| **entry == fixture_bin)
+            .count(),
+        1,
+        "a second preparation stacked the fixture PATH prefix"
     );
 }
 
@@ -1535,6 +1587,21 @@ impl<'runtime> Command<'runtime> {
         self
     }
 
+    /// Put one fixture directory of executables ahead of the host `PATH`.
+    ///
+    /// `.env("PATH", ...)` cannot do this. Every launch rebinds `PATH` to the
+    /// host's through `kin_git::test_support::isolate_fixture_git`, on purpose,
+    /// so an explicit `PATH` is overwritten and whatever the machine has
+    /// installed answers instead. That is how a setup test's `codex` shim was
+    /// never seen: the run passed on a host with Codex installed and failed on
+    /// every runner without it. A directory named here is applied after that
+    /// rebinding, in front of the host entries, so the fixture's executables
+    /// win and the host's stay reachable behind them.
+    pub fn fixture_path_prefix<P: AsRef<Path>>(&mut self, dir: P) -> &mut Self {
+        self.path_prefix.push(dir.as_ref().to_path_buf());
+        self
+    }
+
     pub fn envs<I, K, V>(&mut self, vars: I) -> &mut Self
     where
         I: IntoIterator<Item = (K, V)>,
@@ -1573,6 +1640,28 @@ impl<'runtime> Command<'runtime> {
 
     pub fn stderr<T: Into<Stdio>>(&mut self, cfg: T) -> &mut Self {
         self.inner_mut().stderr(cfg);
+        self
+    }
+
+    /// Run `hook` in the child between fork and exec, before the containment's
+    /// own hook, so a test can put the process under a restriction it inherits
+    /// all the way down, such as a seccomp filter.
+    ///
+    /// # Safety
+    ///
+    /// The contract of [`std::os::unix::process::CommandExt::pre_exec`]: the
+    /// hook runs in the forked child and may only do what is safe there, which
+    /// rules out allocating and taking locks.
+    #[cfg(unix)]
+    pub unsafe fn pre_exec<F>(&mut self, hook: F) -> &mut Self
+    where
+        F: FnMut() -> std::io::Result<()> + Send + Sync + 'static,
+    {
+        use std::os::unix::process::CommandExt as _;
+        // SAFETY: forwarded unchanged under the caller's contract above.
+        unsafe {
+            self.inner_mut().pre_exec(hook);
+        }
         self
     }
 
@@ -1676,6 +1765,24 @@ impl<'runtime> Command<'runtime> {
                 }
             }
         }
+        // After the rebinding above, which is what put the host PATH on the
+        // command, and computed from it each time, so a second preparation does
+        // not stack the prefix twice.
+        if !self.path_prefix.is_empty() {
+            let host_path = command
+                .get_envs()
+                .find(|(key, _)| env_os_names_equal(key, OsStr::new("PATH")))
+                .and_then(|(_, value)| value.map(OsStr::to_os_string))
+                .unwrap_or_default();
+            let path = std::env::join_paths(
+                self.path_prefix
+                    .iter()
+                    .cloned()
+                    .chain(std::env::split_paths(&host_path)),
+            )
+            .unwrap_or_else(|error| panic!("join the fixture PATH prefix: {error}"));
+            command.env("PATH", path);
+        }
     }
 
     fn inner_mut(&mut self) -> &mut std::process::Command {
@@ -1735,6 +1842,11 @@ fn is_allowed_runtime_override(key: &OsStr) -> bool {
         // per-command configuration rather than repository or session
         // authority, so carrying it costs the isolation boundary nothing.
         "KIN_DAEMON_AUTO_EMBED",
+        // The runtime's three seconds are a default for daemons its Drop has to
+        // stop. A test about what a daemon finishes inside its shutdown budget
+        // needs to set that budget, and it waits for its daemon to end before
+        // Drop runs.
+        "KIN_DAEMON_SHUTDOWN_GRACE_SECS",
     ];
     !is_internal_runtime_capability(key)
         && (ALLOWED.iter().any(|allowed| env_os_name_eq(key, allowed))

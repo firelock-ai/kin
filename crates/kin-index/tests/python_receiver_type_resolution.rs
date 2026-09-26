@@ -33,12 +33,20 @@ fn parse_py(file_path: &str, source: &str) -> FileParseData {
     let tree = adapter.parse(bytes).expect("parse");
     let output = adapter.extract(&tree, bytes, &file_id).expect("extract");
 
-    let entities: Vec<Entity> = output
+    let mut entities: Vec<Entity> = output
         .entities
         .into_iter()
         .map(|e| e.into_entity_with_source(adapter.language_id(), &file_id, Some(bytes)))
         .collect();
 
+    // This test ingestion boundary retains the exact source digest, as the
+    // product IndexPipeline does; new import witnesses cannot use previews.
+    for entity in &mut entities {
+        entity.metadata.extra.insert(
+            "blob_hash".into(),
+            serde_json::Value::String(kin_blobs::digest(bytes).to_string()),
+        );
+    }
     FileParseData {
         file_path: file_path.to_string(),
         entities,
@@ -922,14 +930,8 @@ fn module_name_collision_package() -> Vec<FileParseData> {
 
 #[test]
 fn a_package_re_export_reaches_the_function_past_its_module_twin() {
-    // `nk/__init__.py` re-exports `search`, so a caller writing
-    // `from nk import search` pins its callee to the package rather than to the
-    // module file. The package's own file does not declare the symbol, so the
-    // linker falls back to the one same-named entity in that directory — and
-    // the module entity named for `search.py` sits there too, making it two.
-    // Two is not one, so the pinned call was refused outright and the caller
-    // got no edge at all, which is a stricter loss than parking the edge on the
-    // wrong node.
+    // The package explicitly re-exports this exact function. A directory
+    // sibling or module sharing its name is not equivalent source evidence.
     let files = vec![
         parse_py("nk/__init__.py", "from nk.search import search\n"),
         parse_py("nk/search.py", SEARCH_PY),

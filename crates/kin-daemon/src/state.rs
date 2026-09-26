@@ -1912,29 +1912,39 @@ pub struct LspEnrichmentRequest {
 /// repository identity, not the decoded persisted authority.
 ///
 /// The distinction is the difference between a handle and a copy of the store.
-/// This view lives for the whole life of the LSP enrichment worker, so an
-/// opened manager here is retained for the life of the daemon: measured on a
+/// This view can live across a whole LSP sweep, so an opened manager would
+/// retain unnecessary repository metadata: measured on a
 /// converted psf/requests store, one open holds about 2.75 GiB resident, 93.8
 /// percent of which is a change map this path never reads. Source bodies are
-/// immutable and addressed by the live graph entry hash, so later workspace
-/// admissions stay visible through the binding exactly as they did through the
-/// manager, and no stale metadata snapshot is trusted either way.
+/// immutable and addressed by the query's captured tree entry hash. Later
+/// admissions invalidate the query's epoch instead of changing its inputs.
 pub(crate) struct GraphOwnedSourceView {
+    #[cfg(test)]
     graph: Arc<kin_db::InMemoryGraph>,
     binding: kin_core::LocalRepositoryAuthorityBinding,
 }
 
 impl GraphOwnedSourceView {
+    #[cfg(test)]
     pub(crate) fn load_text(&self, file_id: &FilePathId) -> Result<String> {
+        self.load_text_from_tree(file_id, &self.graph.resolved_tree())
+    }
+
+    /// Read immutable CAS bytes named by one captured query input. Never
+    /// substitute a newer live tree while a language-server request is in flight.
+    pub(crate) fn load_text_from_tree(
+        &self,
+        file_id: &FilePathId,
+        tree: &ResolvedTree,
+    ) -> Result<String> {
         let path = RepoPath::from_utf8(file_id.0.clone()).map_err(|error| {
             exact_source_storage_error(format!(
                 "LSP source path {file_id} is not an exact repository path: {error}"
             ))
         })?;
-        let entry = self
-            .graph
-            .get_tree_entry(file_id)
-            .map_err(DaemonError::from)?
+        let entry = tree
+            .artifact_at_path(&path)
+            .map(|artifact| artifact.entry.clone())
             .ok_or_else(|| {
                 exact_source_storage_error(format!(
                     "LSP source path {file_id} has no graph-owned tree entry"
@@ -1977,6 +1987,19 @@ pub enum LspEnrichmentMessage {
 pub struct LspWorkTracker {
     pub pending: AtomicU64,
     pub failed: AtomicU64,
+    /// Language-server query errors the incremental path saw, since this
+    /// daemon started.
+    ///
+    /// Deliberately not `failed`. A protocol error on one position is not work
+    /// this pass abandoned: the arms that did answer are already in the graph
+    /// and nothing requeues the file, so marking the reservation failed leaves
+    /// `failed_work` set over edges that landed and reads as enrichment that
+    /// never drained. It is also not nothing. The sweep path grades its own
+    /// equivalent through `sweep_work_succeeded`, and the incremental path had
+    /// no signal at all, so the same failure was graded on one side and
+    /// invisible on the other. This is the incremental side's signal: counted,
+    /// published on the enrichment status, and not a completion gate.
+    pub incremental_query_failures: AtomicU64,
 }
 
 pub(crate) struct LspWorkGuard {
@@ -2003,6 +2026,16 @@ impl LspWorkTracker {
 impl LspWorkGuard {
     pub(crate) fn complete(&mut self) {
         self.completed = true;
+    }
+
+    /// Record language-server query errors this pass saw, without failing it.
+    pub(crate) fn record_query_failures(&self, failures: usize) {
+        if failures == 0 {
+            return;
+        }
+        self.tracker
+            .incremental_query_failures
+            .fetch_add(failures as u64, Ordering::SeqCst);
     }
 
     /// The queued or buffered message now owns the same reservation.
@@ -2061,6 +2094,7 @@ impl TemporalScope {
 /// Maximum attempts to capture one repo's entity/relation authority without
 /// straddling a graph mutation.
 const SPINE_GRAPH_CAPTURE_ATTEMPTS: usize = 3;
+const DERIVED_MEMBER_SPINE_GAP: &str = kin_spine::SPINE_CANDIDATE_REPRESENTATION_GAP;
 
 /// Fixed upper bound for hosted repository reload coordination.
 ///
@@ -2071,26 +2105,26 @@ const SPINE_GRAPH_CAPTURE_ATTEMPTS: usize = 3;
 const HOSTED_REPO_RELOAD_GATE_SHARDS: usize = 64;
 const HOSTED_REPO_RELOAD_ATTEMPTS: usize = 3;
 
-/// How often a hosted reader re-proves its spine authority in the background.
+/// How often a hosted reader checks, in the background, that its spine
+/// authority proof still binds to durable identity.
 ///
-/// One pass hydrates the whole durable cache and then double-collects the fleet,
-/// loading every repository graph and recomputing every root. A five-repo
-/// production fleet measured a 10.46 s median for one of them on 2026-09-05, so
-/// this interval has to be long enough that the pod is mostly idle between
-/// passes and short enough that a reader nobody queries still tracks its
-/// siblings. It is never on a request path; the readiness probe reads the proof
-/// this pass maintains and never waits for it.
+/// A tick is the cheap check: the GCS admission and runtime authority, the
+/// active Firestore fence and the committed heads, 2 + 2N Firestore document
+/// reads for an N-repository fleet. It runs a full pass only when that check
+/// says one is needed, and then only through the pass limiter in
+/// `hosted_spine_cost`. It is never on a request path.
+///
+/// Until 2026-09-22 every tick was a full pass: a hydration of every committed
+/// spine row plus the fleet double-collect. At about 43,000 billable reads a
+/// pass on the five-repository fleet, one tick a minute plus the pass time was
+/// about 46 million Firestore reads a day, from 2026-09-05 until the spine was
+/// switched off on 2026-09-20.
 const HOSTED_SPINE_AUTHORITY_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
-/// How soon the background pass retries after a failed one, doubling up to
-/// [`HOSTED_SPINE_AUTHORITY_REFRESH_INTERVAL`].
-///
-/// A failed pass invalidates the cached proof, so the daemon reports unready
-/// until a pass succeeds. Waiting a whole minute to retry would turn a single
-/// transient durable read into a minute out of service; retrying in a second
-/// turns it into a second. It is also the floor between passes when a probe
-/// wakes one, so a persistent drift cannot turn the probe back into the thing
-/// that drives a continuous refresh.
+/// The least time between two background ticks. A probe that finds the proof
+/// superseded wakes the cadence early; this keeps a burst of wakes to one tick
+/// a second. A tick that wants a full pass is still bound by the pass
+/// limiter's own floor and backoff, so no rate of wakes can drive hydrations.
 const HOSTED_SPINE_AUTHORITY_RETRY_FLOOR: Duration = Duration::from_secs(1);
 const HOSTED_SPINE_CURSOR_CAS_REQUIRED: &str =
     "hosted persistent spine is unavailable until its durable backend can stage rows and compare-and-swap a head bound to the exact source publication cursor";
@@ -2210,6 +2244,63 @@ impl CachedAuthorityRefusal {
     pub(crate) fn into_reason(self) -> String {
         self.reason
     }
+}
+
+/// Everything local a cached readiness verdict depended on. A verdict answers
+/// only while all of it is exactly what it was when its check began: any
+/// writer that held the publication gate since, any full pass that started or
+/// finished replacing the durable cache, and any change to the proof or to the
+/// admitted evidence, by whichever path, makes the next caller re-check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HostedSpineVerdictKey {
+    publication_gate_writes: u64,
+    cache_replacements: u64,
+    proof: Option<HostedSpineAuthorityProof>,
+    expected_rollout_fence: Option<kin_spine::SpineRolloutFenceEvidence>,
+}
+
+/// Why one full authority pass did not install a proof, and whether it had
+/// read committed rows by then.
+struct HostedSpinePassFailure {
+    reason: String,
+    hydrated: bool,
+}
+
+impl HostedSpinePassFailure {
+    fn before_hydration(reason: String) -> Self {
+        Self {
+            reason,
+            hydrated: false,
+        }
+    }
+
+    fn after_hydration(reason: String) -> Self {
+        Self {
+            reason,
+            hydrated: true,
+        }
+    }
+
+    fn pass_end(&self) -> crate::hosted_spine_cost::HostedSpinePassEnd {
+        if self.hydrated {
+            crate::hosted_spine_cost::HostedSpinePassEnd::Failed(self.reason.clone())
+        } else {
+            crate::hosted_spine_cost::HostedSpinePassEnd::RefusedBeforeHydration(
+                self.reason.clone(),
+            )
+        }
+    }
+}
+
+/// What a caller that wanted a full authority pass got from the limiter.
+pub(crate) enum HostedSpineReproof<'a> {
+    /// This caller ran the pass. `Some` when it established authority.
+    Led(Option<&'a dyn kin_spine::SpineBackend>),
+    /// Another caller's pass finished while this one waited for it.
+    Shared,
+    /// Refused as too soon after the last pass; the reason is recorded where
+    /// `spine_unavailable_reason` reads it.
+    Deferred,
 }
 
 /// What the authority proof this process already holds says about serving one
@@ -2520,6 +2611,16 @@ impl HostedPublicationGuard {
         }
     }
 
+    /// Whether this guard carries a rollout proof that publication control
+    /// asserts, right now, as the live rollout. Only such a guard may publish
+    /// while `KIN_DISABLE_SPINE` is on; see `ensure_spine_under_publication`.
+    fn holds_live_rollout(&self) -> bool {
+        match (self.control.as_ref(), self.rollout.as_ref()) {
+            (Some(control), Some(proof)) => control.assert_rollout_lease(proof).is_ok(),
+            _ => false,
+        }
+    }
+
     fn publication_error(action: &str, error: impl std::fmt::Display) -> DaemonError {
         DaemonError::Graph(kin_db::KinDbError::StorageError(format!(
             "hosted spine publication {action} refused: {error}"
@@ -2635,6 +2736,18 @@ impl Drop for GraphPersistenceAttempt<'_> {
     }
 }
 
+/// What one persistence flush did about the language-server relations the live
+/// graph holds and repository authority does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EnrichmentFlush {
+    /// Not held for a merge: the flush published what it had, found nothing
+    /// to publish, or deferred to a repository command holding the gate.
+    Proceeded,
+    /// A merge is open on this workspace, so the flush published nothing and
+    /// acknowledged nothing. The relations stay in the live graph.
+    HeldForOpenMerge,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SnapshotSaveMode {
     Incremental,
@@ -2735,7 +2848,73 @@ struct GraphAuthorityClock {
     /// final authority check and publishes OnceLock.
     publication_gate: Mutex<()>,
     active_writers: AtomicUsize,
+    /// Open marks over working-copy events the reconcile loop has picked up
+    /// and has not yet published or given back. An answer that claims an
+    /// absence treats one as a writer: the files it covers are on their way
+    /// into the graph, and an answer read from the graph as it stands would
+    /// report a name the agent just wrote as absent. A read that returns rows
+    /// does not wait on one, and no other reader of this clock consults it.
+    pending_admissions: AtomicUsize,
     epoch: AtomicU64,
+    /// Woken each time a writer finishes, and each time a pending admission
+    /// ends, so a reader waiting for authority to settle learns it did without
+    /// polling for it.
+    drained: tokio::sync::Notify,
+    /// A test's stand-in for [`XREF_WRITER_DRAIN_CEILING`], in milliseconds.
+    /// Zero means none.
+    #[cfg(test)]
+    drain_ceiling_override_ms: AtomicU64,
+}
+
+/// How long one reference read waits, in total, for graph-authority writers to
+/// finish before it refuses.
+///
+/// A reference read cannot be certified while a writer holds graph authority,
+/// and an edit admission holds it for its whole pass, which on a loaded host
+/// has been measured at 37 s for a single publication. The read therefore
+/// waits for the writer instead of spending its attempts inside the window.
+/// The bound is the MCP bridge's: `kin mcp start` gives the daemon 60 s before
+/// it stops waiting on the answer and asks whether the daemon is alive, and a
+/// read that waited the full 30 s still has the other half of that budget for
+/// the read itself. The longest find_references measured while an enrichment
+/// sweep was writing took 7.3 s. A longer wait would spend the budget the
+/// answer needs, and past it the caller, not this daemon, decides what the
+/// agent sees.
+pub(crate) const XREF_WRITER_DRAIN_CEILING: Duration = Duration::from_secs(30);
+
+/// How a wait for graph-authority writers to finish ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GraphAuthorityDrain {
+    /// No writer held graph authority when the wait began.
+    NoWriter,
+    /// Every writer that held authority finished before the deadline.
+    Drained,
+    /// The deadline passed with a writer still holding authority, or, for a
+    /// wait that covers them, a pending admission still open.
+    DeadlinePassed(ReadBlocker),
+}
+
+/// What a read waiting for graph authority to settle waits out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SettleScope {
+    /// Writers holding graph authority. All a read that returns rows waits
+    /// for: a pending admission moves nothing it read, so its rows are the
+    /// graph's rows either way.
+    Writers,
+    /// Writers, and the reconcile loop's mark over working-copy changes it has
+    /// picked up and not yet published. What an answer that claims an absence
+    /// waits for, because what it found missing may be on its way in.
+    WritersAndPendingAdmissions,
+}
+
+/// What kept a reference read from settling when its wait ran out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReadBlocker {
+    /// A writer held graph authority.
+    Writer,
+    /// No writer held authority, but the reconcile loop held working-copy
+    /// changes it had picked up and not yet published.
+    PendingAdmission,
 }
 
 /// Marks one entity/relation mutation batch as in flight.
@@ -2755,6 +2934,37 @@ pub(crate) struct LocalRepositoryFinalization {
     pub generation_advanced: bool,
 }
 
+/// Marks working-copy events the reconcile loop has picked up and has not yet
+/// published or given back.
+///
+/// The loop holds one over its whole queue, from the moment the queue holds an
+/// event until it empties. That spans the grace a round waits out for an
+/// imminent commit, a commit stand-down, the rounds a burst takes, and each
+/// pass's wait for the coordination gate and the reconciler lock before it
+/// takes its [`GraphAuthorityMutationGuard`]. The loop lets it go early only
+/// when a round stands down for the admission hold, when a pass fails and
+/// gives its batch back, and when a supervisor stop parks the loop.
+/// An answer that claims an absence treats it as a writer for that whole
+/// window; a read that returns rows is served through it. It moves no epoch,
+/// so every other reader of the clock is unaffected.
+pub(crate) struct PendingAdmissionGuard {
+    clock: Arc<GraphAuthorityClock>,
+}
+
+impl Drop for PendingAdmissionGuard {
+    fn drop(&mut self) {
+        self.clock
+            .pending_admissions
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |pending| {
+                pending.checked_sub(1)
+            })
+            .expect("pending admission count underflow");
+        // After the count drops, so a reader this wakes re-reads it without
+        // this mark.
+        self.clock.drained.notify_waiters();
+    }
+}
+
 impl Drop for GraphAuthorityMutationGuard {
     fn drop(&mut self) {
         self.clock.epoch.fetch_add(1, Ordering::SeqCst);
@@ -2764,6 +2974,9 @@ impl Drop for GraphAuthorityMutationGuard {
                 active.checked_sub(1)
             })
             .expect("graph authority writer count underflow");
+        // After the count drops, so a reader this wakes re-reads it without
+        // this writer.
+        self.clock.drained.notify_waiters();
     }
 }
 
@@ -3262,6 +3475,8 @@ pub struct DaemonState {
     /// Serializes daemon intent lifecycle mutations with MCP transaction
     /// preflight+apply so those two authority paths have one ordering.
     pub coordination_gate: tokio::sync::Mutex<()>,
+    /// Pending prepared-publication serving and request-independent owner custody.
+    pub(crate) prepared_publication: Arc<crate::prepared_publication::ServingFence>,
     /// Shared entity/relation mutation clock. Every authority writer brackets
     /// its complete batch so detached xref reads cannot certify an intermediate
     /// graph state before the writer publishes its normal version/root update.
@@ -3357,8 +3572,10 @@ pub struct DaemonState {
     registered_local_repository_authority_incomplete: bool,
     /// Whether the federation layer was disabled when this daemon state was
     /// constructed. Captured once so startup pinning and request-time spine
-    /// access cannot read different process environments.
-    spine_disabled: bool,
+    /// access cannot read different process environments. Production writes
+    /// it only at construction; a test may switch it on a state that already
+    /// holds a proof, which is what a pod admitted under the kill switch holds.
+    spine_disabled: AtomicBool,
     /// Resolved once, here, rather than read inside the capture loop.
     ///
     /// A daemon captures its levers at process start; reading the environment
@@ -3398,6 +3615,9 @@ pub struct DaemonState {
     pub(crate) mcp_fail_after_authority_once: AtomicBool,
     #[cfg(test)]
     pub(crate) mcp_lifecycle_persist_fail_once: AtomicU8,
+    /// Test-only indexing failure for one exact path in this daemon state.
+    #[cfg(test)]
+    pub(crate) readmission_index_failure: Mutex<Option<FilePathId>>,
     /// Exact MCP commits in flight, keyed by transaction id, so a re-sent commit joins
     /// the one already running instead of running the whole commit a second time.
     pub(crate) inflight_mcp_commits: crate::mcp_commit::InflightMcpCommits,
@@ -3489,6 +3709,15 @@ pub struct DaemonState {
     /// one that finishes second overwrites the newer one's result.
     hosted_spine_authority_pass_seq: AtomicU64,
     hosted_spine_authority_applied_seq: AtomicU64,
+    /// Moves when a full pass starts replacing the durable cache and again
+    /// when the replacement returns. Readers do not wait for a pass, so the
+    /// cached verdict keys on this: a verdict taken before the cache was
+    /// replaced vouched for rows the cache no longer holds.
+    hosted_spine_cache_replacements: AtomicU64,
+    /// The full-pass limiter, the cached readiness verdict and the counters
+    /// that say what the hosted spine costs. See `hosted_spine_cost`.
+    hosted_spine_cost:
+        crate::hosted_spine_cost::HostedSpineCost<HostedSpineVerdictKey, CachedAuthorityRefusal>,
     /// Test-only escape hatch for process-local spine behavior. Production
     /// hosted states have no corresponding field or bypass: they remain held
     /// until the durable backend owns cursor-bound publication CAS.
@@ -3532,7 +3761,9 @@ pub struct DaemonState {
     /// Serializes hosted repo registration and all-repo edge refresh passes.
     /// The backend independently keeps a pass-wide incomplete lease; this gate
     /// prevents daemon request paths from racing that lease with a new ingest.
-    spine_refresh_gate: tokio::sync::RwLock<()>,
+    /// It counts its writers, so a cached readiness verdict can tell that one
+    /// has run since it was taken.
+    spine_refresh_gate: crate::hosted_spine_cost::SpineRefreshGate,
     /// How long the most recent reader waited to take `spine_refresh_gate`,
     /// in microseconds. Written by `acquire_spine_read_authority`, read by
     /// `/readiness` so a refusal can say whether it was waiting on this lock.
@@ -3593,6 +3824,9 @@ pub struct DaemonState {
     /// from, so a reference read whose every attempt meets a writer holding
     /// graph authority can still answer from a graph that has not moved.
     pub(crate) xref_settled: crate::api::XrefSettledHead,
+    /// One fully admitted detached HEAD graph, reused only while its complete
+    /// query currency and the live graph identity still match.
+    pub(crate) xref_graph_cache: crate::api::XrefHeadGraphCache,
     /// Consecutive `kin_graph_status` calls that could not complete a live
     /// sample of the selected graph, reset by the first one that does.
     ///
@@ -3694,6 +3928,10 @@ pub struct DaemonState {
     /// a sub-second window cannot round down into the sentinel and turn "expire
     /// quickly" into "never expire".
     idle_timeout_ms: AtomicU64,
+    /// Set once a caller has asked this daemon to exit as soon as nothing
+    /// needs it. The idle monitor then treats the window as zero, so the exit
+    /// still waits on every gate an idle exit waits on.
+    retirement_requested: AtomicBool,
     /// Number of API requests currently being handled.
     pub active_requests: AtomicU64,
     /// Channel for LSP enrichment messages (incremental or sweep).
@@ -3782,32 +4020,31 @@ pub struct DaemonState {
     /// any of that: it records what the sweep DID, which is the only thing a
     /// skip is entitled to act on.
     pub lsp_enriched_files: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Files a sweep owes: their language-server queries failed, so they carry
+    /// no completion marker, and each waits out a backoff before it is asked
+    /// again. Loaded from and persisted to the owed-enrichment record, and
+    /// served on `/lsp/sweep/status` so a reader can name every one.
+    pub(crate) lsp_owed_files: std::sync::Mutex<crate::owed_enrichment::OwedFiles>,
+    /// Set by an explicit sweep request, so the pass it queues asks about owed
+    /// files now instead of honoring their backoff.
+    pub(crate) lsp_retry_owed_now: AtomicBool,
+    /// Files whose accepted language-server evidence could not be written to
+    /// the crash record since the last authority commit. Their relations are
+    /// live and reach authority at the next publication, and a crash before it
+    /// loses them, which is what status says about exactly these files.
+    pub(crate) lsp_evidence_unrecorded: std::sync::Mutex<std::collections::BTreeSet<String>>,
 
-    /// Repo-relative paths this daemon derived entities for that durable
-    /// authority is not known to hold.
+    /// What an earlier build's owed-work records still owe, held from this
+    /// daemon's startup judgment until one of its authority transactions
+    /// carries it into the owed derivation ledger or pays it.
     ///
-    /// Entity derivation is not durable on its own. A tree admission publishes
-    /// an artifact into repository authority the moment the watcher sees the
-    /// write, while the entities the same tick derives live in this graph until
-    /// a commit publishes them, and a daemon that ends first takes them with
-    /// it. What it leaves behind is a file admitted at exactly the bytes on
-    /// disk, so no later watcher event fires for it and the startup catch-up,
-    /// keyed on host modification time since the last complete admission,
-    /// cannot see it either: the admission that recorded the artifact is later
-    /// than the write. The path is then permanently admitted and permanently
-    /// unqueryable (FIR-2606).
-    ///
-    /// This names those paths and nothing else, which is the whole point. The
-    /// first repair written for FIR-2606 asked the graph which admitted source
-    /// paths carried no entity, and on a freshly converted store that is most
-    /// of the working copy at the moment the conversion answers its first
-    /// queries; the acceptance gate caught it and the approach came out. A
-    /// record of what this daemon actually derived cannot make that mistake.
-    ///
-    /// Operational state beside the pid and port files, never semantic
-    /// authority: nothing answers a query from it, and the next daemon checks
-    /// every entry against the graph before acting on it.
-    pub unpublished_enrichment: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// `None` when no such record was found, or once a transaction that
+    /// carried it is durable and the records are gone. Operational state
+    /// beside the pid and port files, never semantic authority: the obligation
+    /// itself is either in authority or still in those records, and this only
+    /// says which transaction is next to carry it.
+    pub(crate) legacy_owed_derivations:
+        std::sync::Mutex<Option<Vec<(kin_model::RepoPath, kin_model::Hash256)>>>,
     /// Repo ID resolved once at construction. Cached to avoid re-reading
     /// `.kin/manifest.json` on every snapshot save — under high host
     /// concurrency those reads contend and surface as opaque "Core error"
@@ -3895,6 +4132,10 @@ pub struct DaemonState {
     /// Each request probes the backend cursor before reusing an entry.
     pub(crate) repo_semantic_views:
         RwLock<HashMap<String, Arc<crate::api::HostedRepositoryMcpView>>>,
+    /// Independent test daemons must not consume each other's cold admission.
+    /// Requests sharing one state still share the same two-slot bound.
+    #[cfg(test)]
+    pub(crate) hosted_repository_hydration_slots_for_test: Arc<tokio::sync::Semaphore>,
     /// Hosted-only locate rankings. The legacy unscoped route never reads this
     /// cache, so it cannot address a hosted ranking even with a forged inner
     /// locate cursor.
@@ -4189,6 +4430,7 @@ impl DaemonState {
             .revalidate_pinned_namespace()
             .map_err(|refusal| DaemonError::Graph(refusal.into_error()))?;
         Ok(GraphOwnedSourceView {
+            #[cfg(test)]
             graph: Arc::clone(&self.graph),
             binding,
         })
@@ -4243,6 +4485,133 @@ impl DaemonState {
             .load(Ordering::SeqCst)
             == 0)
             .then_some(epoch)
+    }
+
+    /// How long one reference read waits for writers to finish, in total.
+    pub(crate) fn xref_writer_drain_ceiling(&self) -> Duration {
+        #[cfg(test)]
+        {
+            let ms = self
+                .graph_authority_clock
+                .drain_ceiling_override_ms
+                .load(Ordering::SeqCst);
+            if ms != 0 {
+                return Duration::from_millis(ms);
+            }
+        }
+        XREF_WRITER_DRAIN_CEILING
+    }
+
+    /// Shorten the reference-read writer wait, so a test that holds a writer
+    /// through a read reaches the refusal without waiting the production 30 s.
+    #[cfg(test)]
+    pub(crate) fn set_xref_writer_drain_ceiling_for_test(&self, ceiling: Duration) {
+        let ms = u64::try_from(ceiling.as_millis())
+            .unwrap_or(u64::MAX)
+            .max(1);
+        self.graph_authority_clock
+            .drain_ceiling_override_ms
+            .store(ms, Ordering::SeqCst);
+    }
+
+    /// Begin the window in which the reconcile loop holds working-copy events
+    /// it has picked up and not yet published or given back.
+    pub(crate) fn begin_pending_admission(&self) -> PendingAdmissionGuard {
+        self.graph_authority_clock
+            .pending_admissions
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |pending| {
+                pending.checked_add(1)
+            })
+            .expect("pending admission count exhausted");
+        PendingAdmissionGuard {
+            clock: Arc::clone(&self.graph_authority_clock),
+        }
+    }
+
+    /// Whether the reconcile loop holds working-copy changes it picked up and
+    /// has not yet published or given back.
+    pub(crate) fn pending_admission_active(&self) -> bool {
+        self.graph_authority_clock
+            .pending_admissions
+            .load(Ordering::SeqCst)
+            != 0
+    }
+
+    /// What keeps a read waiting over `scope` from settling right now, if
+    /// anything.
+    fn read_blocker(&self, scope: SettleScope) -> Option<ReadBlocker> {
+        let clock = &self.graph_authority_clock;
+        if clock.active_writers.load(Ordering::SeqCst) != 0 {
+            Some(ReadBlocker::Writer)
+        } else if scope == SettleScope::WritersAndPendingAdmissions
+            && clock.pending_admissions.load(Ordering::SeqCst) != 0
+        {
+            Some(ReadBlocker::PendingAdmission)
+        } else {
+            None
+        }
+    }
+
+    /// The epoch an answer that claims an absence certifies against: `None`
+    /// while a writer holds graph authority, and while the reconcile loop holds
+    /// working-copy changes it picked up and has not yet published.
+    ///
+    /// The pending check brackets the epoch sample, so a loop that picks up
+    /// changes during the sample is seen by one side of it.
+    pub(crate) fn settled_read_epoch(&self) -> Option<u64> {
+        if self.pending_admission_active() {
+            return None;
+        }
+        let epoch = self.stable_graph_authority_epoch()?;
+        (!self.pending_admission_active()).then_some(epoch)
+    }
+
+    /// Whether `expected`, from [`Self::settled_read_epoch`], still certifies an
+    /// answer that claims an absence: no writer moved the epoch, none holds
+    /// authority, and the reconcile loop has picked up no changes since.
+    ///
+    /// Picking changes up moves no epoch, so the pending check is what catches
+    /// a mark put up after the sample. A mark that has since come down came
+    /// down after a pass whose writer guard moved the epoch, or with a loop the
+    /// supervisor stopped, which publishes nothing more.
+    pub(crate) fn settled_read_epoch_is_current(&self, expected: u64) -> bool {
+        !self.pending_admission_active()
+            && self.graph_authority_epoch_is_current(expected)
+            && !self.pending_admission_active()
+    }
+
+    /// Wait until no graph-authority writer holds authority and, when `scope`
+    /// covers it, the reconcile loop holds no changes it picked up, or until
+    /// `deadline`.
+    ///
+    /// Reference reads wait here: every one for writers, and one holding an
+    /// answer that claims an absence for a pending admission as well. Holds
+    /// nothing while it waits. Each finishing writer and each mark coming down
+    /// wakes it and it re-reads both counts, so overlapping ones are waited out
+    /// together. It cannot miss one that ends between the check and the wait,
+    /// because `Notify::notify_waiters` reaches every waiter registered before
+    /// the call, polled or not, and the waiter is registered before the check.
+    pub(crate) async fn wait_for_graph_authority_drain(
+        &self,
+        deadline: tokio::time::Instant,
+        scope: SettleScope,
+    ) -> GraphAuthorityDrain {
+        let clock = &self.graph_authority_clock;
+        if self.read_blocker(scope).is_none() {
+            return GraphAuthorityDrain::NoWriter;
+        }
+        loop {
+            let drained = clock.drained.notified();
+            if self.read_blocker(scope).is_none() {
+                return GraphAuthorityDrain::Drained;
+            }
+            if tokio::time::timeout_at(deadline, drained).await.is_err() {
+                return match self.read_blocker(scope) {
+                    None => GraphAuthorityDrain::Drained,
+                    Some(blocker) => GraphAuthorityDrain::DeadlinePassed(blocker),
+                };
+            }
+        }
     }
 
     /// Revalidate a reader's epoch, including the fast writer that can begin
@@ -4392,6 +4761,51 @@ impl DaemonState {
             &self.graph,
             observation,
         );
+    }
+
+    /// Add to the workspace snapshot a local open builds its graph from the
+    /// non-entity enrichment records repository authority does not hold.
+    ///
+    /// The `/embed` coverage pass writes shallow, structured and opaque records
+    /// into the served graph only, and the vector sidecar persisted after it is
+    /// stamped with a retrieval authority that covers them. A graph built from
+    /// authority without them never matches that stamp, so every reopen of an
+    /// unchanged store salvaged its sidecar and dropped every artifact vector
+    /// for the next embed pass to serve again. With the records derived first,
+    /// from the tree and the CAS just hydrated, that store loads its sidecar
+    /// exactly and its persisted text index can stay current.
+    ///
+    /// The records go into the snapshot, not through the graph's upserts,
+    /// because each upsert queues its artifact for embedding and an exact
+    /// sidecar load leaves that queue alone. Built from the snapshot, the graph
+    /// holds the records with nothing queued, and resuming embedding queues only
+    /// the artifact keys the installed index lacks.
+    ///
+    /// A failure is logged and the open continues with whatever was derived,
+    /// which leaves a stamped sidecar to the per-key salvage it had before.
+    #[cfg(feature = "embeddings")]
+    fn restore_non_entity_coverage(
+        mut snapshot: kin_db::GraphSnapshot,
+        blobs: &BlobStore,
+    ) -> kin_db::GraphSnapshot {
+        match crate::loop_runner::ensure_non_entity_enrichment_coverage_in_snapshot(
+            &mut snapshot,
+            blobs,
+        ) {
+            Ok(coverage) if coverage.created > 0 || coverage.unreadable > 0 => info!(
+                created = coverage.created,
+                unreadable = coverage.unreadable,
+                "derived the non-entity enrichment records repository authority does not hold"
+            ),
+            Ok(_) => {}
+            Err(error) => warn!(
+                %error,
+                "could not derive the non-entity enrichment records repository authority does \
+                 not hold; a vector sidecar stamped with them is salvaged per key instead of \
+                 loaded exactly"
+            ),
+        }
+        snapshot
     }
 
     /// Load a persisted vector-index sidecar into a graph that was NOT built
@@ -5530,10 +5944,44 @@ impl DaemonState {
         (pinned, failures.refused > 0)
     }
 
+    /// Rebuild `layout` on the fully resolved spelling of its repository root.
+    ///
+    /// The `.kin` directory is re-joined onto the resolved working directory
+    /// rather than resolved itself, so a store reached through its own link
+    /// keeps naming the repository that owns it instead of relocating the
+    /// working directory to wherever the store happens to live.
+    fn resolve_repository_root(layout: KinLayout) -> Result<KinLayout> {
+        let resolved = layout.working_dir().canonicalize().map_err(|source| {
+            DaemonError::IncompatibleRepo(format!(
+                "cannot resolve the repository root {}: {source}",
+                layout.working_dir().display()
+            ))
+        })?;
+        if resolved.as_path() == layout.working_dir() {
+            return Ok(layout);
+        }
+        Ok(KinLayout::new(resolved.join(".kin")))
+    }
+
     /// Open local daemon state with a repository identity already resolved by
     /// the process entrypoint. Local overrides must name the manifest's exact
     /// authority; they cannot rebind one workspace to another repository.
     pub fn open_with_repo_id(layout: KinLayout, explicit_repo_id: Option<&str>) -> Result<Self> {
+        // Resolve the repository root before anything below reads it. `--repo`
+        // carries whatever spelling the caller typed, and a work directory
+        // reached through a symbolic link is ordinary rather than exotic: on
+        // macOS `/tmp` and `/var` are themselves links, so a repository under
+        // either is already in this case before anyone chooses it.
+        //
+        // Startup recovery opens the projection root with `O_NOFOLLOW`, which
+        // is what stops a root being swapped under a running daemon and has to
+        // stay. `O_NOFOLLOW` refuses a link as the final component, so an
+        // unresolved root did not degrade, it took the whole daemon down before
+        // readiness with `Not a directory`. Resolving once here keeps the guard
+        // intact and covers every opener: the binary, the supervisor-spawned
+        // daemon and replica adoption. `kin init` already canonicalizes the same
+        // way, so this makes the serving path agree with the initializing one.
+        let layout = Self::resolve_repository_root(layout)?;
         let mut phases = OpenPhases::begin();
 
         // Layout gate first. A pre-v2 `.kin/` (file/branch-authority era) must
@@ -5720,11 +6168,30 @@ impl DaemonState {
                 }
             }
         };
+        // Required preparation and interrupted projection recovery precede
+        // graph/layout/cache hydration. The old lease cannot name a recovered
+        // publication, so reacquire it only after the recovery barrier.
+        drop(lease);
+        let recovery_binding = kin_core::LocalRepositoryAuthorityBinding::from_parts(
+            repository_id.clone(),
+            workspace_id,
+            Arc::clone(&local_repository_backend),
+        );
+        crate::session_publication::recover_before_hydration(
+            &layout,
+            &recovery_binding,
+            &authority,
+        )?;
+        let lease = authority.read_authority();
         // Prepared-state serves counted before and after the phase below, which
         // is the only way to know that arm ran: the counter lives inside kin-db
         // and a durable prepared artifact answers before the section is
         // consulted at all.
         let prepared_serves_before = authority.prepared_workspace_graph_stats().serves;
+        #[cfg(all(test, unix))]
+        crate::api::tests::session_crash_prefix_test::record_startup_phase(
+            crate::api::tests::session_crash_prefix_test::StartupPhase::Hydration,
+        );
         let workspace_snapshot = phases
             .record("workspace_snapshot", || {
                 lease.workspace_graph_snapshot(&workspace_id)
@@ -5786,6 +6253,32 @@ impl DaemonState {
         let hydrated_source_bodies = phases.record("cas_hydrate", || {
             Self::hydrate_ingest_cas(&authority, &workspace_snapshot.resolved_tree, &blobs)
         })?;
+        // Before the graph exists: the graph built next judges the persisted
+        // text index and validates the vector sidecar against its own
+        // retrieval authority, and a sidecar written after the embed pass was
+        // stamped with these records present.
+        #[cfg(feature = "embeddings")]
+        let mut workspace_snapshot = phases.record("non_entity_coverage", || {
+            Self::restore_non_entity_coverage(workspace_snapshot, &blobs)
+        });
+        #[cfg(feature = "embeddings")]
+        phases.record("source_layout_coverage", || -> Result<()> {
+            let coverage = crate::loop_runner::restore_missing_source_layouts_in_snapshot(
+                &mut workspace_snapshot,
+                &blobs,
+            )?;
+            if coverage.published > 0 || coverage.unreadable > 0 || coverage.stale > 0 {
+                info!(
+                    restored = coverage.published,
+                    unreadable = coverage.unreadable,
+                    stale = coverage.stale,
+                    "restored current source layouts before retrieval sidecar validation"
+                );
+            }
+            Ok(())
+        })?;
+        #[cfg(not(feature = "embeddings"))]
+        phases.skipped("non_entity_coverage");
         let graph = phases
             .record("graph_text_index", || {
                 if locate_only {
@@ -5802,6 +6295,7 @@ impl DaemonState {
             })
             .map(Arc::new)
             .map_err(DaemonError::Graph)?;
+        crate::accepted_enrichment::replay(&layout, graph.as_ref());
         info!(
             repository = %cached_repo_id,
             workspace = %workspace_id,
@@ -5871,6 +6365,7 @@ impl DaemonState {
             reconciler: RwLock::new(reconciler),
             coordinator,
             coordination_gate: tokio::sync::Mutex::new(()),
+            prepared_publication: Arc::new(crate::prepared_publication::ServingFence::default()),
             graph_authority_clock: Arc::new(GraphAuthorityClock::default()),
             coordination_mode: std::sync::RwLock::new(
                 kin_mcp::CoordinationEnforcementMode::from_env(),
@@ -5893,7 +6388,7 @@ impl DaemonState {
             projection_authority: crate::api::ProjectionAuthorityCache::default(),
             registered_local_repository_authorities,
             registered_local_repository_authority_incomplete,
-            spine_disabled,
+            spine_disabled: AtomicBool::new(spine_disabled),
             eager_sibling_bound: Self::eager_sibling_load_bound(),
             sibling_capture: std::sync::OnceLock::new(),
             filesystem_reconcile_disabled: AtomicBool::new(
@@ -5908,6 +6403,8 @@ impl DaemonState {
             mcp_fail_after_authority_once: AtomicBool::new(false),
             #[cfg(test)]
             mcp_lifecycle_persist_fail_once: AtomicU8::new(0),
+            #[cfg(test)]
+            readmission_index_failure: Mutex::new(None),
             inflight_mcp_commits: Default::default(),
             mcp_mutate_requests: Default::default(),
             #[cfg(test)]
@@ -5945,6 +6442,8 @@ impl DaemonState {
             hosted_spine_refresh_wake: Arc::new(tokio::sync::Notify::new()),
             hosted_spine_authority_pass_seq: AtomicU64::new(0),
             hosted_spine_authority_applied_seq: AtomicU64::new(0),
+            hosted_spine_cache_replacements: AtomicU64::new(0),
+            hosted_spine_cost: crate::hosted_spine_cost::HostedSpineCost::default(),
             #[cfg(test)]
             hosted_in_memory_spine_allowed: AtomicBool::new(false),
             #[cfg(test)]
@@ -5957,7 +6456,7 @@ impl DaemonState {
             spine_initialization_test_hook: Mutex::new(None),
             #[cfg(all(test, feature = "embeddings"))]
             vector_checkpoint_reopen_test_hook: Mutex::new(None),
-            spine_refresh_gate: tokio::sync::RwLock::new(()),
+            spine_refresh_gate: crate::hosted_spine_cost::SpineRefreshGate::default(),
             spine_gate_read_wait_micros: std::sync::atomic::AtomicU64::new(0),
             repo_graphs: RwLock::new(HashMap::new()),
             repo_graph_load_gates: hosted_repo_reload_gates(),
@@ -5971,6 +6470,7 @@ impl DaemonState {
             embed_batch_size: AtomicUsize::new(0),
             graph_status_settled: crate::api::GraphStatusSettledCache::default(),
             xref_settled: crate::api::XrefSettledHead::default(),
+            xref_graph_cache: crate::api::XrefHeadGraphCache::default(),
             graph_status_live_sample_failures: AtomicU64::new(0),
             persist_lock: Mutex::new(()),
             #[cfg(feature = "embeddings")]
@@ -5985,6 +6485,7 @@ impl DaemonState {
             background_embed_paused: AtomicBool::new(false),
             last_activity_ms: AtomicU64::new(0),
             idle_timeout_ms: AtomicU64::new(0),
+            retirement_requested: AtomicBool::new(false),
             active_requests: AtomicU64::new(0),
             lsp_enrichment_tx: None,
             lsp_enrichment_enabled: false,
@@ -5998,7 +6499,10 @@ impl DaemonState {
             lsp_sweep_pending: AtomicBool::new(false),
             lsp_enriched_marker_epoch: AtomicU64::new(0),
             lsp_enriched_files: std::sync::Mutex::new(std::collections::HashSet::new()),
-            unpublished_enrichment: std::sync::Mutex::new(std::collections::HashSet::new()),
+            lsp_owed_files: std::sync::Mutex::new(Default::default()),
+            lsp_retry_owed_now: AtomicBool::new(false),
+            lsp_evidence_unrecorded: std::sync::Mutex::new(Default::default()),
+            legacy_owed_derivations: std::sync::Mutex::new(None),
             cached_repo_id,
             cached_workspace_id: Some(workspace_id),
             is_shutdown: AtomicBool::new(false),
@@ -6015,6 +6519,8 @@ impl DaemonState {
             locate_rankings: Mutex::new(HashMap::new()),
             semantic_locate_pages: Mutex::new(HashMap::new()),
             repo_semantic_views: RwLock::new(HashMap::new()),
+            #[cfg(test)]
+            hosted_repository_hydration_slots_for_test: Arc::new(tokio::sync::Semaphore::new(2)),
             repo_semantic_locate_rankings: Mutex::new(HashMap::new()),
             repo_semantic_instance_id: uuid::Uuid::new_v4(),
             repo_semantic_cursor_secret: new_repo_semantic_cursor_secret(),
@@ -6229,6 +6735,8 @@ impl DaemonState {
             }
         };
 
+        crate::accepted_enrichment::replay(&layout, graph.as_ref());
+
         let blobs = BlobStore::new(layout.ingest_cas_dir()).map_err(DaemonError::from)?;
         let backend: Arc<dyn StorageBackend> = Arc::from(backend);
         // Rehydrating the derived CAS on every open is what makes it safe to
@@ -6290,6 +6798,7 @@ impl DaemonState {
             reconciler: RwLock::new(reconciler),
             coordinator,
             coordination_gate: tokio::sync::Mutex::new(()),
+            prepared_publication: Arc::new(crate::prepared_publication::ServingFence::default()),
             graph_authority_clock: Arc::new(GraphAuthorityClock::default()),
             coordination_mode: std::sync::RwLock::new(
                 kin_mcp::CoordinationEnforcementMode::from_env(),
@@ -6312,7 +6821,7 @@ impl DaemonState {
             projection_authority: crate::api::ProjectionAuthorityCache::default(),
             registered_local_repository_authorities: Vec::new(),
             registered_local_repository_authority_incomplete: false,
-            spine_disabled,
+            spine_disabled: AtomicBool::new(spine_disabled),
             eager_sibling_bound: Self::eager_sibling_load_bound(),
             sibling_capture: std::sync::OnceLock::new(),
             filesystem_reconcile_disabled: AtomicBool::new(
@@ -6327,6 +6836,8 @@ impl DaemonState {
             mcp_fail_after_authority_once: AtomicBool::new(false),
             #[cfg(test)]
             mcp_lifecycle_persist_fail_once: AtomicU8::new(0),
+            #[cfg(test)]
+            readmission_index_failure: Mutex::new(None),
             inflight_mcp_commits: Default::default(),
             mcp_mutate_requests: Default::default(),
             #[cfg(test)]
@@ -6364,6 +6875,8 @@ impl DaemonState {
             hosted_spine_refresh_wake: Arc::new(tokio::sync::Notify::new()),
             hosted_spine_authority_pass_seq: AtomicU64::new(0),
             hosted_spine_authority_applied_seq: AtomicU64::new(0),
+            hosted_spine_cache_replacements: AtomicU64::new(0),
+            hosted_spine_cost: crate::hosted_spine_cost::HostedSpineCost::default(),
             #[cfg(test)]
             hosted_in_memory_spine_allowed: AtomicBool::new(false),
             #[cfg(test)]
@@ -6376,7 +6889,7 @@ impl DaemonState {
             spine_initialization_test_hook: Mutex::new(None),
             #[cfg(all(test, feature = "embeddings"))]
             vector_checkpoint_reopen_test_hook: Mutex::new(None),
-            spine_refresh_gate: tokio::sync::RwLock::new(()),
+            spine_refresh_gate: crate::hosted_spine_cost::SpineRefreshGate::default(),
             spine_gate_read_wait_micros: std::sync::atomic::AtomicU64::new(0),
             repo_graphs: RwLock::new(HashMap::new()), // populated below
             repo_graph_load_gates: hosted_repo_reload_gates(),
@@ -6390,6 +6903,7 @@ impl DaemonState {
             embed_batch_size: AtomicUsize::new(0),
             graph_status_settled: crate::api::GraphStatusSettledCache::default(),
             xref_settled: crate::api::XrefSettledHead::default(),
+            xref_graph_cache: crate::api::XrefHeadGraphCache::default(),
             graph_status_live_sample_failures: AtomicU64::new(0),
             persist_lock: Mutex::new(()),
             #[cfg(feature = "embeddings")]
@@ -6404,6 +6918,7 @@ impl DaemonState {
             background_embed_paused: AtomicBool::new(false),
             last_activity_ms: AtomicU64::new(0),
             idle_timeout_ms: AtomicU64::new(0),
+            retirement_requested: AtomicBool::new(false),
             active_requests: AtomicU64::new(0),
             lsp_enrichment_tx: None,
             lsp_enrichment_enabled: false,
@@ -6417,7 +6932,10 @@ impl DaemonState {
             lsp_sweep_pending: AtomicBool::new(false),
             lsp_enriched_marker_epoch: AtomicU64::new(0),
             lsp_enriched_files: std::sync::Mutex::new(std::collections::HashSet::new()),
-            unpublished_enrichment: std::sync::Mutex::new(std::collections::HashSet::new()),
+            lsp_owed_files: std::sync::Mutex::new(Default::default()),
+            lsp_retry_owed_now: AtomicBool::new(false),
+            lsp_evidence_unrecorded: std::sync::Mutex::new(Default::default()),
+            legacy_owed_derivations: std::sync::Mutex::new(None),
             cached_repo_id: repo_id.to_string(),
             cached_workspace_id: None,
             is_shutdown: AtomicBool::new(false),
@@ -6434,6 +6952,8 @@ impl DaemonState {
             locate_rankings: Mutex::new(HashMap::new()),
             semantic_locate_pages: Mutex::new(HashMap::new()),
             repo_semantic_views: RwLock::new(HashMap::new()),
+            #[cfg(test)]
+            hosted_repository_hydration_slots_for_test: Arc::new(tokio::sync::Semaphore::new(2)),
             repo_semantic_locate_rankings: Mutex::new(HashMap::new()),
             repo_semantic_instance_id: uuid::Uuid::new_v4(),
             repo_semantic_cursor_secret: new_repo_semantic_cursor_secret(),
@@ -6589,6 +7109,56 @@ impl DaemonState {
             } => Err(format!(
                 "hosted Firestore spine fleet-fence CAS lost: attempted fence {attempted_rollout_fence}, observed {observed:?}"
             )),
+        }
+    }
+
+    /// Bring the hosted spine up at process start, after the state is open:
+    /// the pending startup rollout when this is the fleet's first boot,
+    /// otherwise adoption of the completed rollout, unless `KIN_DISABLE_SPINE`
+    /// switched the spine off.
+    ///
+    /// `kin-daemon` calls exactly this, so a test drives the same startup path
+    /// a restarted pod takes. Under the switch a restart used to adopt anyway:
+    /// production logged one full pass, 41,496 entities and 1,489 edges read
+    /// from Firestore, on every restart with the spine off. It now reads
+    /// nothing. A startup that owns a rollout, the fleet's first boot or the
+    /// image the promotion authorized next, still runs it under the switch,
+    /// because `admit_reader` needs the spine evidence the rollout writes and
+    /// nothing is served before a reader is admitted. It runs it without a
+    /// full pass; see `prove_hosted_spine_transition`.
+    #[doc(hidden)]
+    pub async fn start_hosted_spine_after_open(
+        &self,
+        control: &Arc<crate::publication_lease::PublicationControl>,
+        bootstrap: Option<crate::publication_lease::ActivePublicationLease>,
+        legacy_writer_drain_proof_sha256: Option<String>,
+    ) -> std::result::Result<(), String> {
+        if let Some(pending) = bootstrap {
+            return self
+                .complete_hosted_startup_rollout(control, pending, legacy_writer_drain_proof_sha256)
+                .await;
+        }
+        if self.spine_disabled() {
+            // Said once, here, instead of a retry warning on every tick of a
+            // cadence that no longer starts under the switch.
+            info!(
+                "hosted spine is switched off by KIN_DISABLE_SPINE: this restart does not adopt \
+                 it and reads nothing from Firestore; readiness does not consult it and spine \
+                 reads refuse until it is switched back on"
+            );
+            return Ok(());
+        }
+        match control.runtime_spine_authority() {
+            Ok(crate::publication_lease::RuntimeSpineAuthority::Completed(evidence)) => {
+                self.adopt_hosted_spine_rollout_fence(evidence).await
+            }
+            Ok(crate::publication_lease::RuntimeSpineAuthority::RolloutActive(blocking)) => {
+                Err(format!(
+                    "a hosted {blocking}; semantic readiness stays closed while the authenticated \
+                     publication-control API resumes or replaces it"
+                ))
+            }
+            Err(error) => Err(error.to_string()),
         }
     }
 
@@ -6752,8 +7322,41 @@ impl DaemonState {
         publication
             .reassert_before_mutation()
             .map_err(|error| error.to_string())?;
-        without_blocking_runtime_worker(|| self.refresh_hosted_spine_authority(spine))?;
+        self.prove_hosted_spine_transition(spine, "prepare")?;
         Ok(evidence)
+    }
+
+    /// The full pass an authority transition runs before it admits a reader
+    /// or releases a rollout: hydrate every committed row, then prove the
+    /// fleet from them.
+    ///
+    /// Under `KIN_DISABLE_SPINE` it runs none and reads nothing. The proof
+    /// exists so spine reads can be answered, and while the switch is on no
+    /// spine read is answered and no spine publication is admitted outside a
+    /// live rollout. The restart that switches the spine back on adopts the
+    /// completed rollout with one full pass, before it answers any. So a
+    /// rollout under the switch still advances the fence, publishes the fleet
+    /// and checks the fence evidence at every step, but costs no pass, and
+    /// release stays available to clear a lease a failed rollout left behind.
+    fn prove_hosted_spine_transition(
+        &self,
+        spine: &dyn kin_spine::SpineBackend,
+        step: &'static str,
+    ) -> std::result::Result<(), String> {
+        if self.spine_disabled() {
+            info!(
+                step,
+                "hosted spine is switched off by KIN_DISABLE_SPINE: this rollout step runs no \
+                 full pass; the restart that switches the spine back on proves it"
+            );
+            return Ok(());
+        }
+        without_blocking_runtime_worker(|| {
+            self.refresh_hosted_spine_authority(
+                spine,
+                crate::hosted_spine_cost::HostedSpinePassTrigger::Transition,
+            )
+        })
     }
 
     /// Seed a restarted process only from completed GCS reader evidence, then
@@ -6766,6 +7369,15 @@ impl DaemonState {
     ) -> std::result::Result<(), String> {
         if self.storage_backend.is_none() {
             return Err("cannot adopt hosted spine evidence on a local daemon".to_string());
+        }
+        // Adopting hydrates every committed row from Firestore, so a restart
+        // under `KIN_DISABLE_SPINE` must not: nothing may read the spine it
+        // would prove. Refused before the gate and before any durable read.
+        // A rollout that admits a new image still runs under the switch,
+        // because `admit_reader` needs the spine evidence it writes; it
+        // publishes under its live rollout lease and runs no full pass.
+        if self.spine_disabled() {
+            return Err(self.spine_unavailable_reason());
         }
         let _publication_gate = self.spine_refresh_gate.write().await;
         let (expected_scope, fleet) = self.hosted_spine_contract()?;
@@ -6790,9 +7402,12 @@ impl DaemonState {
             .hosted_spine_authority_proof
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-        if let Err(error) =
-            without_blocking_runtime_worker(|| self.refresh_hosted_spine_authority(spine))
-        {
+        if let Err(error) = without_blocking_runtime_worker(|| {
+            self.refresh_hosted_spine_authority(
+                spine,
+                crate::hosted_spine_cost::HostedSpinePassTrigger::Transition,
+            )
+        }) {
             *self
                 .hosted_spine_expected_rollout_fence
                 .lock()
@@ -6854,9 +7469,7 @@ impl DaemonState {
             .hosted_spine_authority_proof
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-        if let Err(error) =
-            without_blocking_runtime_worker(|| self.refresh_hosted_spine_authority(spine))
-        {
+        if let Err(error) = self.prove_hosted_spine_transition(spine, "admit") {
             *self
                 .hosted_spine_expected_rollout_fence
                 .lock()
@@ -6902,7 +7515,7 @@ impl DaemonState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(evidence);
         let spine = self.ensure_hosted_spine_backend_constructed()?;
-        without_blocking_runtime_worker(|| self.refresh_hosted_spine_authority(spine))?;
+        self.prove_hosted_spine_transition(spine, "release")?;
         control
             .assert_rollout_lease(&request.lease)
             .map_err(|error| format!("rollout moved during release proof: {error}"))?;
@@ -7021,23 +7634,173 @@ impl DaemonState {
         Err("hosted spine rollout fence or GCS source cursors did not stabilize after three authority-proof attempts".to_string())
     }
 
+    /// Run one full authority pass: hydrate the whole committed cache from the
+    /// durable store, then prove the fleet by double collection.
+    ///
+    /// This is the expensive path, about 43,000 billable Firestore reads on
+    /// the five-repository hosted fleet, and it runs unconditionally here.
+    /// Every caller other than an authority transition reaches it through the
+    /// pass limiter (`ensure_spine_as`); transitions hold the publication
+    /// write gate for the control plane and are counted but never refused.
     fn refresh_hosted_spine_authority(
         &self,
         spine: &dyn kin_spine::SpineBackend,
+        trigger: crate::hosted_spine_cost::HostedSpinePassTrigger,
     ) -> std::result::Result<(), String> {
+        self.refresh_hosted_spine_authority_detailed(spine, trigger)
+            .map_err(|failure| failure.reason)
+    }
+
+    /// [`Self::refresh_hosted_spine_authority`], saying whether a failure
+    /// happened before any committed row was read, which the pass limiter
+    /// schedules differently: a refusal that cost a head listing is retried
+    /// at the retry floor, a failure that cost a hydration backs off.
+    fn refresh_hosted_spine_authority_detailed(
+        &self,
+        spine: &dyn kin_spine::SpineBackend,
+        trigger: crate::hosted_spine_cost::HostedSpinePassTrigger,
+    ) -> std::result::Result<(), HostedSpinePassFailure> {
+        let previous_failure = self.hosted_spine_cost.limiter.last_failure();
+        let started = Instant::now();
+        let reads_before = spine.durable_read_stats();
+        let outcome = self.run_hosted_spine_authority_pass(spine);
+        let reads_after = spine.durable_read_stats();
+        let pass_reads = reads_before
+            .zip(reads_after)
+            .map(|(before, after)| after.since(before).document_reads);
+        let elapsed = started.elapsed();
+        match &outcome {
+            Err(failure) if !failure.hydrated => {
+                self.hosted_spine_cost
+                    .counters
+                    .record_refused_before_hydration();
+                // Retried every 15 s while the fleet cannot prove, so said at
+                // info only when the reason changes.
+                if previous_failure.as_deref() == Some(failure.reason.as_str()) {
+                    debug!(
+                        trigger = trigger.as_str(),
+                        reason = %failure.reason,
+                        firestore_document_reads = pass_reads,
+                        "hosted spine authority pass refused before hydrating"
+                    );
+                } else {
+                    info!(
+                        trigger = trigger.as_str(),
+                        reason = %failure.reason,
+                        firestore_document_reads = pass_reads,
+                        "hosted spine authority pass refused before hydrating"
+                    );
+                }
+            }
+            _ => {
+                self.hosted_spine_cost.counters.record_full_pass(
+                    trigger,
+                    outcome.is_ok(),
+                    elapsed,
+                    pass_reads,
+                    self.hosted_spine_cost.clock.now(),
+                );
+                info!(
+                    trigger = trigger.as_str(),
+                    succeeded = outcome.is_ok(),
+                    duration_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+                    firestore_document_reads = pass_reads,
+                    firestore_document_reads_total = reads_after.map(|stats| stats.document_reads),
+                    full_passes_total = self.hosted_spine_cost.counters.full_passes(),
+                    "hosted spine authority full pass finished"
+                );
+            }
+        }
+        if trigger == crate::hosted_spine_cost::HostedSpinePassTrigger::Transition {
+            self.hosted_spine_cost
+                .limiter
+                .record_transition(outcome.is_ok());
+        }
+        outcome
+    }
+
+    /// Refuse a full pass before it reads a single committed row when durable
+    /// identity already shows it cannot prove: a repository with no committed
+    /// head, or whose GCS source cursor is not the cursor its committed head
+    /// was published at.
+    ///
+    /// Every such pass used to hydrate first, about 43,000 reads on the hosted
+    /// fleet, and fail in validation, so a source that ran ahead of its head
+    /// paid a hydration on every retry. This is one head listing and one cursor
+    /// probe per repository. It is a necessary condition only; the full proof
+    /// still decides.
+    fn hosted_spine_fleet_is_provable(
+        &self,
+        spine: &dyn kin_spine::SpineBackend,
+    ) -> std::result::Result<(), String> {
+        let (_, fleet) = self.hosted_spine_contract()?;
+        let heads = self.committed_head_identities(spine)?;
+        let cursors = self.probe_fleet_publication_cursors(&fleet)?;
+        for repo_id in &fleet {
+            let Some((head, _)) = heads.get(repo_id) else {
+                return Err(format!(
+                    "repo {repo_id} has no committed durable spine head, so a full pass cannot \
+                     prove the fleet until it is published"
+                ));
+            };
+            let Some(cursor) = cursors.get(repo_id) else {
+                return Err(format!(
+                    "repo {repo_id} was not probed for its source cursor"
+                ));
+            };
+            if head.source_cursor != *cursor {
+                return Err(format!(
+                    "repo {repo_id} source publication is at {cursor:?} but its committed spine \
+                     head was published at {:?}, so a full pass cannot prove it until the head \
+                     is republished",
+                    head.source_cursor
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn run_hosted_spine_authority_pass(
+        &self,
+        spine: &dyn kin_spine::SpineBackend,
+    ) -> std::result::Result<(), HostedSpinePassFailure> {
         #[cfg(test)]
         self.spine_backend_hydrations.fetch_add(1, Ordering::SeqCst);
         let ticket = self
             .hosted_spine_authority_pass_seq
             .fetch_add(1, Ordering::SeqCst)
             + 1;
-        let refreshed = spine
-            .refresh_committed_publications()
-            .map_err(|error| format!("refresh committed hosted spine heads: {error}"))
-            // Always rebuild the proof through the real double-collect path. A
-            // cached single-pass shortcut can accept an A-out/B-in fleet vector
-            // that never existed at one instant.
-            .and_then(|()| self.validate_hosted_spine_authority(spine));
+        // Everything a pass can refuse on before it reads a committed row:
+        // no hosted contract, no admitted evidence, or durable identity that
+        // already shows the fleet cannot prove. A pass that would fail for
+        // one of those must not read every committed row to find that out.
+        let refreshed = self
+            .hosted_spine_contract()
+            .and_then(|_| self.expected_hosted_spine_rollout_fence())
+            .and_then(|_| self.hosted_spine_fleet_is_provable(spine))
+            .map_err(HostedSpinePassFailure::before_hydration)
+            .and_then(|()| {
+                // Before and after: a verdict taken before the replacement
+                // began, or while it ran, no longer answers once it returns.
+                self.hosted_spine_cache_replacements
+                    .fetch_add(1, Ordering::SeqCst);
+                let hydrated = spine.refresh_committed_publications();
+                self.hosted_spine_cache_replacements
+                    .fetch_add(1, Ordering::SeqCst);
+                hydrated
+                    .map_err(|error| {
+                        HostedSpinePassFailure::after_hydration(format!(
+                            "refresh committed hosted spine heads: {error}"
+                        ))
+                    })
+                    // Always rebuild the proof through the real double-collect
+                    // path. A cached single-pass shortcut can accept an
+                    // A-out/B-in fleet vector that never existed at one instant.
+                    .and_then(|()| {
+                        self.validate_hosted_spine_authority(spine)
+                            .map_err(HostedSpinePassFailure::after_hydration)
+                    })
+            });
         // A FAILED pass clears the proof. Leaving the previous one installed
         // is how a process that has already determined its authority is
         // invalid goes on certifying reads from it: the caller records the
@@ -7068,11 +7831,11 @@ impl DaemonState {
                 }
                 Ok(())
             }
-            Err(error) => {
+            Err(failure) => {
                 if !stale {
                     *cached = None;
                 }
-                Err(error)
+                Err(failure)
             }
         }
     }
@@ -7128,7 +7891,7 @@ impl DaemonState {
         // through `ensure_hosted_spine_backend_constructed` and not through
         // here, and a restart is what constructs primary authority from the
         // fenced generation.
-        if self.spine_disabled
+        if self.spine_disabled()
             || self.hosted_restart_required()
             || self.hosted_persistent_spine_blocked()
         {
@@ -7165,6 +7928,10 @@ impl DaemonState {
         let spine = match self.ensure_spine_under_publication(&mut publication) {
             Ok(spine) => spine,
             Err(error) => {
+                *self
+                    .spine_initialization_failure
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error.to_string());
                 warn!(%error, "spine publication refused before an external mutation");
                 return None;
             }
@@ -7180,7 +7947,15 @@ impl DaemonState {
         &self,
         publication: &mut HostedPublicationGuard,
     ) -> Result<Option<&dyn kin_spine::SpineBackend>> {
-        if self.spine_disabled {
+        // A spine switched off with `KIN_DISABLE_SPINE` refuses publication,
+        // with one exception: the live rollout that admits a reader.
+        // `admit_reader` needs the Firestore spine evidence that rollout
+        // writes, so refusing it here leaves a first boot, or a new daemon
+        // image, unable to be admitted while the switch is on, and nothing is
+        // served without an admitted reader. The exception is exact: a guard
+        // carrying a rollout proof that publication control asserts as the
+        // live rollout now. Every other publication still refuses.
+        if self.spine_disabled() && !publication.holds_live_rollout() {
             return Ok(None);
         }
         if self.spine.get().is_none() {
@@ -7299,21 +8074,99 @@ impl DaemonState {
     /// Lazily initialize the spine and return only a reader-ready authority.
     /// Hosted readers refresh committed Firestore heads, prove the exact fleet
     /// fence, and bind every installed root to the current GCS source cursor.
+    ///
+    /// On a hosted daemon that is a full pass, so this is rate limited: it
+    /// refuses, returning `None` with the reason recorded, when another pass
+    /// is running or the last one finished too recently. An async caller that
+    /// would rather wait for a running pass takes
+    /// [`Self::reprove_hosted_spine_authority`] instead.
     pub fn ensure_spine(&self) -> Option<&dyn kin_spine::SpineBackend> {
-        let spine = self.ensure_spine_initialized()?;
+        self.ensure_spine_as(
+            crate::hosted_spine_cost::HostedSpinePassTrigger::Direct,
+            None,
+        )
+    }
+
+    /// Whether a full hosted pass on this state goes through the pass limiter:
+    /// a hosted backend that refreshes from its durable store.
+    fn hosted_spine_passes_limited(&self) -> bool {
         #[cfg(test)]
         if self.hosted_in_memory_spine_allowed.load(Ordering::SeqCst) {
+            return false;
+        }
+        self.storage_backend.is_some()
+    }
+
+    fn record_spine_unavailable(&self, reason: String) {
+        *self
+            .spine_initialization_failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(reason);
+    }
+
+    /// [`Self::ensure_spine`], for a caller that may already hold the limiter's
+    /// admission for the pass.
+    fn ensure_spine_as(
+        &self,
+        trigger: crate::hosted_spine_cost::HostedSpinePassTrigger,
+        admitted: Option<crate::hosted_spine_cost::HostedSpinePassLease<'_>>,
+    ) -> Option<&dyn kin_spine::SpineBackend> {
+        let Some(spine) = self.ensure_spine_initialized() else {
+            if let Some(lease) = admitted {
+                // Refused before construction, so before any durable read.
+                lease.finish(
+                    crate::hosted_spine_cost::HostedSpinePassEnd::RefusedBeforeHydration(
+                        self.spine_unavailable_reason(),
+                    ),
+                );
+            }
+            return None;
+        };
+        #[cfg(test)]
+        if self.hosted_in_memory_spine_allowed.load(Ordering::SeqCst) {
+            if let Some(lease) = admitted {
+                lease.finish(crate::hosted_spine_cost::HostedSpinePassEnd::Proved);
+            }
             return Some(spine);
         }
         if self.storage_backend.is_some() {
-            if let Err(error) =
-                without_blocking_runtime_worker(|| self.refresh_hosted_spine_authority(spine))
-            {
-                *self
-                    .spine_initialization_failure
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error.clone());
-                warn!(error = %error, "hosted spine reader readiness failed closed");
+            use crate::hosted_spine_cost::HostedSpinePassAdmission;
+            let lease = match admitted {
+                Some(lease) => lease,
+                None => match self.hosted_spine_cost.admit(trigger) {
+                    HostedSpinePassAdmission::Lead(lease) => lease,
+                    HostedSpinePassAdmission::InFlight(_) => {
+                        // A synchronous caller cannot wait for it, so this is
+                        // a refusal, not a shared pass.
+                        self.hosted_spine_cost.counters.record_deferred();
+                        self.record_spine_unavailable(
+                            "a hosted spine authority pass is already running; this caller does \
+                             not start a second one"
+                                .to_string(),
+                        );
+                        return None;
+                    }
+                    HostedSpinePassAdmission::Deferred(deferral) => {
+                        self.hosted_spine_cost.counters.record_deferred();
+                        self.record_spine_unavailable(deferral.reason());
+                        return None;
+                    }
+                },
+            };
+            let refreshed = without_blocking_runtime_worker(|| {
+                self.refresh_hosted_spine_authority_detailed(spine, trigger)
+            });
+            lease.finish(match &refreshed {
+                Ok(()) => crate::hosted_spine_cost::HostedSpinePassEnd::Proved,
+                Err(failure) => failure.pass_end(),
+            });
+            if let Err(failure) = refreshed {
+                // A refusal before hydrating was already logged by the pass,
+                // once per reason; a hydration that failed is worth a warning.
+                if failure.hydrated {
+                    warn!(error = %failure.reason, "hosted spine reader readiness failed closed");
+                }
+                self.record_spine_unavailable(failure.reason);
                 return None;
             }
         } else {
@@ -7334,6 +8187,66 @@ impl DaemonState {
         Some(spine)
     }
 
+    /// Ask the pass limiter for one full hosted authority pass and take what
+    /// it allows: run the pass, wait for the one already running, or refuse
+    /// as too soon.
+    ///
+    /// Call with the publication read gate held. Every caller that waits here
+    /// holds it too and the running pass needs nothing they hold, so a queued
+    /// writer waits for all of them rather than for each other.
+    pub(crate) async fn reprove_hosted_spine_authority(
+        &self,
+        trigger: crate::hosted_spine_cost::HostedSpinePassTrigger,
+    ) -> HostedSpineReproof<'_> {
+        use crate::hosted_spine_cost::HostedSpinePassAdmission;
+        match self.hosted_spine_cost.admit(trigger) {
+            HostedSpinePassAdmission::Lead(lease) => {
+                HostedSpineReproof::Led(self.ensure_spine_as(trigger, Some(lease)))
+            }
+            HostedSpinePassAdmission::InFlight(waiter) => {
+                self.hosted_spine_cost.counters.record_shared();
+                waiter.wait().await;
+                HostedSpineReproof::Shared
+            }
+            HostedSpinePassAdmission::Deferred(deferral) => {
+                self.hosted_spine_cost.counters.record_deferred();
+                debug!(
+                    trigger = trigger.as_str(),
+                    retry_in_ms = u64::try_from(deferral.retry_in.as_millis()).unwrap_or(u64::MAX),
+                    "hosted spine full pass deferred by the rate limit"
+                );
+                self.record_spine_unavailable(deferral.reason());
+                HostedSpineReproof::Deferred
+            }
+        }
+    }
+
+    /// Re-establish authority for one semantic read whose per-request check
+    /// found no usable proof. A read that joins a pass another caller ran
+    /// re-checks identity afterwards rather than trust a pass that began
+    /// before it arrived.
+    async fn reprove_spine_for_read(&self) -> Option<&dyn kin_spine::SpineBackend> {
+        if !self.hosted_spine_passes_limited() {
+            return self.ensure_spine();
+        }
+        if self.spine_disabled() {
+            return None;
+        }
+        match self
+            .reprove_hosted_spine_authority(
+                crate::hosted_spine_cost::HostedSpinePassTrigger::Request,
+            )
+            .await
+        {
+            HostedSpineReproof::Led(answer) => answer,
+            HostedSpineReproof::Shared => match self.cached_spine_read_authority().await {
+                CachedReadAuthority::Proved(backend) => Some(backend),
+                CachedReadAuthority::Refuse | CachedReadAuthority::Reprove => None,
+            },
+            HostedSpineReproof::Deferred => None,
+        }
+    }
+
     /// Whether this read can be answered from the authority proof this process
     /// already holds, without re-establishing it.
     ///
@@ -7349,12 +8262,19 @@ impl DaemonState {
     /// this daemon held 1489 of them.
     ///
     /// So a query answers the way a readiness probe does, from the proof the
-    /// publication, rollout and background passes establish. The reuse is
-    /// conditional on identity and never on age:
-    /// [`Self::assert_cached_hosted_spine_authority`] re-proves every
-    /// repository's committed head and source cursor on every call, so a
-    /// superseded generation is refused here rather than served.
-    fn cached_spine_read_authority(&self) -> CachedReadAuthority<'_> {
+    /// publication, rollout and background passes establish, and it re-proves
+    /// every repository's committed head and source cursor against it through
+    /// [`Self::assert_cached_hosted_spine_authority`].
+    ///
+    /// That re-proof is 2 + 2N billable Firestore reads, and it ran on every
+    /// request, so the read path's cost grew with the request rate. It is now
+    /// shared: concurrent reads wait for one check, and a check answers the
+    /// reads that follow for `QUERY_VERDICT_TTL`, 5 s, provided nothing local
+    /// changed the proof, the admitted evidence or the publication gate. The
+    /// GCS admission and runtime authority are still re-read on every call, so
+    /// a superseded generation is refused within 5 s and a lost admission or an
+    /// active rollout at once.
+    async fn cached_spine_read_authority(&self) -> CachedReadAuthority<'_> {
         #[cfg(test)]
         if self.hosted_in_memory_spine_allowed.load(Ordering::SeqCst) {
             return CachedReadAuthority::Reprove;
@@ -7385,7 +8305,13 @@ impl DaemonState {
         let Ok(backend) = self.initialized_spine_backend() else {
             return CachedReadAuthority::Reprove;
         };
-        match self.assert_cached_hosted_spine_authority(backend) {
+        match self
+            .hosted_spine_authority_verdict(
+                backend,
+                crate::hosted_spine_cost::HostedSpineVerdictUse::Query,
+            )
+            .await
+        {
             Ok(()) => CachedReadAuthority::Proved(backend),
             Err(refusal) if refusal.superseded => CachedReadAuthority::Reprove,
             Err(refusal) => {
@@ -7406,6 +8332,13 @@ impl DaemonState {
     /// read. Hosted and local writers use the same gate, so the proof cannot be
     /// invalidated in the gap between readiness and response construction.
     pub(crate) async fn acquire_spine_read_authority(&self) -> Option<SpineAuthorityReadGuard<'_>> {
+        // A spine switched off with `KIN_DISABLE_SPINE` answers no read, even
+        // when a proof exists from a rollout that ran under the switch, and
+        // reads nothing durable to say so.
+        if self.spine_disabled() {
+            self.record_spine_unavailable(self.spine_unavailable_reason());
+            return None;
+        }
         let gate_started = Instant::now();
         let publication_gate = self.spine_refresh_gate.read().await;
         self.spine_gate_read_wait_micros.store(
@@ -7427,10 +8360,15 @@ impl DaemonState {
         }
         // The gate and the admission assert above are unchanged and still run
         // first, so nothing below can answer for a reader that is not admitted.
-        let backend = match self.cached_spine_read_authority() {
+        //
+        // A read that finds no usable proof used to run the full pass inline,
+        // every time, so a burst of reads against a superseded proof ran one
+        // hydration each. It goes through the pass limiter now: one pass at a
+        // time, shared by every read that arrives while it runs.
+        let backend = match self.cached_spine_read_authority().await {
             CachedReadAuthority::Proved(backend) => backend,
             CachedReadAuthority::Refuse => return None,
-            CachedReadAuthority::Reprove => self.ensure_spine()?,
+            CachedReadAuthority::Reprove => self.reprove_spine_for_read().await?,
         };
         Some(SpineAuthorityReadGuard {
             backend,
@@ -7570,6 +8508,32 @@ impl DaemonState {
         ))
     }
 
+    /// The GCS half of the control-plane authority: this reader's durable
+    /// admission and the completed runtime spine authority, from the
+    /// publication-control record. No Firestore read.
+    fn read_hosted_durable_evidence(
+        &self,
+        control: &crate::publication_lease::PublicationControl,
+    ) -> std::result::Result<kin_spine::SpineRolloutFenceEvidence, CachedAuthorityRefusal> {
+        control
+            .assert_runtime_admitted(kin_db::GraphSnapshot::CURRENT_VERSION)
+            .map_err(|error| {
+                CachedAuthorityRefusal::blocked(format!(
+                    "hosted spine reader is not durably admitted: {error}"
+                ))
+            })?;
+        match control.runtime_spine_authority().map_err(|error| {
+            CachedAuthorityRefusal::blocked(format!("load hosted spine runtime authority: {error}"))
+        })? {
+            crate::publication_lease::RuntimeSpineAuthority::Completed(evidence) => Ok(evidence),
+            crate::publication_lease::RuntimeSpineAuthority::RolloutActive(blocking) => {
+                Err(CachedAuthorityRefusal::blocked(format!(
+                    "hosted spine {blocking}; cached authority is not readable"
+                )))
+            }
+        }
+    }
+
     /// The durable control-plane authority a cached proof is read under: the
     /// admitted fence evidence, the active Firestore fence with the revision
     /// that carried it, and the registered fleet.
@@ -7582,23 +8546,7 @@ impl DaemonState {
         control: &crate::publication_lease::PublicationControl,
         backend: &dyn kin_spine::SpineBackend,
     ) -> std::result::Result<HostedControlAuthority, CachedAuthorityRefusal> {
-        control
-            .assert_runtime_admitted(kin_db::GraphSnapshot::CURRENT_VERSION)
-            .map_err(|error| {
-                CachedAuthorityRefusal::blocked(format!(
-                    "hosted spine reader is not durably admitted: {error}"
-                ))
-            })?;
-        let durable = match control.runtime_spine_authority().map_err(|error| {
-            CachedAuthorityRefusal::blocked(format!("load hosted spine runtime authority: {error}"))
-        })? {
-            crate::publication_lease::RuntimeSpineAuthority::Completed(evidence) => evidence,
-            crate::publication_lease::RuntimeSpineAuthority::RolloutActive(blocking) => {
-                return Err(CachedAuthorityRefusal::blocked(format!(
-                    "hosted spine {blocking}; cached authority is not readable"
-                )))
-            }
-        };
+        let durable = self.read_hosted_durable_evidence(control)?;
         let active_fence = without_blocking_runtime_worker(|| backend.active_rollout_fence())
             .map_err(|error| {
                 CachedAuthorityRefusal::blocked(format!(
@@ -7726,19 +8674,207 @@ impl DaemonState {
     /// Guard an already-initialized spine for side-effect-free diagnostics.
     /// Hosted health must never warm, hydrate, or publish, but it also must not
     /// report an unadmitted cached generation as healthy. The durable reader
-    /// admission and Firestore evidence are re-read only after the local writer
-    /// gate is held, then compared with the exact cached authority proof.
+    /// admission is re-read on every call once the local writer gate is held;
+    /// the Firestore half answers from the same cached verdict readiness uses,
+    /// because this route is public and each fresh check is 2 + 2N billable
+    /// reads.
     pub(crate) async fn acquire_initialized_spine_read_authority(
         &self,
     ) -> std::result::Result<SpineAuthorityReadGuard<'_>, String> {
         let publication_gate = self.spine_refresh_gate.read().await;
+        // A rollout under the kill switch constructs the backend, so one can
+        // exist while the spine is off. Health reports the switch rather than
+        // checking a spine nobody may use, and reads nothing durable to do it.
+        if self.spine_disabled() {
+            return Err(self.spine_unavailable_reason());
+        }
         let backend = self.initialized_spine_backend()?;
-        self.assert_cached_hosted_spine_authority(backend)
-            .map_err(CachedAuthorityRefusal::into_reason)?;
+        self.hosted_spine_authority_verdict(
+            backend,
+            crate::hosted_spine_cost::HostedSpineVerdictUse::Readiness,
+        )
+        .await
+        .map_err(CachedAuthorityRefusal::into_reason)?;
         Ok(SpineAuthorityReadGuard {
             backend,
             _publication_gate: publication_gate,
         })
+    }
+
+    /// Whether this state answers readiness and spine health from a cached
+    /// verdict. Only a hosted reader under publication control holds a proof
+    /// the cheap check can bind to; everywhere else the check answers directly
+    /// and reads nothing durable.
+    fn hosted_spine_verdicts_apply(&self) -> bool {
+        self.hosted_spine_passes_limited() && self.publication_control.is_some()
+    }
+
+    // Each lock below is taken and released in its own statement. Holding the
+    // proof and the admitted evidence at once would put an order on two locks
+    // that every other path takes one at a time.
+    fn current_hosted_spine_verdict_key(&self) -> HostedSpineVerdictKey {
+        let publication_gate_writes = self.spine_refresh_gate.write_generation();
+        let cache_replacements = self.hosted_spine_cache_replacements.load(Ordering::SeqCst);
+        let proof = self
+            .hosted_spine_authority_proof
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let expected_rollout_fence = self
+            .hosted_spine_expected_rollout_fence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        HostedSpineVerdictKey {
+            publication_gate_writes,
+            cache_replacements,
+            proof,
+            expected_rollout_fence,
+        }
+    }
+
+    fn hosted_spine_verdict_key_is_current(&self, key: &HostedSpineVerdictKey) -> bool {
+        if key.publication_gate_writes != self.spine_refresh_gate.write_generation()
+            || key.cache_replacements != self.hosted_spine_cache_replacements.load(Ordering::SeqCst)
+        {
+            return false;
+        }
+        let proof_unchanged = *self
+            .hosted_spine_authority_proof
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            == key.proof;
+        if !proof_unchanged {
+            return false;
+        }
+        *self
+            .hosted_spine_expected_rollout_fence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            == key.expected_rollout_fence
+    }
+
+    /// The cached verdict, when one may still answer a caller of this kind.
+    ///
+    /// While a full pass runs, only a verdict taken after it began answers,
+    /// because hydration can replace the cache before the proof that describes
+    /// it is replaced; the first caller in that window re-checks and the rest
+    /// share what it found. A verdict taken after the pass began but before its
+    /// hydration returned does not answer either: the key counts cache
+    /// replacements, so the replacement itself retires it. A check made after
+    /// the replacement compares the old proof with the durable heads, and a
+    /// head whose revision has not changed since the proof was built is the
+    /// head the hydration read, so the rows it vouches for are the rows the old
+    /// proof validated. A ready verdict still re-reads the GCS admission
+    /// and runtime authority on every call, so a lost admission, an active
+    /// rollout or moved evidence refuses at once; what the TTL covers is the
+    /// Firestore half, the active fence and the committed heads, and the GCS
+    /// source cursors read beside them.
+    fn fresh_hosted_spine_verdict(
+        &self,
+        used_for: crate::hosted_spine_cost::HostedSpineVerdictUse,
+    ) -> Option<std::result::Result<(), CachedAuthorityRefusal>> {
+        let policy = self.hosted_spine_cost.policy();
+        let cached = self.hosted_spine_cost.verdicts.fresh(
+            self.hosted_spine_cost.clock.now(),
+            &policy,
+            used_for,
+            self.hosted_spine_cost.limiter.in_flight_since(),
+            |key| self.hosted_spine_verdict_key_is_current(key),
+        )?;
+        self.hosted_spine_cost.counters.record_verdict_cache_hit();
+        Some(match cached {
+            Ok(()) => self.assert_hosted_control_plane_admits(),
+            Err(refusal) => Err(refusal),
+        })
+    }
+
+    /// The GCS half of the cached-authority check, alone: this reader is still
+    /// admitted, no rollout holds the fleet, and the admitted evidence is the
+    /// evidence the proof was built under.
+    fn assert_hosted_control_plane_admits(
+        &self,
+    ) -> std::result::Result<(), CachedAuthorityRefusal> {
+        let Some(control) = self.publication_control.as_ref() else {
+            return Ok(());
+        };
+        let durable = self.read_hosted_durable_evidence(control)?;
+        let expected = self
+            .expected_hosted_spine_rollout_fence()
+            .map_err(CachedAuthorityRefusal::blocked)?;
+        if expected != durable {
+            return Err(CachedAuthorityRefusal::blocked(
+                "cached hosted spine evidence differs from the GCS publication-control record"
+                    .to_string(),
+            ));
+        }
+        let proved_under = self
+            .hosted_spine_authority_proof
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|proof| proof.rollout_fence.evidence());
+        if proved_under.as_ref() != Some(&durable) {
+            return Err(CachedAuthorityRefusal::blocked(
+                "cached hosted spine proof was not built under the admitted evidence".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Run the full cached-authority check now and keep its verdict. The key
+    /// is read before the check, so anything that moves while it runs leaves
+    /// the stored verdict unable to answer.
+    fn check_and_store_hosted_spine_verdict(
+        &self,
+        backend: &dyn kin_spine::SpineBackend,
+    ) -> std::result::Result<(), CachedAuthorityRefusal> {
+        let key = self.current_hosted_spine_verdict_key();
+        let checked_at = self.hosted_spine_cost.clock.now();
+        self.hosted_spine_cost.counters.record_identity_check();
+        let outcome = self.assert_cached_hosted_spine_authority(backend);
+        self.hosted_spine_cost
+            .verdicts
+            .store(checked_at, key, outcome.clone());
+        outcome
+    }
+
+    /// The answer about the cached proof for readiness, spine health or an
+    /// authenticated read: from a fresh verdict when there is one, otherwise
+    /// from one new check that every concurrent caller shares. Call with the
+    /// publication read gate held.
+    async fn hosted_spine_authority_verdict(
+        &self,
+        backend: &dyn kin_spine::SpineBackend,
+        used_for: crate::hosted_spine_cost::HostedSpineVerdictUse,
+    ) -> std::result::Result<(), CachedAuthorityRefusal> {
+        if !self.hosted_spine_verdicts_apply() {
+            return self.assert_cached_hosted_spine_authority(backend);
+        }
+        if let Some(answer) = self.fresh_hosted_spine_verdict(used_for) {
+            return answer;
+        }
+        let _single_flight = self.hosted_spine_cost.verdicts.refresh_turn().await;
+        // Whoever held the turn before this caller may have just stored the
+        // verdict it needs.
+        if let Some(answer) = self.fresh_hosted_spine_verdict(used_for) {
+            return answer;
+        }
+        let outcome = self.check_and_store_hosted_spine_verdict(backend);
+        if let Err(refusal) = &outcome {
+            // A read re-proves through the pass limiter itself; only the
+            // public routes wake the cadence to do it for them.
+            if refusal.superseded
+                && used_for == crate::hosted_spine_cost::HostedSpineVerdictUse::Readiness
+            {
+                // Re-prove on the cadence now rather than at the end of its
+                // interval. The cadence debounces wakes, and every pass it
+                // asks for goes through the pass limiter, so no rate of
+                // probes can drive hydrations.
+                self.hosted_spine_refresh_wake.notify_one();
+            }
+        }
+        outcome
     }
 
     /// Answer one hosted readiness probe. Nothing here hydrates the durable
@@ -7755,9 +8891,19 @@ impl DaemonState {
     /// Ready and the rollout was reverted.
     ///
     /// So the probe reads the proof that the authority transitions establish and
-    /// [`Self::start_hosted_spine_authority_refresh_cadence`] keeps current, and
-    /// it re-proves durable identity every time so a lost admission, an active
-    /// rollout or drifted evidence still refuses.
+    /// [`Self::start_hosted_spine_authority_refresh_cadence`] keeps current.
+    ///
+    /// It no longer re-proves durable identity on every probe either. That
+    /// check is 2 + 2N billable Firestore reads, the probe runs every 5 s for
+    /// the life of the pod, and the route is public, so any client could make
+    /// the daemon read Firestore as fast as it could send requests. The probe
+    /// answers from a verdict at most `READY_VERDICT_TTL` old, which the
+    /// background cadence refreshes every minute, re-reading only the GCS
+    /// admission and runtime authority on every call so a lost admission or an
+    /// active rollout still refuses at once. A verdict past its TTL, or taken
+    /// before any local change to the proof, the admitted evidence or the
+    /// publication gate, never answers: the next probe re-checks, and every
+    /// concurrent probe shares that one check.
     pub(crate) async fn hosted_readiness_spine_authority(&self) -> std::result::Result<(), String> {
         let gate_started = Instant::now();
         let _publication_gate = self.spine_refresh_gate.read().await;
@@ -7765,6 +8911,11 @@ impl DaemonState {
             u64::try_from(gate_started.elapsed().as_micros()).unwrap_or(u64::MAX),
             Ordering::Relaxed,
         );
+        // A spine switched off by configuration has no authority to report and
+        // must not start any durable read to find that out.
+        if self.spine_disabled() {
+            return Err(self.spine_unavailable_reason());
+        }
         // The refusal `ensure_spine_initialized` would have reached first. A
         // build or configuration that cannot construct the hosted backend must
         // not report ready on the strength of a proof cached before it broke.
@@ -7772,20 +8923,12 @@ impl DaemonState {
             return Err(self.spine_unavailable_reason());
         }
         let backend = self.initialized_spine_backend()?;
-        match self.assert_cached_hosted_spine_authority(backend) {
-            Ok(()) => Ok(()),
-            Err(refusal) => {
-                if refusal.superseded {
-                    // Re-prove now rather than at the end of the interval, so
-                    // Ready comes back on the next successful pass instead of a
-                    // minute later. The pass keeps its own floor between runs,
-                    // so a drift that persists cannot turn the probe back into
-                    // the thing that drives a continuous refresh.
-                    self.hosted_spine_refresh_wake.notify_one();
-                }
-                Err(refusal.into_reason())
-            }
-        }
+        self.hosted_spine_authority_verdict(
+            backend,
+            crate::hosted_spine_cost::HostedSpineVerdictUse::Readiness,
+        )
+        .await
+        .map_err(CachedAuthorityRefusal::into_reason)
     }
 
     /// How long the background authority refresh sleeps between passes.
@@ -7801,7 +8944,7 @@ impl DaemonState {
         HOSTED_SPINE_AUTHORITY_REFRESH_INTERVAL
     }
 
-    /// Start the one background pass that keeps the hosted spine authority
+    /// Start the one background cadence that keeps the hosted spine authority
     /// proof current, if it is not already running.
     ///
     /// Idempotent, so a request route may call it unconditionally. It exists
@@ -7810,13 +8953,16 @@ impl DaemonState {
     /// that nobody queries proving its authority once, at admission, and never
     /// again.
     ///
-    /// A failed pass does not by itself make this daemon unready. The three
-    /// conditions a probe must refuse on, a lost durable admission, an active
-    /// rollout and drifted evidence, are re-read on every probe and decide the
-    /// answer; flapping a serving pod out of the fleet over one transient
-    /// durable read would take out the whole pool on a blip.
+    /// Each tick is [`Self::run_hosted_spine_cadence_tick`]: the cheap identity
+    /// check, and a full pass only when that check says the proof is gone or
+    /// superseded, or at most once per `COMPLETENESS_REPAIR_FLOOR` when a local
+    /// mutation left the cache's edges dirty. Until 2026-09-22 every tick was a
+    /// full pass, about 43,000 Firestore reads each, on a fleet where nothing
+    /// had changed.
+    ///
+    /// A spine switched off with `KIN_DISABLE_SPINE` gets no cadence at all.
     pub(crate) fn start_hosted_spine_authority_refresh_cadence(self: &Arc<Self>) {
-        if !self.hosted_spine_readiness_required() {
+        if !self.hosted_spine_readiness_required() || self.spine_disabled() {
             return;
         }
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
@@ -7838,12 +8984,10 @@ impl DaemonState {
         let wake = Arc::clone(&self.hosted_spine_refresh_wake);
         let state = Arc::downgrade(self);
         runtime.spawn(async move {
-            // `Some` only while a pass is failing, and it doubles from the
-            // retry floor up to the interval. A failed pass invalidates the
-            // cached proof, so the daemon reports unready until one succeeds:
-            // waiting a whole interval to retry would turn one transient
-            // durable read into a minute out of service.
-            let mut retry: Option<Duration> = None;
+            // `Some` when the pass limiter will admit the pass this cadence
+            // wants sooner than the next interval, so a failed pass is retried
+            // on the limiter's backoff rather than a minute later.
+            let mut sooner: Option<Duration> = None;
             loop {
                 let (interval, floor) = {
                     let Some(state) = state.upgrade() else { return };
@@ -7851,43 +8995,186 @@ impl DaemonState {
                     (interval, HOSTED_SPINE_AUTHORITY_RETRY_FLOOR.min(interval))
                 };
                 tokio::select! {
-                    () = tokio::time::sleep(retry.unwrap_or(interval)) => {}
+                    () = tokio::time::sleep(sooner.unwrap_or(interval).min(interval)) => {}
                     () = wake.notified() => {
-                        // A probe saw durable identity move. Re-prove soon, but
+                        // A probe saw durable identity move. Check soon, but
                         // never faster than the floor.
                         tokio::time::sleep(floor).await;
                     }
                 }
                 let Some(state) = state.upgrade() else { return };
-                let started = Instant::now();
-                let refreshed = {
-                    let _publication_gate = state.spine_refresh_gate.read().await;
-                    state.ensure_spine().is_some()
-                };
-                let elapsed_ms = started.elapsed().as_millis() as u64;
-                if refreshed {
-                    retry = None;
-                    debug!(
-                        elapsed_ms,
-                        "hosted spine authority refreshed on the background cadence"
-                    );
-                } else {
-                    retry = Some(
-                        retry
-                            .map_or(floor, |backoff| backoff.saturating_mul(2))
-                            .min(interval),
-                    );
-                    warn!(
-                        elapsed_ms,
-                        retry_in_ms = retry.unwrap_or(interval).as_millis() as u64,
-                        reason = %state.spine_unavailable_reason(),
-                        "background hosted spine authority refresh failed; the cached proof is \
-                         invalidated and readiness refuses until a pass succeeds"
-                    );
-                }
+                sooner = state
+                    .run_hosted_spine_cadence_tick()
+                    .await
+                    .map(|wait| wait.max(floor));
+                state.log_hosted_spine_cost_summary_if_due();
                 drop(state);
             }
         });
+    }
+
+    /// One tick of the background cadence.
+    ///
+    /// Check durable identity (2 + 2N Firestore reads) and keep the verdict
+    /// readiness answers from. Ask the pass limiter for a full pass only when
+    /// the check says one is needed: no proof is held, durable identity moved
+    /// under it, or there is no publication control to check against; or, at
+    /// most once per `COMPLETENESS_REPAIR_FLOOR`, the cache lost the edge
+    /// authority it was proved with. A blocked refusal, a lost admission or an
+    /// active rollout, is not re-proved: a pass reaches the same refusal one
+    /// hydration later.
+    ///
+    /// Returns how soon the pass limiter would admit a pass this tick wanted
+    /// and could not run or did not get to succeed, so the cadence can retry on
+    /// the limiter's schedule instead of a minute later.
+    pub(crate) async fn run_hosted_spine_cadence_tick(&self) -> Option<Duration> {
+        let _publication_gate = self.spine_refresh_gate.read().await;
+        if self.spine_disabled() || self.hosted_restart_required() {
+            return None;
+        }
+        let needs_pass = match self.initialized_spine_backend() {
+            // Nothing constructed yet: the pass is what constructs it.
+            Err(_) => true,
+            Ok(_) if !self.hosted_spine_verdicts_apply() => true,
+            Ok(backend) => {
+                let _single_flight = self.hosted_spine_cost.verdicts.refresh_turn().await;
+                match self.check_and_store_hosted_spine_verdict(backend) {
+                    Ok(()) if backend.authority_complete() => false,
+                    // Proved, but a local graph mutation marked the cache's
+                    // edges dirty. Only a full pass restores them, and a daemon
+                    // that mutates often must not buy one a minute for it.
+                    Ok(()) => self.hosted_spine_cost.claim_completeness_repair(),
+                    Err(refusal) => refusal.superseded,
+                }
+            }
+        };
+        if !needs_pass {
+            return None;
+        }
+        match self
+            .reprove_hosted_spine_authority(
+                crate::hosted_spine_cost::HostedSpinePassTrigger::Background,
+            )
+            .await
+        {
+            HostedSpineReproof::Led(Some(_)) => None,
+            HostedSpineReproof::Led(None) => {
+                // A refusal before hydrating is logged by the pass itself, once
+                // per reason, and retried at the retry floor. A pass that read
+                // the committed rows and still failed is worth a warning.
+                if !self
+                    .hosted_spine_cost
+                    .limiter
+                    .last_refused_before_hydration()
+                {
+                    warn!(
+                        reason = %self.spine_unavailable_reason(),
+                        retry_in_ms = self
+                            .hosted_spine_cost
+                            .retry_in()
+                            .map(|wait| u64::try_from(wait.as_millis()).unwrap_or(u64::MAX)),
+                        "background hosted spine authority pass failed; the cached proof is \
+                         invalidated and readiness refuses until a pass succeeds"
+                    );
+                }
+                self.hosted_spine_cost.retry_in()
+            }
+            HostedSpineReproof::Shared | HostedSpineReproof::Deferred => {
+                self.hosted_spine_cost.retry_in()
+            }
+        }
+    }
+
+    /// Log the cumulative cost counters, at most once per
+    /// `COST_SUMMARY_INTERVAL`, so the Firestore spend is visible in the pod
+    /// log without anyone polling `/health`.
+    fn log_hosted_spine_cost_summary_if_due(&self) {
+        if !self
+            .hosted_spine_cost
+            .claim_summary(self.hosted_spine_cost.clock.now())
+        {
+            return;
+        }
+        let Some(report) = self.hosted_spine_cost_report() else {
+            return;
+        };
+        info!(
+            full_passes = report.full_passes,
+            full_passes_background = report.full_passes_by_trigger.background,
+            full_passes_request = report.full_passes_by_trigger.request,
+            full_passes_transition = report.full_passes_by_trigger.transition,
+            full_passes_failed = report.full_passes_failed,
+            full_passes_deferred = report.full_passes_deferred,
+            full_passes_shared = report.full_passes_shared,
+            completeness_repairs = report.completeness_repairs,
+            refused_before_hydration = report.refused_before_hydration,
+            identity_checks = report.identity_checks,
+            verdict_cache_hits = report.verdict_cache_hits,
+            firestore_read_requests = report.firestore.map(|stats| stats.requests),
+            firestore_document_reads = report.firestore.map(|stats| stats.document_reads),
+            "hosted spine cost"
+        );
+    }
+
+    /// What the hosted spine authority has cost this process, for `/health`.
+    /// `None` on a local daemon, which has no durable spine store.
+    pub(crate) fn hosted_spine_cost_report(
+        &self,
+    ) -> Option<crate::hosted_spine_cost::HostedSpineCostReport> {
+        self.storage_backend.as_ref()?;
+        let firestore = self
+            .spine
+            .get()
+            .and_then(|spine| spine.durable_read_stats());
+        Some(
+            self.hosted_spine_cost
+                .report(self.spine_disabled(), firestore),
+        )
+    }
+
+    /// Step the clock the pass limiter and the verdict cache read, so a test
+    /// can pass a sixty-second floor without sleeping through it.
+    #[cfg(test)]
+    pub(crate) fn advance_hosted_spine_clock_for_test(&self, by: Duration) {
+        self.hosted_spine_cost.clock.advance(by);
+    }
+
+    /// Run the cached-authority check now and keep its verdict, exactly as a
+    /// probe that found no fresh verdict does, whatever else is running.
+    #[cfg(test)]
+    pub(crate) fn check_hosted_spine_verdict_now_for_test(
+        &self,
+    ) -> std::result::Result<(), String> {
+        let backend = self
+            .spine
+            .get()
+            .ok_or_else(|| "no hosted spine backend".to_string())?;
+        self.check_and_store_hosted_spine_verdict(backend.as_ref())
+            .map_err(CachedAuthorityRefusal::into_reason)
+    }
+
+    /// Whether a full pass holds the limiter's admission right now.
+    #[cfg(test)]
+    pub(crate) fn hosted_spine_pass_in_flight_for_test(&self) -> bool {
+        self.hosted_spine_cost.limiter.in_flight_since().is_some()
+    }
+
+    /// Whether a caller of this kind would be answered from the verdict cache
+    /// right now instead of checking again.
+    #[cfg(test)]
+    pub(crate) fn hosted_spine_verdict_answers_for_test(
+        &self,
+        used_for: crate::hosted_spine_cost::HostedSpineVerdictUse,
+    ) -> bool {
+        self.fresh_hosted_spine_verdict(used_for).is_some()
+    }
+
+    /// Switch this state's spine on or off the way `KIN_DISABLE_SPINE=1` does
+    /// at startup, without setting the variable for every other state the test
+    /// process opens meanwhile.
+    #[cfg(test)]
+    pub(crate) fn set_spine_disabled_for_test(&self, disabled: bool) {
+        self.spine_disabled.store(disabled, Ordering::SeqCst);
     }
 
     /// Refuse hosted operation unless the deployed bytes and configuration can
@@ -7965,8 +9252,15 @@ impl DaemonState {
             .store(true, Ordering::SeqCst);
     }
 
+    /// Whether `KIN_DISABLE_SPINE` switched the spine off when this state was
+    /// opened.
+    #[doc(hidden)]
+    pub fn spine_disabled(&self) -> bool {
+        self.spine_disabled.load(Ordering::SeqCst)
+    }
+
     pub(crate) fn spine_unavailable_reason(&self) -> String {
-        if self.spine_disabled {
+        if self.spine_disabled() {
             "spine disabled via KIN_DISABLE_SPINE".to_string()
         } else if self.hosted_restart_required.load(Ordering::SeqCst) {
             "hosted authority recovery completed or remains in progress; restart is required before this process may serve semantic graph state"
@@ -7985,6 +9279,79 @@ impl DaemonState {
         } else {
             "spine initialization could not capture stable graph authority; retry".to_string()
         }
+    }
+
+    /// Why a read on this local daemon found no spine to consult, or `None` when
+    /// the spine is not there to consult at all.
+    ///
+    /// A pass that meets a writer on the primary, or whose captured graphs
+    /// advance before it can publish, leaves the spine unbuilt, records why in
+    /// `spine_initialization_failure`, and leaves the next read to retry. A
+    /// read in that window has no cross-repo authority behind it. That is a gap
+    /// in its answer, where a spine switched off with `KIN_DISABLE_SPINE` is a
+    /// fact about the install, and the reference handlers report the two
+    /// differently.
+    ///
+    /// This reads the slot the pass already records into rather than keeping a
+    /// second one, and it reads it as a separate step after the read's own
+    /// pass. A pass on another request can build the spine in between, and a
+    /// pass that succeeds clears the slot, so an empty slot is a deferral too:
+    /// a missing record never means the spine is off. A derived-member refusal
+    /// comes back as recorded, opening with its code, and
+    /// `kin_spine::DaemonSpine::from_read` tells that standing refusal apart
+    /// from a deferral. `None` comes back only for a spine that is switched off
+    /// and for a hosted daemon, whose reads refuse without a proven spine
+    /// instead. The routes call this on every read and use it only when the
+    /// read found no spine, so a deferral lasts only until a read builds the
+    /// spine.
+    pub(crate) fn spine_initialization_deferral(&self) -> Option<String> {
+        #[cfg(test)]
+        if let Some(seam) = Self::spine_deferral_read_seam(None) {
+            seam();
+        }
+        if self.spine_disabled() || self.hosted_spine_readiness_required() {
+            return None;
+        }
+        let recorded = self
+            .spine_initialization_failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        // Nothing recorded, though this read found no spine, means a pass on
+        // another request built it after this read's own pass stepped aside,
+        // and a pass that succeeds clears the slot. This read still went
+        // without the spine.
+        Some(recorded.unwrap_or_else(|| {
+            "no spine was ready for this read, and a pass that built it since cleared the \
+             recorded reason"
+                .to_string()
+        }))
+    }
+
+    /// Run `seam` on this thread the next time a read classifies the spine it
+    /// found, before it reads the slot.
+    ///
+    /// A route reads the slot straight after its own pass, with nothing between
+    /// the two that a test can pause on, so this is the one way to put another
+    /// request's pass there on demand. Thread-local, because such a test drives
+    /// both requests from one current-thread runtime and no other test may see
+    /// it.
+    #[cfg(test)]
+    pub(crate) fn run_before_next_spine_deferral_read(seam: Box<dyn FnOnce()>) {
+        Self::spine_deferral_read_seam(Some(seam));
+    }
+
+    /// Install `seam`, or with `None` take the one installed.
+    #[cfg(test)]
+    fn spine_deferral_read_seam(seam: Option<Box<dyn FnOnce()>>) -> Option<Box<dyn FnOnce()>> {
+        thread_local! {
+            static SEAM: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+                const { std::cell::RefCell::new(None) };
+        }
+        SEAM.with(|slot| match seam {
+            Some(seam) => slot.borrow_mut().replace(seam),
+            None => slot.borrow_mut().take(),
+        })
     }
 
     /// Retain a hosted bootstrap or hydration failure on the constructed state
@@ -8016,21 +9383,42 @@ impl DaemonState {
         self.hosted_restart_required.load(Ordering::SeqCst)
     }
 
-    /// Whether the spine's registered primary watermark is the live graph root.
+    /// Whether the spine's registered primary watermark is the live graph root
+    /// and the primary's cross-repo edges were materialized at it.
     fn primary_spine_registration_is_current(&self, spine: &dyn kin_spine::SpineBackend) -> bool {
+        // Matching roots do not prove that an older publisher preserved member
+        // derivation authority; force capture/refusal even at the same root.
+        if self.graph.list_all_entities().map_or(true, |entities| {
+            entities.iter().any(kin_model::is_derived_member)
+        }) {
+            return false;
+        }
         let live_root = hex::encode(self.graph.compute_root_hash());
         spine.root_hash(&self.cached_repo_id).as_deref() == Some(live_root.as_str())
+            // Every graph-authority mutation invalidates the primary's edges
+            // before it runs, including one that leaves the root where it was:
+            // a commit of work the graph already served, or an explicit
+            // admission that found nothing to move. A matching root alone left
+            // that invalidation standing for the rest of the daemon's life.
+            && !spine.cross_repo_edges_stale(&self.cached_repo_id)
     }
 
     /// Re-capture and re-register the primary repository once graph authority
-    /// has moved past the spine's registered watermark.
+    /// has moved past the spine's registered watermark, or once a mutation has
+    /// left the primary's cross-repo edges stale at the watermark it holds.
     ///
     /// The registered root and the registered entity metadata are one fact. A
     /// watermark advanced on its own would certify a cross-repo answer that was
     /// read out of the pre-mutation index, so the whole capture is replaced and
-    /// this repo's outgoing edges are re-resolved against it. A capture that
-    /// cannot stabilize leaves the repo explicitly dirty for the next caller
-    /// instead of publishing a root its entity set does not back.
+    /// this repo's outgoing edges are re-resolved against it. A capture at the
+    /// root already registered describes the entity set that registration
+    /// installed, so only the edges are re-resolved then: registering it again
+    /// would replace nothing and would mark every other registered repository
+    /// stale over a change that did not happen. A registration at a moved root
+    /// does mark them all stale, so every stale sibling is then resolved again
+    /// from the imports the spine kept for it. A capture that cannot stabilize
+    /// leaves the repo explicitly dirty for the next caller instead of
+    /// publishing a root its entity set does not back.
     fn reregister_primary_at_current_root(
         &self,
         spine: &dyn kin_spine::SpineBackend,
@@ -8059,16 +9447,25 @@ impl DaemonState {
                             error = %capture_error,
                             "spine re-registration deferred until primary graph authority is stable"
                         );
+                        if capture_error.starts_with(DERIVED_MEMBER_SPINE_GAP) {
+                            return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
+                                capture_error,
+                            )));
+                        }
                         return Ok(());
                     }
                 };
             let entity_count = capture.entries.len();
-            publication.reassert_before_mutation()?;
-            spine.register_repo(
-                primary_repo_id,
-                std::mem::take(&mut capture.entries),
-                &capture.root_hash,
-            );
+            let root_moved =
+                spine.root_hash(primary_repo_id).as_deref() != Some(capture.root_hash.as_str());
+            if root_moved {
+                publication.reassert_before_mutation()?;
+                spine.register_repo(
+                    primary_repo_id,
+                    std::mem::take(&mut capture.entries),
+                    &capture.root_hash,
+                );
+            }
             let registry_ids = spine.registered_repo_ids().into_iter().collect::<Vec<_>>();
             publication.reassert_before_mutation()?;
             spine.refresh_cross_repo_edges(
@@ -8086,15 +9483,68 @@ impl DaemonState {
                 );
                 return Ok(());
             }
+            // A registration at a moved root marked every sibling stale, since
+            // any of them may import from the entity set that just changed, and
+            // a writer racing this pass can leave one stale at an unchanged
+            // root. This daemon holds no sibling graph after spine
+            // initialization; the spine kept each sibling's imports when that
+            // pass refreshed it, and resolving them again against the primary
+            // registered now is the refresh the sibling's own graph would give.
+            let siblings_refreshed = Self::refresh_stale_sibling_cross_repo_edges(
+                spine,
+                primary_repo_id,
+                &registry_ids,
+                publication,
+            )?;
             info!(
                 repo_id = primary_repo_id,
                 entities = entity_count,
                 root_hash = %capture.root_hash,
+                root_moved,
+                siblings_refreshed,
                 cross_repo_edges = spine.edge_count(),
                 "re-registered primary graph authority in spine"
             );
             Ok(())
         })
+    }
+
+    /// Bring every stale sibling's outgoing cross-repo edges current from the
+    /// imports the spine kept for it, and return how many it brought current.
+    ///
+    /// A sibling the spine kept no imports for stays stale, which keeps
+    /// cross-repo authority incomplete rather than certifying edges nobody
+    /// resolved. That is the state an explicit all-repo refresh leaves when it
+    /// cannot load a sibling, and it holds until a pass that can load it, or a
+    /// restart, refreshes the sibling from its graph.
+    fn refresh_stale_sibling_cross_repo_edges(
+        spine: &dyn kin_spine::SpineBackend,
+        primary_repo_id: &str,
+        registry_ids: &[String],
+        publication: &mut HostedPublicationGuard,
+    ) -> Result<usize> {
+        let mut refreshed = 0;
+        let mut left_stale = Vec::new();
+        for sibling_id in registry_ids {
+            if sibling_id == primary_repo_id || !spine.cross_repo_edges_stale(sibling_id) {
+                continue;
+            }
+            publication.reassert_before_mutation()?;
+            if spine.refresh_cross_repo_edges_from_retained_imports(sibling_id, registry_ids) {
+                refreshed += 1;
+            } else {
+                left_stale.push(sibling_id.as_str());
+            }
+        }
+        if !left_stale.is_empty() {
+            warn!(
+                siblings = left_stale.len(),
+                first = left_stale[0],
+                "sibling cross-repo edges stay stale: the spine kept no imports to resolve them \
+                 from, so they wait for a refresh from their graphs"
+            );
+        }
+        Ok(refreshed)
     }
 
     /// Bind a graph Arc to the exact hosted cache publication it came from.
@@ -8202,6 +9652,15 @@ impl DaemonState {
             let entity_ids = snapshot.entities.keys().copied().collect::<HashSet<_>>();
             let mut entities = snapshot.entities.into_values().collect::<Vec<_>>();
             entities.sort_by_key(|entity| entity.id);
+            if let Some(entity) = entities
+                .iter()
+                .find(|entity| kin_model::is_derived_member(entity))
+            {
+                return Err(format!(
+                    "{DERIVED_MEMBER_SPINE_GAP}: repo {repo_id} contains inferred member {}; the current spine format cannot preserve candidate authority. Local Kin queries and generator edits remain available. Federation requires versioned candidate-status support before this graph can be published.",
+                    entity.id
+                ));
+            }
             let mut relations = snapshot
                 .relations
                 .into_values()
@@ -8684,9 +10143,16 @@ impl DaemonState {
                 publication.reassert_before_mutation()?;
                 backend.invalidate_cross_repo_edges(&repo_id);
             }
-            warn!(
-                "spine initialization discarded because a captured graph advanced during publication"
-            );
+            // Recorded like the deferrals above, so a read that finds no spine
+            // after this pass is told why rather than reading whatever an
+            // earlier pass left in the slot.
+            let reason =
+                "spine initialization discarded because a captured graph advanced during publication";
+            *self
+                .spine_initialization_failure
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(reason.to_string());
+            warn!("{reason}");
             return Ok(());
         }
 
@@ -8744,9 +10210,14 @@ impl DaemonState {
                 publication.reassert_before_mutation()?;
                 backend.invalidate_cross_repo_edges(&repo_id);
             }
-            warn!(
-                "spine initialization discarded because graph authority advanced before visibility"
-            );
+            // Recorded for the same reason as the discard above.
+            let reason =
+                "spine initialization discarded because graph authority advanced before visibility";
+            *self
+                .spine_initialization_failure
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(reason.to_string());
+            warn!("{reason}");
             return Ok(());
         }
 
@@ -9186,10 +10657,14 @@ impl DaemonState {
         let mut captures = Vec::with_capacity(registry_ids.len());
         for repo_id in &registry_ids {
             let entry = self.get_repo_cache_entry(repo_id).await?;
-            captures.push(
-                self.capture_spine_repo(repo_id, Arc::clone(&entry.graph))
-                    .map_err(storage_error)?,
-            );
+            match self.capture_spine_repo(repo_id, Arc::clone(&entry.graph)) {
+                Ok(capture) => captures.push(capture),
+                Err(reason) => {
+                    publication.reassert_before_mutation()?;
+                    spine.invalidate_cross_repo_edges(repo_id);
+                    return Err(storage_error(reason));
+                }
+            }
         }
         if !self.graph_authority_epoch_is_current(graph_authority_epoch)
             || captures
@@ -9391,6 +10866,9 @@ impl DaemonState {
                         error = %error,
                         "skipping cross-repo refresh: graph authority capture failed"
                     );
+                    if error.starts_with(DERIVED_MEMBER_SPINE_GAP) {
+                        return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(error)));
+                    }
                 }
             }
         }
@@ -10632,9 +12110,17 @@ impl DaemonState {
                 ),
             )));
         }
+        self.graph.invalidate_binding_history();
         self.snapshot_generation.store(generation, Ordering::SeqCst);
         self.post_commit_finalization_pending
             .store(true, Ordering::SeqCst);
+        crate::accepted_enrichment::clear(&self.layout);
+        // The record just emptied, so nothing is owed a record any more: what
+        // it failed to hold was live, and this commit is the moment authority
+        // either took it or never will from this process.
+        if let Ok(mut unrecorded) = self.lsp_evidence_unrecorded.lock() {
+            unrecorded.clear();
+        }
         Ok(())
     }
 
@@ -10705,21 +12191,12 @@ impl DaemonState {
     /// against the still-live graph so a replay heals the authority/daemon crash
     /// gap without absorbing an unrelated later generation.
     ///
-    /// The daemon-side semantic and tree transition is planned here rather than
-    /// taken from `planned_delta`. Between planning and this call the authority
-    /// transaction committed and the projection was materialized, and the
-    /// asynchronous LSP enrichment worker writes into the live graph without
-    /// taking either the coordination gate or the persistence lock. A plan-time
-    /// delta can therefore no longer describe the transition the live graph
-    /// needs, and applying it would leave the daemon short of the exact
-    /// authority graph after authority had already advanced. Only the admission
-    /// policy transition, which no derived writer produces, is carried over from
-    /// the plan.
-    ///
-    /// One consequence is worth naming: because the target is the exact
-    /// authority graph, every finalization discards whatever derived enrichment
-    /// the live graph is holding beyond authority. That lead is derived, and the
-    /// enrichment worker recomputes it.
+    /// Derive the installation delta from the frozen durable successor and
+    /// verify complete semantic equality before returning. The caller's plan
+    /// supplies the admission-policy transition. LSP installation takes the
+    /// same coordination and persistence locks, so it cannot publish through
+    /// this interval. Completed historical replay must preserve later live
+    /// enrichment and must not call this replacement finalizer.
     pub(crate) fn finalize_local_repository_commit(
         &self,
         receipt: &RepositoryCommitReceipt,
@@ -10826,12 +12303,35 @@ impl DaemonState {
         )?;
         let tree_deltas =
             kin_core::exact_tree_correction(&live_snapshot.resolved_tree, desired_tree)?;
+        // External endpoints are part of the same semantic graph as their
+        // relations. Omitting this difference can report successful finalization
+        // while live queries retain removed endpoints or lack committed ones.
+        let mut external_reference_deltas = Vec::new();
+        for (id, old) in &live_snapshot.external_references {
+            match authority_snapshot.external_references.get(id) {
+                None => external_reference_deltas
+                    .push(kin_model::ExternalReferenceDelta::Removed { old: old.clone() }),
+                Some(new) if new != old => {
+                    return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
+                        "repository finalization cannot rewrite an immutable external endpoint"
+                            .to_string(),
+                    )));
+                }
+                _ => {}
+            }
+        }
+        for (id, new) in &authority_snapshot.external_references {
+            if !live_snapshot.external_references.contains_key(id) {
+                external_reference_deltas
+                    .push(kin_model::ExternalReferenceDelta::Added { new: new.clone() });
+            }
+        }
         let finalization_delta = TransactionDelta {
             entity_deltas: semantics.entity_deltas().to_vec(),
             relation_deltas: semantics.relation_deltas().to_vec(),
             tree_deltas,
             admission_policy_delta: planned_delta.admission_policy_delta.clone(),
-            external_reference_deltas: Vec::new(),
+            external_reference_deltas,
         };
         let graph_changed = finalization_delta != TransactionDelta::default();
         if graph_changed {
@@ -10844,6 +12344,7 @@ impl DaemonState {
             if preflight_snapshot.resolved_tree != *desired_tree
                 || preflight_snapshot.entities != authority_snapshot.entities
                 || preflight_snapshot.relations != authority_snapshot.relations
+                || preflight_snapshot.external_references != authority_snapshot.external_references
             {
                 return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
                     "preflighted repository delta does not produce the durable workspace graph"
@@ -10858,6 +12359,7 @@ impl DaemonState {
         if live_snapshot.resolved_tree != *desired_tree
             || live_snapshot.entities != authority_snapshot.entities
             || live_snapshot.relations != authority_snapshot.relations
+            || live_snapshot.external_references != authority_snapshot.external_references
         {
             return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
                 "repository graph finalization did not install the durable workspace graph"
@@ -10875,6 +12377,7 @@ impl DaemonState {
         if generation_advanced {
             self.record_repository_authority_commit(receipt.generation)?;
         }
+        self.graph.restore_binding_history_from(&authority_graph);
         Ok(LocalRepositoryFinalization {
             graph_changed,
             generation_advanced,
@@ -11281,6 +12784,20 @@ impl DaemonState {
     }
 
     fn save_snapshot_impl(&self, mode: SnapshotSaveMode) -> Result<()> {
+        self.save_snapshot_reporting(mode).map(|_| ())
+    }
+
+    /// [`Self::save_snapshot`], saying whether it held language-server
+    /// enrichment back for a merge open on this workspace.
+    ///
+    /// For the one caller that decides something from a flush: the sweep
+    /// records its files as enriched only once their relations are durable, and
+    /// a held flush returns `Ok` without making them so.
+    pub(crate) fn save_snapshot_reporting_enrichment(&self) -> Result<EnrichmentFlush> {
+        self.save_snapshot_reporting(SnapshotSaveMode::Incremental)
+    }
+
+    fn save_snapshot_reporting(&self, mode: SnapshotSaveMode) -> Result<EnrichmentFlush> {
         // Serialize the whole kndb + generation-marker + kidx write sequence
         // against any other save (persist loop, idle flush, embed worker).
         // Without this, two concurrent saves race on the shared tmp paths and
@@ -11290,6 +12807,9 @@ impl DaemonState {
             .persist_lock
             .lock()
             .map_err(|_| DaemonError::Io(std::io::Error::other("persist lock poisoned")))?;
+
+        #[cfg(test)]
+        crate::prepared_publication::tests::record_actual_save_entry(self);
 
         // Make the derived CAS names durable before persisting a graph that
         // references them.
@@ -11489,9 +13009,24 @@ impl DaemonState {
                     generation = expected_gen,
                     "deferred enrichment publication while a repository command holds the coordination gate"
                 );
-                return Ok(());
+                return Ok(EnrichmentFlush::Proceeded);
             };
-            let published_generation = self.publish_local_workspace_enrichment(expected_gen)?;
+            // Held the same way, and for as long as the merge stays open. The
+            // publication is a workspace mutation, and an open merge pinned
+            // this workspace as its restore point, so publishing through it
+            // makes `resolve --continue` refuse a merge nobody touched. Nothing
+            // is acknowledged here either, and the caller is told, because a
+            // sweep that took this for a publication would record its files as
+            // enriched over relations authority never received.
+            let Some(published_generation) =
+                self.publish_local_workspace_enrichment(expected_gen)?
+            else {
+                debug!(
+                    generation = expected_gen,
+                    "held enrichment publication while a merge is open on this workspace"
+                );
+                return Ok(EnrichmentFlush::HeldForOpenMerge);
+            };
             self.graph.flush_text_index().map_err(DaemonError::from)?;
             if let Some(attempt) = persistence_attempt {
                 attempt.complete();
@@ -11533,7 +13068,7 @@ impl DaemonState {
             committed,
             "saved snapshot to storage backend"
         );
-        Ok(())
+        Ok(EnrichmentFlush::Proceeded)
     }
 
     /// Incremental per-batch embed-progress flush for the background
@@ -11797,6 +13332,9 @@ impl DaemonState {
         generation: u64,
         authority_graph: &kin_db::InMemoryGraph,
     ) -> Result<()> {
+        // A live graph ahead of this immutable authority deliberately remains
+        // unproven. Only exact semantic equality rebinds its admitted witness.
+        self.graph.restore_binding_history_from(authority_graph);
         let (staged_index, persisted_entity_count) =
             self.stage_read_index_from_graph(generation, authority_graph)?;
         let index_path = self.invalidate_canonical_read_index()?;
@@ -11861,6 +13399,11 @@ impl DaemonState {
     /// generation, publish the language-server relations authority does not
     /// hold yet, and report the generation the workspace ends at.
     ///
+    /// `None` when there was something to publish and a merge is open on this
+    /// workspace. The merge recorded this workspace as its restore point, and
+    /// publication is a workspace mutation, so it waits for the merge to publish
+    /// or be abandoned exactly as ambient admission does. Nothing is written.
+    ///
     /// The order is load-bearing. The tree proof reads the workspace's exact
     /// persisted tree out of the authority envelope, the decision to publish is
     /// taken from the live graph, and authority's workspace graph is
@@ -11891,7 +13434,7 @@ impl DaemonState {
     /// and a flush that opened its own paid that for a publication the daemon
     /// already held. The tree proof, the diff and the commit all run against
     /// this one authority.
-    fn publish_local_workspace_enrichment(&self, expected_generation: u64) -> Result<u64> {
+    fn publish_local_workspace_enrichment(&self, expected_generation: u64) -> Result<Option<u64>> {
         let binding = self.local_repository_authority_binding()?;
         let authority = self.held_local_repository_authority()?;
         let workspace_id = binding.workspace_id();
@@ -11921,6 +13464,9 @@ impl DaemonState {
                     self.cached_repo_id
                 )))
             })?;
+        let merge_open =
+            crate::repository_merge_state::workspace_merge_record(authority_metadata, workspace_id)
+                .is_some_and(|record| record.state.is_in_progress());
         let roots = lease.roots().clone();
 
         // The live tree is proved against the workspace's own persisted tree
@@ -11950,7 +13496,7 @@ impl DaemonState {
             .values()
             .any(|relation| relation.origin == kin_model::RelationOrigin::Lsp)
         {
-            return Ok(expected_generation);
+            return Ok(Some(expected_generation));
         }
 
         let authority_snapshot = lease
@@ -11978,7 +13524,13 @@ impl DaemonState {
             );
         }
         if semantic_delta.is_empty() {
-            return Ok(expected_generation);
+            return Ok(Some(expected_generation));
+        }
+        // Decided after the delta, so a flush with nothing new to publish still
+        // reads as settled while a merge is open and only a real workspace move
+        // is held.
+        if merge_open {
+            return Ok(None);
         }
         let published = semantic_delta.relation_deltas().len();
 
@@ -12032,7 +13584,10 @@ impl DaemonState {
             collaboration_delta: None,
         };
         let receipt = authority
-            .commit_repository_transaction(transaction)
+            .commit_repository_transaction_with_binding_history(
+                transaction,
+                &kin_index::binding_history::LocalBindingHistoryVerifier,
+            )
             .map_err(DaemonError::from)?;
         self.record_repository_authority_commit(receipt.generation)?;
         info!(
@@ -12041,7 +13596,7 @@ impl DaemonState {
             generation = receipt.generation,
             "published language-server enrichment into workspace authority"
         );
-        Ok(receipt.generation)
+        Ok(Some(receipt.generation))
     }
 
     /// The canonical workspace semantic transition that publishes every
@@ -12524,9 +14079,49 @@ impl DaemonState {
             });
     }
 
+    /// Track the start of a watchdog probe, a request that is not client
+    /// activity.
+    ///
+    /// The supervisor reads every worker's `/health` every 15 seconds to decide
+    /// whether to reap, adopt or redeploy it. Counted as client activity, that
+    /// read reset the idle clock on every sweep, so no worker ever idled out
+    /// while a supervisor ran, and no supervisor idled out while it had a
+    /// worker: both ran until someone stopped them by hand. A probe still
+    /// counts as in flight, so nothing shuts the daemon down underneath it and
+    /// the health body it reads reports the same request count it always has.
+    /// It only leaves the idle clock alone.
+    pub fn begin_probe(&self) {
+        self.active_requests.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Track the end of a watchdog probe. See [`Self::begin_probe`].
+    pub fn end_probe(&self) {
+        let _ = self
+            .active_requests
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                Some(current.saturating_sub(1))
+            });
+    }
+
     /// Number of API requests currently in flight.
     pub fn active_request_count(&self) -> u64 {
         self.active_requests.load(Ordering::SeqCst)
+    }
+
+    /// Ask this daemon to exit as soon as nothing needs it. Returns whether
+    /// this call was the one that asked.
+    ///
+    /// Not a stop. The idle monitor keeps every gate an idle exit has: an
+    /// attached client, a request in flight, a pending publication, running
+    /// enrichment or embedding, and an unflushed graph all keep the daemon up,
+    /// and it exits on the first check after the last of them clears.
+    pub fn request_retirement(&self) -> bool {
+        !self.retirement_requested.swap(true, Ordering::SeqCst)
+    }
+
+    /// Whether a caller has asked this daemon to exit once nothing needs it.
+    pub fn retirement_requested(&self) -> bool {
+        self.retirement_requested.load(Ordering::SeqCst)
     }
 
     /// Duration since the last recorded external activity.
@@ -12714,6 +14309,10 @@ impl Drop for EmbedPassGuard<'_> {
         self.0.active_embed_passes.fetch_sub(1, Ordering::SeqCst);
     }
 }
+
+#[cfg(test)]
+#[path = "state_finalization_external_test.rs"]
+mod finalization_external_tests;
 
 #[cfg(test)]
 mod tests {
@@ -16192,6 +17791,121 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
+    fn derived_member_spine_publication_refuses_and_invalidates_prior_authority() {
+        use kin_model::{
+            GraphNodeId, Relation, RelationEvidence, RelationId, RelationKind, RelationOrigin,
+        };
+        use kin_spine::SpineBackend as _;
+        let registry_dir = tempfile::tempdir().unwrap();
+        let registry_path = registry_dir.path().join("registry.toml");
+        kin_core::registry::KinRegistry { repos: Vec::new() }
+            .save_to(&registry_path)
+            .unwrap();
+        let _env = kin_core::test_env::EnvVarGuard::set("KIN_REGISTRY_PATH", &registry_path)
+            .without("KIN_DISABLE_SPINE");
+        let source = "const app = {}; for (const key of ['get']) { app[key] = () => 1; }";
+        let indexed = kin_index::IndexPipeline::new()
+            .index_file_content_with_tests(
+                &FilePathId::new("members.js"),
+                source.as_bytes(),
+                kin_blobs::Hash256::from_bytes(kin_blobs::digest_bytes(source.as_bytes())),
+            )
+            .unwrap()
+            .indexed_file;
+        let typed = indexed
+            .entities
+            .iter()
+            .find(|entity| entity.name == "app.get")
+            .unwrap();
+        for legacy in [false, true] {
+            let repo_dir = tempfile::tempdir().unwrap();
+            let init = kin_core::init(repo_dir.path()).unwrap();
+            let state = test_state(init.layout, repo_dir.path());
+            let repo = state.cached_repo_id.as_str();
+            let normal = test_entity("normal", "normal.rs");
+            state.graph.upsert_entity(&normal).unwrap();
+            assert!(state
+                .capture_spine_repo(repo, Arc::clone(&state.graph))
+                .is_ok());
+            let mut candidate = typed.clone();
+            if legacy {
+                candidate
+                    .metadata
+                    .extra
+                    .remove(kin_model::derivation::ENTITY_DERIVATION_KEY);
+                candidate.doc_summary =
+                    Some("Derived from a loop over `names`; no literal `get` declaration".into());
+            }
+            state.graph.upsert_entity(&candidate).unwrap();
+            let relation = Relation {
+                id: RelationId::new(),
+                kind: RelationKind::Calls,
+                src: GraphNodeId::Entity(candidate.id),
+                dst: GraphNodeId::Entity(kin_model::EntityId::new()),
+                confidence: 1.0,
+                origin: RelationOrigin::Parsed,
+                created_in: None,
+                import_source: Some("foreign".into()),
+                evidence: vec![RelationEvidence {
+                    token: Some("foreign::target".into()),
+                    ..Default::default()
+                }],
+            };
+            state.graph.upsert_relation(&relation).unwrap();
+            let refusal = state
+                .capture_spine_repo(repo, Arc::clone(&state.graph))
+                .err()
+                .unwrap();
+            assert!(refusal.contains("spine_candidate_representation_gap"));
+            assert!(refusal.contains("Local Kin queries and generator edits remain available"));
+            // Reproduce an older publisher at the exact SAME graph root. This
+            // proves a matching watermark cannot bypass the new capture gate.
+            let spine = Arc::new(kin_spine::InMemorySpineBackend::new());
+            spine.register_repo(
+                repo,
+                DaemonState::entities_to_spine_entries(repo, &[candidate.clone(), normal]),
+                &hex::encode(state.graph.compute_root_hash()),
+            );
+            let foreign = test_entity("target", "target.rs");
+            spine.register_repo(
+                "foreign",
+                DaemonState::entities_to_spine_entries("foreign", &[foreign]),
+                "foreign-root",
+            );
+            let registry = vec![repo.to_string(), "foreign".to_string()];
+            spine.refresh_cross_repo_edges("foreign", &[], &[], &registry);
+            spine.refresh_cross_repo_edges(repo, &[candidate.clone()], &[relation], &registry);
+            let before = spine.cross_repo_xref_response(repo, &candidate.id);
+            assert!(before.authority_complete_for(repo, &candidate.id));
+            assert!(!before.edges.is_empty());
+            assert!(before.edges.iter().all(|edge| edge.confidence >= 0.9));
+            assert!(state.spine.set(spine.clone()).is_ok());
+            let mut publication = HostedPublicationGuard::local();
+            let error = state
+                .reregister_primary_at_current_root(spine.as_ref(), &mut publication)
+                .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("spine_candidate_representation_gap"));
+            assert!(!spine.authority_complete());
+            let after = spine.cross_repo_xref_response(repo, &candidate.id);
+            assert!(!after.authority_complete_for(repo, &candidate.id));
+            assert!(state.ensure_spine().is_none());
+            assert!(state
+                .spine_unavailable_reason()
+                .contains("spine_candidate_representation_gap"));
+            assert!(state.graph.get_entity(&candidate.id).unwrap().is_some());
+            let local =
+                kin_index::relation_read::relations_for_read(state.graph.as_ref(), &candidate.id)
+                    .unwrap();
+            assert!(local
+                .iter()
+                .all(|edge| !kin_index::RelationResolution::of(edge).is_proven()));
+        }
+    }
+
+    #[test]
     fn spine_capture_retries_after_primary_mutates_between_snapshot_and_validation() {
         use kin_model::{GraphNodeId, Relation, RelationId, RelationKind, RelationOrigin};
 
@@ -16499,6 +18213,343 @@ mod tests {
             response.authority_complete_for(&primary_repo_id, &after.id),
             "a single-repo daemon must still certify its own absence after a mutation"
         );
+    }
+
+    /// A commit of work the graph already served moves repository authority
+    /// and leaves the graph root where it was, and so does an explicit
+    /// admission that finds nothing to move. Each still revokes the primary's
+    /// cross-repo completeness before it runs. Re-registration followed the
+    /// root alone, so a registered root that already matched left that
+    /// revocation standing for the rest of the daemon's life, and every later
+    /// `find_references` read `cross_repo_authority_incomplete` until a
+    /// restart.
+    #[test]
+    #[serial_test::serial]
+    fn cross_repo_authority_recovers_after_a_mutation_that_leaves_the_root_in_place() {
+        let registry_dir = tempfile::tempdir().unwrap();
+        let registry_path = registry_dir.path().join("registry.toml");
+        kin_core::registry::KinRegistry { repos: Vec::new() }
+            .save_to(&registry_path)
+            .unwrap();
+        let _spine_env = kin_core::test_env::EnvVarGuard::set("KIN_REGISTRY_PATH", &registry_path)
+            .without("KIN_DISABLE_SPINE");
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let state = Arc::new(test_state(init.layout, repo_dir.path()));
+        let primary_repo_id = state.cached_repo_id.clone();
+        let served = test_entity("already_served", "src/served.rs");
+        state.graph.upsert_entity(&served).unwrap();
+        let root = hex::encode(state.graph.compute_root_hash());
+        let spine = state
+            .ensure_spine()
+            .expect("the fixture must publish a spine");
+        assert!(
+            spine
+                .cross_repo_xref_response(&primary_repo_id, &served.id)
+                .authority_complete_for(&primary_repo_id, &served.id),
+            "the control: a freshly registered single-repo spine certifies"
+        );
+
+        // Authority moves; graph truth does not.
+        drop(state.begin_graph_authority_mutation());
+        assert_eq!(
+            hex::encode(state.graph.compute_root_hash()),
+            root,
+            "the fixture mutation must leave the graph root where it was"
+        );
+
+        let spine = state
+            .ensure_spine()
+            .expect("a mutation must not cost the daemon its spine");
+        let response = spine.cross_repo_xref_response(&primary_repo_id, &served.id);
+        assert!(response.authority_root_matches(&primary_repo_id, &root));
+        assert!(
+            response.authority_complete_for(&primary_repo_id, &served.id),
+            "a mutation that left the root in place must not hold cross-repo authority \
+             incomplete for the rest of the daemon's life"
+        );
+        assert!(spine.authority_complete());
+    }
+
+    /// The same recovery in a daemon with a registered sibling. The primary's
+    /// entity set is unchanged at an unchanged root, so what it owes is a
+    /// refresh of its own edges. Re-registering it would mark every other
+    /// registered repository stale over a change that did not happen, and
+    /// nothing in a local daemon refreshes a sibling's edges afterwards.
+    #[test]
+    #[serial_test::serial]
+    fn a_mutation_that_leaves_the_root_in_place_leaves_a_sibling_complete() {
+        let (sibling_dir, sibling_id) = committed_spine_sibling("remote_call");
+        let registry_dir = tempfile::tempdir().unwrap();
+        let registry_path = registry_dir.path().join("registry.toml");
+        kin_core::registry::KinRegistry {
+            repos: vec![kin_core::registry::RegisteredRepo {
+                id: sibling_id.clone(),
+                path: sibling_dir.path().to_path_buf(),
+                entities: 1,
+                last_commit: String::new(),
+                dependencies: vec![],
+                dependencies_recorded_by: None,
+            }],
+        }
+        .save_to(&registry_path)
+        .unwrap();
+        let _spine_env = kin_core::test_env::EnvVarGuard::set("KIN_REGISTRY_PATH", &registry_path)
+            .without("KIN_DISABLE_SPINE");
+
+        let primary_dir = tempfile::tempdir().unwrap();
+        let primary_init = kin_core::init(primary_dir.path()).unwrap();
+        let state = test_state(primary_init.layout, primary_dir.path());
+        let primary_repo_id = state.cached_repo_id.clone();
+        let caller = test_entity("caller", "src/main.rs");
+        state.graph.upsert_entity(&caller).unwrap();
+        let spine = state.ensure_spine().expect("spine must be enabled");
+        assert_eq!(spine.repo_count(), 2, "the sibling must be registered");
+        assert!(
+            spine.authority_complete(),
+            "the control: a freshly initialized two-repository spine is complete"
+        );
+
+        drop(state.begin_graph_authority_mutation());
+
+        let spine = state
+            .ensure_spine()
+            .expect("a mutation must not cost the daemon its spine");
+        assert!(
+            !spine.cross_repo_edges_stale(&primary_repo_id),
+            "the primary's edges must be refreshed at the root it already registered"
+        );
+        assert!(
+            !spine.cross_repo_edges_stale(&sibling_id),
+            "a mutation that moved nothing must not leave the sibling's edges stale"
+        );
+        assert!(spine.authority_complete());
+    }
+
+    /// A commit that moves the primary's graph root registers the primary
+    /// again, and a registration marks every registered repository's
+    /// cross-repo edges stale, because any of them may import from the entity
+    /// set that just changed. Only the primary's own edges were refreshed
+    /// afterwards: the daemon keeps no sibling graph once the spine is built, so
+    /// a registered sibling stayed stale for the rest of the daemon's life and
+    /// every later `find_references` read `cross_repo_authority_incomplete`
+    /// until a restart.
+    ///
+    /// The sibling here calls two primary symbols. One resolves from the start.
+    /// The other names a function only the mutation adds, so its edge can appear
+    /// only if the sibling's imports are resolved again against the moved
+    /// primary; clearing the stale mark without that would certify a reference
+    /// set that is missing it.
+    #[test]
+    #[serial_test::serial]
+    fn a_mutation_that_moves_the_root_brings_a_sibling_current() {
+        let primary_dir = tempfile::tempdir().unwrap();
+        let primary_init = kin_core::init(primary_dir.path()).unwrap();
+        let primary_repo_id = primary_init.repository_id.as_str().to_string();
+        let (sibling_dir, sibling_id, sibling_caller) = committed_spine_sibling_importing(
+            &primary_repo_id,
+            &["shared_target", "added_by_the_mutation"],
+        );
+        let registry_dir = tempfile::tempdir().unwrap();
+        let registry_path = registry_dir.path().join("registry.toml");
+        kin_core::registry::KinRegistry {
+            repos: vec![kin_core::registry::RegisteredRepo {
+                id: sibling_id.clone(),
+                path: sibling_dir.path().to_path_buf(),
+                entities: 1,
+                last_commit: String::new(),
+                dependencies: vec![],
+                dependencies_recorded_by: None,
+            }],
+        }
+        .save_to(&registry_path)
+        .unwrap();
+        let _spine_env = kin_core::test_env::EnvVarGuard::set("KIN_REGISTRY_PATH", &registry_path)
+            .without("KIN_DISABLE_SPINE");
+
+        let state = test_state(primary_init.layout, primary_dir.path());
+        assert_eq!(state.cached_repo_id, primary_repo_id);
+        let shared_target = test_entity("shared_target", "src/lib.rs");
+        state.graph.upsert_entity(&shared_target).unwrap();
+        let sibling_edge_to = |spine: &dyn kin_spine::SpineBackend, target: &Entity| {
+            spine
+                .cross_repo_xref_response(&primary_repo_id, &target.id)
+                .edges
+                .iter()
+                .any(|edge| {
+                    edge.src_repo == sibling_id
+                        && edge.src_entity == sibling_caller
+                        && edge.dst_repo == primary_repo_id
+                        && edge.dst_entity == target.id
+                })
+        };
+
+        let spine = state.ensure_spine().expect("spine must be enabled");
+        assert_eq!(spine.repo_count(), 2, "the sibling must be registered");
+        assert!(
+            spine.authority_complete(),
+            "the control: a freshly initialized two-repository spine is complete"
+        );
+        assert!(
+            sibling_edge_to(spine, &shared_target),
+            "the control: the sibling's call into the primary must resolve at spine init"
+        );
+        let root_at_init = spine.root_hash(&primary_repo_id);
+
+        let added = test_entity("added_by_the_mutation", "src/added.rs");
+        let mutation = state.begin_graph_authority_mutation();
+        state.graph.upsert_entity(&added).unwrap();
+        drop(mutation);
+        let live_root = hex::encode(state.graph.compute_root_hash());
+        assert_ne!(
+            root_at_init.as_deref(),
+            Some(live_root.as_str()),
+            "the fixture mutation must move the primary's graph root"
+        );
+
+        let spine = state
+            .ensure_spine()
+            .expect("a mutation must not cost the daemon its spine");
+        assert_eq!(
+            spine.root_hash(&primary_repo_id).as_deref(),
+            Some(live_root.as_str()),
+            "the primary must be registered at the moved root"
+        );
+        let primary_stale = spine.cross_repo_edges_stale(&primary_repo_id);
+        let sibling_stale = spine.cross_repo_edges_stale(&sibling_id);
+        let complete = spine.authority_complete();
+        assert!(
+            !primary_stale && !sibling_stale && complete,
+            "a root-moving mutation must leave every registered repository's edges current \
+             without a restart: primary_stale={primary_stale} sibling_stale={sibling_stale} \
+             complete={complete}"
+        );
+        assert!(
+            spine
+                .cross_repo_xref_response(&primary_repo_id, &shared_target.id)
+                .authority_complete_for(&primary_repo_id, &shared_target.id),
+            "find_references on the primary must certify after the mutation"
+        );
+        assert!(
+            sibling_edge_to(spine, &shared_target),
+            "the sibling's call into an unchanged primary function must survive the move"
+        );
+        assert!(
+            sibling_edge_to(spine, &added),
+            "the sibling's call into the function the mutation added must resolve against \
+             the moved primary"
+        );
+    }
+
+    /// A sibling repository whose committed graph holds one caller,
+    /// `sibling_caller`, that calls each of `symbols` through an import from
+    /// `import_source`. Each call ends at the external target admission binds
+    /// for a symbol another repository owns: the imported name, no file, no
+    /// signature and the uniform module kind, which is what the spine collects
+    /// as an unresolved cross-repo import. Returns the caller's id.
+    fn committed_spine_sibling_importing(
+        import_source: &str,
+        symbols: &[&str],
+    ) -> (tempfile::TempDir, String, kin_model::EntityId) {
+        use kin_model::{
+            GraphNodeId, Relation, RelationEvidence, RelationId, RelationKind, RelationOrigin,
+        };
+        let caller = test_entity("sibling_caller", "src/lib.rs");
+        let mut entities = vec![caller.clone()];
+        let mut relations = Vec::new();
+        for symbol in symbols {
+            let mut target = test_entity(symbol, "src/lib.rs");
+            target.kind = EntityKind::Module;
+            target.file_origin = None;
+            target.signature = String::new();
+            target.role = kin_model::EntityRole::External;
+            relations.push(Relation {
+                id: RelationId::new(),
+                kind: RelationKind::Calls,
+                src: GraphNodeId::Entity(caller.id),
+                dst: GraphNodeId::Entity(target.id),
+                confidence: 1.0,
+                origin: RelationOrigin::Parsed,
+                created_in: None,
+                import_source: Some(import_source.to_string()),
+                evidence: vec![RelationEvidence {
+                    token: Some((*symbol).to_string()),
+                    ..RelationEvidence::default()
+                }],
+            });
+            entities.push(target);
+        }
+        let calls = symbols
+            .iter()
+            .map(|symbol| format!("    {symbol}();\n"))
+            .collect::<String>();
+        let source = format!("pub fn sibling_caller() {{\n{calls}}}\n");
+        let (sibling_dir, sibling_id) = commit_spine_sibling(&source, &entities, &relations);
+        (sibling_dir, sibling_id, caller.id)
+    }
+
+    /// A sibling repository holding one committed entity named `symbol`, the
+    /// way `kin init` and a native commit leave one, for a spine test to
+    /// register through the registry.
+    fn committed_spine_sibling(symbol: &str) -> (tempfile::TempDir, String) {
+        commit_spine_sibling(
+            &format!("pub fn {symbol}() {{}}\n"),
+            &[test_entity(symbol, "src/lib.rs")],
+            &[],
+        )
+    }
+
+    /// A sibling repository whose committed graph holds exactly `entities` and
+    /// `relations`, with `source` as its one file, `src/lib.rs`.
+    fn commit_spine_sibling(
+        source: &str,
+        entities: &[Entity],
+        relations: &[kin_model::Relation],
+    ) -> (tempfile::TempDir, String) {
+        let sibling_dir = tempfile::tempdir().unwrap();
+        let sibling_init = kin_core::init(sibling_dir.path()).unwrap();
+        let sibling_id = sibling_init.repository_id.as_str().to_string();
+        let sibling_graph = kin_db::InMemoryGraph::new();
+        let sibling_blobs =
+            kin_blobs::BlobStore::new(sibling_init.layout.ingest_cas_dir()).unwrap();
+        let sibling_digest = sibling_blobs.write(source.as_bytes()).unwrap();
+        sibling_graph
+            .apply_transaction_delta(&kin_model::TransactionDelta {
+                entity_deltas: Vec::new(),
+                relation_deltas: Vec::new(),
+                tree_deltas: vec![TreeDelta::Added {
+                    artifact_id: ArtifactId::new(),
+                    new: LocatedEntry::new(
+                        RepoPath::from_bytes(b"src/lib.rs".to_vec()).unwrap(),
+                        kin_model::TreeEntry::blob(Hash256::from_bytes(sibling_digest.0), false),
+                    ),
+                }],
+                admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
+            })
+            .unwrap();
+        sibling_graph.batch_upsert_entities(entities).unwrap();
+        for relation in relations {
+            sibling_graph.upsert_relation(relation).unwrap();
+        }
+        let context =
+            crate::local_repository_authority::LocalRepositoryAuthorityContext::from_layout_for_test(
+                &sibling_init.layout,
+            )
+            .unwrap();
+        let plan = crate::repository_commit::plan_native_commit(
+            &sibling_graph,
+            &sibling_blobs,
+            &context,
+            kin_model::OperationId::new(),
+            kin_model::Timestamp::now(),
+            kin_model::AuthorId::new("spine-fixture"),
+            "publish sibling semantic authority".to_string(),
+        )
+        .unwrap();
+        crate::repository_commit::commit_native_plan(&sibling_blobs, &context, plan).unwrap();
+        (sibling_dir, sibling_id)
     }
 
     #[test]
@@ -16901,7 +18952,7 @@ mod tests {
         }));
     }
 
-    /// FIR-2763's remaining acceptance: what the eager sibling pass costs on a
+    /// The eager sibling pass's remaining acceptance: what it costs on a
     /// REAL populated registry, measured rather than argued.
     ///
     /// `#[ignore]` because it opens this host's own registry and loads whole
@@ -18183,6 +20234,8 @@ mod tests {
             &admitted,
             kin_model::OperationId::new(),
             kin_model::AuthorId::new("authority-open-test"),
+            &[],
+            &[],
         )
         .unwrap()
         .expect("exact workspace admission must advance authority");
@@ -18217,6 +20270,42 @@ mod tests {
             let target_hash = symlink_artifact.entry.blob_identity().unwrap();
             assert_eq!(state.blobs.read(&target_hash).unwrap(), b"compose.yaml");
         }
+    }
+
+    /// A repository root reached through a symbolic link must still serve.
+    ///
+    /// Startup recovery opens the projection root with `O_NOFOLLOW`, which
+    /// refuses a link as the final component. Reaching a repository that way is
+    /// ordinary rather than exotic: on macOS `/tmp` and `/var` are themselves
+    /// links, so a repository under either is already in this case. Before the
+    /// root was resolved at this boundary the daemon did not degrade, it exited
+    /// before readiness with `Not a directory`, and the only surface that
+    /// noticed was an end-to-end test that spawns a real daemon.
+    #[cfg(unix)]
+    #[test]
+    fn open_with_repo_id_serves_a_root_reached_through_a_symlink() {
+        let parent = tempfile::tempdir().unwrap();
+        let real = parent.path().join("real-repo");
+        let linked = parent.path().join("linked-repo");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &linked).unwrap();
+        kin_core::init(&real).unwrap();
+
+        let unresolved = KinLayout::new(linked.join(".kin"));
+        // CONTROL: the layout handed in really does carry the linked spelling.
+        // Without this the assertion below would pass just as well on a build
+        // that had resolved the root somewhere upstream of the daemon.
+        assert_eq!(unresolved.working_dir(), linked.as_path());
+        assert_ne!(linked.as_path(), real.canonicalize().unwrap().as_path());
+
+        let state = DaemonState::open_with_repo_id(unresolved, None)
+            .expect("a repository reached through a symlinked root must open");
+        assert_eq!(
+            state.layout.working_dir(),
+            real.canonicalize().unwrap().as_path(),
+            "the daemon serves the resolved root, so recovery and the watcher \
+             agree on one spelling"
+        );
     }
 
     #[test]
@@ -18265,6 +20354,8 @@ mod tests {
             &admitted,
             kin_model::OperationId::new(),
             kin_model::AuthorId::new("lsp-authority-test"),
+            &[],
+            &[],
         )
         .unwrap()
         .expect("exact source admission must advance authority");
@@ -18336,6 +20427,8 @@ mod tests {
             &admitted,
             kin_model::OperationId::new(),
             kin_model::AuthorId::new("lsp-authority-test"),
+            &[],
+            &[],
         )
         .unwrap()
         .expect("exact source admission must advance authority");
@@ -18824,6 +20917,8 @@ mod tests {
             &admitted,
             kin_model::OperationId::new(),
             kin_model::AuthorId::new("read-index-reuse-test"),
+            &[],
+            &[],
         )
         .unwrap()
         .expect("exact workspace admission must advance authority");
@@ -19019,6 +21114,8 @@ mod tests {
             &admitted,
             kin_model::OperationId::new(),
             kin_model::AuthorId::new("dogfood"),
+            &[],
+            &[],
         )
         .unwrap()
         .unwrap();
@@ -19742,6 +21839,8 @@ mod tests {
             &admitted,
             kin_model::OperationId::new(),
             kin_model::AuthorId::new("ingest-cas-hydration-test"),
+            &[],
+            &[],
         )
         .unwrap()
         .expect("exact workspace admission must advance authority");
@@ -19999,11 +22098,11 @@ mod tests {
     /// A sidecar bound to a graph that has since moved on is salvaged per
     /// key: every vector whose entity truth is unchanged is reused, only the
     /// genuinely new key is missing, and nothing is announced as discarded.
-    /// The whole-index refusal this test used to pin was the FIR-2325 defect;
+    /// The whole-index refusal this test used to pin was a defect;
     /// kin-db 0.7.24 replaced it with per-key salvage, and the corrupted-format
     /// case above still proves a real refusal stays loud.
     ///
-    /// It now also pins the half FIR-2562 was about. "Not discarded" was the
+    /// It now also pins the salvage-reporting half. "Not discarded" was the
     /// only thing this path could say about a salvage, and a caller reading it
     /// learned that an index attached and nothing else. A salvage has to arrive
     /// as its own fact, with the counts kin-db already computed, or the
@@ -20053,7 +22152,7 @@ mod tests {
     /// reports NO salvage.
     ///
     /// Loaded whole and loaded partially are different facts, and a reader that
-    /// cannot tell them apart is back where FIR-2562 started. Without this arm
+    /// cannot tell them apart reports a salvage as a first fill. Without this arm
     /// a `load_validated_vector_index` that reported a salvage on every attach
     /// would satisfy the test above completely.
     #[test]
@@ -20091,9 +22190,9 @@ mod tests {
     /// (`crates/kin-db/src/storage/snapshot.rs:1460` in 0.7.49), so the retired
     /// count it reports beside it is already inside that number. Passing
     /// `vectors_loaded` straight through as "kept" would have printed
-    /// `2112 vectors were kept and 342 were retired` for the store FIR-2562 was
-    /// filed on, which reads 1770/2112 indexed: two numbers that cannot both be
-    /// true, on the one line the ticket exists to make trustworthy.
+    /// `2112 vectors were kept and 342 were retired` for the store that exposed
+    /// the salvage defect, which reads 1770/2112 indexed: two numbers that cannot
+    /// both be true, on the one line this report exists to make trustworthy.
     ///
     /// The store fixtures cannot catch this on their own. They install a single
     /// vector and retire nothing, so kept and loaded are the same number there
@@ -20161,6 +22260,769 @@ mod tests {
         assert_eq!(
             opened.salvage, None,
             "and nothing was salvaged either, since there was nothing to salvage"
+        );
+    }
+
+    // Artifact vectors across a local reopen.
+    //
+    // Repository authority records the tree and entity truth. It does not
+    // record the non-entity enrichment facets (shallow, structured and opaque
+    // records), which exist only in the served graph, and the retrieval
+    // authority stamp on a vector sidecar covers them. These fixtures publish
+    // a tree, run the coverage pass `/embed` runs before its vector pass, give
+    // the artifacts synthetic vectors, persist the sidecar through the
+    // daemon's own checkpoint, and reopen through the real local open path.
+
+    /// One tracked file of an artifact reopen fixture: a stable identity, a
+    /// path, and the exact bytes the tree records for it.
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    #[derive(Clone, Copy)]
+    struct TrackedBody {
+        id: ArtifactId,
+        path: &'static str,
+        body: &'static [u8],
+    }
+
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    impl TrackedBody {
+        fn new(path: &'static str, body: &'static [u8]) -> Self {
+            Self {
+                id: ArtifactId::new(),
+                path,
+                body,
+            }
+        }
+    }
+
+    /// How many of [`artifact_reopen_bodies`] carry a non-entity facet.
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    const ARTIFACT_REOPEN_FACETS: usize = 3;
+
+    /// The bodies every artifact reopen fixture tracks.
+    ///
+    /// One of each facet a tree body can produce today: a Dockerfile is a
+    /// structured artifact, a Markdown note is opaque by name, and binary bytes
+    /// under a `.rs` name are opaque by content. No extension classifies as
+    /// shallow syntax, so that facet has no body here. The last body is entity
+    /// source, which the coverage pass must leave without a facet.
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    fn artifact_reopen_bodies() -> [TrackedBody; 4] {
+        [
+            TrackedBody::new("Dockerfile", b"FROM scratch\nCOPY kin /kin\n"),
+            TrackedBody::new(
+                "NOTES.md",
+                b"# Operator notes\n\nA reopen keeps its artifact vectors.\n",
+            ),
+            TrackedBody::new("src/blob.rs", b"\0\xff\x10not-source"),
+            TrackedBody::new("src/lib.rs", b"pub fn entity_source() -> u8 { 1 }\n"),
+        ]
+    }
+
+    /// Publish `bodies` as this workspace's exact tree, replacing whatever tree
+    /// authority held, and return each body's content hash by path.
+    ///
+    /// Only the tree moves. No entity or enrichment record is published, which
+    /// is what repository authority holds for a file that is not entity source.
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    fn publish_tracked_bodies(
+        layout: &KinLayout,
+        bodies: &[TrackedBody],
+    ) -> std::collections::BTreeMap<&'static str, Hash256> {
+        let blobs = BlobStore::new(layout.ingest_cas_dir()).unwrap();
+        let mut hashes = std::collections::BTreeMap::new();
+        let desired = ResolvedTree::from_artifacts(
+            bodies
+                .iter()
+                .map(|tracked| {
+                    let hash = Hash256::from_bytes(blobs.write(tracked.body).unwrap().0);
+                    hashes.insert(tracked.path, hash);
+                    ResolvedArtifact::new(
+                        tracked.id,
+                        RepoPath::from_utf8(tracked.path).unwrap(),
+                        TreeEntry::blob(hash, false),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let context =
+            crate::local_repository_authority::LocalRepositoryAuthorityContext::from_layout_for_test(
+                layout,
+            )
+            .unwrap();
+        let previous = crate::repository_commit::authority_workspace_tree(&context).unwrap();
+        let admitted = crate::repository_commit::admitted_workspace_tree_for_test(
+            layout.working_dir(),
+            context.open().unwrap().read_authority().roots().clone(),
+            previous,
+            desired,
+        );
+        crate::repository_commit::publish_workspace_tree(
+            &blobs,
+            &context,
+            &admitted,
+            kin_model::OperationId::new(),
+            kin_model::AuthorId::new("artifact-vector-reopen-test"),
+            &[],
+            &[],
+        )
+        .unwrap()
+        .expect("exact workspace admission must advance authority");
+        hashes
+    }
+
+    /// Every non-entity facet `graph` serves for `bodies`, by path, as JSON so
+    /// two records compare field for field.
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    fn served_non_entity_facets(
+        graph: &kin_db::InMemoryGraph,
+        bodies: &[TrackedBody],
+    ) -> std::collections::BTreeMap<&'static str, serde_json::Value> {
+        let mut facets = std::collections::BTreeMap::new();
+        for tracked in bodies {
+            let file_id = FilePathId::new(tracked.path);
+            let facet = if let Some(record) = graph.get_shallow_file(&file_id).unwrap() {
+                json!({ "shallow": record })
+            } else if let Some(record) = graph.get_structured_artifact(&file_id).unwrap() {
+                json!({ "structured": record })
+            } else if let Some(record) = graph.get_opaque_artifact(&file_id).unwrap() {
+                json!({ "opaque": record })
+            } else {
+                continue;
+            };
+            facets.insert(tracked.path, facet);
+        }
+        facets
+    }
+
+    /// What the first daemon session of an artifact reopen fixture left behind.
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    struct PersistedArtifactVectors {
+        /// The retrieval authority the persisted sidecar is stamped with.
+        stamped_authority: [u8; 32],
+        /// How many vectors the persisted sidecar holds.
+        vectors: usize,
+        /// The non-entity facets that session served.
+        facets: std::collections::BTreeMap<&'static str, serde_json::Value>,
+    }
+
+    /// Run a first daemon session over the published tree: open it, run the
+    /// coverage pass `/embed` runs, give every artifact a synthetic vector
+    /// except the ones at `unvectored`, and persist the sidecar through the
+    /// daemon's checkpoint so it carries this session's authority stamp.
+    ///
+    /// The vectors are four synthetic dimensions, so no model loads and no
+    /// inference runs. The sidecar gates read metadata and the authority stamp,
+    /// never the vectors.
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    fn persist_artifact_vectors_after_embed_coverage(
+        layout: &KinLayout,
+        bodies: &[TrackedBody],
+        unvectored: &[&str],
+    ) -> PersistedArtifactVectors {
+        let state = DaemonState::open(layout.clone()).expect("the published fixture must open");
+        crate::loop_runner::ensure_non_entity_enrichment_coverage(&state).unwrap();
+        let facets = served_non_entity_facets(&state.graph, bodies);
+        assert_eq!(
+            facets.len(),
+            ARTIFACT_REOPEN_FACETS,
+            "after the embed coverage pass every non-entity body has a facet and the entity \
+             source has none: {facets:?}"
+        );
+
+        let descriptor = kin_db::vector::IndexDescriptor {
+            model_id: Some("fixture-embedder-v1".to_string()),
+            graph_root: Some("fixture-root".to_string()),
+        };
+        let index = kin_db::VectorIndex::new(4).unwrap();
+        index.set_descriptor(descriptor.clone());
+        let mut vectors = 0usize;
+        for tracked in bodies {
+            if !facets.contains_key(tracked.path) || unvectored.contains(&tracked.path) {
+                continue;
+            }
+            let mut embedding = [0.0f32; 4];
+            embedding[vectors % 4] = 1.0;
+            index
+                .upsert_retrievable(kin_db::RetrievalKey::Artifact(tracked.id), &embedding)
+                .unwrap();
+            vectors += 1;
+        }
+        let vector_path = layout.kindb_vector_index_path();
+        index.save(&vector_path).unwrap();
+        assert!(matches!(
+            state.graph.load_vector_index_compatible(&vector_path, &descriptor),
+            kin_db::vector::VectorIndexLoad::Loaded(loaded) if loaded == vectors
+        ));
+        state.persist_vector_sidecar().unwrap();
+        PersistedArtifactVectors {
+            stamped_authority: state.graph.retrieval_authority_hash(),
+            vectors,
+            facets,
+        }
+    }
+
+    /// What a reopen must leave as it found it in repository authority: the
+    /// root bundle, and this workspace's persisted semantic overlay, which is
+    /// what a merge refusal reads.
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    fn persisted_workspace_authority(
+        layout: &KinLayout,
+    ) -> (kin_model::RootBundle, kin_model::WorkspaceSemanticOverlay) {
+        let context =
+            crate::local_repository_authority::LocalRepositoryAuthorityContext::from_layout_for_test(
+                layout,
+            )
+            .unwrap();
+        let workspace_id = context.workspace_id();
+        let authority = context.open().unwrap();
+        let lease = authority.read_authority();
+        let overlay = lease
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == workspace_id)
+            .expect("the local workspace exists in authority")
+            .semantic_overlay
+            .clone();
+        (lease.roots().clone(), overlay)
+    }
+
+    /// The step a daemon's background embedding takes when it resumes after a
+    /// restart: queue every retrievable key the installed index has no vector
+    /// for. Returns how much artifact work is then queued and how much of it
+    /// one batch prepares. The fixtures hold no entities, so all prepared work
+    /// is artifact work.
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    fn artifact_work_after_resume(graph: &kin_db::InMemoryGraph) -> (usize, usize) {
+        graph.queue_missing_for_embedding();
+        graph.queue_missing_artifacts_for_embedding();
+        let queued = graph.pending_artifact_embeddings();
+        let prepared = graph.prepare_pending_embedding_batch(64).len();
+        (queued, prepared)
+    }
+
+    /// An unchanged store reopens with every artifact vector it persisted.
+    ///
+    /// The sidecar's stamp covers the non-entity facets the embed coverage pass
+    /// wrote into the served graph. Repository authority does not hold them,
+    /// so a reopen that validated the sidecar against the graph authority
+    /// alone saw a drift on every open, evicted each artifact vector and
+    /// re-served it from the content cache. The reopen has to hold the same
+    /// facets before the sidecar is validated, and holding them must not queue
+    /// the artifacts for a re-embed they do not need.
+    #[test]
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    fn an_unchanged_reopen_keeps_every_artifact_vector_and_owes_no_artifact_work() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let layout = kin_core::init(repo_dir.path()).unwrap().layout;
+        let bodies = artifact_reopen_bodies();
+        publish_tracked_bodies(&layout, &bodies);
+        let persisted = persist_artifact_vectors_after_embed_coverage(&layout, &bodies, &[]);
+        assert_eq!(persisted.vectors, ARTIFACT_REOPEN_FACETS);
+        let authority_before = persisted_workspace_authority(&layout);
+
+        let reopened = DaemonState::open(layout.clone()).expect("an unchanged store must reopen");
+
+        assert_eq!(
+            reopened.vector_index_discarded, None,
+            "an unchanged store's sidecar must not be refused"
+        );
+        assert_eq!(
+            reopened.vector_index_salvage, None,
+            "an unchanged store must load its sidecar exactly, not salvage it per key"
+        );
+        assert_eq!(
+            reopened.graph.retrieval_authority_hash(),
+            persisted.stamped_authority,
+            "the reopened graph must reproduce the authority the sidecar was stamped with"
+        );
+        assert_eq!(
+            served_non_entity_facets(&reopened.graph, &bodies),
+            persisted.facets,
+            "the reopen must serve the facets the embed pass wrote, field for field"
+        );
+        assert_eq!(
+            reopened.graph.vector_index_stats().map(|(_, len)| len),
+            Some(persisted.vectors),
+            "the index must hold exactly the vectors the sidecar persisted"
+        );
+        let status = reopened.graph.embedding_status();
+        assert_eq!(
+            (status.indexed, status.total, status.pending, status.queued),
+            (persisted.vectors, ARTIFACT_REOPEN_FACETS, 0, 0),
+            "every artifact in truth keeps its vector and nothing is queued: {status:?}"
+        );
+        // Not `has_unpersisted_changes`: every local open registers the
+        // daemon's own session, and that upsert sets the full-snapshot flag
+        // whatever else the open restored. The claim here is only that the
+        // facets arrived with the base rather than as a pending mutation.
+        assert!(
+            !reopened.graph.has_pending_delta(),
+            "the reopen's facets are not a pending graph mutation"
+        );
+        assert_eq!(
+            persisted_workspace_authority(&layout),
+            authority_before,
+            "the reopen publishes nothing: authority roots and the persisted overlay a merge \
+             refusal reads are unchanged"
+        );
+        assert_eq!(
+            artifact_work_after_resume(&reopened.graph),
+            (0, 0),
+            "the background resume must find no artifact to queue or prepare"
+        );
+    }
+
+    /// A small real Git import carries revisions and source entities but no
+    /// source layouts, the shape whose canonical startup used to change the
+    /// retrieval stamp after sidecar admission. No model or language server runs.
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    fn mixed_import_with_persisted_vectors() -> (tempfile::TempDir, KinLayout, [u8; 32], usize) {
+        let repo = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let output = kin_git::test_support::fixture_git_in(repo.path())
+                .args([
+                    "-c",
+                    "user.name=Reopen Test",
+                    "-c",
+                    "user.email=reopen@example.test",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(repo.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q", "--initial-branch=main"]);
+        // Exact import resolves these in the parent process too. Pin both to
+        // this temporary repository rather than the developer's global scope.
+        let hooks = repo.path().join(".git/hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        git(&["config", "core.hooksPath", hooks.to_str().unwrap()]);
+        let excludes = repo.path().join(".git/fixture-excludes");
+        std::fs::write(&excludes, b"").unwrap();
+        git(&["config", "core.excludesFile", excludes.to_str().unwrap()]);
+        std::fs::write(
+            repo.path().join("notes.md"),
+            b"# Notes\nRetain unchanged vectors.\n",
+        )
+        .unwrap();
+        for value in [1, 2] {
+            std::fs::write(
+                repo.path().join("query.go"),
+                format!("package query\n\nfunc Value() int {{ return {value} }}\nfunc Caller() int {{ return Value() }}\n"),
+            ).unwrap();
+            git(&["add", "notes.md", "query.go"]);
+            git(&["commit", "-q", "-s", "-m", "Update the query value"]);
+        }
+        let layout = kin_core::init_from_git(repo.path()).unwrap().layout;
+        let state = DaemonState::open(layout.clone()).unwrap();
+        // Run the same layout step canonical startup runs. Before the fix this
+        // writes the missing layout, reproducing the actual post-open stamp.
+        crate::loop_runner::backfill_missing_file_layouts(&state).unwrap();
+        crate::loop_runner::ensure_non_entity_enrichment_coverage(&state).unwrap();
+        let entities = state.graph.list_all_entities().unwrap();
+        let value = entities
+            .iter()
+            .find(|entity| entity.name == "Value")
+            .unwrap();
+        let caller = entities
+            .iter()
+            .find(|entity| entity.name == "Caller")
+            .unwrap();
+        let relation = kin_model::Relation {
+            id: kin_model::RelationId::new(),
+            kind: kin_model::RelationKind::References,
+            src: kin_model::GraphNodeId::Entity(caller.id),
+            dst: kin_model::GraphNodeId::Entity(value.id),
+            confidence: 0.95,
+            origin: kin_model::RelationOrigin::Lsp,
+            created_in: None,
+            import_source: None,
+            evidence: vec![kin_model::RelationEvidence {
+                source_span: caller.span.clone(),
+                parser_rule: Some("lsp_references".to_string()),
+                occurrence_count: 1,
+                ..Default::default()
+            }],
+        };
+        state.graph.upsert_relation(&relation).unwrap();
+        assert!(crate::accepted_enrichment::record(&layout, &[relation]));
+        let snapshot = state.graph.to_snapshot();
+        assert!(snapshot
+            .entity_revisions
+            .values()
+            .any(|revisions| revisions.len() > 1));
+        let mut keys: Vec<_> = snapshot
+            .entities
+            .keys()
+            .map(|id| kin_db::RetrievalKey::Entity(*id))
+            .collect();
+        keys.extend(
+            snapshot
+                .entity_revisions
+                .iter()
+                .filter(|(id, _)| snapshot.entities.contains_key(*id))
+                .filter_map(|(_, revisions)| revisions.last())
+                .map(|revision| kin_db::RetrievalKey::EntityRevision(revision.revision_id)),
+        );
+        let notes = snapshot
+            .resolved_tree
+            .artifact_at_path(&RepoPath::from_utf8("notes.md").unwrap())
+            .unwrap();
+        keys.push(kin_db::RetrievalKey::Artifact(notes.artifact_id));
+        let index = kin_db::VectorIndex::new(4).unwrap();
+        let descriptor = kin_db::vector::IndexDescriptor {
+            model_id: Some("fixture-embedder-v1".to_string()),
+            graph_root: Some("fixture-root".to_string()),
+        };
+        index.set_descriptor(descriptor.clone());
+        for (i, key) in keys.iter().enumerate() {
+            let mut vector = [0.0_f32; 4];
+            vector[i % 4] = 1.0;
+            index.upsert_retrievable(*key, &vector).unwrap();
+        }
+        let vector_path = layout.kindb_vector_index_path();
+        index.save(&vector_path).unwrap();
+        assert!(
+            matches!(state.graph.load_vector_index_compatible(&vector_path, &descriptor), kin_db::vector::VectorIndexLoad::Loaded(n) if n == keys.len())
+        );
+        state.persist_vector_sidecar().unwrap();
+        let stamp = state.graph.retrieval_authority_hash();
+        (repo, layout, stamp, keys.len())
+    }
+
+    #[test]
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    fn mixed_import_reopen_keeps_artifact_vectors_after_layout_and_enrichment_reconstruction() {
+        let (_repo, layout, stamp, count) = mixed_import_with_persisted_vectors();
+        let authority_before = persisted_workspace_authority(&layout);
+        let state = DaemonState::open(layout.clone()).unwrap();
+        assert_eq!(state.vector_index_discarded, None);
+        assert_eq!(
+            state.vector_index_salvage, None,
+            "an unchanged mixed import must attach exactly"
+        );
+        assert_eq!(state.graph.retrieval_authority_hash(), stamp);
+        assert_eq!(
+            state.graph.vector_index_stats().map(|(_, n)| n),
+            Some(count)
+        );
+        assert!(state
+            .graph
+            .to_snapshot()
+            .relations
+            .values()
+            .any(|relation| relation.origin == kin_model::RelationOrigin::Lsp));
+        state.graph.queue_missing_artifacts_for_embedding();
+        assert_eq!(state.graph.pending_artifact_embeddings(), 0);
+        let second_pass = crate::loop_runner::backfill_missing_file_layouts(&state).unwrap();
+        assert_eq!(
+            second_pass.published, 0,
+            "canonical startup must not parse or republish restored layouts"
+        );
+        assert_eq!(second_pass.already_published, 1);
+        assert_eq!(persisted_workspace_authority(&layout), authority_before);
+    }
+
+    #[test]
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    fn source_layout_restoration_cannot_certify_changed_or_unreadable_inputs() {
+        let (_repo, layout, stamp, _) = mixed_import_with_persisted_vectors();
+        let state = DaemonState::open(layout.clone()).unwrap();
+        let base = state.graph.to_snapshot();
+        let source_id = FilePathId::new("query.go");
+        for input in ["missing", "moved_spans", "same_spans"] {
+            let mut snapshot = base.clone();
+            snapshot
+                .file_layouts
+                .retain(|record| record.file_id != source_id);
+            let missing_cas = tempfile::tempdir().unwrap();
+            let blobs = BlobStore::new(missing_cas.path().to_path_buf()).unwrap();
+            if input != "missing" {
+                let body: &[u8] = if input == "moved_spans" {
+                    b"package query\n\n// moved\nfunc Value() int { return 3 }\nfunc Caller() int { return Value() }\n"
+                } else {
+                    // Coordinates still agree, but the tree's content identity
+                    // differs. Matching layout spans must not admit old vectors.
+                    b"package query\n\nfunc Value() int { return 3 }\nfunc Caller() int { return Value() }\n"
+                };
+                let hash = Hash256::from_bytes(blobs.write(body).unwrap().0);
+                let artifacts = snapshot
+                    .resolved_tree
+                    .clone()
+                    .into_artifacts()
+                    .map(|mut artifact| {
+                        if artifact.path.as_utf8() == Some("query.go") {
+                            artifact.entry = TreeEntry::blob(hash, false);
+                        }
+                        artifact
+                    })
+                    .collect::<Vec<_>>();
+                snapshot.resolved_tree = ResolvedTree::from_artifacts(artifacts).unwrap();
+            }
+            let report = crate::loop_runner::restore_missing_source_layouts_in_snapshot(
+                &mut snapshot,
+                &blobs,
+            )
+            .unwrap();
+            assert_eq!(
+                report.published,
+                usize::from(input == "same_spans"),
+                "unreadable or stale spans must stay absent: {input}: {report:?}"
+            );
+            assert_eq!(
+                (report.stale, report.unreadable),
+                (
+                    usize::from(input == "moved_spans"),
+                    usize::from(input == "missing")
+                )
+            );
+            assert_eq!(
+                snapshot
+                    .file_layouts
+                    .iter()
+                    .any(|layout| layout.file_id == source_id),
+                input == "same_spans"
+            );
+            let graph = kin_db::InMemoryGraph::from_snapshot_without_text_index(snapshot).unwrap();
+            assert_ne!(graph.retrieval_authority_hash(), stamp);
+            let opened = DaemonState::load_validated_vector_index(&layout, &graph, None);
+            assert!(
+                opened.salvage.is_some(),
+                "missing or changed source proof cannot claim exact sidecar reuse"
+            );
+            graph.queue_missing_artifacts_for_embedding();
+            assert_eq!(
+                graph.pending_artifact_embeddings(),
+                1,
+                "the unproven artifact vector must retire"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    fn source_layout_restoration_preserves_existing_authoritative_observations() {
+        let (_repo, layout, _, _) = mixed_import_with_persisted_vectors();
+        let state = DaemonState::open(layout).unwrap();
+        let mut snapshot = state.graph.to_snapshot();
+        let layout = snapshot
+            .file_layouts
+            .iter_mut()
+            .find(|layout| layout.file_id.0 == "query.go")
+            .unwrap();
+        layout.parse_completeness = kin_model::layout::ParseCompleteness::Partial(
+            "retained authoritative observation".to_string(),
+        );
+        let before = serde_json::to_value(&snapshot.file_layouts).unwrap();
+        let empty = tempfile::tempdir().unwrap();
+        let report = crate::loop_runner::restore_missing_source_layouts_in_snapshot(
+            &mut snapshot,
+            &BlobStore::new(empty.path().to_path_buf()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(report.already_published, 1);
+        assert_eq!(report.published, 0);
+        assert_eq!(
+            report.unreadable, 0,
+            "an existing layout must not trigger a second body read"
+        );
+        assert_eq!(
+            serde_json::to_value(&snapshot.file_layouts).unwrap(),
+            before
+        );
+    }
+
+    /// An artifact the sidecar never held a vector for is still owed after an
+    /// unchanged reopen: the exact load keeps what it holds, and the resume
+    /// queues the one key it lacks.
+    #[test]
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    fn an_unchanged_reopen_still_owes_the_artifact_its_sidecar_never_held() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let layout = kin_core::init(repo_dir.path()).unwrap().layout;
+        let bodies = artifact_reopen_bodies();
+        publish_tracked_bodies(&layout, &bodies);
+        let persisted =
+            persist_artifact_vectors_after_embed_coverage(&layout, &bodies, &["NOTES.md"]);
+        assert_eq!(persisted.vectors, ARTIFACT_REOPEN_FACETS - 1);
+
+        let reopened = DaemonState::open(layout.clone()).expect("an unchanged store must reopen");
+
+        assert_eq!(reopened.vector_index_discarded, None);
+        assert_eq!(
+            reopened.vector_index_salvage, None,
+            "a key the sidecar never held is not drift; the load must still be exact"
+        );
+        let status = reopened.graph.embedding_status();
+        assert_eq!(
+            (status.indexed, status.total, status.pending),
+            (persisted.vectors, ARTIFACT_REOPEN_FACETS, 1),
+            "the kept vectors stay and the one missing artifact is still owed: {status:?}"
+        );
+        assert_eq!(
+            artifact_work_after_resume(&reopened.graph),
+            (1, 1),
+            "the resume must queue and prepare exactly the artifact that has no vector"
+        );
+    }
+
+    /// A body that changed in authority after the sidecar was written drifts
+    /// the stamp. Its artifact vector is retired rather than served, and the
+    /// reopened graph describes the new bytes, so the resume re-embeds it.
+    #[test]
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    fn an_artifact_changed_since_the_sidecar_drifts_and_its_vector_is_retired() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let layout = kin_core::init(repo_dir.path()).unwrap().layout;
+        let mut bodies = artifact_reopen_bodies();
+        publish_tracked_bodies(&layout, &bodies);
+        let persisted = persist_artifact_vectors_after_embed_coverage(&layout, &bodies, &[]);
+
+        // Same identity and path, new bytes.
+        bodies[1].body = b"# Operator notes\n\nThese bytes moved after the sidecar was written.\n";
+        let hashes = publish_tracked_bodies(&layout, &bodies);
+
+        let reopened = DaemonState::open(layout.clone()).expect("a changed store must reopen");
+
+        assert_eq!(reopened.vector_index_discarded, None);
+        let salvage = reopened
+            .vector_index_salvage
+            .expect("a body that moved since the stamp must drift the sidecar");
+        assert_ne!(
+            reopened.graph.retrieval_authority_hash(),
+            persisted.stamped_authority
+        );
+        let notes = reopened
+            .graph
+            .get_opaque_artifact(&FilePathId::new(bodies[1].path))
+            .unwrap()
+            .expect("the changed body keeps a facet, derived from its new bytes");
+        assert_eq!(
+            notes.content_hash, hashes[bodies[1].path],
+            "the reopened facet must describe the bytes authority holds now"
+        );
+        assert_eq!(
+            (salvage.kept, salvage.dropped),
+            (0, persisted.vectors),
+            "drift leaves no per-key proof for an artifact, so no artifact vector is kept"
+        );
+        assert_eq!(
+            reopened.graph.vector_index_stats().map(|(_, len)| len),
+            Some(0),
+            "the changed artifact's stale vector must not be served"
+        );
+        assert_eq!(
+            artifact_work_after_resume(&reopened.graph),
+            (ARTIFACT_REOPEN_FACETS, ARTIFACT_REOPEN_FACETS),
+            "every retired artifact, the changed one among them, is queued on resume"
+        );
+    }
+
+    /// A body removed from authority after the sidecar was written is evicted
+    /// from the index, gets no facet back, and is never queued.
+    #[test]
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    fn a_removed_artifact_is_evicted_and_neither_resurrected_nor_queued() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let layout = kin_core::init(repo_dir.path()).unwrap().layout;
+        let bodies = artifact_reopen_bodies();
+        publish_tracked_bodies(&layout, &bodies);
+        let persisted = persist_artifact_vectors_after_embed_coverage(&layout, &bodies, &[]);
+        assert_eq!(persisted.vectors, ARTIFACT_REOPEN_FACETS);
+
+        let removed = bodies[2];
+        let remaining: Vec<TrackedBody> = bodies
+            .iter()
+            .copied()
+            .filter(|tracked| tracked.path != removed.path)
+            .collect();
+        publish_tracked_bodies(&layout, &remaining);
+
+        let reopened = DaemonState::open(layout.clone()).expect("a pruned store must reopen");
+
+        assert!(
+            reopened.vector_index_salvage.is_some(),
+            "removing a tracked body drifts the stamp"
+        );
+        assert_eq!(
+            reopened
+                .graph
+                .artifact_id_at_path(&RepoPath::from_utf8(removed.path).unwrap()),
+            None,
+            "the removed body is gone from tree truth"
+        );
+        let served = served_non_entity_facets(&reopened.graph, &bodies);
+        assert!(
+            !served.contains_key(removed.path),
+            "the removed body must not be given a facet back: {served:?}"
+        );
+        assert_eq!(
+            served.len(),
+            ARTIFACT_REOPEN_FACETS - 1,
+            "the bodies still tracked keep their facets: {served:?}"
+        );
+        assert_eq!(
+            reopened.graph.vector_index_stats().map(|(_, len)| len),
+            Some(0),
+            "the removed artifact's vector is evicted, and drift retires the others"
+        );
+        assert_eq!(
+            reopened.graph.embedding_status().total,
+            ARTIFACT_REOPEN_FACETS - 1,
+            "truth owes vectors for the surviving artifacts only"
+        );
+        assert_eq!(
+            artifact_work_after_resume(&reopened.graph),
+            (ARTIFACT_REOPEN_FACETS - 1, ARTIFACT_REOPEN_FACETS - 1),
+            "the resume queues the surviving artifacts and never the removed one"
+        );
+    }
+
+    /// A sidecar this build refuses installs nothing, so every artifact the
+    /// reopened graph holds stays owed.
+    #[test]
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    fn a_refused_sidecar_leaves_every_artifact_owed() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let layout = kin_core::init(repo_dir.path()).unwrap().layout;
+        let bodies = artifact_reopen_bodies();
+        publish_tracked_bodies(&layout, &bodies);
+        persist_artifact_vectors_after_embed_coverage(&layout, &bodies, &[]);
+
+        let metadata_path = DaemonState::vector_metadata_path(&layout);
+        let mut metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&metadata_path).unwrap()).unwrap();
+        metadata["version"] = json!(u32::MAX);
+        std::fs::write(&metadata_path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+
+        let reopened =
+            DaemonState::open(layout.clone()).expect("a refused sidecar must not block open");
+
+        assert!(
+            reopened.vector_index_discarded.is_some(),
+            "the refusal must be announced"
+        );
+        assert_eq!(
+            reopened
+                .graph
+                .vector_index_stats()
+                .map_or(0, |(_, len)| len),
+            0,
+            "a refused sidecar installs no vector"
+        );
+        assert_eq!(
+            artifact_work_after_resume(&reopened.graph),
+            (ARTIFACT_REOPEN_FACETS, ARTIFACT_REOPEN_FACETS),
+            "every artifact the reopened graph holds is queued on resume"
         );
     }
 

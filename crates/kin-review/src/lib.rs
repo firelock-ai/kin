@@ -17,6 +17,7 @@ pub mod revert_history;
 pub mod review;
 pub mod risk;
 pub mod shadow;
+pub mod source_derivation;
 pub mod write;
 
 pub use change_shape::{

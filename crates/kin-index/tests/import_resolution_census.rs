@@ -16,13 +16,28 @@ use std::path::{Path, PathBuf};
 
 use kin_index::{link_cross_file, FileParseData};
 use kin_model::{ArtifactId, Entity, EntityKind, FilePathId, GraphNodeId, RelationKind};
-use kin_parser::{JavaScriptAdapter, LanguageAdapter, PythonAdapter, TypeScriptAdapter};
+use kin_parser::{
+    GoAdapter, JavaAdapter, JavaScriptAdapter, KotlinAdapter, LanguageAdapter, PhpAdapter,
+    PythonAdapter, RustAdapter, SwiftAdapter, TypeScriptAdapter,
+};
 
+/// The languages this census can read.
+///
+/// Go, Java, Kotlin, PHP, Rust and Swift are here so the census can be pointed
+/// at a corpus in one of them and report what fraction of its imports now
+/// resolve. Those six minted no entity-level import edge before, so their
+/// census was known to be zero and there was nothing to measure; there is now.
 fn adapter_for(path: &Path) -> Option<Box<dyn LanguageAdapter>> {
     match path.extension().and_then(|e| e.to_str()) {
         Some("py") => Some(Box::new(PythonAdapter)),
         Some("js") | Some("mjs") | Some("cjs") => Some(Box::new(JavaScriptAdapter)),
         Some("ts") | Some("tsx") => Some(Box::new(TypeScriptAdapter)),
+        Some("go") => Some(Box::new(GoAdapter)),
+        Some("java") => Some(Box::new(JavaAdapter)),
+        Some("kt") | Some("kts") => Some(Box::new(KotlinAdapter)),
+        Some("php") => Some(Box::new(PhpAdapter)),
+        Some("rs") => Some(Box::new(RustAdapter)),
+        Some("swift") => Some(Box::new(SwiftAdapter)),
         _ => None,
     }
 }

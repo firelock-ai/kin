@@ -197,6 +197,8 @@ pub const CLAUSE_CODES: &[ClauseCode] = &[
         code: "depth_zero",
         meaning: "The walk expanded no edges, so an empty neighbourhood is not evidence of isolation.",
     },
+    ClauseCode { code: "derived_source_stale", meaning: "Derived source evidence differs from admitted bytes; useful last-good rows do not establish current completeness." },
+    ClauseCode { code: "derived_source_unproven", meaning: "Bounded graph evidence did not establish source binding in the selected scope." },
     ClauseCode {
         code: "edge_coverage_budget_exhausted",
         meaning: "The coverage scan for the language stopped before it could establish what the graph holds.",
@@ -271,7 +273,7 @@ pub const CLAUSE_CODES: &[ClauseCode] = &[
     },
     ClauseCode {
         code: "graph_behind_working_tree",
-        meaning: "Host paths on disk have never been admitted; `_kin.behind` counts them.",
+        meaning: "Host paths on disk have never been admitted, or admitted paths are still owed their parse; `_kin.behind` counts each separately.",
     },
     ClauseCode {
         code: "graph_empty",
@@ -286,8 +288,24 @@ pub const CLAUSE_CODES: &[ClauseCode] = &[
         meaning: "The daemon has not confirmed its first reconciliation or snapshot load.",
     },
     ClauseCode {
+        code: "history_predates_upgrade",
+        meaning: "The answer reads the store's history, and history recorded before its last `kin upgrade` keeps the replay version that authored it and carries no checked binding history.",
+    },
+    ClauseCode {
         code: "lexical_fallback_matched_nothing",
         meaning: "A phrase query matched no name, and the per-token fallback ranks by word overlap rather than meaning.",
+    },
+    ClauseCode {
+        code: "lexical_lookup_not_structural",
+        meaning: "This is lexical evidence over stored graph fields, not a resolved call or reference edge; a hit or a miss here is not proof the identifier is or is not used.",
+    },
+    ClauseCode {
+        code: "local_binding_outstanding",
+        meaning: "Previously local source bindings remain unresolved; current source and parse evidence do not establish complete dependency knowledge.",
+    },
+    ClauseCode {
+        code: "local_binding_unproven",
+        meaning: "Prior-local binding evidence could not be validated for the checked scope; complete dependency knowledge is unproven.",
     },
     ClauseCode {
         code: "method_call_resolution_incomplete",
@@ -337,9 +355,30 @@ pub const CLAUSE_CODES: &[ClauseCode] = &[
         code: "semantic_authoritative",
         meaning: "Certifying: daemon-owned truth with complete embedding coverage. Appears only when trust is authoritative.",
     },
+    ClauseCode { code: "semantic_readmission_failed", meaning: "Semantic readmission failed for admitted source; current semantic completeness is not established." },
+    ClauseCode {
+        code: "spine_candidate_representation_gap",
+        meaning: "The daemon's cross-repo spine refused this repository's graph because it holds an inferred member whose candidate authority the spine format cannot carry, so no cross-repo authority stands behind the answer for as long as the graph holds it.",
+    },
+    ClauseCode {
+        code: "spine_initialization_deferred",
+        meaning: "The daemon's cross-repo spine was not built yet, because its initialization stepped aside while a writer held graph authority, so no cross-repo authority stands behind the answer; a read after the writer finishes builds it.",
+    },
     ClauseCode {
         code: "spine_root_stale",
         meaning: "The cross-repo spine's recorded root for this repository is stale.",
+    },
+    ClauseCode {
+        code: "store_semantics_ahead",
+        meaning: "A newer Kin build recorded this store's replay semantics; upgrade Kin rather than re-deriving the store with this older build.",
+    },
+    ClauseCode {
+        code: "store_semantics_behind",
+        meaning: "This store serves state an older Kin build derived; run `kin upgrade` in this repository (`npx -y @kinlab/kin@<version> upgrade` through npm) to re-derive it under this build, keeping every native commit, branch and review.",
+    },
+    ClauseCode {
+        code: "store_semantics_unknown",
+        meaning: "This store's replay-semantics record is missing or unreadable; upgrade Kin to the newest build, then run `kin upgrade` in this repository.",
     },
     ClauseCode {
         code: "structural_authoritative",
@@ -364,6 +403,14 @@ pub const CLAUSE_CODES: &[ClauseCode] = &[
     ClauseCode {
         code: "trace_walk_truncated",
         meaning: "The walk hit a per-step or total cap before examining everything an empty chain would have to rule out.",
+    },
+    ClauseCode {
+        code: "tracked_changes_unadmitted",
+        meaning: "Tracked files changed or removed while no daemon was watching are not admitted yet, so the answer may describe bytes the working copy no longer holds; the daemon's catch-up takes them on its own, and `kin admit` takes them now.",
+    },
+    ClauseCode {
+        code: "tracked_changes_unchecked",
+        meaning: "The daemon could not check whether tracked files changed while no daemon was watching, so the answer may describe bytes the working copy no longer holds; `kin admit` settles it.",
     },
     ClauseCode {
         code: "unlisted_clause",
@@ -629,9 +676,20 @@ impl Verdict {
             // is missing an unknown set of paths, which is the fact that
             // qualifies all of them.
             ("watcher_loss", watcher_loss_reading(envelope)),
+            // Beside the watcher loss, for the same reason: it says graph truth
+            // itself holds bytes the working copy no longer does, which
+            // qualifies every reading below it, a populated answer included.
+            ("tracked_changes", tracked_changes_reading(envelope)),
             (
                 "absence_gate",
                 absence_gate_reading(tool, payload, negative),
+            ),
+            // Right after the absence gate, whose composition already carries
+            // this reading's clauses under the same labels, so the factor names
+            // each gap once and the input still says it was read.
+            (
+                "caller_arrival",
+                caller_arrival_reading(tool, payload, makes_absence_claim),
             ),
             ("edge_coverage", edge_coverage_reading(tool, payload)),
             ("withheld_candidates", withheld_candidates_reading(payload)),
@@ -640,6 +698,19 @@ impl Verdict {
             ("outside_graph", outside_graph_reading(payload)),
             ("completeness", completeness_reading(envelope)),
             ("graph_freshness", graph_freshness_reading(envelope)),
+            (
+                "source_derivation",
+                match envelope.source_derivation.as_ref().and_then(|observation| {
+                    observation.limiting_factor(if tool == "entity_history" {
+                        crate::envelope::AbsenceSubstrate::History
+                    } else {
+                        crate::envelope::AbsenceSubstrate::Relations
+                    })
+                }) {
+                    Some(reason) => Reading::Inconclusive(vec![reason.into()]),
+                    None => Reading::Silent,
+                },
+            ),
             // Last, so where the absence gate already named an empty graph its clause
             // leads and this one is folded into it by label. It is the only input
             // that speaks on an answer with no absence gate at all, which is the
@@ -885,6 +956,50 @@ fn absence_gate_reading(tool: &str, payload: &Value, negative: Option<&Value>) -
         return Reading::Certified;
     }
     Reading::Silent
+}
+
+/// The caller-arrival reading, named as its own input.
+///
+/// Its gaps reach the verdict through the absence gate too, which folds every
+/// gap `negative` pushed into one reading, so a certified verdict used to cite
+/// `absence_gate` and never the arrival reading it certified over. Named here,
+/// `inputs.caller_arrival` says the answer's `caller_arrival` block was read and
+/// what it said, and the block's `scope` says what that reading can and cannot
+/// see.
+///
+/// It reads the block with the functions the absence gate's own gaps come from,
+/// and only where that gate reads it: an answer from `find_references`,
+/// `get_context_pack` or `impact_analysis` that claims an absence. A populated
+/// reference list claims none, and a shortfall in the arrival paths says
+/// nothing about whether the rows it did return are real. An impact answer
+/// that reported no entity without consumers had nothing for the reading to
+/// qualify, and says so with `not_applicable`.
+fn caller_arrival_reading(tool: &str, payload: &Value, makes_absence_claim: bool) -> Reading {
+    if !makes_absence_claim {
+        return Reading::Silent;
+    }
+    let Some(state) = payload
+        .get(crate::caller_arrival::CALLER_ARRIVAL_KEY)
+        .and_then(|block| block.get("state"))
+        .and_then(Value::as_str)
+    else {
+        return Reading::Silent;
+    };
+    let gaps: Vec<String> = match tool {
+        "find_references" | "get_context_pack" => crate::caller_arrival::arrival_gap(payload)
+            .into_iter()
+            .collect(),
+        "impact_analysis" if state == crate::caller_arrival::IMPACT_ARRIVAL_NOT_APPLICABLE => {
+            return Reading::Silent
+        }
+        "impact_analysis" => crate::caller_arrival::impact_arrival_gaps(payload),
+        _ => return Reading::Silent,
+    };
+    if gaps.is_empty() {
+        Reading::Certified
+    } else {
+        Reading::Inconclusive(gaps)
+    }
 }
 
 /// The raw `edge_coverage` observation's own reading, independent of whichever
@@ -1252,6 +1367,29 @@ fn watcher_loss_reading(envelope: &Envelope) -> Reading {
     }
 }
 
+/// Tracked files the working copy edited or removed while no daemon watched,
+/// that no admission has taken yet.
+///
+/// Every answer is inconclusive while one stands, a populated one included,
+/// because the graph still answers from those files' old bytes: it names a
+/// renamed function under its old name and ranks a deleted file as a hit. The
+/// daemon plans these paths before it publishes its endpoint and admits them on
+/// its own, so the reading clears without anyone acting, and it is bounded the
+/// way a permanent floor would not be.
+///
+/// Silent when nothing is owed; the producer omits the count on a daemon that
+/// took everything, and a silent input never licenses an answer.
+fn tracked_changes_reading(envelope: &Envelope) -> Reading {
+    match envelope
+        .behind
+        .as_ref()
+        .and_then(crate::envelope::GraphBehind::tracked_changes_limiting_factor)
+    {
+        Some(reason) => Reading::Inconclusive(vec![reason]),
+        None => Reading::Silent,
+    }
+}
+
 fn graph_freshness_reading(envelope: &Envelope) -> Reading {
     match envelope.freshness.as_ref() {
         // The clause is taken from the type rather than written again here, so
@@ -1421,6 +1559,67 @@ pub fn mark_response_bounded(annotated: &mut Value) {
     }
 }
 
+/// A source observation is sampled after the query. Add its refusal to an
+/// already serialized verdict without discarding earlier limiting inputs.
+pub(crate) fn qualify_source_observation(payload: &mut Value, reason: &'static str) {
+    if let Some(negative) = payload.get_mut(crate::negative::NEGATIVE_KEY) {
+        crate::negative::qualify_source_observation(negative, reason);
+    }
+    let Some(envelope) = payload
+        .get_mut(crate::envelope::ENVELOPE_KEY)
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    let Some(previous) = envelope.get(VERDICT_KEY).and_then(Value::as_object) else {
+        return;
+    };
+    let mut inputs = previous
+        .get("inputs")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    inputs.insert("source_derivation".into(), json!(INCONCLUSIVE));
+    let verdict = Verdict {
+        certified: false,
+        absence_claim: if previous.get("absence_claim").and_then(Value::as_str)
+            == Some("not_applicable")
+        {
+            AbsenceClaim::NotApplicable
+        } else {
+            AbsenceClaim::NotAuthoritative
+        },
+        limiting_factor: Some(lead_with_code(
+            previous.get("limiting_factor").and_then(Value::as_str),
+            reason
+                .split(':')
+                .next()
+                .unwrap_or("derived_source_unproven"),
+        )),
+        inputs,
+    };
+    if let Some(value) = envelope.get_mut("completeness") {
+        if let Ok(typed) = serde_json::from_value(value.clone()) {
+            let mut completeness = Some(typed);
+            verdict.project_onto_completeness(&mut completeness);
+            *value = serde_json::to_value(completeness).expect("completeness serializes");
+        }
+    }
+    envelope.insert(VERDICT_KEY.into(), verdict.to_value());
+    if let Some(edge) = payload
+        .get_mut(crate::edge_coverage::EDGE_COVERAGE_KEY)
+        .and_then(Value::as_object_mut)
+    {
+        let limits = edge.entry("limits").or_insert_with(|| json!([]));
+        if let Some(limits) = limits.as_array_mut() {
+            let value = json!("source_derivation:inconclusive");
+            if !limits.contains(&value) {
+                limits.push(value);
+            }
+        }
+    }
+}
+
 /// Every way a built response contradicts its own single verdict, as one message
 /// per disagreement.
 ///
@@ -1547,6 +1746,24 @@ fn headline_count_disagreements(response: &Value) -> Vec<String> {
     let Some(candidates) = response.get("candidates").and_then(Value::as_array) else {
         return Vec::new();
     };
+    // Focal choices are not withheld reference rows. They have their own
+    // accounting, including brief and explicitly omitted choices. Reference
+    // accounting takes precedence even if a malformed response also claims an
+    // ambiguous focal, so the marker cannot hide a real counter disagreement.
+    let reference_accounting = [
+        "/total_upstream",
+        "/unconfirmed_candidates",
+        "/counts/receiver_name_candidates",
+        "/counts/unresolved_name_candidates",
+        "/_kin/completeness/counted/withheld_candidates",
+    ]
+    .iter()
+    .any(|pointer| response.pointer(pointer).is_some());
+    if response.get("ambiguous_focal").and_then(Value::as_bool) == Some(true)
+        && !reference_accounting
+    {
+        return focal_choice_count_disagreements(response, candidates.len() as u64);
+    }
     let withheld = candidates.len() as u64;
     if withheld == 0 {
         return Vec::new();
@@ -1606,6 +1823,42 @@ fn headline_count_disagreements(response: &Value) -> Vec<String> {
     }
     found
 }
+
+/// Name resolution keeps the total when detailed choices become brief rows
+/// or an explicitly omitted suffix. Check that accounting without inventing a
+/// reference-count headline for a response that answered about no focal.
+fn focal_choice_count_disagreements(response: &Value, detailed: u64) -> Vec<String> {
+    let brief = match response.get("more_candidates") {
+        None => 0,
+        Some(Value::Array(rows)) => rows.len() as u64,
+        Some(_) => return vec!["more_candidates is not an array of focal choices".to_string()],
+    };
+    let omitted = match response.get("omitted_candidates") {
+        None => 0,
+        Some(value) => match value.as_u64() {
+            Some(count) => count,
+            None => return vec!["omitted_candidates is not a nonnegative count".to_string()],
+        },
+    };
+    let Some(total) = detailed
+        .checked_add(brief)
+        .and_then(|listed| listed.checked_add(omitted))
+    else {
+        return vec!["focal choice accounting overflows its count".to_string()];
+    };
+    match response.get("candidate_count").and_then(Value::as_u64) {
+        None => vec!["focal choices carry no valid candidate_count".to_string()],
+        Some(reported) if reported != total => vec![format!(
+            "candidate_count reads {reported} against {total} focal choice(s) \
+             in candidates, more_candidates and omitted_candidates"
+        )],
+        Some(_) => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+#[path = "../tests_support/clause_codes.rs"]
+mod clause_codes_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1890,6 +2143,139 @@ mod tests {
                 "the verdict returns once the recovery has happened: {:?}",
                 verdict.limiting_factor
             );
+        }
+    }
+
+    mod tracked_changes {
+        use super::*;
+
+        fn envelope_with(changed: Option<(u64, Value)>, unchecked: Option<&str>) -> Envelope {
+            let mut reconcile = json!({
+                "untracked_path_count": 0,
+                "untracked_observed_age_seconds": 0,
+                "last_admission_success_at": "2026-09-09T00:00:00Z",
+                "last_admission_success_age_seconds": 12,
+            });
+            if let Some((count, sample)) = changed {
+                reconcile["changed_path_count"] = json!(count);
+                reconcile["changed_paths_sample"] = sample;
+            }
+            if let Some(reason) = unchecked {
+                reconcile["changed_paths_unchecked"] = json!(reason);
+            }
+            Envelope::daemon().with_health(&json!({
+                "graph_loaded": true,
+                "initialized": true,
+                "reconcile": reconcile,
+            }))
+        }
+
+        /// The control, on the same payload and the same store with nothing
+        /// owed. Without it, `inconclusive` below could come from anything on
+        /// this fixture and would say nothing about the tracked files.
+        #[test]
+        fn a_store_that_owes_no_tracked_file_certifies_on_the_same_payload() {
+            let envelope = envelope_with(Some((0, json!([]))), None);
+            assert!(
+                envelope.behind.is_none(),
+                "a store that owes nothing publishes no behind block: {:?}",
+                envelope.behind
+            );
+            assert!(matches!(
+                tracked_changes_reading(&envelope),
+                Reading::Silent
+            ));
+            let verdict = Verdict::compute(
+                "find_references",
+                &populated_reference_payload("present"),
+                &envelope,
+                None,
+            )
+            .expect("the readings are not all silent");
+            assert!(
+                verdict.certified,
+                "the control must certify, or the arm below proves nothing: {:?}",
+                verdict.limiting_factor
+            );
+        }
+
+        /// A populated answer over a store still holding the old bytes of a
+        /// tracked file the host edited while no daemon watched is not
+        /// certified: the rows it carries can name code the file no longer
+        /// declares. The reader is told which files and what clears them.
+        #[test]
+        fn a_populated_answer_over_an_unadmitted_tracked_edit_is_inconclusive() {
+            let envelope = envelope_with(Some((2, json!(["src/doomed.rs", "src/lib.rs"]))), None);
+            let behind = envelope
+                .behind
+                .as_ref()
+                .expect("the owed tracked files are read off the wire");
+            assert_eq!(behind.changed_paths, 2);
+            assert_eq!(behind.changed_sample, vec!["src/doomed.rs", "src/lib.rs"]);
+
+            let verdict = Verdict::compute(
+                "find_references",
+                &populated_reference_payload("present"),
+                &envelope,
+                None,
+            )
+            .expect("the readings are not all silent")
+            .to_value();
+            assert_eq!(verdict["state"], json!(INCONCLUSIVE), "{verdict}");
+            assert_eq!(
+                verdict["inputs"]["tracked_changes"],
+                json!(INCONCLUSIVE),
+                "{verdict}"
+            );
+            let factor = verdict["limiting_factor"]
+                .as_str()
+                .expect("a refusing verdict names its factor");
+            assert!(
+                factor
+                    .split(CLAUSE_SEPARATOR)
+                    .any(|code| code == "tracked_changes_unadmitted"),
+                "the code survives composition: {factor}"
+            );
+            assert!(
+                CLAUSE_CODES.iter().any(|entry| {
+                    entry.code == "tracked_changes_unadmitted"
+                        && entry.meaning.contains("kin admit")
+                }),
+                "the code's written meaning names what clears it"
+            );
+            // The absence half rides the behind block, so an empty answer is
+            // withheld for the same reason and names the tracked files too.
+            assert!(
+                behind
+                    .limiting_factor()
+                    .contains("tracked path(s) changed or removed"),
+                "{}",
+                behind.limiting_factor()
+            );
+        }
+
+        /// A check that could not run is not a working copy with nothing owed.
+        #[test]
+        fn a_startup_check_that_could_not_run_refuses_certification() {
+            let envelope = envelope_with(None, Some("the walk failed"));
+            assert!(envelope
+                .behind
+                .as_ref()
+                .is_some_and(|behind| behind.changed_unchecked));
+            let verdict = Verdict::compute(
+                "find_references",
+                &populated_reference_payload("present"),
+                &envelope,
+                None,
+            )
+            .expect("an unchecked working copy needs a verdict")
+            .to_value();
+            assert_eq!(verdict["state"], INCONCLUSIVE, "{verdict}");
+            assert!(verdict["limiting_factor"]
+                .as_str()
+                .unwrap()
+                .split(CLAUSE_SEPARATOR)
+                .any(|code| code == "tracked_changes_unchecked"));
         }
     }
 
@@ -2707,6 +3093,71 @@ mod tests {
             "{:?}",
             headline_count_disagreements(&response)
         );
+    }
+
+    #[test]
+    fn focal_choice_counts_include_brief_and_omitted_candidates() {
+        let mut response = json!({
+            "ambiguous_focal": true,
+            "candidate_count": 5,
+            "candidates": [{"entity_id": "function"}, {"entity_id": "module"}],
+            "more_candidates": [{"entity_id": "another"}],
+            "omitted_candidates": 2,
+        });
+        assert!(headline_count_disagreements(&response).is_empty());
+
+        response["candidate_count"] = json!(2);
+        let found = headline_count_disagreements(&response);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains("candidate_count reads 2 against 5"));
+        response["candidate_count"] = json!(5);
+        for (field, invalid) in [
+            ("candidate_count", Value::Null),
+            ("more_candidates", json!(1)),
+            ("omitted_candidates", json!(-1)),
+            ("omitted_candidates", json!(u64::MAX)),
+        ] {
+            let mut malformed = response.clone();
+            malformed[field] = invalid;
+            assert!(
+                !headline_count_disagreements(&malformed).is_empty(),
+                "malformed {field} must not bypass accounting: {malformed}"
+            );
+        }
+        response["candidates"] = json!([]);
+        response["more_candidates"] = json!([]);
+        response["omitted_candidates"] = json!(5);
+        assert!(headline_count_disagreements(&response).is_empty());
+        response["omitted_candidates"] = json!(4);
+        assert!(!headline_count_disagreements(&response).is_empty());
+    }
+
+    #[test]
+    fn reference_counter_checks_take_precedence_over_focal_choice_markers() {
+        for reference_fields in [
+            json!({"total_upstream": 0}),
+            json!({"unconfirmed_candidates": 1}),
+            json!({"counts": {"receiver_name_candidates": 1}}),
+            json!({"counts": {"unresolved_name_candidates": 1}}),
+            json!({"_kin": {"completeness": {"counted": {"withheld_candidates": 1}}}}),
+        ] {
+            let mut response = json!({
+                "ambiguous_focal": true,
+                "candidate_count": 2,
+                "candidates": [{"entity_id": "first"}, {"entity_id": "second"}],
+            });
+            response
+                .as_object_mut()
+                .unwrap()
+                .extend(reference_fields.as_object().unwrap().clone());
+            let found = headline_count_disagreements(&response);
+            assert!(
+                found
+                    .iter()
+                    .any(|message| message.contains("unconfirmed_candidates")),
+                "reference accounting must still check its own headline: {response}, {found:?}"
+            );
+        }
     }
 
     /// The substrate reading stays raw. `status: "complete"` and a `classes` map

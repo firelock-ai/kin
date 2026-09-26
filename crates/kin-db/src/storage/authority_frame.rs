@@ -88,6 +88,48 @@ impl GitExternalAuthorityPatch {
     }
 }
 
+/// How a frame moves the envelope's owed derivation ledger.
+///
+/// The successor's whole ledger when it moved, because a commit both records
+/// and pays within one ledger and the ledger is small next to the frame. A
+/// frame whose ledger did not move carries no element for it at all, so every
+/// such frame keeps the bytes and the version it had before the ledger
+/// existed.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub enum OwedDerivationPatch {
+    /// The successor carries the base's ledger unchanged.
+    #[default]
+    Unchanged,
+    /// The successor's ledger, which differs from the base's.
+    Set(super::derivation_ledger::OwedDerivationLedger),
+}
+
+impl OwedDerivationPatch {
+    /// The patch that carries `base` to `successor`.
+    pub fn between(
+        base: &super::derivation_ledger::OwedDerivationLedger,
+        successor: &super::derivation_ledger::OwedDerivationLedger,
+    ) -> Self {
+        if successor == base {
+            Self::Unchanged
+        } else {
+            Self::Set(successor.clone())
+        }
+    }
+
+    /// Whether this patch leaves the ledger as the base had it.
+    pub fn is_unchanged(&self) -> bool {
+        matches!(self, Self::Unchanged)
+    }
+
+    fn apply_to(&self, target: &mut super::derivation_ledger::OwedDerivationLedger) {
+        match self {
+            Self::Unchanged => {}
+            Self::Set(ledger) => *target = ledger.clone(),
+        }
+    }
+}
+
 /// The collaboration records one successor added or replaced, as the
 /// successor holds them.
 ///
@@ -333,7 +375,7 @@ impl CollaborationPatch {
 /// Every sequence with set semantics is carried in canonical sorted order so
 /// that encoding the same successor twice yields identical bytes, which is what
 /// makes an exact retry of a frame append idempotent at the backend.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuthorityFrame {
     /// Envelope schema of the base and the successor.
@@ -367,6 +409,54 @@ pub struct AuthorityFrame {
     /// and a version 2 body decodes with an empty patch.
     #[serde(default, skip_serializing_if = "CollaborationPatch::is_empty")]
     pub collaboration: CollaborationPatch,
+    #[serde(default)]
+    pub binding_history: Vec<super::binding_history::BindingHistoryWitness>,
+    /// How the successor moved the owed derivation ledger.
+    ///
+    /// Appended in version 5 and written only when the ledger moved, so a frame
+    /// that leaves it alone keeps its version 2, 3 or 4 body byte for byte, and
+    /// a frame that moves it is one an older reader refuses at the header.
+    #[serde(default)]
+    pub owed_derivations: OwedDerivationPatch,
+}
+
+impl Serialize for AuthorityFrame {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        // Positional: a trailing field is written only when it, or one after
+        // it, is, so every earlier position stays filled.
+        let ledger = !self.owed_derivations.is_unchanged();
+        let capability = self.schema_version
+            >= super::binding_history::BINDING_HISTORY_AUTHORITY_SCHEMA
+            || ledger;
+        let collaboration = capability || !self.collaboration.is_empty();
+        let mut out = serializer.serialize_struct(
+            "AuthorityFrame",
+            12 + usize::from(collaboration) + usize::from(capability) + usize::from(ledger),
+        )?;
+        out.serialize_field("schema_version", &self.schema_version)?;
+        out.serialize_field("repository_id", &self.repository_id)?;
+        out.serialize_field("operation", &self.operation)?;
+        out.serialize_field("changes", &self.changes)?;
+        out.serialize_field("admission_policies", &self.admission_policies)?;
+        out.serialize_field("external_objects", &self.external_objects)?;
+        out.serialize_field("aliases", &self.aliases)?;
+        out.serialize_field("git_external_authority", &self.git_external_authority)?;
+        out.serialize_field("ref_state", &self.ref_state)?;
+        out.serialize_field("workspaces", &self.workspaces)?;
+        out.serialize_field("local_overlays", &self.local_overlays)?;
+        out.serialize_field("merge_transactions", &self.merge_transactions)?;
+        if collaboration {
+            out.serialize_field("collaboration", &self.collaboration)?;
+        }
+        if capability {
+            out.serialize_field("binding_history", &self.binding_history)?;
+        }
+        if ledger {
+            out.serialize_field("owed_derivations", &self.owed_derivations)?;
+        }
+        out.end()
+    }
 }
 
 impl AuthorityFrame {
@@ -378,7 +468,15 @@ impl AuthorityFrame {
     /// Version 3 appends [`CollaborationPatch`]. A frame is written at the
     /// version its contents need ([`Self::wire_version`]), so only a frame
     /// that carries collaboration is a version 3 frame.
-    pub const CURRENT_VERSION: u32 = 3;
+    pub const CURRENT_VERSION: u32 = Self::OWED_DERIVATION_VERSION;
+
+    /// The version a schema5 frame whose owed derivation ledger did not move
+    /// is written at, binding-history capability included.
+    pub const BINDING_HISTORY_VERSION: u32 = 4;
+
+    /// The version a frame that moves the owed derivation ledger is written
+    /// at, whatever its envelope schema.
+    pub const OWED_DERIVATION_VERSION: u32 = 5;
 
     /// The oldest frame format version this binary reads, and the version a
     /// frame that carries no collaboration is still written at.
@@ -396,16 +494,21 @@ impl AuthorityFrame {
     /// The version these exact contents are written at.
     ///
     /// Derived from the contents, as a snapshot's version is: a frame that
-    /// carries collaboration needs the version 3 body, and every other frame
-    /// keeps the version 2 body byte for byte. So a store stays readable by a
-    /// version 2 reader until it holds its first collaboration frame, and a
-    /// version 2 reader refuses that frame by version rather than misreading
-    /// it.
+    /// moves the owed derivation ledger uses version5 at any schema. Otherwise
+    /// a frame that requires schema5 uses version4, including the required
+    /// binding-history capability. In legacy schemas, collaboration uses
+    /// version3 and a frame without it keeps the version2 body byte for byte.
     pub fn wire_version(&self) -> u32 {
+        if !self.owed_derivations.is_unchanged() {
+            return Self::OWED_DERIVATION_VERSION;
+        }
+        if self.schema_version >= super::binding_history::BINDING_HISTORY_AUTHORITY_SCHEMA {
+            return Self::BINDING_HISTORY_VERSION;
+        }
         if self.collaboration.is_empty() {
             Self::MIN_SUPPORTED_VERSION
         } else {
-            Self::CURRENT_VERSION
+            3
         }
     }
 
@@ -537,9 +640,10 @@ impl AuthorityFrame {
         if frame.wire_version() != declared {
             return Err(KinDbError::StorageError(format!(
                 "authority frame declares version {declared} but its contents are written at \
-                 version {}; a frame is version {} exactly when it carries collaboration records",
-                frame.wire_version(),
-                Self::CURRENT_VERSION
+                 version {}; a moved owed derivation ledger requires version5, schema5 \
+                 requires version4, while legacy frames use version3 with collaboration \
+                 records and version2 without them",
+                frame.wire_version()
             )));
         }
         frame.validate_shape()?;
@@ -547,6 +651,16 @@ impl AuthorityFrame {
     }
 
     fn validate_shape(&self) -> Result<(), KinDbError> {
+        if !(super::repository::MIN_REPOSITORY_AUTHORITY_SCHEMA_VERSION
+            ..=super::repository::REPOSITORY_AUTHORITY_SCHEMA_VERSION)
+            .contains(&self.schema_version)
+            || (self.schema_version < super::binding_history::BINDING_HISTORY_AUTHORITY_SCHEMA
+                && !self.binding_history.is_empty())
+        {
+            return Err(KinDbError::StorageError(
+                "unsupported binding-history authority frame schema".into(),
+            ));
+        }
         self.operation.validate().map_err(|error| {
             KinDbError::StorageError(format!(
                 "authority frame carries an invalid operation record: {error}"
@@ -745,6 +859,11 @@ impl AuthorityFrame {
             local_overlays: successor.local_overlays.clone(),
             merge_transactions: successor.merge_transactions.clone(),
             collaboration: CollaborationPatch::drain(current, next)?,
+            binding_history: successor.binding_history.clone(),
+            owed_derivations: OwedDerivationPatch::between(
+                &base.owed_derivations,
+                &successor.owed_derivations,
+            ),
         };
         frame.validate_shape()?;
         Ok(frame)
@@ -888,6 +1007,9 @@ impl AuthorityFrame {
         envelope.workspaces = workspaces.into_values().collect();
         envelope.local_overlays = self.local_overlays.clone();
         envelope.merge_transactions = self.merge_transactions.clone();
+        envelope.binding_history = self.binding_history.clone();
+        self.owed_derivations
+            .apply_to(&mut envelope.owed_derivations);
 
         let operation = self.operation.clone();
         if envelope
@@ -1071,6 +1193,8 @@ pub(crate) fn first_difference(
         // answer or is refused at read time. The worst a missed mutation costs
         // here is a replay, never a wrong graph.
         materialized_graph: _,
+        // Runtime-only capability is reconstructed from admitted authority.
+        verified_binding_history: _,
     } = reconstructed;
     let GraphSnapshot {
         version: _,
@@ -1109,6 +1233,8 @@ pub(crate) fn first_difference(
         repository_authority: next_repository_authority,
         external_references: next_external_references,
         materialized_graph: _,
+        // Runtime-only capability is reconstructed from admitted authority.
+        verified_binding_history: _,
     } = next;
     let checks = [
         ("entities", entities == next_entities),
@@ -1605,11 +1731,11 @@ mod tests {
     fn frame_versions_outside_the_supported_range_refuse_by_name() {
         let body = b"never decoded";
         for (version, needle) in [
-            (1, "this kin-db reads versions 2 to 3"),
+            (1, "this kin-db reads versions 2 to 5"),
             (
                 AuthorityFrame::CURRENT_VERSION + 1,
                 "a newer kin-db wrote it, so open this store with a kin built on a kin-db that \
-                 reads frame version 4",
+                 reads frame version 6",
             ),
         ] {
             let mut bytes = frame_bytes_from(body);

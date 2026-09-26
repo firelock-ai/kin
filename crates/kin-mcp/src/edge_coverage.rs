@@ -965,35 +965,35 @@ pub(crate) mod test_support {
 /// exactly as before.
 ///
 /// An entity-level `Imports` edge needs two halves, and either can be missing.
-/// First the specifier has to resolve to a file this repository holds:
+/// First the coordinate has to reach a file this repository holds:
 /// `resolve_module_path` in `kin_index::linker` sends a Python source file to
 /// `resolve_python_module_import`, joins a `.`-prefixed specifier onto the
 /// importer's directory with extension and index probing, and otherwise tries a
 /// repo-local header, a monorepo package, a Java dotted package and a Go module
-/// path, in that order. Rust `use` paths take none of those branches, which is
-/// why a Rust store reports its import statements parsed and none resolved.
+/// path, and `kin_index::import_binding` reads the coordinates none of those
+/// branches understands: a Rust `use` path, a PHP namespace, a Swift module and
+/// a Java or Kotlin package whose type name was split into the specifier.
 /// Second, the importing file has to carry a module entity, which
 /// `make_entity_import_relations` uses as the edge's source and
 /// `module_entity_by_file` reads as the first `EntityKind::Module` entity in the
-/// file: the cpp, hcl, javascript, python, rust and typescript adapters emit
-/// one, and go, java, kotlin, php and swift do not, so those five cannot source
-/// the edge however well their specifiers resolve.
+/// file. Go, Java, Kotlin, PHP, Rust and Swift each emit one per source file,
+/// beside cpp, hcl, javascript, python and typescript.
+///
+/// That leaves C, and it is named here for the same reason the six were: the C
+/// adapter emits no `EntityKind::Module` entity at all, so no C file can source
+/// the edge whatever its includes resolve to. Its `#include` directives are
+/// `Includes` edges besides, which is a different class.
+///
+/// The table stays one-sided. A language is named only where the source proves
+/// the edge impossible, so every language it does not name is scanned for
+/// exactly as before, and a witness still beats the table.
 ///
 /// `Calls` and `References` are never named here. Calls are minted from call
 /// sites for every language that parses them, and whether a reference edge can
 /// exist is a fact about the language server that `reference_enrichment`
 /// already carries.
 fn cannot_mint_entity_level(language: LanguageId, kind: RelationKind) -> bool {
-    kind == RelationKind::Imports
-        && matches!(
-            language,
-            LanguageId::Rust
-                | LanguageId::Go
-                | LanguageId::Java
-                | LanguageId::Kotlin
-                | LanguageId::Swift
-                | LanguageId::Php
-        )
+    kind == RelationKind::Imports && matches!(language, LanguageId::C)
 }
 
 /// The reference classes among `kinds`, in the order given. Other relation kinds
@@ -1151,7 +1151,9 @@ fn observe_language<S: EntityStore>(
                         break;
                     }
                     examined += 1;
-                    let Ok(relations) = store.get_all_relations_for_entity(&entity.id) else {
+                    let Ok(relations) =
+                        kin_index::relation_read::relations_for_read(store, &entity.id)
+                    else {
                         continue;
                     };
                     for relation in relations {
@@ -1173,6 +1175,11 @@ fn observe_language<S: EntityStore>(
                         };
                         if !seen_any.contains(&relation.kind) {
                             seen_any.push(relation.kind);
+                        }
+                        // A derived candidate can disclose a producible class, but
+                        // cannot witness a resolved cross-file destination.
+                        if kin_index::resolution::is_derived_member_candidate(&relation) {
+                            continue;
                         }
                         let source_file = endpoint_file(store, &files, &source);
                         let destination_file = endpoint_file(store, &files, &destination);
@@ -1353,7 +1360,7 @@ pub fn language_has_a_proven_cross_file_reference<S: EntityStore>(
         if examined >= WITNESS_BUDGET {
             break;
         }
-        let Ok(relations) = store.get_all_relations_for_entity(&entity.id) else {
+        let Ok(relations) = kin_index::relation_read::relations_for_read(store, &entity.id) else {
             continue;
         };
         for relation in relations {
@@ -1437,10 +1444,12 @@ mod tests {
     ///
     /// The shape this exists for was measured on a 5,088-entity Rust store: the
     /// search spent all 4,096 entities of its budget looking for an entity-level
-    /// `Imports` edge the linker has no branch to mint for Rust, reported
+    /// `Imports` edge the linker then had no branch to mint for Rust, reported
     /// `budget_exhausted`, and left every other class `unknown`, so a
     /// default-kinds `find_references` was inconclusive on the budget whatever
-    /// the graph held.
+    /// the graph held. Rust mints that edge now and C is what remains on the
+    /// table, so C is what this case drives; the mechanism it grades is the
+    /// table's, not any one language's.
     ///
     /// Breaking it: stop excluding the class from the search and it reads
     /// `absent`, a statement about the code, for a class no repository could
@@ -1448,8 +1457,8 @@ mod tests {
     #[test]
     fn a_class_this_build_cannot_mint_is_unproduced_and_spends_no_budget() {
         let store = InMemoryGraph::new();
-        let caller = entity("open_store", "src/engine/open.rs", LanguageId::Rust);
-        let target = entity("read_header", "src/storage/header.rs", LanguageId::Rust);
+        let caller = entity("open_store", "src/engine/open.c", LanguageId::C);
+        let target = entity("read_header", "src/storage/header.c", LanguageId::C);
         store.upsert_entity(&caller).unwrap();
         store.upsert_entity(&target).unwrap();
         store
@@ -1470,7 +1479,7 @@ mod tests {
         assert_eq!(coverage["budget_exhausted"], json!(false));
         assert_eq!(
             coverage["unproduced_evidence"]["imports"]["this_build_mints_no_entity_level_edge_for"],
-            json!(["Rust"]),
+            json!(["C"]),
             "the payload says which of the state's two reasons this is: {coverage}"
         );
     }

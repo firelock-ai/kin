@@ -1,6 +1,65 @@
 // The live graph falling behind repository authority, and the levelling that
 // brings it back level. Included into `loop_runner::tests`.
 
+#[cfg(unix)]
+type SplitPublicationFault = Box<dyn FnOnce(&DaemonState) + Send>;
+
+#[cfg(unix)]
+static SPLIT_PUBLICATION_FAULTS: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<usize, SplitPublicationFault>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+#[cfg(unix)]
+struct SplitPublicationFaultGuard(usize);
+
+#[cfg(unix)]
+impl Drop for SplitPublicationFaultGuard {
+    fn drop(&mut self) {
+        SPLIT_PUBLICATION_FAULTS.lock().unwrap().remove(&self.0);
+    }
+}
+
+#[cfg(unix)]
+fn split_publication_fault(
+    state: &DaemonState,
+    fault: SplitPublicationFault,
+) -> SplitPublicationFaultGuard {
+    let owner = state as *const DaemonState as usize;
+    assert!(SPLIT_PUBLICATION_FAULTS
+        .lock()
+        .unwrap()
+        .insert(owner, fault)
+        .is_none());
+    SplitPublicationFaultGuard(owner)
+}
+
+/// Controlled corruption after actual authority publication, not an LSP
+/// protocol race. The production LSP installer cannot bypass coordination.
+#[cfg(unix)]
+pub(super) fn split_after_standalone_publication_for_test(state: &DaemonState) {
+    let fault = SPLIT_PUBLICATION_FAULTS
+        .lock()
+        .unwrap()
+        .remove(&(state as *const DaemonState as usize));
+    if let Some(fault) = fault {
+        fault(state);
+    }
+}
+
+#[cfg(unix)]
+fn split_durable_snapshot(state: &DaemonState) -> kin_db::GraphSnapshot {
+    let context =
+        crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(state)
+            .unwrap();
+    context
+        .open()
+        .unwrap()
+        .read_authority()
+        .workspace_graph_snapshot(&context.workspace_id())
+        .unwrap()
+        .unwrap()
+}
+
 /// Plant the edge a late enrichment write can leave: a relation whose source
 /// entity the graph does not hold.
 ///
@@ -9,7 +68,7 @@
 /// Returns the relation and the endpoint it is filed under.
 #[cfg(unix)]
 fn split_plant_relation_from_a_missing_entity(
-    state: &Arc<DaemonState>,
+    state: &DaemonState,
     target_file: &str,
 ) -> (kin_model::RelationId, kin_model::GraphNodeId) {
     let target = state
@@ -74,8 +133,8 @@ fn split_publish_behind_the_graphs_back(state: &Arc<DaemonState>, rel_path: &str
     let digest = state.blobs.write(content).unwrap();
     let previous = state.graph.resolved_tree();
     let path = test_repo_path(rel_path);
-    let desired = kin_model::ResolvedTree::from_artifacts(previous.artifacts_by_path().map(
-        |artifact| {
+    let desired =
+        kin_model::ResolvedTree::from_artifacts(previous.artifacts_by_path().map(|artifact| {
             if artifact.path == path {
                 kin_model::ResolvedArtifact::new(
                     artifact.artifact_id,
@@ -85,9 +144,8 @@ fn split_publish_behind_the_graphs_back(state: &Arc<DaemonState>, rel_path: &str
             } else {
                 artifact.clone()
             }
-        },
-    ))
-    .unwrap();
+        }))
+        .unwrap();
     let (roots, _) = current_authority_admission(state).unwrap();
     let admitted = crate::repository_commit::admitted_workspace_tree_for_test(
         state.layout.working_dir(),
@@ -104,6 +162,8 @@ fn split_publish_behind_the_graphs_back(state: &Arc<DaemonState>, rel_path: &str
         &admitted,
         kin_model::OperationId::new(),
         kin_model::AuthorId::new("a writer this daemon never heard from"),
+        &[],
+        &[],
     )
     .unwrap()
     .expect("authority moves to the new bytes");
@@ -114,10 +174,10 @@ fn split_publish_behind_the_graphs_back(state: &Arc<DaemonState>, rel_path: &str
 /// that refused it is dropped with a record, and the next admission plans from
 /// the tree authority holds.
 ///
-/// This is the split reproduced through its real trigger, a relation whose
-/// source entity the graph does not hold. Without the levelling the round hands
-/// back the refusal with authority one generation ahead of the graph, and every
-/// later round is refused as a stale plan, one full authority open each.
+/// Deliberate in-process fault injection after real publication reaches the
+/// graph-apply refusal. It does not claim a coordinated LSP write can now make
+/// this interleaving. Early malformed observations must instead refuse before
+/// publication, which the separate negative below preserves.
 #[cfg(unix)]
 #[test]
 #[serial_test::serial(commit_phase_capture)]
@@ -126,13 +186,36 @@ fn a_graph_apply_refused_after_authority_moved_is_levelled_in_the_same_round() {
     let state = open_test_state(&repo);
     admit_and_derive(&state, "a.py", "def a():\n    return 1\n");
     admit_and_derive(&state, "b.py", "def b():\n    return 2\n");
-    let (dangling, endpoint) = split_plant_relation_from_a_missing_entity(&state, "a.py");
     let generation = authority_generation(&state);
+    let planted = Arc::new(std::sync::Mutex::new(None));
+    let result = Arc::clone(&planted);
+    let _fault = split_publication_fault(
+        &state,
+        Box::new(move |state| {
+            assert_eq!(
+                authority_generation(state),
+                generation + 1,
+                "inject only after the real authority publication"
+            );
+            assert_ne!(state.graph.resolved_tree(), authority_tree(state));
+            let (relation, endpoint) = split_plant_relation_from_a_missing_entity(state, "a.py");
+            assert!(split_relation_is_held(state, relation, endpoint));
+            assert!(!split_durable_snapshot(state)
+                .relations
+                .contains_key(&relation));
+            *result.lock().unwrap() = Some((relation, endpoint));
+        }),
+    );
 
     std::fs::write(repo.path().join("b.py"), "def b():\n    return 3\n").unwrap();
     let observation = BTreeSet::from([test_repo_path("b.py")]);
     let admission = exact_tree_admission(&state, Some(&observation), TreePublication::Standalone)
         .expect("a round whose tree authority accepted must finish, not leave the graph behind");
+    let (dangling, endpoint) = planted
+        .lock()
+        .unwrap()
+        .take()
+        .expect("the postpublication fault must run through the actual admission");
 
     assert_eq!(
         authority_generation(&state),
@@ -148,6 +231,12 @@ fn a_graph_apply_refused_after_authority_moved_is_levelled_in_the_same_round() {
         !split_relation_is_held(&state, dangling, endpoint),
         "the relation that refused the transition is dropped"
     );
+    assert!(
+        !split_durable_snapshot(&state)
+            .relations
+            .contains_key(&dangling),
+        "the injected malformed relation must never enter durable authority"
+    );
     let levelled = state
         .background_work
         .reconcile()
@@ -155,7 +244,10 @@ fn a_graph_apply_refused_after_authority_moved_is_levelled_in_the_same_round() {
         .authority_levelled
         .expect("a levelling that dropped a relation is recorded, not only logged");
     assert_eq!(levelled.dropped_relations, 1);
-    assert_eq!(levelled.dropped_relations_sample, vec![dangling.to_string()]);
+    assert_eq!(
+        levelled.dropped_relations_sample,
+        vec![dangling.to_string()]
+    );
     assert!(
         admission
             .semantic_events
@@ -170,6 +262,48 @@ fn a_graph_apply_refused_after_authority_moved_is_levelled_in_the_same_round() {
     exact_tree_admission(&state, Some(&next), TreePublication::Standalone)
         .expect("the next admission plans from authority's tree and is not refused as stale");
     assert_eq!(authority_generation(&state), generation + 2);
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial(commit_phase_capture)]
+fn a_graph_apply_with_an_invalid_precapture_endpoint_refuses_before_authority_moves() {
+    let repo = tempfile::tempdir().unwrap();
+    let state = open_test_state(&repo);
+    admit_and_derive(&state, "a.py", "def a():\n    return 1\n");
+    admit_and_derive(&state, "b.py", "def b():\n    return 2\n");
+    let (dangling, endpoint) = split_plant_relation_from_a_missing_entity(&state, "a.py");
+    let roots = current_authority_admission(&state).unwrap().0;
+    let durable = split_durable_snapshot(&state);
+    let live_tree = state.graph.resolved_tree();
+    std::fs::write(repo.path().join("b.py"), "def b():\n    return 3\n").unwrap();
+
+    let error = exact_tree_admission(
+        &state,
+        Some(&BTreeSet::from([test_repo_path("b.py")])),
+        TreePublication::Standalone,
+    )
+    .unwrap_err();
+    let message = error.to_string();
+    assert!(
+        message.contains(&format!("snapshot relation {dangling}"))
+            && message.contains("unadmitted source endpoint"),
+        "the malformed captured snapshot must be the refusal: {message}"
+    );
+    assert_eq!(current_authority_admission(&state).unwrap().0, roots);
+    let after = split_durable_snapshot(&state);
+    assert_eq!(after.resolved_tree, durable.resolved_tree);
+    assert_eq!(after.entities, durable.entities);
+    assert_eq!(after.relations, durable.relations);
+    assert_eq!(after.external_references, durable.external_references);
+    assert_eq!(state.graph.resolved_tree(), live_tree);
+    assert!(split_relation_is_held(&state, dangling, endpoint));
+    assert!(state
+        .background_work
+        .reconcile()
+        .report(Instant::now())
+        .authority_levelled
+        .is_none());
 }
 
 /// A graph already behind authority is levelled on the first stale-plan refusal
@@ -253,7 +387,10 @@ fn a_failed_levelling_counts_toward_the_restart_ceiling_and_one_that_lands_clear
             .authority_split
             .expect("a failed levelling is published, not only logged");
         assert_eq!(split.attempts, attempt);
-        assert!(split.error.contains("unadmitted source endpoint"), "{split:?}");
+        assert!(
+            split.error.contains("unadmitted source endpoint"),
+            "{split:?}"
+        );
     }
     let wedged = state.background_work.reconcile().report(Instant::now());
     assert!(

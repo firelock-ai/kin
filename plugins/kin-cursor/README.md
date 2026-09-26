@@ -14,18 +14,20 @@ Add this to `~/.cursor/mcp.json`:
 ```json
 {
   "mcpServers": {
-    "kin": { "command": "npx", "args": ["-y", "@kinlab/kin-mcp"] }
+    "kin": { "command": "npx", "args": ["-y", "@kinlab/kin", "mcp", "start"] }
   }
 }
 ```
 
-`kin setup --intent agent` writes that entry for you, pointing at your installed binary.
+This is the entry `kin doctor` checks. `kin setup --intent agent` writes the same server
+for you, pointing at your installed `kin` binary instead of `npx`.
 
-## What it does
+## The MCP server and its tools
 
 The plugin registers Kin's MCP server, which runs `npx -y @kinlab/kin-mcp`. On first run
 that downloads the matching Kin release for your platform, verifies its published SHA-256,
-and serves the curated `agent-default` tool profile.
+and serves the curated `agent-default` tool profile. Until that first download finishes,
+the server lists one tool, `kin_startup_status`, which reports its progress.
 
 The tools worth knowing: `semantic_search` finds parsed declarations by name, kind, and
 language. `semantic_locate` ranks code against a natural-language description using the
@@ -41,16 +43,18 @@ search.
 
 ## Before the tools can answer
 
-Kin answers from a graph, so a repository has to be admitted first. Run `kin init .` in the
-repository, or set `KIN_MCP_AUTO_INIT=1` to let the server do it. Then run `kin embed` to
-build the vector index that `semantic_locate` ranks against. The structural tools work as
-soon as admission finishes.
+Kin answers from a graph, so a repository has to be admitted first. Ask the agent to call
+`kin_init`, or run `npx -y @kinlab/kin init .` in the repository yourself: the plugin puts no
+`kin` on your PATH, so `npx` runs it. Then run `npx -y @kinlab/kin embed` to build the vector
+index that `semantic_locate` ranks against. The structural tools work as soon as admission
+finishes.
 [llms-install.md](https://github.com/firelock-ai/kin/blob/main/llms-install.md) is the
 step-by-step version, written so an agent can follow it unattended.
 
 ## Requirements
 
 Node 20 or newer for `npx`, and network access on the first run to fetch the Kin release.
-macOS, Linux, and Windows x64 are supported. On Windows, WSL2 is the recommended path.
+macOS and Linux are supported. On Windows, use WSL2: native Windows x64 support is early,
+and review workflows are not yet tested there.
 
 Apache-2.0. Home: https://kinlab.ai

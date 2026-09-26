@@ -47,6 +47,70 @@ pub struct McpServerConfig {
     /// citable result, and a benchmark number must not move because a
     /// description was rewritten or a payload was narrowed.
     pub agent_belt: bool,
+    /// The routed surface this connection serves, when it serves one.
+    ///
+    /// A routed connection lists the one tool [`crate::routed::TOOL_NAME`] and
+    /// reaches every other tool through its commands; `allowed_tools` holds that
+    /// one name, so a named tool called directly is refused with the command
+    /// that runs it here.
+    pub routed: Option<crate::routed::RoutedSurface>,
+    /// Whether entity bodies are served with each line marked by its offset in
+    /// the entity, as [`crate::entity_lines`] presents them.
+    ///
+    /// Set only for a profile with no Kin write path, and cleared for any
+    /// client that asks for exact bodies when it connects, as `kin agent run`
+    /// does. Everything that restates a body as the base of an edit is served
+    /// its exact bytes.
+    pub number_entity_lines: bool,
+    /// Whether this connection's bytes are an input to a citable result.
+    ///
+    /// `benchmark` and `context-bench` are served the instructions a published
+    /// number was measured under, byte for byte, for the same reason
+    /// `agent_belt` leaves their descriptions and payloads alone.
+    pub citable: bool,
+    /// The folder the client works in: its first workspace root once it names
+    /// one, and until then the launch directory the launcher records here.
+    ///
+    /// An answer from a repository that is not this folder says so, and
+    /// `kin_init` sets this folder up when it is named nothing else.
+    pub client_root: Option<PathBuf>,
+    /// How a path is resolved before two are compared, supplied by the
+    /// launcher. Resolving symlinks reads the filesystem, which this crate
+    /// leaves to its launcher; the default compares paths as given.
+    pub canonicalize: fn(&Path) -> PathBuf,
+}
+
+impl McpServerConfig {
+    /// Serve this connection exact entity bodies, whatever its profile would
+    /// present. Called when a client asks for them at `initialize`.
+    pub fn serve_exact_entity_bodies(&mut self) {
+        self.number_entity_lines = false;
+        if let Some(surface) = self.routed.as_mut() {
+            surface.numbered = false;
+        }
+    }
+
+    /// Read what an `initialize` request asks of the connection.
+    fn apply_client_capabilities(&mut self, initialize: &serde_json::Value) {
+        if crate::entity_lines::client_wants_exact_bodies(initialize) {
+            self.serve_exact_entity_bodies();
+        }
+    }
+
+    /// Whether this connection serves `kin_init`: as the named tool on a
+    /// profile that lists it, or as the routed `init` command where the routed
+    /// tool carries writes. Setting a folder up creates a store and the
+    /// repository's canonical state, so no read-only profile serves it, and a
+    /// remedy there names the command a person runs instead.
+    pub fn serves_init(&self) -> bool {
+        match self.routed {
+            Some(surface) => surface.writes,
+            None => self
+                .allowed_tools
+                .as_ref()
+                .is_none_or(|allowed| allowed.contains(crate::repository_init::TOOL_NAME)),
+        }
+    }
 }
 
 /// How the stdio server should present session authority.
@@ -78,6 +142,11 @@ impl Default for McpServerConfig {
             snapshot_path: None,
             repository_authority: None,
             agent_belt: false,
+            routed: None,
+            number_entity_lines: false,
+            citable: false,
+            client_root: None,
+            canonicalize: Path::to_path_buf,
         }
     }
 }
@@ -143,6 +212,13 @@ pub async fn run_stdio<G: PersistableMcpStore + 'static>(
     }
 
     while let Some((message, framed)) = read_stdio_message(&mut reader).await? {
+        if message.contains("\"initialize\"") {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&message) {
+                if value.get("method").and_then(|method| method.as_str()) == Some("initialize") {
+                    config.apply_client_capabilities(&value);
+                }
+            }
+        }
         if let Some(response) = process_message(&message, &store, &config, &sessions).await {
             let response_json = serde_json::to_string(&response).map_err(McpError::Json)?;
             write_stdio_message(&mut stdout, &response_json, framed).await?;
@@ -246,6 +322,7 @@ pub async fn run_stdio_daemon(
     config: McpServerConfig,
     repo_binder: Option<RepoBinder>,
     startup: Option<std::sync::Arc<StartupDaemonBinding>>,
+    initializer: Option<crate::repository_init::RepoInitializer>,
 ) -> Result<()> {
     if !config.session_authority_mode.requires_daemon() {
         return Err(McpError::Other(
@@ -264,6 +341,7 @@ pub async fn run_stdio_daemon(
         repo_binder,
         bound_daemon_url_from_env(),
         startup,
+        initializer,
     )
     .await
 }
@@ -282,10 +360,11 @@ pub async fn run_stdio_daemon(
 async fn run_stdio_daemon_over<R, W>(
     reader: &mut R,
     writer: &mut W,
-    config: McpServerConfig,
+    mut config: McpServerConfig,
     repo_binder: Option<RepoBinder>,
     bound_daemon_url: Option<String>,
     startup: Option<std::sync::Arc<StartupDaemonBinding>>,
+    initializer: Option<crate::repository_init::RepoInitializer>,
 ) -> Result<()>
 where
     R: AsyncBufRead + Unpin,
@@ -301,6 +380,11 @@ where
     let mut client_supports_roots = false;
     let mut roots_request_state = WorkspaceRootsRequestState::default();
     let mut binding = RepoBindingState::started_with(bound_daemon_url);
+    binding.init_served = config.serves_init();
+    // A `kin_init` this server started, and the folder the client works in
+    // before any roots arrive: the launch directory the launcher recorded.
+    let mut init_tracker = crate::repository_init::InitTracker::default();
+    let launch_root = config.client_root.clone();
 
     while let Some((message, framed)) = read_stdio_message(&mut *reader).await? {
         // The launcher's startup binding runs behind this loop so `initialize`
@@ -324,6 +408,7 @@ where
 
             if method == Some("initialize") {
                 client_supports_roots = value.pointer("/params/capabilities/roots").is_some();
+                config.apply_client_capabilities(&value);
             }
 
             // Whether `--repo`/`KIN_MCP_REPO` pinned this server's repository.
@@ -332,6 +417,53 @@ where
             let repo_pinned = startup
                 .as_ref()
                 .is_some_and(|startup| startup.pinned_by_operator());
+
+            // An initialization that finished behind the server since the last
+            // message binds its repository before anything reads the binding.
+            if let Some((dir, outcome)) = init_tracker.take_finished().await {
+                if outcome.is_repository() {
+                    adopt_initialized_repository(
+                        dir,
+                        &mut binding,
+                        repo_binder.as_ref(),
+                        startup.as_deref(),
+                        repo_pinned,
+                    )
+                    .await;
+                } else {
+                    tracing::warn!(
+                        dir = %dir.display(),
+                        ?outcome,
+                        "kin-mcp: a kin_init that ran past its call did not set the folder up"
+                    );
+                }
+            }
+
+            // `kin_init` is answered here, where the client's folder and the
+            // binder are, and before anything waits on a daemon or refuses a
+            // workspace it cannot bind: it is how a server with no repository
+            // gets one.
+            if method == Some("tools/call") {
+                if let Some(call) = init_call(&value, &config) {
+                    let response = answer_init_call(
+                        call,
+                        &config,
+                        &mut init_tracker,
+                        initializer.as_ref(),
+                        &mut binding,
+                        repo_binder.as_ref(),
+                        startup.as_deref(),
+                        repo_pinned,
+                    )
+                    .await;
+                    if let Some(response) = response {
+                        let response_json =
+                            serde_json::to_string(&response).map_err(McpError::Json)?;
+                        write_stdio_message(&mut *writer, &response_json, framed).await?;
+                    }
+                    continue;
+                }
+            }
 
             // A `tools/call` racing the launcher's startup binding gets a
             // bounded moment for a warm daemon to bind, then an honest
@@ -343,11 +475,27 @@ where
             // question no daemon can answer better, and admitting a daemon spawn
             // for it would undo FIR-3099: an agent that asked only what tools
             // exist would open the store and schedule a full embedding pass.
+            // A routed `describe`, or a routed call that will be refused, reads
+            // no graph either.
             let call_reads_the_graph = value
                 .pointer("/params/name")
                 .and_then(|name| name.as_str())
                 .map(crate::agent_belt::canonical_tool_name)
-                != Some(crate::handlers::tool_search::TOOL_NAME);
+                != Some(crate::handlers::tool_search::TOOL_NAME)
+                && !crate::routed::answers_locally(&value, config.routed);
+            // While a `kin_init` this server started is still building the
+            // graph, and nothing else is bound, there is no repository to
+            // answer from yet and no daemon worth starting.
+            if method == Some("tools/call") && call_reads_the_graph && !binding.is_bound() {
+                if let Some((dir, elapsed)) = init_tracker.running() {
+                    if let Some(response) = initializing_response(&value, dir, elapsed, &config) {
+                        let response_json =
+                            serde_json::to_string(&response).map_err(McpError::Json)?;
+                        write_stdio_message(&mut *writer, &response_json, framed).await?;
+                    }
+                    continue;
+                }
+            }
             if method == Some("tools/call") && call_reads_the_graph {
                 if let Some(startup) = startup.as_ref() {
                     // The first ask for a graph answer, and the only thing that
@@ -432,14 +580,19 @@ where
                 && value.get("id").and_then(|id| id.as_str()) == Some(ROOTS_REQUEST_ID)
             {
                 roots_request_state.complete();
+                let roots = parse_workspace_roots(&value);
+                // The folder the client works in is its first root from here
+                // on, which is what an answer from another repository is
+                // compared to and what `kin_init` sets up by default.
+                if !roots.is_empty() {
+                    config.client_root = crate::first_contact::client_root(
+                        &roots,
+                        launch_root.as_deref(),
+                        config.canonicalize,
+                    );
+                }
                 if let Some(binder) = repo_binder.as_ref() {
-                    apply_workspace_roots(
-                        binder,
-                        parse_workspace_roots(&value),
-                        &mut binding,
-                        repo_pinned,
-                    )
-                    .await;
+                    apply_workspace_roots(binder, roots, &mut binding, repo_pinned).await;
                 }
                 continue;
             }
@@ -468,7 +621,10 @@ where
             }
         }
 
-        if let Some(response) = process_daemon_message(&message, &config).await {
+        if let Some(mut response) = process_daemon_message(&message, &config).await {
+            if is_tools_call(&message) {
+                stamp_client_folder(&mut response, binding.repo_root.as_deref(), &config);
+            }
             let response_json = serde_json::to_string(&response).map_err(McpError::Json)?;
             write_stdio_message(&mut *writer, &response_json, framed).await?;
         }
@@ -476,6 +632,98 @@ where
 
     tracing::info!("kin-mcp daemon-proxy stdio server shutting down");
     Ok(())
+}
+
+/// Whether a raw message is a `tools/call` request.
+fn is_tools_call(message: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(message)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("method")
+                .and_then(|m| m.as_str())
+                .map(str::to_string)
+        })
+        .as_deref()
+        == Some("tools/call")
+}
+
+/// Make a tool answer on a connection whose client works in a folder other
+/// than the repository this server is bound to say so, first.
+///
+/// An answer the daemon's health reached already carries `_kin.repository` and
+/// the warning at the head of `_kin.advice`. Every other answer, a refusal, a
+/// routed answer given here, a delegate error, gets both here, so no answer on
+/// such a connection reads as if it came from the client's own folder. An
+/// answer that is not JSON gets the warning as its first line. The same folder,
+/// or no bound repository, leaves the answer as it is.
+fn stamp_client_folder(
+    response: &mut JsonRpcResponse,
+    repo_root: Option<&Path>,
+    config: &McpServerConfig,
+) {
+    let (Some(root), Some(client)) = (repo_root, config.client_root.as_deref()) else {
+        return;
+    };
+    let identity =
+        crate::first_contact::repository_identity(&(config.canonicalize)(root), Some(client));
+    let Some(warning) = identity.warning.clone() else {
+        return;
+    };
+    let Some(block) = response
+        .result
+        .as_mut()
+        .and_then(|result| result.get_mut("content"))
+        .and_then(serde_json::Value::as_array_mut)
+        .and_then(|content| content.first_mut())
+    else {
+        return;
+    };
+    let Some(text) = block.get("text").and_then(serde_json::Value::as_str) else {
+        return;
+    };
+    let stamped = match serde_json::from_str::<serde_json::Value>(text) {
+        Ok(serde_json::Value::Object(mut payload)) => {
+            let key = crate::envelope::ENVELOPE_KEY;
+            let mut kin = match payload.remove(key) {
+                Some(serde_json::Value::Object(kin)) => kin,
+                Some(_) => return,
+                None => serde_json::Map::new(),
+            };
+            if kin
+                .get("repository")
+                .and_then(|repository| repository.get("warning"))
+                .is_some()
+            {
+                return;
+            }
+            let advice = match kin.remove("advice") {
+                Some(serde_json::Value::String(existing)) => format!("{warning} {existing}"),
+                _ => warning,
+            };
+            kin.insert(
+                "repository".to_string(),
+                serde_json::to_value(&identity).unwrap_or_default(),
+            );
+            // Built in reading order, advice first and the envelope first,
+            // whichever order the map keeps.
+            let mut envelope = serde_json::Map::new();
+            envelope.insert("advice".to_string(), serde_json::Value::String(advice));
+            envelope.extend(kin);
+            let mut ordered = serde_json::Map::new();
+            ordered.insert(key.to_string(), serde_json::Value::Object(envelope));
+            ordered.extend(payload);
+            // Keep the wire format the answer already had: re-indenting a
+            // compact answer would undo the call's `compact` choice after its
+            // size was settled.
+            match crate::budget::render_in_format_of(&serde_json::Value::Object(ordered), text) {
+                Ok(text) => text,
+                Err(_) => return,
+            }
+        }
+        _ => format!("{warning}\n\n{text}"),
+    };
+    block["text"] = serde_json::Value::String(stamped);
 }
 
 /// Feed a `roots/list` response through the binder and record what it means for
@@ -564,6 +812,174 @@ async fn apply_workspace_roots(
     }
 }
 
+/// A `tools/call` that is, or routes to, `kin_init` on this connection.
+struct InitCall {
+    id: Option<serde_json::Value>,
+    /// The call as the named tool it stands for.
+    params: ToolCallParams,
+    /// Whether it came through the routed tool.
+    routed: bool,
+}
+
+/// The `kin_init` call this request is, if it is one this connection serves.
+fn init_call(request: &serde_json::Value, config: &McpServerConfig) -> Option<InitCall> {
+    let id = request.get("id").cloned();
+    let mut params: ToolCallParams = serde_json::from_value(request.get("params")?.clone()).ok()?;
+    if config.routed.is_some() {
+        if params.name != crate::routed::TOOL_NAME {
+            return None;
+        }
+        let dispatched = matches!(
+            crate::routed::route(&mut params, config.routed),
+            crate::routed::Routing::Dispatch
+        );
+        return (dispatched && params.name == crate::repository_init::TOOL_NAME).then_some(
+            InitCall {
+                id,
+                params,
+                routed: true,
+            },
+        );
+    }
+    crate::agent_belt::canonicalize_tool_name(&mut params.name);
+    let served = config
+        .allowed_tools
+        .as_ref()
+        .is_none_or(|allowed| allowed.contains(crate::repository_init::TOOL_NAME));
+    (params.name == crate::repository_init::TOOL_NAME && served).then_some(InitCall {
+        id,
+        params,
+        routed: false,
+    })
+}
+
+/// Answer one `kin_init` call: set the folder up, or report where that stands.
+#[allow(clippy::too_many_arguments)]
+async fn answer_init_call(
+    call: InitCall,
+    config: &McpServerConfig,
+    tracker: &mut crate::repository_init::InitTracker,
+    initializer: Option<&crate::repository_init::RepoInitializer>,
+    binding: &mut RepoBindingState,
+    binder: Option<&RepoBinder>,
+    startup: Option<&StartupDaemonBinding>,
+    repo_pinned: bool,
+) -> Option<JsonRpcResponse> {
+    use crate::repository_init::{
+        busy_answer, finished_answer, running_answer, target_dir, unavailable_answer, InitProgress,
+        INIT_WAIT,
+    };
+    let id = call.id.clone().filter(|id| !id.is_null())?;
+    let result = match target_dir(&call.params.arguments, config.client_root.as_deref()) {
+        Err(problem) => ToolCallResult::error(problem),
+        Ok(dir) => {
+            let dir = (config.canonicalize)(&dir);
+            match initializer {
+                None => unavailable_answer(crate::first_contact::Spelling::here()),
+                Some(initializer) => match tracker
+                    .start_or_join(dir.clone(), initializer, INIT_WAIT)
+                    .await
+                {
+                    InitProgress::Finished(outcome) => {
+                        if outcome.is_repository() {
+                            adopt_initialized_repository(
+                                dir.clone(),
+                                binding,
+                                binder,
+                                startup,
+                                repo_pinned,
+                            )
+                            .await;
+                        }
+                        finished_answer(&dir, &outcome, crate::first_contact::Spelling::here())
+                    }
+                    InitProgress::Running { elapsed } => running_answer(&dir, elapsed),
+                    InitProgress::Busy {
+                        dir: running,
+                        elapsed,
+                    } => busy_answer(&dir, &running, elapsed),
+                },
+            }
+        }
+    };
+    let budget = ResponseBudget::from_arguments(&call.params.arguments);
+    let enveloped = envelope::finalize_bounded(
+        result,
+        Envelope::daemon(),
+        crate::repository_init::TOOL_NAME,
+        &budget,
+    );
+    let mut response = JsonRpcResponse::success(
+        Some(id),
+        serde_json::to_value(&enveloped).unwrap_or_default(),
+    );
+    if call.routed {
+        present_routed_hints(&mut response, &call.params);
+    }
+    Some(response)
+}
+
+/// Serve a folder `kin_init` just set up.
+///
+/// A server with nothing bound hands the folder to the next graph call, through
+/// the path that already binds a repository the client named before a daemon
+/// start was admitted, so this call answers as soon as the graph exists rather
+/// than after a daemon has also started behind it. A server bound elsewhere,
+/// the enclosing repository a nested folder was answered from, is moved to the
+/// new repository now: the user asked for it. An operator pin is never
+/// repointed by a setup call, and a server already bound to this folder has
+/// nothing to do.
+async fn adopt_initialized_repository(
+    dir: PathBuf,
+    binding: &mut RepoBindingState,
+    binder: Option<&RepoBinder>,
+    startup: Option<&StartupDaemonBinding>,
+    repo_pinned: bool,
+) {
+    if repo_pinned || binding.repo_root.as_deref() == Some(dir.as_path()) {
+        return;
+    }
+    if !binding.is_bound() {
+        binding.defer_roots(vec![dir]);
+        return;
+    }
+    if let Some(startup) = startup {
+        startup.admit_daemon_spawn();
+    }
+    if let Some(binder) = binder {
+        apply_workspace_roots(binder, vec![dir], binding, repo_pinned).await;
+    }
+}
+
+/// The answer a graph call gets while a `kin_init` this server started is
+/// still building the graph. `None` for a call with no id.
+fn initializing_response(
+    request: &serde_json::Value,
+    dir: &Path,
+    elapsed: Duration,
+    config: &McpServerConfig,
+) -> Option<JsonRpcResponse> {
+    let id = request.get("id").filter(|id| !id.is_null())?.clone();
+    let tool = request
+        .pointer("/params/name")
+        .and_then(|name| name.as_str())
+        .unwrap_or("this tool");
+    let result = crate::repository_init::graph_call_while_initializing(tool, dir, elapsed);
+    let enveloped = envelope::finalize(result, Envelope::no_repository(), tool);
+    let mut response = JsonRpcResponse::success(
+        Some(id),
+        serde_json::to_value(&enveloped).unwrap_or_default(),
+    );
+    if config.routed.is_some() && tool == crate::routed::TOOL_NAME {
+        if let Ok(params) = serde_json::from_value::<ToolCallParams>(
+            request.get("params").cloned().unwrap_or_default(),
+        ) {
+            present_routed_hints(&mut response, &params);
+        }
+    }
+    Some(response)
+}
+
 /// The daemon bound before the stdio loop started (`KIN_DAEMON_URL` unset or
 /// empty means nothing was bound).
 fn bound_daemon_url_from_env() -> Option<String> {
@@ -606,6 +1022,9 @@ struct RepoBindingState {
     /// again once starting a daemon is admitted. Cleared by the next successful
     /// bind.
     deferred_roots: Vec<PathBuf>,
+    /// Whether this connection serves `kin_init`, so a refusal offers it only
+    /// where a caller can call it.
+    init_served: bool,
 }
 
 /// A workspace change the server could not follow: it is still bound to
@@ -617,6 +1036,8 @@ struct WorkspaceMismatch {
     /// Whether `--repo`/`KIN_MCP_REPO` pinned this server's repository, which
     /// decides which remedies the refusal is allowed to offer.
     repo_pinned: bool,
+    /// Whether this connection serves `kin_init`.
+    init_served: bool,
 }
 
 impl RepoBindingState {
@@ -673,6 +1094,7 @@ impl RepoBindingState {
             bound_repo: self.repo_root.clone(),
             requested_roots,
             repo_pinned,
+            init_served: self.init_served,
         });
     }
 
@@ -739,14 +1161,24 @@ impl WorkspaceMismatch {
     /// to see, so running `kin init` there does not repair the mismatch. It
     /// creates a second, empty repository beside the real one and leaves the
     /// refusal exactly where it was.
-    fn remedy(&self) -> &'static str {
+    fn remedy(&self) -> String {
         if self.repo_pinned {
             "This server is pinned by --repo / KIN_MCP_REPO, so point the pin at the repository \
              you are working in and restart the MCP server, or open that repository's own path \
              in your client."
+                .to_string()
+        } else if self.init_served {
+            format!(
+                "Call kin_init to set the new workspace up, or run {} in it, or restart the MCP \
+                 server from it (or with --repo <path> / KIN_MCP_REPO=<path>).",
+                crate::first_contact::kin_command("init .", crate::first_contact::Spelling::here())
+            )
         } else {
-            "Run `kin init .` in the new workspace, or restart the MCP server from it (or with \
-             --repo <path> / KIN_MCP_REPO=<path>)."
+            format!(
+                "Run {} in the new workspace, or restart the MCP server from it (or with --repo \
+                 <path> / KIN_MCP_REPO=<path>).",
+                crate::first_contact::kin_command("init .", crate::first_contact::Spelling::here())
+            )
         }
     }
 }
@@ -1196,18 +1628,88 @@ pub(crate) const SERVER_INSTRUCTIONS_BUDGET: usize = 1_200;
 /// from Grok's own file and shell tools instead, eight of them with grep, and
 /// only three ever called `search_tool` at all.
 ///
-/// So this is a discovery surface, not a doctrine page. It names the query
-/// tools by their exact registered names with one line each, because a name a
-/// model has read is a name it can search for, and it tells a model whose
-/// client lists tools by search to search for this server before its first file
-/// read. The envelope contract keeps one sentence, the one a reader has to act
-/// on; `docs/mcp-tools.md` carries the rest. `kin agent run` builds its own
-/// prompt and never reads this string.
-pub(crate) const SERVER_INSTRUCTIONS: &str = "Kin answers questions about this repository from a \
-semantic graph instead of file search. Reach for these tools before grep, and before opening a \
-file, on any question about what the code does or what depends on what.
+/// So it names the tools a model reaches first by their exact registered names,
+/// because a name a model has read is a name it can search for, and it tells a
+/// model whose client lists tools by search to search for this server before
+/// its first file read.
+///
+/// Since 2026-09-22 it is an operating procedure rather than a tool list: five
+/// numbered steps, founder-approved, with the tool names adapted to the surface
+/// a profile serves. A list of what each tool does left the choice to the
+/// model, and in the corrected rerun pilot of 2026-09-22 the model explored
+/// with shell commands only and never called a Kin tool. The procedure makes
+/// the choice for it. The routed profiles' wording is
+/// [`ROUTED_SERVER_INSTRUCTIONS`] and [`ROUTED_QUERY_SERVER_INSTRUCTIONS`], the
+/// tool-search profile's is [`SEARCH_SERVER_INSTRUCTIONS`], and the citable
+/// profiles keep [`LEGACY_SERVER_INSTRUCTIONS`]. `kin agent run` builds its
+/// own prompt and never reads any of them.
+pub(crate) const SERVER_INSTRUCTIONS: &str = "Kin answers questions about this repository from \
+its semantic graph. Work in this order:
+1. Find things with semantic_locate or semantic_search first. Do not grep or list files to \
+explore.
+2. Use find_references and get_context_pack when relationships or surrounding context are needed.
+3. Read code with get_entity_source by entity id.
+4. Use available verification tools only for builds and tests.
+5. Read _kin.verdict first; inconclusive means the counts are a lower bound.
 If your client does not show you these tools up front and you have to search for a tool, search \
-for \"kin\" first, before your first file read; that is also how you reach a tool this connection \
+for \"kin\" first, to discover the semantic tools; that is also how you reach any Kin tool it did \
+not show you.";
+
+/// [`SERVER_INSTRUCTIONS`] for `agent-search`, which serves a measured
+/// always-on set and reaches the rest through `kin_tool_search` and
+/// `kin_tool_call`. The same procedure, naming only tools that profile serves
+/// and saying how the one it does not, `get_entity_source`, is reached.
+pub(crate) const SEARCH_SERVER_INSTRUCTIONS: &str = "Kin answers questions about this \
+repository from its semantic graph. Work in this order:
+1. Find things with semantic_locate first. Do not grep or list files to explore.
+2. Use get_context_pack and trace_data_flow when context or call flow is needed.
+3. Read code by entity id with kin_tool_call, tool get_entity_source.
+4. Use available verification tools only for builds and tests.
+5. Read _kin.verdict first; inconclusive means the counts are a lower bound.
+kin_tool_search finds every other read-only Kin tool, and kin_tool_call runs it. If your client \
+does not show you these tools up front and you have to search for a tool, search for \"kin\" \
+first, to discover the semantic tools.";
+
+/// [`SERVER_INSTRUCTIONS`] for `agent-routed`, where every command is reached
+/// through the one tool [`crate::routed::TOOL_NAME`]. The founder's wording,
+/// verbatim: `kin locate` is that tool called with the `locate` command.
+///
+/// Its last sentence is true on this profile and on no named one: `describe`
+/// lists every registered tool the commands do not name, and `call` runs it.
+pub(crate) const ROUTED_SERVER_INSTRUCTIONS: &str = "Kin answers questions about this repository \
+from its semantic graph, through one tool, kin, called with a command and its args. Work in this \
+order:
+1. Find things with kin locate or kin search first. Do not grep or list files to explore.
+2. Use kin refs and kin context when relationships or surrounding context are needed.
+3. Read code with kin source by entity id.
+4. Use available verification tools only for builds and tests.
+5. Read _kin.verdict first; inconclusive means the counts are a lower bound.
+If your client does not show you the kin tool up front and you have to search for a tool, search \
+for \"kin\" first, to discover the semantic tools. kin describe lists every other Kin tool, and kin \
+call runs any of them.";
+
+/// [`ROUTED_SERVER_INSTRUCTIONS`] for `agent-routed-query`, which serves the
+/// same commands without a write path and reaches only read-only tools.
+pub(crate) const ROUTED_QUERY_SERVER_INSTRUCTIONS: &str = "Kin answers questions about this \
+repository from its semantic graph, through one tool, kin, called with a command and its args. \
+Work in this order:
+1. Find things with kin locate or kin search first. Do not grep or list files to explore.
+2. Use kin refs and kin context when relationships or surrounding context are needed.
+3. Read code with kin source by entity id.
+4. Use available verification tools only for builds and tests.
+5. Read _kin.verdict first; inconclusive means the counts are a lower bound.
+If your client does not show you the kin tool up front and you have to search for a tool, search \
+for \"kin\" first, to discover the semantic tools. kin describe lists every other read-only Kin \
+tool, and kin call runs any of them.";
+
+/// Historical instructions for the benchmark profiles, with retired file catalogs
+/// removed from newly built servers. Earlier measurements remain bound to their
+/// original binaries; changing this served surface requires a new measurement.
+pub(crate) const LEGACY_SERVER_INSTRUCTIONS: &str = "Kin answers questions about this repository \
+from a semantic graph. Use these tools instead of grep or file reads for questions about \
+code and dependencies. Report missing semantic coverage as a gap.
+If your client does not show you these tools up front and you have to search for a tool, search \
+for \"kin\" first, to discover the semantic tools; that is also how you reach a tool this connection \
 did not list.
 semantic_locate: find code by describing what it does, when you do not know the name.
 semantic_search: find declarations by exact name, kind or language.
@@ -1216,15 +1718,86 @@ find_references: who calls, imports or references one entity.
 trace_data_flow: the ordered call chain out from one entity.
 trace_path: how one entity reaches another.
 impact_analysis: what a change to one entity could affect.
-list_file_entities: everything the graph holds for one file.
+graph_neighborhood: dependencies and dependents of an entity.
 Every answer carries a `_kin` envelope. Read `_kin.verdict` first: when its `state` is \
 `inconclusive`, treat the counts as a lower bound and do not act on an absence in the answer.";
 
 const _: () = assert!(
-    SERVER_INSTRUCTIONS.len() <= SERVER_INSTRUCTIONS_BUDGET,
-    "SERVER_INSTRUCTIONS is over SERVER_INSTRUCTIONS_BUDGET: a client injects it once per \
+    SERVER_INSTRUCTIONS.len() <= SERVER_INSTRUCTIONS_BUDGET
+        && SEARCH_SERVER_INSTRUCTIONS.len() <= SERVER_INSTRUCTIONS_BUDGET
+        && ROUTED_SERVER_INSTRUCTIONS.len() <= SERVER_INSTRUCTIONS_BUDGET
+        && ROUTED_QUERY_SERVER_INSTRUCTIONS.len() <= SERVER_INSTRUCTIONS_BUDGET
+        && LEGACY_SERVER_INSTRUCTIONS.len() <= SERVER_INSTRUCTIONS_BUDGET,
+    "an instructions string is over SERVER_INSTRUCTIONS_BUDGET: a client injects it once per \
      session, and on a client that hides tool schemas it is the whole surface the model reads"
 );
+
+/// The tools [`SERVER_INSTRUCTIONS`] sends a model to, in the order it does.
+pub(crate) const NAMED_PROCEDURE_TOOLS: [&str; 5] = [
+    "semantic_locate",
+    "semantic_search",
+    "find_references",
+    "get_context_pack",
+    "get_entity_source",
+];
+
+/// The instructions this connection's profile is served.
+pub(crate) fn instructions_for(config: &McpServerConfig) -> &'static str {
+    if config.citable {
+        return LEGACY_SERVER_INSTRUCTIONS;
+    }
+    match config.routed {
+        Some(surface) if surface.writes => ROUTED_SERVER_INSTRUCTIONS,
+        Some(_) => ROUTED_QUERY_SERVER_INSTRUCTIONS,
+        None => {
+            let allowed = config.allowed_tools.as_ref();
+            let serves_the_procedure = allowed.is_none_or(|allowed| {
+                NAMED_PROCEDURE_TOOLS
+                    .iter()
+                    .all(|tool| allowed.contains(*tool))
+            });
+            if !serves_the_procedure && crate::tool_invocation::enabled(allowed) {
+                SEARCH_SERVER_INSTRUCTIONS
+            } else {
+                SERVER_INSTRUCTIONS
+            }
+        }
+    }
+}
+
+/// The tool listing this connection is served, exactly as `tools/list` writes
+/// it: the routed tool on a routed connection, and otherwise the profile's
+/// filtered, annotated and compacted list, with the source tools' description
+/// saying so where bodies are numbered.
+///
+/// One function, so a test that measures the served bytes measures what the
+/// server writes to the client rather than its own copy of the recipe.
+pub fn served_tools_for(config: &McpServerConfig) -> ToolsListResult {
+    if let Some(surface) = config.routed {
+        return crate::routed::served_list(surface);
+    }
+    let mut tools =
+        crate::tools::served_tools_list(config.allowed_tools.as_ref(), config.agent_belt);
+    if config.number_entity_lines {
+        crate::entity_lines::describe_numbered_bodies(&mut tools);
+    }
+    tools
+}
+
+/// Present one tool's result the way this connection is served it, before the
+/// envelope is attached.
+///
+/// Today that is one thing: an entity's source body marked with each line's
+/// offset in the entity, on a connection that numbers. A connection that can
+/// write through Kin keeps the exact bytes, because it restates them, and so
+/// does any client that asked for them, `kin agent run` among them; the
+/// benchmark profiles keep their payload bytes because those are an input to a
+/// citable result.
+fn present_result(config: &McpServerConfig, tool: &str, result: &mut ToolCallResult) {
+    if config.number_entity_lines && crate::entity_lines::numbers_this_tool(tool) {
+        crate::entity_lines::number_entity_body(result);
+    }
+}
 
 fn handle_initialize(
     id: Option<serde_json::Value>,
@@ -1250,7 +1823,7 @@ fn handle_initialize(
             name: config.server_name.clone(),
             version: config.server_version.clone(),
         },
-        instructions: Some(SERVER_INSTRUCTIONS.into()),
+        instructions: Some(instructions_for(config).into()),
     })
     .unwrap_or_default();
 
@@ -1272,10 +1845,7 @@ fn handle_initialize(
 }
 
 fn handle_tools_list(id: Option<serde_json::Value>, config: &McpServerConfig) -> JsonRpcResponse {
-    // The filter, the withheld-tool annotation and the belt compaction live in
-    // one function, so a test that measures the served bytes measures what this
-    // writes to the client rather than its own copy of the recipe.
-    let tools = crate::tools::served_tools_list(config.allowed_tools.as_ref(), config.agent_belt);
+    let tools = served_tools_for(config);
     JsonRpcResponse::success(id, serde_json::to_value(&tools).unwrap_or_default())
 }
 
@@ -1292,6 +1862,46 @@ async fn handle_tools_call<G: PersistableMcpStore>(
             return JsonRpcResponse::error(id, -32602, format!("Invalid params: {}", e));
         }
     };
+    // A routed call becomes the named call it stands for before anything reads
+    // its name, so everything below, the dispatcher and the envelope included,
+    // treats it as that named call. `describe` and a call that did not validate
+    // are answered here, through the same envelope.
+    let routed_call = match crate::routed::route(&mut call_params, config.routed) {
+        crate::routed::Routing::Answer(result) => {
+            let budget = ResponseBudget::from_arguments(&call_params.arguments);
+            return offline_envelope_success(id, result, crate::routed::TOOL_NAME, &budget);
+        }
+        crate::routed::Routing::Dispatch => true,
+        crate::routed::Routing::NotRouted => false,
+    };
+    let mut response =
+        dispatch_tools_call(id, &mut call_params, routed_call, store, sessions, config).await;
+    if routed_call {
+        present_routed_hints(&mut response, &call_params);
+    }
+    response
+}
+
+/// The offline route from a named call to its enveloped answer.
+async fn dispatch_tools_call<G: PersistableMcpStore>(
+    id: Option<serde_json::Value>,
+    call_params: &mut ToolCallParams,
+    routed_call: bool,
+    store: &G,
+    sessions: &SessionRegistry,
+    config: &McpServerConfig,
+) -> JsonRpcResponse {
+    // A routed connection's dispatcher is the routed tool, so the discovery
+    // dispatcher is answered as the named call it is, with the refusal that
+    // names the routed command.
+    let discovered_call = if config.routed.is_some() {
+        false
+    } else {
+        match crate::tool_invocation::expand(call_params, config.allowed_tools.as_ref()) {
+            Ok(value) => value,
+            Err(error) => return JsonRpcResponse::error(id, -32602, error.to_string()),
+        }
+    };
     // Resolve the served name to the registered one here, once, before anything
     // keyed on a tool name reads it: the profile filter below, the dispatcher,
     // the response-budget shape, the negative-evidence spec and the envelope.
@@ -1299,6 +1909,11 @@ async fn handle_tools_call<G: PersistableMcpStore>(
     // four landings, so that name is still accepted here; every profile now
     // advertises the registered name, and everything internal stays keyed on it.
     crate::agent_belt::canonicalize_tool_name(&mut call_params.name);
+    // Refuse before forwarding too: an older daemon must not restore retired
+    // file operations on an unfiltered connection.
+    if let Some(message) = crate::tools::retired_file_operation(&call_params.name) {
+        return JsonRpcResponse::error(id, -32602, message.into());
+    }
     // The belt asks for the compact locate shape on its agents' behalf, only
     // when the caller named no surface. Applied here rather than in the daemon
     // because this is the one layer that knows which profile is being served.
@@ -1308,13 +1923,19 @@ async fn handle_tools_call<G: PersistableMcpStore>(
     let budget = ResponseBudget::from_arguments(&call_params.arguments);
 
     if let Some(allowed) = &config.allowed_tools {
-        if !allowed.contains(&call_params.name) {
-            let error_result = ToolCallResult::error(format!(
-                "tool '{}' is not enabled in this MCP profile",
-                call_params.name
-            ));
+        if !discovered_call && !routed_call && !allowed.contains(&call_params.name) {
+            let error_result = not_enabled_refusal(config, &call_params.name);
             return offline_envelope_success(id, error_result, &call_params.name, &budget);
         }
+    }
+
+    // The "at least one of" rules the served schemas no longer carry: every
+    // served schema is a plain object, because provider tool APIs drop a tool
+    // whose schema opens with a combinator. Refused here, before anything
+    // runs, with one call that works.
+    if let Some(refusal) = crate::input_contract::refusal(&call_params.name, &call_params.arguments)
+    {
+        return offline_envelope_success(id, refusal, &call_params.name, &budget);
     }
 
     if call_params.name == crate::handlers::tool_search::TOOL_NAME {
@@ -1324,6 +1945,37 @@ async fn handle_tools_call<G: PersistableMcpStore>(
         )
         .unwrap_or_else(|error| ToolCallResult::error(error.to_string()));
         return offline_envelope_success(id, result, &call_params.name, &budget);
+    }
+
+    // Nor a session workspace to run a command in. A command that would be
+    // refused anywhere is still refused as it is on the daemon route.
+    if call_params.name == crate::session_exec::TOOL_NAME {
+        return offline_envelope_success(
+            id,
+            crate::session_exec::handle_with(
+                &call_params.arguments,
+                None,
+                if routed_call {
+                    crate::session_exec::CallForm::Routed
+                } else {
+                    crate::session_exec::CallForm::Named
+                },
+            )
+            .await,
+            &call_params.name,
+            &budget,
+        );
+    }
+
+    // This runtime serves a store, not a repository, so there is no folder here
+    // for `kin_init` to set up.
+    if call_params.name == crate::repository_init::TOOL_NAME {
+        return offline_envelope_success(
+            id,
+            crate::repository_init::unavailable_answer(crate::first_contact::Spelling::here()),
+            &call_params.name,
+            &budget,
+        );
     }
 
     let mut handler = std::pin::pin!(handle_tool_call(
@@ -1374,7 +2026,8 @@ async fn handle_tools_call<G: PersistableMcpStore>(
     };
 
     match call_result {
-        Ok(result) => {
+        Ok(mut result) => {
+            present_result(config, &call_params.name, &mut result);
             if tool_requires_persist(&call_params.name) {
                 if let Err(error) = store.persist_primary_snapshot(config.snapshot_path.as_deref())
                 {
@@ -1393,6 +2046,107 @@ async fn handle_tools_call<G: PersistableMcpStore>(
             &budget,
         ),
     }
+}
+
+/// The refusal a call to a tool this profile does not serve gets. On a routed
+/// connection it names the routed command that runs the tool there.
+fn not_enabled_refusal(config: &McpServerConfig, tool: &str) -> ToolCallResult {
+    match config.routed {
+        Some(surface) => crate::routed::refuse_named_call(tool, surface),
+        None => ToolCallResult::error(format!("tool '{tool}' is not enabled in this MCP profile")),
+    }
+}
+
+/// Present a routed call's finished answer with its hints naming the routed
+/// commands that reach what they name, inside the budget the call was bounded
+/// to. Authority and budget-cut disclosures stay exactly as the named answer
+/// carries them. Only the existing final byte/token counters follow the new
+/// spelling; a spelling that cannot fit keeps the original qualified answer.
+fn present_routed_hints(response: &mut JsonRpcResponse, call_params: &ToolCallParams) {
+    let Some(value) = response.result.as_ref() else {
+        return;
+    };
+    let Ok(mut result) = serde_json::from_value::<ToolCallResult>(value.clone()) else {
+        return;
+    };
+    let budget = ResponseBudget::from_arguments(&call_params.arguments);
+    let original = result.clone();
+    crate::routed::rewrite_hints(&mut result, budget.max_chars);
+    for (block, original_block) in result.content.iter_mut().zip(&original.content) {
+        let ContentBlock::Text { text } = block;
+        let ContentBlock::Text {
+            text: original_text,
+        } = original_block;
+        if text == original_text {
+            continue;
+        }
+        // A soft-budget residual already discloses an over-budget answer.
+        // Presentation must not silently change that standing fact or trim
+        // the evidence which required it. Keep that answer intact.
+        let fitted = (original_text.len() <= budget.max_chars)
+            .then(|| fit_routed_hint_accounting(text, &call_params.name, &budget))
+            .flatten();
+        *text = fitted.unwrap_or_else(|| original_text.clone());
+    }
+    if let Ok(presented) = serde_json::to_value(&result) {
+        response.result = Some(presented);
+    }
+}
+
+/// Settle only already-present accounting after hint presentation. This is not
+/// another envelope pass: no authority, verdict, absence, cuts or payload facts
+/// are recomputed. The context limit is the payload's effective tier, which may
+/// be higher than the caller's requested tier. Failure keeps the original text.
+fn fit_routed_hint_accounting(text: &str, tool: &str, budget: &ResponseBudget) -> Option<String> {
+    let Ok(mut payload) = serde_json::from_str::<serde_json::Value>(text) else {
+        return (text.len() <= budget.max_chars).then(|| text.to_string());
+    };
+    let bytes_pointer = "/_kin/response/chars_after_budget";
+    let carries_bytes = match payload.pointer(bytes_pointer) {
+        Some(value) => {
+            value.as_u64()?;
+            true
+        }
+        None => false,
+    };
+    let context = matches!(tool, "get_context_pack" | "trace_computation");
+    let token_limit = if context {
+        match payload.get("token_budget") {
+            Some(value) => Some(value.as_u64()?),
+            None => None,
+        }
+    } else {
+        None
+    };
+    let carries_tokens = context && payload.get("tokens_used").is_some();
+    if carries_tokens {
+        payload.get("tokens_used")?.as_u64()?;
+        token_limit?;
+    }
+    let pretty = text.starts_with("{\n");
+    for _ in 0..16 {
+        let rendered = if pretty {
+            serde_json::to_string_pretty(&payload).ok()?
+        } else {
+            serde_json::to_string(&payload).ok()?
+        };
+        let bytes = rendered.len() as u64;
+        let tokens = kin_context::estimate_tokens(&rendered) as u64;
+        let bytes_match = !carries_bytes || payload.pointer(bytes_pointer)?.as_u64() == Some(bytes);
+        let tokens_match = !carries_tokens || payload.get("tokens_used")?.as_u64() == Some(tokens);
+        if bytes_match && tokens_match {
+            return (rendered.len() <= budget.max_chars
+                && token_limit.is_none_or(|limit| tokens <= limit))
+            .then_some(rendered);
+        }
+        if carries_bytes {
+            *payload.pointer_mut(bytes_pointer)? = serde_json::json!(bytes);
+        }
+        if carries_tokens {
+            *payload.get_mut("tokens_used")? = serde_json::json!(tokens);
+        }
+    }
+    None
 }
 
 /// Attach the offline/in-process response envelope and wrap the result as a
@@ -1421,6 +2175,52 @@ async fn handle_tools_call_daemon(
             return JsonRpcResponse::error(id, -32602, format!("Invalid params: {}", e));
         }
     };
+    // A routed call becomes the named call it stands for before anything reads
+    // its name, so it is forwarded to the daemon as that named call and the
+    // daemon never learns a routed tool exists. `describe` and a call that did
+    // not validate read no graph and are answered here, through the same
+    // envelope the tool registry is.
+    let routed_call = match crate::routed::route(&mut call_params, config.routed) {
+        crate::routed::Routing::Answer(result) => {
+            let budget = ResponseBudget::from_arguments(&call_params.arguments);
+            let enveloped = envelope::finalize_bounded(
+                result,
+                Envelope::daemon(),
+                crate::routed::TOOL_NAME,
+                &budget,
+            );
+            return JsonRpcResponse::success(
+                id,
+                serde_json::to_value(&enveloped).unwrap_or_default(),
+            );
+        }
+        crate::routed::Routing::Dispatch => true,
+        crate::routed::Routing::NotRouted => false,
+    };
+    let mut response = forward_tools_call(id, &mut call_params, routed_call, config).await;
+    if routed_call {
+        present_routed_hints(&mut response, &call_params);
+    }
+    response
+}
+
+/// The daemon route from a named call to its enveloped answer.
+async fn forward_tools_call(
+    id: Option<serde_json::Value>,
+    call_params: &mut ToolCallParams,
+    routed_call: bool,
+    config: &McpServerConfig,
+) -> JsonRpcResponse {
+    // See `dispatch_tools_call`: on a routed connection the routed tool is the
+    // dispatcher.
+    let discovered_call = if config.routed.is_some() {
+        false
+    } else {
+        match crate::tool_invocation::expand(call_params, config.allowed_tools.as_ref()) {
+            Ok(value) => value,
+            Err(error) => return JsonRpcResponse::error(id, -32602, error.to_string()),
+        }
+    };
     // Resolve the served name to the registered one here, once, before anything
     // keyed on a tool name reads it: the profile filter below, the dispatcher,
     // the response-budget shape, the negative-evidence spec and the envelope.
@@ -1428,6 +2228,11 @@ async fn handle_tools_call_daemon(
     // four landings, so that name is still accepted here; every profile now
     // advertises the registered name, and everything internal stays keyed on it.
     crate::agent_belt::canonicalize_tool_name(&mut call_params.name);
+    // Refuse before forwarding too: an older daemon must not restore retired
+    // file operations on an unfiltered connection.
+    if let Some(message) = crate::tools::retired_file_operation(&call_params.name) {
+        return JsonRpcResponse::error(id, -32602, message.into());
+    }
     // The belt asks for the compact locate shape on its agents' behalf, only
     // when the caller named no surface. Applied here rather than in the daemon
     // because this is the one layer that knows which profile is being served.
@@ -1437,11 +2242,8 @@ async fn handle_tools_call_daemon(
     let budget = ResponseBudget::from_arguments(&call_params.arguments);
 
     if let Some(allowed) = &config.allowed_tools {
-        if !allowed.contains(&call_params.name) {
-            let error_result = ToolCallResult::error(format!(
-                "tool '{}' is not enabled in this MCP profile",
-                call_params.name
-            ));
+        if !discovered_call && !routed_call && !allowed.contains(&call_params.name) {
+            let error_result = not_enabled_refusal(config, &call_params.name);
             let enveloped = envelope::finalize_bounded(
                 error_result,
                 Envelope::daemon(),
@@ -1453,6 +2255,16 @@ async fn handle_tools_call_daemon(
                 serde_json::to_value(&enveloped).unwrap_or_default(),
             );
         }
+    }
+
+    // See `dispatch_tools_call`: the rules the plain served schemas no longer
+    // carry are refused here, before the daemon is asked anything. Not in the
+    // handlers, which the daemon also calls with arguments it has rewritten.
+    if let Some(refusal) = crate::input_contract::refusal(&call_params.name, &call_params.arguments)
+    {
+        let enveloped =
+            envelope::finalize_bounded(refusal, Envelope::daemon(), &call_params.name, &budget);
+        return JsonRpcResponse::success(id, serde_json::to_value(&enveloped).unwrap_or_default());
     }
 
     // The tool registry is answered here rather than forwarded. It is the
@@ -1468,6 +2280,35 @@ async fn handle_tools_call_daemon(
             config.allowed_tools.as_ref(),
         )
         .unwrap_or_else(|error| ToolCallResult::error(error.to_string()));
+        let enveloped =
+            envelope::finalize_bounded(result, Envelope::daemon(), &call_params.name, &budget);
+        return JsonRpcResponse::success(id, serde_json::to_value(&enveloped).unwrap_or_default());
+    }
+
+    // `kin_init` is answered by the stdio loop, which holds the client's folder
+    // and the binder. A call that reaches this handler another way has no
+    // folder to set up, and is told where the command is answered.
+    if call_params.name == crate::repository_init::TOOL_NAME {
+        let enveloped = envelope::finalize_bounded(
+            crate::repository_init::unavailable_answer(crate::first_contact::Spelling::here()),
+            Envelope::daemon(),
+            &call_params.name,
+            &budget,
+        );
+        return JsonRpcResponse::success(id, serde_json::to_value(&enveloped).unwrap_or_default());
+    }
+
+    // A toolchain run is answered here, by the executor the launcher
+    // installed: it materializes a session workspace through this daemon, runs
+    // the command locally and hands the write-back to the daemon's reconcile
+    // boundary. The daemon never runs a command itself.
+    if call_params.name == crate::session_exec::TOOL_NAME {
+        let form = if routed_call {
+            crate::session_exec::CallForm::Routed
+        } else {
+            crate::session_exec::CallForm::Named
+        };
+        let result = crate::session_exec::handle(&call_params.arguments, form).await;
         let enveloped =
             envelope::finalize_bounded(result, Envelope::daemon(), &call_params.name, &budget);
         return JsonRpcResponse::success(id, serde_json::to_value(&enveloped).unwrap_or_default());
@@ -1490,12 +2331,18 @@ async fn handle_tools_call_daemon(
     // cannot be discharged by counters that may have preceded it.
     let graph_status_observation_started_at_unix =
         (call_params.name == "kin_graph_status").then(daemon_delegate::current_unix_seconds);
-    let (result, mut base_env) =
+    let (mut result, mut base_env) =
         match daemon_delegate::forward_tool_call(&call_params.name, &call_params.arguments).await {
             Ok(Some(result)) => (result, Envelope::daemon()),
             // Which gap it was decides the envelope: a working directory that is no
             // repository has no daemon to be unreachable.
-            Ok(None) => daemon_delegate::daemon_unavailable_tool_result(&call_params.name).await,
+            Ok(None) => {
+                daemon_delegate::daemon_unavailable_tool_result(
+                    &call_params.name,
+                    config.serves_init(),
+                )
+                .await
+            }
             Err(error) => {
                 let base = envelope_for_delegate_error(
                     &error,
@@ -1504,6 +2351,7 @@ async fn handle_tools_call_daemon(
                 (ToolCallResult::error(error), base)
             }
         };
+    present_result(config, &call_params.name, &mut result);
 
     // Stamped on every answer, not only on the ones that failed. A suspended
     // sweep is a standing fact about what this store's graph can contain, so
@@ -1573,6 +2421,11 @@ async fn handle_tools_call_daemon(
         // graph; selected-graph finalization below still replaces every graph
         // field from the report itself.
         if let Some(health) = health.as_ref() {
+            base_env = base_env.with_repository(
+                health,
+                config.client_root.as_deref(),
+                config.canonicalize,
+            );
             base_env = base_env.with_working_copy_health(health);
             // The third lift: which daemon answered, and how long it had been up.
             // A status read from a daemon that began serving a moment ago is the
@@ -1598,6 +2451,8 @@ async fn handle_tools_call_daemon(
 
     if let Some(health) = health.as_ref() {
         base_env = base_env.with_health(health);
+        base_env =
+            base_env.with_repository(health, config.client_root.as_deref(), config.canonicalize);
     }
 
     let enveloped = envelope::finalize_bounded(result, base_env, &call_params.name, &budget);
@@ -1735,17 +2590,7 @@ fn finalize_daemon_graph_status(
 }
 
 fn tool_requires_persist(name: &str) -> bool {
-    matches!(
-        name,
-        "kin_review_create"
-            | "kin_review_decide"
-            | "kin_review_note_add"
-            | "kin_review_discuss"
-            | "kin_review_discuss_reply"
-            | "kin_review_discuss_resolve"
-            | "kin_review_assign"
-            | "kin_review_remove_reviewer"
-    )
+    crate::handlers::review::is_review_mutation(name)
 }
 
 #[cfg(test)]
@@ -1794,6 +2639,241 @@ mod tests {
         );
         // Honesty: the offline path flags itself as a non-daemon fallback.
         assert_eq!(env["degraded"]["offline_fallback"], true, "tool {tool}");
+    }
+
+    async fn offline_review_call(
+        store: &InMemoryGraph,
+        config: &McpServerConfig,
+        tool: &str,
+        arguments: serde_json::Value,
+    ) -> ToolCallResult {
+        let message = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": tool, "arguments": arguments }
+        })
+        .to_string();
+        let response = process_message(&message, store, config, &SessionRegistry::new())
+            .await
+            .unwrap();
+        assert!(response.error.is_none(), "{response:?}");
+        serde_json::from_value(response.result.unwrap()).unwrap()
+    }
+
+    fn review_payload(result: &ToolCallResult) -> serde_json::Value {
+        let ContentBlock::Text { text } = &result.content[0];
+        serde_json::from_str(text).unwrap()
+    }
+
+    fn assigned_reviewers(store: &InMemoryGraph, review: &kin_model::ReviewId) -> Vec<String> {
+        let mut names: Vec<_> = kin_review::assignments::current_assignments(store, review)
+            .unwrap()
+            .into_iter()
+            .map(|assignment| assignment.reviewer.name)
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// A named call that breaks an "at least one of" rule the plain served
+    /// schema no longer carries is refused by the server on both call routes,
+    /// before anything runs: offline, and on the daemon route with no daemon
+    /// to reach at all.
+    #[tokio::test]
+    async fn both_call_routes_refuse_a_call_missing_every_alternative() {
+        let message = |tool: &str, arguments: serde_json::Value| {
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": { "name": tool, "arguments": arguments }
+            })
+            .to_string()
+        };
+        let refused_text = |response: JsonRpcResponse| -> serde_json::Value {
+            assert!(response.error.is_none(), "{response:?}");
+            let result: ToolCallResult = serde_json::from_value(response.result.unwrap()).unwrap();
+            assert_eq!(result.is_error, Some(true), "{result:?}");
+            let ContentBlock::Text { text } = &result.content[0];
+            serde_json::from_str(text).unwrap()
+        };
+        let offline = McpServerConfig {
+            session_authority_mode: SessionAuthorityMode::OfflineFallback,
+            ..Default::default()
+        };
+        let daemon = McpServerConfig {
+            allowed_tools: Some(crate::tools::name_set(
+                crate::tools::agent_default_tool_names(),
+            )),
+            agent_belt: true,
+            ..Default::default()
+        };
+        let store = InMemoryGraph::new();
+        for (tool, arguments, needs) in [
+            (
+                "semantic_locate",
+                serde_json::json!({"limit": 3}),
+                "query or cursor",
+            ),
+            (
+                "get_context_pack",
+                serde_json::json!({"depth": 1}),
+                "entity_id or entities or question",
+            ),
+            (
+                crate::handlers::lexical::TOOL_NAME,
+                serde_json::json!({"kind": "function"}),
+                "literal or cursor",
+            ),
+        ] {
+            let answers = [
+                refused_text(
+                    process_message(
+                        &message(tool, arguments.clone()),
+                        &store,
+                        &offline,
+                        &SessionRegistry::new(),
+                    )
+                    .await
+                    .unwrap(),
+                ),
+                refused_text(
+                    process_daemon_message(&message(tool, arguments.clone()), &daemon)
+                        .await
+                        .unwrap(),
+                ),
+            ];
+            for answer in answers {
+                assert!(
+                    answer["message"].as_str().unwrap().contains(needs),
+                    "{tool}: {answer}"
+                );
+                assert_eq!(answer["example"]["name"], tool);
+            }
+        }
+        // The review rules hold on the offline route, which serves them.
+        for (tool, arguments) in [
+            ("kin_review_create", serde_json::json!({"title": "t"})),
+            (
+                "kin_review_create",
+                serde_json::json!({"title": "t", "base": "working-tree"}),
+            ),
+            (
+                "kin_review_assign",
+                serde_json::json!({"review_id": "r", "requested_reviewers": ["a"]}),
+            ),
+        ] {
+            let answer = refused_text(
+                process_message(
+                    &message(tool, arguments.clone()),
+                    &store,
+                    &offline,
+                    &SessionRegistry::new(),
+                )
+                .await
+                .unwrap(),
+            );
+            assert_eq!(
+                answer["error"], "missing_arguments",
+                "{tool} {arguments}: {answer}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn offline_review_unassign_survives_snapshot_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = dir.path().join("graph.kindb");
+        let config = McpServerConfig {
+            snapshot_path: Some(snapshot.clone()),
+            session_authority_mode: SessionAuthorityMode::OfflineFallback,
+            allowed_tools: None,
+            ..Default::default()
+        };
+        let store = InMemoryGraph::new();
+        let created = offline_review_call(
+            &store,
+            &config,
+            "kin_review_create",
+            // base and head as the handler would default them, which the
+            // create call's "at least one of" rule asks the caller to name.
+            serde_json::json!({"title":"Persist assignments", "base":"working-tree",
+                "head":"working-tree", "reviewers":["Alice", "Bob"]}),
+        )
+        .await;
+        assert_ne!(created.is_error, Some(true), "{created:?}");
+        let review = kin_model::ReviewId(
+            uuid::Uuid::parse_str(review_payload(&created)["review_id"].as_str().unwrap()).unwrap(),
+        );
+        let original = kin_db::SnapshotManager::open_without_text_index(&snapshot).unwrap();
+        assert_eq!(
+            assigned_reviewers(original.graph().as_ref(), &review),
+            vec!["Alice", "Bob"]
+        );
+        drop(original);
+        for _ in 0..2 {
+            let result = offline_review_call(
+                &store,
+                &config,
+                "kin_review_unassign",
+                serde_json::json!({"review_id":review.to_string(), "reviewer":"Alice"}),
+            )
+            .await;
+            assert_ne!(result.is_error, Some(true), "{result:?}");
+            assert_eq!(review_payload(&result)["unassigned"], true);
+            assert_eq!(assigned_reviewers(&store, &review), vec!["Bob"]);
+            let reopened = kin_db::SnapshotManager::open_without_text_index(&snapshot).unwrap();
+            assert_eq!(
+                assigned_reviewers(reopened.graph().as_ref(), &review),
+                vec!["Bob"],
+                "a successful unassign must survive reopening the configured snapshot"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn offline_review_unassign_reports_snapshot_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = dir.path().join("graph.kindb");
+        let mut config = McpServerConfig {
+            snapshot_path: Some(snapshot.clone()),
+            session_authority_mode: SessionAuthorityMode::OfflineFallback,
+            allowed_tools: None,
+            ..Default::default()
+        };
+        let store = InMemoryGraph::new();
+        let created = offline_review_call(
+            &store,
+            &config,
+            "kin_review_create",
+            serde_json::json!({"title":"Refuse false durable success", "base":"working-tree",
+                "head":"working-tree", "reviewers":["Alice"]}),
+        )
+        .await;
+        assert_ne!(created.is_error, Some(true), "{created:?}");
+        let review = kin_model::ReviewId(
+            uuid::Uuid::parse_str(review_payload(&created)["review_id"].as_str().unwrap()).unwrap(),
+        );
+        let blocked_parent = dir.path().join("not-a-directory");
+        std::fs::write(&blocked_parent, b"owned fixture").unwrap();
+        config.snapshot_path = Some(blocked_parent.join("graph.kindb"));
+        let result = offline_review_call(
+            &store,
+            &config,
+            "kin_review_unassign",
+            serde_json::json!({"review_id":review.to_string(), "reviewer":"Alice"}),
+        )
+        .await;
+        assert_eq!(result.is_error, Some(true), "{result:?}");
+        assert!(review_payload(&result)["message"]
+            .as_str()
+            .unwrap()
+            .contains("snapshot persistence failed"));
+        // The existing offline contract applies in memory before persistence.
+        // Failure must disclose this, not claim rollback or durable success.
+        assert!(assigned_reviewers(&store, &review).is_empty());
+        let reopened = kin_db::SnapshotManager::open_without_text_index(&snapshot).unwrap();
+        assert_eq!(
+            assigned_reviewers(reopened.graph().as_ref(), &review),
+            vec!["Alice"]
+        );
     }
 
     // ── D.8: every tool family carries the unified response envelope ──────────
@@ -2581,28 +3661,20 @@ mod tests {
 
     #[tokio::test]
     async fn daemon_required_tools_do_not_use_local_handlers() {
-        struct RemoveCreatedKinDir(Option<std::path::PathBuf>);
-
-        impl Drop for RemoveCreatedKinDir {
-            fn drop(&mut self) {
-                if let Some(path) = self.0.take() {
-                    let _ = std::fs::remove_dir(path);
-                }
-            }
-        }
-
         // Bind this end-to-end dispatch test to a Kin repository explicitly.
         // Without `.kin`, the production delegate correctly reports the
         // distinct "not inside a kin repository" state before it can prove the
         // daemon-required branch this test is intended to lock down.
-        let kin_dir = std::env::current_dir().unwrap().join(".kin");
-        let remove_kin_dir = match std::fs::create_dir(&kin_dir) {
-            Ok(()) => RemoveCreatedKinDir(Some(kin_dir)),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && kin_dir.is_dir() => {
-                RemoveCreatedKinDir(None)
-            }
-            Err(error) => panic!("failed to establish Kin repo fixture: {error}"),
-        };
+        //
+        // The repository is private to this test, and the delegate is pointed
+        // at it rather than at the process working directory. That directory is
+        // shared by every test in this binary and the work handlers' tests move
+        // it into repositories of their own, so a `.kin` made beside the crate
+        // was sometimes looked for from another test's repository, or from one
+        // already deleted, and this test read "not inside a kin repository".
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repo.path().join(".kin")).unwrap();
+        let _working_dir = crate::daemon_delegate::TestWorkingDir::enter(repo.path());
         let _daemon_url = kin_core::test_env::EnvVarGuard::unset("KIN_DAEMON_URL");
         let config = McpServerConfig::default();
         let sessions = SessionRegistry::new();
@@ -2625,7 +3697,6 @@ mod tests {
             text.contains("no daemon is serving it"),
             "expected the repository-present, daemon-absent gap, got: {text}"
         );
-        drop(remove_kin_dir);
     }
 
     #[tokio::test]
@@ -2650,6 +3721,212 @@ mod tests {
         let resp = process_daemon_message(msg, &config).await.unwrap();
         assert!(resp.result.is_some());
         assert!(resp.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn resource_uris_cannot_bypass_entity_only_source_tools() {
+        let config = McpServerConfig::default();
+        let init = handle_initialize(Some(serde_json::json!(1)), &serde_json::json!({}), &config);
+        assert!(init.result.unwrap()["capabilities"]
+            .get("resources")
+            .is_none());
+        for method in [
+            "resources/list",
+            "resources/templates/list",
+            "resources/read",
+        ] {
+            for uri in ["file:///README.md", "kin://artifact/README.md"] {
+                let request = serde_json::json!({"jsonrpc":"2.0","id":1,"method":method,"params":{"uri":uri}}).to_string();
+                for daemon in [false, true] {
+                    let response = if daemon {
+                        process_daemon_message(&request, &config).await
+                    } else {
+                        process_message(
+                            &request,
+                            &InMemoryGraph::default(),
+                            &config,
+                            &SessionRegistry::new(),
+                        )
+                        .await
+                    }
+                    .unwrap();
+                    assert_eq!(response.error.unwrap().code, -32601);
+                    assert!(response.result.is_none());
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn file_catalogs_are_absent_and_refused_on_every_profile_and_transport() {
+        let mut configs = vec![
+            McpServerConfig::default(),
+            default_config(),
+            query_config(),
+            with_writes(),
+            read_only(),
+        ];
+        for names in [
+            crate::tools::agent_search_tool_names(),
+            crate::tools::benchmark_tool_names(),
+            crate::tools::context_bench_tool_names(),
+        ] {
+            configs.push(McpServerConfig {
+                allowed_tools: Some(crate::tools::name_set(names)),
+                ..Default::default()
+            });
+        }
+        for retired in ["kin_artifact_list", "list_file_entities"] {
+            for config in &configs {
+                let listed = handle_tools_list(Some(serde_json::json!(1)), config);
+                assert!(!serde_json::to_string(&listed.result)
+                    .unwrap()
+                    .contains(retired));
+                for daemon in [false, true] {
+                    for (name, args) in [
+                        (retired, serde_json::json!({"path":"README.md"})),
+                        (
+                            "kin_tool_call",
+                            serde_json::json!({"tool":retired,"arguments":{"path":"README.md"}}),
+                        ),
+                        (
+                            "kin",
+                            serde_json::json!({"command":retired,"args":{"path":"README.md"}}),
+                        ),
+                        (
+                            "kin",
+                            serde_json::json!({"command":format!("kin {retired}"),"args":{"path":"README.md"}}),
+                        ),
+                        (
+                            "kin",
+                            serde_json::json!({"command":"call","args":{"tool":retired,"arguments":{"path":"README.md"}}}),
+                        ),
+                    ] {
+                        if name == "kin" && config.routed.is_none() {
+                            continue;
+                        }
+                        let request = tools_call(name, args);
+                        let response = if daemon {
+                            process_daemon_message(&request, config).await
+                        } else {
+                            process_message(
+                                &request,
+                                &InMemoryGraph::default(),
+                                config,
+                                &SessionRegistry::new(),
+                            )
+                            .await
+                        }
+                        .unwrap();
+                        assert!(
+                            response.error.is_some()
+                                || response
+                                    .result
+                                    .as_ref()
+                                    .is_some_and(|r| r["isError"] == true),
+                            "{retired} through {name}: {:?}",
+                            response.result
+                        );
+                        // An unfiltered daemon connection must refuse locally, not
+                        // contact an older daemon that still knows this operation.
+                        if name == retired && config.allowed_tools.is_none() {
+                            assert!(response
+                                .error
+                                .as_ref()
+                                .unwrap()
+                                .message
+                                .contains("File catalogs are unavailable"));
+                        }
+                    }
+                }
+            }
+            let discovery =
+                crate::handlers::tool_search::handle_tool_search(&std::collections::HashMap::new())
+                    .unwrap();
+            assert!(!serde_json::to_string(&discovery).unwrap().contains(retired));
+            assert!(!LEGACY_SERVER_INSTRUCTIONS.contains(retired));
+        }
+    }
+
+    #[tokio::test]
+    async fn whole_artifact_read_is_absent_and_refused_on_every_profile_and_transport() {
+        let mut configs = vec![
+            McpServerConfig::default(),
+            default_config(),
+            query_config(),
+            with_writes(),
+            read_only(),
+        ];
+        for names in [
+            crate::tools::agent_search_tool_names(),
+            crate::tools::benchmark_tool_names(),
+            crate::tools::context_bench_tool_names(),
+        ] {
+            configs.push(McpServerConfig {
+                allowed_tools: Some(crate::tools::name_set(names)),
+                ..Default::default()
+            });
+        }
+        for config in configs {
+            let listed = handle_tools_list(Some(serde_json::json!(1)), &config);
+            assert!(!serde_json::to_string(&listed.result)
+                .unwrap()
+                .contains("kin_artifact_read"));
+            for daemon in [false, true] {
+                for (name, args) in [
+                    ("kin_artifact_read", serde_json::json!({"path":"README.md"})),
+                    (
+                        "kin_tool_call",
+                        serde_json::json!({"tool":"kin_artifact_read","arguments":{"path":"README.md"}}),
+                    ),
+                    (
+                        "kin",
+                        serde_json::json!({"command":"read","args":{"path":"README.md"}}),
+                    ),
+                    (
+                        "kin",
+                        serde_json::json!({"command":"kin_artifact_read","args":{"path":"README.md"}}),
+                    ),
+                    (
+                        "kin",
+                        serde_json::json!({"command":"call","args":{"tool":"kin_artifact_read","arguments":{"path":"README.md"}}}),
+                    ),
+                ] {
+                    // The routed tool is meaningful only on a routed profile.
+                    if name == "kin" && config.routed.is_none() {
+                        continue;
+                    }
+                    let request = tools_call(name, args);
+                    let response = if daemon {
+                        process_daemon_message(&request, &config).await
+                    } else {
+                        process_message(
+                            &request,
+                            &InMemoryGraph::default(),
+                            &config,
+                            &SessionRegistry::new(),
+                        )
+                        .await
+                    }
+                    .unwrap();
+                    assert!(
+                        response.error.is_some()
+                            || response
+                                .result
+                                .as_ref()
+                                .is_some_and(|r| r["isError"] == true),
+                        "{name}: {:?}",
+                        response.result
+                    );
+                }
+            }
+        }
+        let discovery =
+            crate::handlers::tool_search::handle_tool_search(&std::collections::HashMap::new())
+                .unwrap();
+        assert!(!serde_json::to_string(&discovery)
+            .unwrap()
+            .contains("kin_artifact_read"));
     }
 
     #[tokio::test]
@@ -2719,6 +3996,200 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn discovered_calls_reach_real_handlers_without_expanding_the_profile() {
+        let config = McpServerConfig {
+            allowed_tools: Some(crate::tools::name_set(
+                crate::tools::agent_search_tool_names(),
+            )),
+            agent_belt: true,
+            session_authority_mode: SessionAuthorityMode::OfflineFallback,
+            ..McpServerConfig::default()
+        };
+        let store = InMemoryGraph::default();
+        let sessions = SessionRegistry::new();
+        let bytes = b"fn dispatched_symbol() {}\n";
+        let kin_index::IndexedAny::EntitySource(indexed) = kin_index::IndexPipeline::new()
+            .index_any_content(
+                &kin_model::FilePathId::new("src/lib.rs"),
+                bytes,
+                kin_blobs::digest(bytes),
+            )
+            .unwrap()
+        else {
+            panic!("source fixture");
+        };
+        for entity in indexed.entities {
+            kin_model::EntityStore::upsert_entity(&store, &entity).unwrap();
+        }
+        store.flush_text_index().unwrap();
+        let before = handle_tools_list(Some(serde_json::json!(1)), &config);
+        let message = |name: &str, arguments: serde_json::Value| {
+            serde_json::json!({
+            "jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":name,"arguments":arguments}
+        }).to_string()
+        };
+        let searched = process_message(
+            &message(
+                "kin_tool_search",
+                serde_json::json!({"need":"semantic_search","limit":1}),
+            ),
+            &store,
+            &config,
+            &sessions,
+        )
+        .await
+        .unwrap()
+        .result
+        .unwrap();
+        let discovery: serde_json::Value =
+            serde_json::from_str(searched["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(discovery["matches"][0]["name"], "semantic_search");
+        assert_eq!(
+            discovery["invocation"]["profile_enabled"]["semantic_search"],
+            false
+        );
+        assert_eq!(
+            discovery["invocation"]["callable_via_dispatcher"]["semantic_search"],
+            true
+        );
+        let args = serde_json::json!({"query":"dispatched_symbol"});
+        let refused = process_message(
+            &message("semantic_search", args.clone()),
+            &store,
+            &config,
+            &sessions,
+        )
+        .await
+        .unwrap();
+        assert_eq!(refused.result.unwrap()["isError"], true);
+        let full = McpServerConfig {
+            allowed_tools: None,
+            ..config.clone()
+        };
+        let direct = process_message(
+            &message("semantic_search", args.clone()),
+            &store,
+            &full,
+            &sessions,
+        )
+        .await
+        .unwrap();
+        let wrapped = process_message(
+            &message(
+                "kin_tool_call",
+                serde_json::json!({"tool":"semantic_search","arguments":args}),
+            ),
+            &store,
+            &config,
+            &sessions,
+        )
+        .await
+        .unwrap();
+        assert!(wrapped.error.is_none());
+        let text = wrapped.result.as_ref().unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(
+            text.contains("dispatched_symbol") && text.contains("src/lib.rs"),
+            "{text}"
+        );
+        assert_ne!(wrapped.result.as_ref().unwrap()["isError"], true);
+        assert_eq!(
+            direct.result, wrapped.result,
+            "target answer, negative evidence and envelope must be unchanged"
+        );
+        assert_eq!(
+            before.result,
+            handle_tools_list(Some(serde_json::json!(3)), &config).result
+        );
+    }
+
+    /// One guarded whole-entity update as `kin_mutate` takes it: the new body
+    /// beside a well-formed `source_base`, whose entity id is the target.
+    ///
+    /// No route these tests drive compares a base with repository bytes, so a
+    /// base that passes `EntitySourceBase::validate` is all they need. A body
+    /// without one is refused as `source_base_required` before the behaviour
+    /// these tests assert about could run.
+    fn guarded_update_operation(body: &str) -> serde_json::Value {
+        let base = crate::source_base::EntitySourceBase {
+            schema: crate::source_base::SourceBaseSchema::V1,
+            context: crate::source_base::SourceBaseContext {
+                repository_id: "server-test".into(),
+                workspace_id: uuid::Uuid::new_v4().to_string(),
+                workspace_generation: 1,
+                workspace_head_hash: "a".repeat(64),
+                workspace_tree_hash: "b".repeat(64),
+            },
+            entity_id: kin_model::EntityId::new(),
+            artifact_id: kin_model::ArtifactId::new(),
+            source_blob_hash: "c".repeat(64),
+            start_byte: 0,
+            end_byte: 12,
+            body_hash: "d".repeat(64),
+        };
+        serde_json::json!({
+            "verb": "update",
+            "target": base.entity_id.to_string(),
+            "payload": { "EntitySourceBase": base },
+            "body": body,
+            "description": "edit",
+        })
+    }
+
+    #[tokio::test]
+    async fn discovered_calls_keep_profile_and_mutation_authority_refusals() {
+        // An admissible mutation, so the refusals below are the profile's and
+        // the session authority's rather than the operation's.
+        let call = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
+            "name":"kin_tool_call","arguments":{"tool":"kin_mutate","arguments":{
+                "operations":[guarded_update_operation("fn widget() {}")]
+            }}
+        }})
+        .to_string();
+        let store = InMemoryGraph::default();
+        let sessions = SessionRegistry::new();
+        for names in [
+            crate::tools::agent_default_tool_names(),
+            crate::tools::agent_query_tool_names(),
+            crate::tools::context_bench_tool_names(),
+        ] {
+            let config = McpServerConfig {
+                allowed_tools: Some(crate::tools::name_set(names)),
+                session_authority_mode: SessionAuthorityMode::OfflineFallback,
+                ..McpServerConfig::default()
+            };
+            for daemon in [false, true] {
+                let response = if daemon {
+                    process_daemon_message(&call, &config).await
+                } else {
+                    process_message(&call, &store, &config, &sessions).await
+                }
+                .unwrap();
+                assert!(response.error.unwrap().message.contains("not enabled"));
+            }
+        }
+        let config = McpServerConfig {
+            allowed_tools: Some(crate::tools::name_set(
+                crate::tools::agent_search_tool_names(),
+            )),
+            agent_belt: true,
+            session_authority_mode: SessionAuthorityMode::OfflineFallback,
+            ..McpServerConfig::default()
+        };
+        for daemon in [false, true] {
+            let response = if daemon {
+                process_daemon_message(&call, &config).await
+            } else {
+                process_message(&call, &store, &config, &sessions).await
+            }
+            .unwrap();
+            assert!(response.error.unwrap().message.contains("read-only"));
+        }
+        assert_eq!(sessions.count(), 0);
     }
 
     /// The tool registry is answered by this binary on the daemon route, from
@@ -2797,11 +4268,15 @@ mod tests {
     #[tokio::test]
     async fn a_mutation_is_expanded_locally_on_the_daemon_route() {
         let config = McpServerConfig::default();
+        // Guarded, so the expansion's check on the operations passes and the
+        // only thing left for it to refuse is the missing session.
+        let edit = guarded_update_operation("pub fn widget() {}");
 
         let unsessioned = process_daemon_message(
-            r#"{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"kin_mutate",
-               "arguments":{"operations":[{"verb":"update","target":"Widget",
-               "body":"pub fn widget() {}","description":"edit"}]}}}"#,
+            &serde_json::json!({"jsonrpc":"2.0","id":11,"method":"tools/call","params":{
+                "name":"kin_mutate","arguments":{"operations":[edit]}
+            }})
+            .to_string(),
             &config,
         )
         .await
@@ -2830,10 +4305,13 @@ mod tests {
         // guard is the one above: only a locally expanded mutate names
         // `kin_session_start`, and a forwarded one cannot, under any daemon.
         let sessioned = process_daemon_message(
-            r#"{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"kin_mutate",
-               "arguments":{"session_id":"11111111-1111-4111-8111-111111111111",
-               "operations":[{"verb":"update","target":"Widget",
-               "body":"pub fn widget() {}","description":"edit"}]}}}"#,
+            &serde_json::json!({"jsonrpc":"2.0","id":12,"method":"tools/call","params":{
+                "name":"kin_mutate","arguments":{
+                    "session_id":"11111111-1111-4111-8111-111111111111",
+                    "operations":[edit]
+                }
+            }})
+            .to_string(),
             &config,
         )
         .await
@@ -2847,6 +4325,10 @@ mod tests {
         assert!(
             !text.contains("kin_session_start"),
             "a named session was refused as missing: {text}"
+        );
+        assert!(
+            !text.contains("source_base_required"),
+            "the expansion refused the operations it should have forwarded: {text}"
         );
         assert_eq!(
             sessioned.get("isError"),
@@ -3440,6 +4922,7 @@ mod tests {
             repo_binder,
             bound_daemon_url,
             startup,
+            None,
         )
         .await
         .expect("stdio loop must drain the scripted client session");
@@ -4397,5 +5880,1740 @@ mod tests {
             rendered.contains("still starting") && rendered.contains("retry"),
             "the answer is still the honest still-starting report: {rendered}"
         );
+    }
+
+    // ── The routed profiles ─────────────────────────────────────────────────
+
+    /// A routed profile's config, served the way `kin mcp start` serves it.
+    fn routed_config(surface: crate::routed::RoutedSurface) -> McpServerConfig {
+        McpServerConfig {
+            allowed_tools: Some(crate::tools::name_set(
+                crate::tools::agent_routed_tool_names(),
+            )),
+            agent_belt: true,
+            routed: Some(surface),
+            number_entity_lines: surface.numbered,
+            session_authority_mode: SessionAuthorityMode::OfflineFallback,
+            ..McpServerConfig::default()
+        }
+    }
+
+    fn with_writes() -> McpServerConfig {
+        routed_config(crate::routed::RoutedSurface::WITH_WRITES)
+    }
+
+    fn read_only() -> McpServerConfig {
+        routed_config(crate::routed::RoutedSurface::READ_ONLY)
+    }
+
+    /// The belt with its write half, which `agent-routed` must answer as.
+    fn default_config() -> McpServerConfig {
+        McpServerConfig {
+            allowed_tools: Some(crate::tools::name_set(
+                crate::tools::agent_default_tool_names(),
+            )),
+            agent_belt: true,
+            session_authority_mode: SessionAuthorityMode::OfflineFallback,
+            ..McpServerConfig::default()
+        }
+    }
+
+    /// The query belt, which `agent-routed-query` must answer as.
+    fn query_config() -> McpServerConfig {
+        McpServerConfig {
+            allowed_tools: Some(crate::tools::name_set(
+                crate::tools::agent_query_tool_names(),
+            )),
+            agent_belt: true,
+            number_entity_lines: true,
+            session_authority_mode: SessionAuthorityMode::OfflineFallback,
+            ..McpServerConfig::default()
+        }
+    }
+
+    fn tools_call(name: &str, arguments: serde_json::Value) -> String {
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 7, "method": "tools/call",
+            "params": { "name": name, "arguments": arguments },
+        })
+        .to_string()
+    }
+
+    /// One change against `focal`'s history, with an id computed from its
+    /// content, the shape the history handler's own tests build.
+    fn history_change_for(
+        parents: Vec<kin_model::SemanticChangeId>,
+        deltas: Vec<kin_model::change::EntityDelta>,
+        message: &str,
+        second: usize,
+    ) -> kin_model::change::SemanticChange {
+        let root = parents.is_empty();
+        let mut change = kin_model::change::SemanticChange {
+            id: kin_model::SemanticChangeId::from_hash(kin_model::Hash256::from_bytes([0; 32])),
+            origin: kin_model::change::ChangeOrigin::Native,
+            parents,
+            timestamp: serde_json::from_value(serde_json::json!(format!(
+                "2026-09-22T21:{:02}:{:02}Z",
+                second / 60,
+                second % 60
+            )))
+            .unwrap(),
+            author: kin_model::AuthorId::new("History parity"),
+            message: message.into(),
+            entity_deltas: deltas,
+            relation_deltas: vec![],
+            tree_deltas: vec![],
+            admission_policy_delta: root.then(|| {
+                kin_model::AdmissionPolicyDelta::initialize(
+                    kin_model::SharedAdmissionPolicy::empty(0),
+                )
+            }),
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            external_reference_deltas: vec![],
+        };
+        change.id = kin_model::compute_semantic_change_id(&change).unwrap();
+        change
+    }
+
+    /// The bounded entity history answers through the routed tool exactly as
+    /// the named `entity_history` tool answers on a profile that serves it:
+    /// the same default page of 20 and ceiling of 100, the same
+    /// `next_offset`, `change_count` and `latest_change_id`, the same
+    /// `max_chars` trimming, and the same structured refusals when the
+    /// metadata cannot fit. Reached through `call` and by the tool's own name,
+    /// on both routed surfaces, byte for byte once the named answer's hints
+    /// name the routed commands.
+    #[tokio::test]
+    async fn routed_entity_history_pages_and_bounds_like_the_named_tool() {
+        use kin_model::change::EntityDelta;
+        use kin_model::graph::ChangeStore;
+        let (store, entities) = routed_fixture();
+        let focal = entities
+            .iter()
+            .find(|entity| entity.name == "routed_helper")
+            .expect("the fixture's helper")
+            .clone();
+        let bystander = entities
+            .iter()
+            .find(|entity| entity.name == "routed_caller")
+            .expect("the fixture's caller")
+            .clone();
+        // 35 changes to the helper, with long messages so a budget has to trim.
+        let mut parent = Vec::new();
+        let mut previous = focal.clone();
+        for n in 0..35 {
+            let delta = if n == 0 {
+                EntityDelta::Added { new: focal.clone() }
+            } else {
+                let mut revised = previous.clone();
+                revised.signature = format!("fn routed_helper() -> u32 /* revision {n} */");
+                let old = std::mem::replace(&mut previous, revised.clone());
+                EntityDelta::Modified { old, new: revised }
+            };
+            let change = history_change_for(
+                parent.clone(),
+                vec![delta],
+                &format!("{n}:{}", "界".repeat(150)),
+                n,
+            );
+            store.create_change(&change).unwrap();
+            parent = vec![change.id];
+        }
+        // The caller's history: one change whose ancestry is too long to
+        // carry, and one whose metadata no page of max_chars 2,000 can hold.
+        let fake_parent = |seed: usize| {
+            let mut bytes = [0u8; 32];
+            bytes[..8].copy_from_slice(&(seed as u64).to_le_bytes());
+            bytes[31] = 0x5a;
+            kin_model::SemanticChangeId::from_hash(kin_model::Hash256::from_bytes(bytes))
+        };
+        let caller_root = history_change_for(
+            vec![],
+            vec![EntityDelta::Added {
+                new: bystander.clone(),
+            }],
+            "caller root",
+            100,
+        );
+        store.create_change(&caller_root).unwrap();
+        let mut revised = bystander.clone();
+        revised.signature = "fn routed_caller() -> u32 /* merged */".into();
+        let wide_merge = history_change_for(
+            std::iter::once(caller_root.id)
+                .chain((0..40).map(fake_parent))
+                .collect(),
+            vec![EntityDelta::Modified {
+                old: bystander.clone(),
+                new: revised.clone(),
+            }],
+            "a merge with forty parents",
+            101,
+        );
+        store.create_change(&wide_merge).unwrap();
+
+        let focal_id = focal.id.to_string();
+        let caller_id = bystander.id.to_string();
+        let named = McpServerConfig {
+            allowed_tools: None,
+            agent_belt: true,
+            session_authority_mode: SessionAuthorityMode::OfflineFallback,
+            ..McpServerConfig::default()
+        };
+        let cases: Vec<serde_json::Value> = vec![
+            serde_json::json!({"entity_id": focal_id}),
+            serde_json::json!({"entity_id": focal_id, "offset": 20, "limit": 10}),
+            serde_json::json!({"entity_id": focal_id, "limit": 100}),
+            serde_json::json!({"entity_id": focal_id, "offset": 30}),
+            serde_json::json!({"entity_id": focal_id, "max_chars": 8000}),
+            serde_json::json!({"entity_id": caller_id, "max_chars": 2000}),
+            serde_json::json!({"entity_id": caller_id}),
+        ];
+        let mut seen_codes = Vec::new();
+        let mut seen_next = Vec::new();
+        for arguments in &cases {
+            let sessions = SessionRegistry::new();
+            let named_answer = process_message(
+                &tools_call("entity_history", arguments.clone()),
+                &store,
+                &named,
+                &sessions,
+            )
+            .await
+            .expect("a named response");
+            let named_answer = presented_as_routed(named_answer, "entity_history", arguments);
+            for surface in [with_writes(), read_only()] {
+                for routed_args in [
+                    serde_json::json!({"command": "call", "args": {"tool": "entity_history", "arguments": arguments}}),
+                    serde_json::json!({"command": "entity_history", "args": arguments}),
+                ] {
+                    let routed_answer = process_message(
+                        &tools_call(crate::routed::TOOL_NAME, routed_args.clone()),
+                        &store,
+                        &surface,
+                        &sessions,
+                    )
+                    .await
+                    .expect("a routed response");
+                    assert_eq!(
+                        serde_json::to_string(&routed_answer.result).unwrap(),
+                        serde_json::to_string(&named_answer.result).unwrap(),
+                        "{routed_args} on {:?} answered differently from entity_history",
+                        surface.routed
+                    );
+                }
+            }
+            let text = named_answer.result.as_ref().unwrap()["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            let payload: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+            if arguments.get("entity_id") == Some(&serde_json::json!(focal_id))
+                && arguments.get("max_chars").is_none()
+            {
+                let rows = payload["result"].as_array().expect("a real history page");
+                let offset = arguments["offset"].as_u64().unwrap_or(0);
+                let limit = arguments["limit"].as_u64().unwrap_or(20);
+                let returned = rows.len() as u64;
+                assert!(returned > 0 && returned <= limit && offset + returned <= 35);
+                assert_eq!(payload["returned"], rows.len());
+                assert_eq!(
+                    payload["next_offset"],
+                    if offset + returned < 35 {
+                        serde_json::json!(offset + returned)
+                    } else {
+                        serde_json::Value::Null
+                    }
+                );
+                if limit == 100 {
+                    assert!(returned < 35, "the ceiling case must exercise a budget cut");
+                }
+                assert!(
+                    rows.iter().all(|row| row.get("detail_summary").is_none()),
+                    "tail rows must be withheld before retained focal details"
+                );
+            }
+            if let Some(code) = payload
+                .pointer("/error/code")
+                .or_else(|| payload.pointer("/_kin/error/code"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+                .or_else(|| {
+                    [
+                        "history_metadata_exceeds_budget",
+                        "history_ancestry_exceeds_limit",
+                    ]
+                    .into_iter()
+                    .find(|code| text.contains(code))
+                    .map(str::to_string)
+                })
+            {
+                seen_codes.push(code);
+            }
+            if arguments.get("entity_id") == Some(&serde_json::json!(focal_id))
+                && arguments.get("max_chars").is_none()
+            {
+                seen_next.push((
+                    arguments.clone(),
+                    payload["limit"].clone(),
+                    payload["returned"].clone(),
+                    payload["next_offset"].clone(),
+                    payload["change_count"].clone(),
+                    payload["latest_change_id"].is_string(),
+                ));
+            }
+        }
+        // The controls: the pages are the bounded ones, and the refusal was
+        // reached, so the comparison covered it. The ceiling page gives up tail
+        // rows to preserve retained detail. Its size is budget-dependent;
+        // next_offset must follow the rows actually returned on both routes.
+        let returned = |case: usize| seen_next[case].2.as_u64().expect("returned row count");
+        let page = |case: usize, limit: u64, returned: u64, next: serde_json::Value| {
+            (
+                cases[case].clone(),
+                serde_json::json!(limit),
+                serde_json::json!(returned),
+                next,
+                serde_json::json!(35),
+                true,
+            )
+        };
+        assert_eq!(
+            seen_next,
+            vec![
+                page(0, 20, returned(0), serde_json::json!(returned(0))),
+                page(1, 10, returned(1), serde_json::json!(20 + returned(1))),
+                page(2, 100, returned(2), serde_json::json!(returned(2))),
+                page(3, 20, 5, serde_json::Value::Null),
+            ],
+        );
+        assert!(
+            seen_codes.contains(&"history_metadata_exceeds_budget".to_string()),
+            "{seen_codes:?}"
+        );
+
+        // Outside the schema's bounds, or the wrong type, both routes refuse,
+        // and in the same sentence: the router before dispatch, the named
+        // handler itself. Neither clamps.
+        for (field, value, sentence) in [
+            (
+                "limit",
+                serde_json::json!(500),
+                "entity_history: limit must be at most 100.",
+            ),
+            (
+                "limit",
+                serde_json::json!(0),
+                "entity_history: limit must be at least 1.",
+            ),
+            (
+                "limit",
+                serde_json::json!("ten"),
+                "entity_history: limit must be an integer.",
+            ),
+            (
+                "max_chars",
+                serde_json::json!(1999),
+                "entity_history: max_chars must be at least 2000.",
+            ),
+            (
+                "max_chars",
+                serde_json::json!(60001),
+                "entity_history: max_chars must be at most 60000.",
+            ),
+            (
+                "offset",
+                serde_json::json!(-1),
+                "entity_history: offset must be at least 0.",
+            ),
+        ] {
+            let mut arguments = serde_json::json!({"entity_id": focal_id});
+            arguments[field] = value.clone();
+            let named_answer = process_message(
+                &tools_call("entity_history", arguments.clone()),
+                &store,
+                &named,
+                &SessionRegistry::new(),
+            )
+            .await
+            .expect("a named response");
+            let named_text = serde_json::to_string(&named_answer.result).unwrap();
+            assert_eq!(
+                named_answer.result.as_ref().unwrap()["isError"],
+                true,
+                "{field} {value}: {named_text}"
+            );
+            assert!(
+                named_text.contains(sentence),
+                "named {field} {value}: {named_text}"
+            );
+            for surface in [with_writes(), read_only()] {
+                let routed_answer = process_message(
+                    &tools_call(
+                        crate::routed::TOOL_NAME,
+                        serde_json::json!({"command": "call", "args": {"tool": "entity_history", "arguments": arguments}}),
+                    ),
+                    &store,
+                    &surface,
+                    &SessionRegistry::new(),
+                )
+                .await
+                .expect("a routed response");
+                let routed_text = serde_json::to_string(&routed_answer.result).unwrap();
+                assert_eq!(
+                    routed_answer.result.as_ref().unwrap()["isError"],
+                    true,
+                    "{field} {value}: {routed_text}"
+                );
+                assert!(
+                    routed_text.contains(sentence),
+                    "routed {field} {value}: {routed_text}"
+                );
+            }
+        }
+    }
+
+    /// A store holding one small Rust file whose second function calls its
+    /// first, so a reference, a chain and a route all have something to find.
+    fn routed_fixture() -> (InMemoryGraph, Vec<kin_model::Entity>) {
+        let store = InMemoryGraph::default();
+        let bytes = b"fn routed_helper() -> u32 {\n    7\n}\n\nfn routed_caller() -> u32 {\n    routed_helper() + 1\n}\n";
+        let kin_index::IndexedAny::EntitySource(indexed) = kin_index::IndexPipeline::new()
+            .index_any_content(
+                &kin_model::FilePathId::new("src/routed.rs"),
+                bytes,
+                kin_blobs::digest(bytes),
+            )
+            .unwrap()
+        else {
+            panic!("source fixture");
+        };
+        for entity in &indexed.entities {
+            kin_model::EntityStore::upsert_entity(&store, entity).unwrap();
+        }
+        for relation in &indexed.relations {
+            kin_model::EntityStore::upsert_relation(&store, relation).unwrap();
+        }
+        store.flush_text_index().unwrap();
+        (store, indexed.entities)
+    }
+
+    /// `text` with every UUID replaced by one placeholder.
+    fn mask_uuids(text: &str) -> String {
+        let bytes = text.as_bytes();
+        let shape = |at: usize| {
+            at + 36 <= bytes.len()
+                && bytes[at..at + 36].iter().enumerate().all(|(index, byte)| {
+                    if matches!(index, 8 | 13 | 18 | 23) {
+                        *byte == b'-'
+                    } else {
+                        byte.is_ascii_hexdigit()
+                    }
+                })
+        };
+        let mut out = String::with_capacity(text.len());
+        let mut index = 0;
+        while index < bytes.len() {
+            if shape(index) {
+                out.push_str("<uuid>");
+                index += 36;
+            } else {
+                let character = text[index..].chars().next().unwrap();
+                out.push(character);
+                index += character.len_utf8();
+            }
+        }
+        out
+    }
+
+    /// The named answer as a routed connection presents it: the same bytes
+    /// with its hints naming the routed commands.
+    fn presented_as_routed(
+        mut response: JsonRpcResponse,
+        tool: &str,
+        arguments: &serde_json::Value,
+    ) -> JsonRpcResponse {
+        let params: ToolCallParams =
+            serde_json::from_value(serde_json::json!({"name": tool, "arguments": arguments}))
+                .unwrap();
+        present_routed_hints(&mut response, &params);
+        response
+    }
+
+    fn finalized_hint_context(
+        tool: &str,
+        arguments: &serde_json::Value,
+        hint: &str,
+        body: &str,
+    ) -> JsonRpcResponse {
+        let params: ToolCallParams = serde_json::from_value(serde_json::json!({
+            "name": tool, "arguments": arguments
+        }))
+        .unwrap();
+        let payload = serde_json::json!({
+            "token_budget": 8000, "tokens_used": 0,
+            "focal_entity": {"id": "focal", "name": "focal", "body": body, "body_complete": true},
+            "dependencies": [{"id": "dependency", "name": "dependency", "body_unavailable": hint}],
+            "dependents": [],
+            "degradations": [{"reason": "references_are_incomplete"}]
+        });
+        let result = envelope::finalize_bounded(
+            ToolCallResult::text(payload.to_string()),
+            Envelope::daemon(),
+            tool,
+            &ResponseBudget::from_arguments(&params.arguments),
+        );
+        assert_ne!(result.is_error, Some(true));
+        JsonRpcResponse::success(
+            Some(serde_json::json!(1)),
+            serde_json::to_value(result).unwrap(),
+        )
+    }
+
+    fn presented_text(response: &JsonRpcResponse) -> &str {
+        response.result.as_ref().unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+    }
+
+    /// Exercise the supported final presentation boundary after real envelope
+    /// qualification, including shortening, lengthening and equal-byte hints.
+    #[test]
+    fn routed_hint_accounting_matches_final_context_wire_without_changing_facts() {
+        let body = "fn café() {\r\n    execute();\r\n}";
+        let hints = [
+            (
+                "no source body was read for this row: it was not priced by this request's source projection; read it with get_entity_source",
+                "no source body was read for this row: it was not priced by this request's source projection; read it with kin source",
+            ),
+            ("use graph_neighborhood", "use kin call graph_neighborhood"),
+            ("use trace_data_flow", "use kin trace-data-flow"),
+            ("use kin_graph_status", "use kin graph status"),
+        ];
+        for tool in ["get_context_pack", "trace_computation"] {
+            for compact in [true, false] {
+                let args = serde_json::json!({"compact": compact, "max_chars": 60000});
+                for (hint, routed_hint) in hints {
+                    let before = finalized_hint_context(tool, &args, hint, body);
+                    let mut expected: serde_json::Value =
+                        serde_json::from_str(presented_text(&before)).unwrap();
+                    let after = presented_as_routed(before, tool, &args);
+                    let text = presented_text(&after);
+                    let actual: serde_json::Value = serde_json::from_str(text).unwrap();
+                    assert_eq!(actual["dependencies"][0]["body_unavailable"], routed_hint);
+                    assert_eq!(actual["_kin"]["response"]["chars_after_budget"], text.len());
+                    assert_eq!(actual["tokens_used"], kin_context::estimate_tokens(text));
+                    assert_eq!(text.contains('\n'), !compact);
+                    assert!(text.len() <= 60000);
+                    assert!(kin_context::estimate_tokens(text) <= 8000);
+                    // Every fact, source byte, standing limitation, negative and
+                    // authority field stays equal. Only these three values vary.
+                    expected["dependencies"][0]["body_unavailable"] =
+                        serde_json::json!(routed_hint);
+                    expected["_kin"]["response"]["chars_after_budget"] =
+                        serde_json::json!(text.len());
+                    expected["tokens_used"] = serde_json::json!(kin_context::estimate_tokens(text));
+                    assert_eq!(actual, expected, "{tool}, compact={compact}, {hint}");
+                }
+            }
+        }
+    }
+
+    /// A routed spelling can be shorter in bytes and still require more of the
+    /// context token estimate. It must not escape the effective context tier.
+    #[test]
+    fn routed_hint_accounting_keeps_original_at_effective_token_limit() {
+        let args = serde_json::json!({"token_budget": 4000, "max_chars": 60000});
+        for tool in ["get_context_pack", "trace_computation"] {
+            let mut words = 5000;
+            let mut at_limit = None;
+            for _ in 0..8 {
+                let body = "word ".repeat(words);
+                let before = finalized_hint_context(tool, &args, "use get_entity_source", &body);
+                let text = presented_text(&before);
+                let payload: serde_json::Value = serde_json::from_str(text).unwrap();
+                assert_eq!(payload["focal_entity"]["body"], body);
+                let tokens = kin_context::estimate_tokens(text);
+                assert!(tokens <= 8000);
+                if tokens == 8000 {
+                    at_limit = Some(before);
+                    break;
+                }
+                words += ((8000 - tokens) * 7 / 8).max(1);
+            }
+            let before = at_limit.expect("the real finalizer reaches the effective token ceiling");
+            // The same payload with room still takes the routed spelling even
+            // though its effective tier exceeds the caller's requested tier.
+            let roomy = finalized_hint_context(
+                tool,
+                &args,
+                "use get_entity_source",
+                &"word ".repeat(words - 100),
+            );
+            assert!(kin_context::estimate_tokens(presented_text(&roomy)) > 4000);
+            let roomy_after = presented_as_routed(roomy, tool, &args);
+            let payload: serde_json::Value =
+                serde_json::from_str(presented_text(&roomy_after)).unwrap();
+            assert_eq!(
+                payload["dependencies"][0]["body_unavailable"],
+                "use kin source"
+            );
+            let original = before.result.clone();
+            let after = presented_as_routed(before, tool, &args);
+            assert_eq!(after.result, original, "the named spelling fits exactly");
+            assert_eq!(kin_context::estimate_tokens(presented_text(&after)), 8000);
+        }
+    }
+
+    /// Recounting the final byte counter itself can add a digit. The old hint
+    /// byte guard alone admitted this rewrite with stale four-digit accounting.
+    #[test]
+    fn routed_hint_accounting_checks_ceiling_after_counter_growth() {
+        let args = serde_json::json!({"max_chars": 10000});
+        let mut padding = 6000;
+        let mut exact = None;
+        for _ in 0..8 {
+            let body = "x".repeat(padding);
+            let before =
+                finalized_hint_context("get_context_pack", &args, "use graph_neighborhood", &body);
+            let text = presented_text(&before);
+            let payload: serde_json::Value = serde_json::from_str(text).unwrap();
+            assert_eq!(payload["focal_entity"]["body"], body);
+            if text.len() == 9991 {
+                exact = Some(before);
+                break;
+            }
+            padding = padding
+                .checked_add_signed(9991 - text.len() as isize)
+                .unwrap();
+        }
+        let before = exact.expect("the finalized fixture is nine bytes below its ceiling");
+        let original = before.result.clone();
+        let after = presented_as_routed(before, "get_context_pack", &args);
+        assert_eq!(after.result, original);
+        assert_eq!(presented_text(&after).len(), 9991);
+    }
+
+    #[test]
+    fn routed_hint_accounting_preserves_existing_soft_budget_residual() {
+        let args = serde_json::json!({"max_chars": 2000});
+        let params: ToolCallParams = serde_json::from_value(serde_json::json!({
+            "name": "find_references", "arguments": args
+        }))
+        .unwrap();
+        let result = envelope::finalize_bounded(
+            ToolCallResult::text(
+                serde_json::json!({
+                    "references": [], "total": 0, "observation": "x".repeat(4000),
+                    "hint": "use get_entity_source"
+                })
+                .to_string(),
+            ),
+            Envelope::daemon(),
+            "find_references",
+            &ResponseBudget::from_arguments(&params.arguments),
+        );
+        let before = JsonRpcResponse::success(
+            Some(serde_json::json!(1)),
+            serde_json::to_value(result).unwrap(),
+        );
+        assert!(presented_text(&before).len() > 2000);
+        assert!(presented_text(&before).contains("response_over_budget"));
+        let original = before.result.clone();
+        let after = presented_as_routed(before, "find_references", &args);
+        assert_eq!(after.result, original);
+    }
+
+    /// `graph source` and `kin graph source`, the CLI's spellings, answer a
+    /// routed call byte for byte as `source` does on both routed profiles:
+    /// payload, `_kin` envelope and any refusal. The Kin block `kin setup`
+    /// writes for a routed client names source that way, so the same words
+    /// run through the routed tool and in a shell.
+    #[tokio::test]
+    async fn graph_source_answers_exactly_as_source_does() {
+        async fn answer(
+            store: &InMemoryGraph,
+            config: &McpServerConfig,
+            command: &str,
+            entity_id: &str,
+        ) -> serde_json::Value {
+            let request = tools_call(
+                crate::routed::TOOL_NAME,
+                serde_json::json!({"command": command, "args": {"entity_id": entity_id}}),
+            );
+            let response = process_message(&request, store, config, &SessionRegistry::new())
+                .await
+                .expect("a routed response");
+            assert!(response.error.is_none(), "{command} was a transport error");
+            response.result.expect("a result")
+        }
+
+        let (store, entities) = routed_fixture();
+        let helper = entities
+            .iter()
+            .find(|entity| entity.name == "routed_helper")
+            .expect("the fixture has routed_helper")
+            .id
+            .to_string();
+        for config in [with_writes(), read_only()] {
+            let source = answer(&store, &config, "source", &helper).await;
+            let text = source["content"][0]["text"].as_str().expect("a text block");
+            let payload: serde_json::Value =
+                serde_json::from_str(text).expect("an enveloped payload is JSON");
+            assert!(payload.get(ENVELOPE_KEY).is_some(), "{payload}");
+            assert!(
+                payload.get("example").is_none(),
+                "source stopped at the router: {payload}"
+            );
+            for spelling in ["graph source", "kin graph source"] {
+                assert_eq!(
+                    answer(&store, &config, spelling, &helper).await,
+                    source,
+                    "{spelling} on {:?}",
+                    config.routed
+                );
+            }
+        }
+    }
+
+    /// Every routed command answers with exactly what its named tool answers
+    /// on the named profile it stands in for, for the same arguments: payload,
+    /// negative evidence and `_kin` envelope, byte for byte once the named
+    /// answer's hints name the routed commands, including where the named tool
+    /// itself refuses. `agent-routed` answers as `agent-default`, writes
+    /// included, and `agent-routed-query` as `agent-query`.
+    #[tokio::test]
+    async fn each_routed_command_returns_its_named_tool_payload() {
+        let (store, entities) = routed_fixture();
+        let id_of = |name: &str| {
+            entities
+                .iter()
+                .find(|entity| entity.name == name)
+                .unwrap_or_else(|| panic!("the fixture has no {name}"))
+                .id
+                .to_string()
+        };
+        let (helper, caller) = (id_of("routed_helper"), id_of("routed_caller"));
+        let reads: Vec<(serde_json::Value, &str, serde_json::Value)> = vec![
+            (
+                serde_json::json!({"command": "locate", "args": {"query": "routed helper"}}),
+                "semantic_locate",
+                serde_json::json!({"query": "routed helper"}),
+            ),
+            (
+                serde_json::json!({"command": "search", "args": {"query": "routed_helper"}}),
+                "semantic_search",
+                serde_json::json!({"query": "routed_helper"}),
+            ),
+            (
+                serde_json::json!({"command": "search", "args": {"literal": "routed_helper()"}}),
+                "lexical_lookup",
+                serde_json::json!({"literal": "routed_helper()"}),
+            ),
+            (
+                serde_json::json!({"command": "context", "args": {"entity_id": caller}}),
+                "get_context_pack",
+                serde_json::json!({"entity_id": caller}),
+            ),
+            (
+                serde_json::json!({"command": "refs", "args": {"entity_id": helper}}),
+                "find_references",
+                serde_json::json!({"entity_id": helper}),
+            ),
+            (
+                serde_json::json!({"command": "trace", "args": {"focal": caller}}),
+                "trace_data_flow",
+                serde_json::json!({"focal": caller}),
+            ),
+            (
+                serde_json::json!({"command": "path", "args": {"from": caller, "to": helper}}),
+                "trace_path",
+                serde_json::json!({"from": caller, "to": helper}),
+            ),
+            (
+                serde_json::json!({"command": "impact", "args": {"entity_ids": [helper]}}),
+                "impact_analysis",
+                serde_json::json!({"entity_ids": [helper]}),
+            ),
+            (
+                serde_json::json!({"command": "source", "args": {"entity_id": helper}}),
+                "get_entity_source",
+                serde_json::json!({"entity_id": helper}),
+            ),
+            (
+                serde_json::json!({"command": "status"}),
+                "kin_graph_status",
+                serde_json::json!({}),
+            ),
+            (
+                serde_json::json!({"command": "call", "args": {"tool": "graph_neighborhood", "arguments": {"entity_id": helper}}}),
+                "graph_neighborhood",
+                serde_json::json!({"entity_id": helper}),
+            ),
+            (
+                serde_json::json!({"command": "graph_neighborhood", "args": {"entity_id": helper}}),
+                "graph_neighborhood",
+                serde_json::json!({"entity_id": helper}),
+            ),
+        ];
+        // A mutate the handler refuses before it changes anything, so both
+        // calls meet the same store: kin_mutate's own refusal, the same way
+        // whichever name reached it. The update names an entity the store does
+        // not hold and carries its source base, so it passes the semantic check
+        // and opens a transaction before the in-process commit refuses its body.
+        let edit = guarded_update_operation("fn x() {}");
+        let writes: Vec<(serde_json::Value, &str, serde_json::Value)> = vec![(
+            serde_json::json!({"command": "mutate", "args": {"operations": [edit]}}),
+            "kin_mutate",
+            serde_json::json!({"operations": [edit]}),
+        )];
+        let mut answered: Vec<&str> = Vec::new();
+        let cases = reads
+            .iter()
+            .map(|case| (case, true))
+            .chain(writes.iter().map(|case| (case, false)));
+        for ((routed_args, tool, named_args), read) in cases {
+            let pairs: Vec<(McpServerConfig, McpServerConfig)> = if read {
+                vec![
+                    (with_writes(), default_config()),
+                    (read_only(), query_config()),
+                ]
+            } else {
+                vec![(with_writes(), default_config())]
+            };
+            for (routed, named) in pairs {
+                let sessions = SessionRegistry::new();
+                let routed_answer = process_message(
+                    &tools_call(crate::routed::TOOL_NAME, routed_args.clone()),
+                    &store,
+                    &routed,
+                    &sessions,
+                )
+                .await
+                .expect("a routed response");
+                let named_answer = process_message(
+                    &tools_call(tool, named_args.clone()),
+                    &store,
+                    &named,
+                    &sessions,
+                )
+                .await
+                .expect("a named response");
+                assert!(
+                    routed_answer.error.is_none(),
+                    "{routed_args} was a transport error"
+                );
+                let named_answer = presented_as_routed(named_answer, tool, named_args);
+                // A write opens its own transaction, so the two answers carry
+                // different transaction ids and nothing else.
+                let comparable = |result: &Option<serde_json::Value>| {
+                    let mut result = result.clone();
+                    // Independent traversals record their own duration. Normalize
+                    // only the measured elapsed_ms, never semantic payload data.
+                    if let Some(contents) = result
+                        .as_mut()
+                        .and_then(|v| v.get_mut("content"))
+                        .and_then(serde_json::Value::as_array_mut)
+                    {
+                        for block in contents {
+                            if let Some(text) =
+                                block.get("text").and_then(serde_json::Value::as_str)
+                            {
+                                if let Ok(mut payload) =
+                                    serde_json::from_str::<serde_json::Value>(text)
+                                {
+                                    if let Some(explored) = payload
+                                        .get_mut("explored")
+                                        .and_then(serde_json::Value::as_array_mut)
+                                    {
+                                        for row in explored {
+                                            if row.get("elapsed_ms").is_some() {
+                                                row["elapsed_ms"] = serde_json::json!(0);
+                                            }
+                                        }
+                                    }
+                                    block["text"] =
+                                        serde_json::json!(serde_json::to_string(&payload).unwrap());
+                                }
+                            }
+                        }
+                    }
+                    let text = serde_json::to_string(&result).unwrap();
+                    if read {
+                        text
+                    } else {
+                        mask_uuids(&text)
+                    }
+                };
+                assert_eq!(
+                    comparable(&routed_answer.result),
+                    comparable(&named_answer.result),
+                    "{routed_args} on {:?} answered differently from {tool}",
+                    routed.routed
+                );
+                let result = routed_answer.result.expect("a result");
+                let text = result["content"][0]["text"].as_str().expect("a text block");
+                let payload: serde_json::Value =
+                    serde_json::from_str(text).expect("an enveloped payload is JSON");
+                assert!(
+                    payload.get(ENVELOPE_KEY).is_some(),
+                    "{routed_args} came back without the envelope: {payload}"
+                );
+                if result.get("isError") != Some(&serde_json::json!(true)) {
+                    if routed.routed.is_some_and(|surface| surface.writes) {
+                        answered.push(tool);
+                    }
+                    continue;
+                }
+                // The in-process route has no daemon and no pinned repository
+                // authority, so some tools refuse here. Their refusal has to be
+                // the HANDLER's own, which proves the routed call reached the
+                // handler rather than stopping at the router.
+                assert!(
+                    payload.get("example").is_none(),
+                    "{tool} came back with the router's refusal: {payload}"
+                );
+            }
+        }
+        // The control: the graph-only tools answer for real here, so the
+        // comparison covers real payloads and not only matching refusals.
+        answered.sort_unstable();
+        assert!(
+            answered.len() >= 5
+                && [
+                    "impact_analysis",
+                    "semantic_search",
+                    "trace_data_flow",
+                    "trace_path"
+                ]
+                .iter()
+                .all(|tool| answered.contains(tool)),
+            "the commands that answer in-process moved: {answered:?}"
+        );
+    }
+
+    /// A write on the read-only routed surface is refused before anything
+    /// runs, and the refusal names the profile that carries it.
+    #[tokio::test]
+    async fn the_read_only_routed_surface_refuses_every_write() {
+        let store = InMemoryGraph::default();
+        let sessions = SessionRegistry::new();
+        for arguments in [
+            serde_json::json!({"command": "mutate", "args": {"operations": []}}),
+            serde_json::json!({"command": "session", "args": {"vendor": "v", "client_name": "c", "cwd": "/"}}),
+            serde_json::json!({"command": "kin_mutate", "args": {"operations": []}}),
+            serde_json::json!({"command": "call", "args": {"tool": "kin_transaction_begin", "arguments": {}}}),
+        ] {
+            let result = process_message(
+                &tools_call(crate::routed::TOOL_NAME, arguments.clone()),
+                &store,
+                &read_only(),
+                &sessions,
+            )
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+            assert_eq!(result["isError"], true, "{arguments}");
+            let payload: serde_json::Value =
+                serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+            let message = payload["message"].as_str().unwrap();
+            assert!(
+                message.contains("read-only agent-routed-query")
+                    && message.contains("agent-routed profile carries"),
+                "{arguments}: {message}"
+            );
+            assert!(payload.get(ENVELOPE_KEY).is_some());
+        }
+        assert!(
+            sessions.list_agent_sessions().is_empty(),
+            "a refused write still opened a session"
+        );
+        // Named directly, the write tool is refused the same way.
+        let direct = process_message(
+            &tools_call("kin_mutate", serde_json::json!({"operations": []})),
+            &store,
+            &read_only(),
+            &sessions,
+        )
+        .await
+        .unwrap()
+        .result
+        .unwrap();
+        assert!(direct["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("agent-routed profile carries"));
+    }
+
+    /// `describe` and a refusal are answered by this server, with the
+    /// envelope, on both routes, and the daemon route needs no daemon for
+    /// either because neither reads a graph.
+    #[tokio::test]
+    async fn routed_describe_and_refusals_carry_the_envelope_on_both_routes() {
+        let store = InMemoryGraph::default();
+        let sessions = SessionRegistry::new();
+        for surface in [
+            crate::routed::RoutedSurface::WITH_WRITES,
+            crate::routed::RoutedSurface::READ_ONLY,
+        ] {
+            let offline = routed_config(surface);
+            let mut daemon_config = routed_config(surface);
+            daemon_config.session_authority_mode = SessionAuthorityMode::DaemonRequired;
+            for (arguments, is_error) in [
+                (
+                    serde_json::json!({"command": "describe", "args": {"command": "search"}}),
+                    false,
+                ),
+                (serde_json::json!({"command": "describe"}), false),
+                (
+                    serde_json::json!({"command": "locate", "args": {"q": "retries"}}),
+                    true,
+                ),
+            ] {
+                let message = tools_call(crate::routed::TOOL_NAME, arguments.clone());
+                for response in [
+                    process_message(&message, &store, &offline, &sessions).await,
+                    process_daemon_message(&message, &daemon_config).await,
+                ] {
+                    let result = response.expect("a response").result.expect("a result");
+                    assert_eq!(
+                        result.get("isError") == Some(&serde_json::json!(true)),
+                        is_error,
+                        "{arguments}: {result}"
+                    );
+                    let payload: serde_json::Value =
+                        serde_json::from_str(result["content"][0]["text"].as_str().unwrap())
+                            .unwrap();
+                    assert!(payload.get(ENVELOPE_KEY).is_some(), "{payload}");
+                    if is_error {
+                        let message = payload["message"].as_str().expect("a refusal says why");
+                        assert!(message.contains("query (string)"), "{message}");
+                        assert_eq!(payload["example"]["command"], "locate");
+                    } else if arguments.get("args").is_some() {
+                        assert_eq!(payload["variants"].as_array().map(Vec::len), Some(2));
+                    } else {
+                        assert!(payload["other_tools"]
+                            .as_array()
+                            .is_some_and(|rows| !rows.is_empty()));
+                    }
+                }
+            }
+            // The control: a named tool the routed profile does not serve is
+            // still refused, so routing did not become a way around the
+            // profile, and the refusal names the command that runs it here.
+            let refused = process_message(
+                &tools_call("semantic_locate", serde_json::json!({"query": "x"})),
+                &store,
+                &offline,
+                &sessions,
+            )
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+            let text = refused["content"][0]["text"].as_str().unwrap();
+            assert!(text.contains("not enabled in this MCP profile"), "{text}");
+            assert!(text.contains("command locate"), "{text}");
+        }
+    }
+
+    /// Initialize serves the operating procedure worded for the surface the
+    /// profile serves.
+    #[tokio::test]
+    async fn initialize_serves_the_procedure_for_the_profile() {
+        let store = InMemoryGraph::default();
+        let sessions = SessionRegistry::new();
+        let message = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+        for (config, expected, names) in [
+            (with_writes(), ROUTED_SERVER_INSTRUCTIONS, "kin locate"),
+            (read_only(), ROUTED_QUERY_SERVER_INSTRUCTIONS, "kin locate"),
+            (query_config(), SERVER_INSTRUCTIONS, "semantic_locate"),
+            (default_config(), SERVER_INSTRUCTIONS, "semantic_locate"),
+            (
+                McpServerConfig::default(),
+                SERVER_INSTRUCTIONS,
+                "semantic_locate",
+            ),
+        ] {
+            let result = process_message(message, &store, &config, &sessions)
+                .await
+                .unwrap()
+                .result
+                .unwrap();
+            let instructions = result["instructions"].as_str().unwrap();
+            assert_eq!(instructions, expected);
+            assert!(instructions.contains(names));
+            for step in ["1. ", "2. ", "3. ", "4. ", "5. "] {
+                assert!(
+                    instructions.contains(&format!("\n{step}")),
+                    "{step}: {instructions}"
+                );
+            }
+        }
+    }
+
+    /// Each profile's `tools/list` is what its surface says: one routed tool on
+    /// the routed profiles, read-only on the read-only one, and the source
+    /// tool described the way the connection serves bodies.
+    #[tokio::test]
+    async fn each_profile_lists_what_its_surface_serves() {
+        let store = InMemoryGraph::default();
+        let sessions = SessionRegistry::new();
+        let list = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#;
+        let listed = |config: McpServerConfig| {
+            let store = &store;
+            let sessions = &sessions;
+            async move {
+                process_message(list, store, &config, sessions)
+                    .await
+                    .unwrap()
+                    .result
+                    .unwrap()["tools"]
+                    .as_array()
+                    .unwrap()
+                    .clone()
+            }
+        };
+        let routed = listed(with_writes()).await;
+        assert_eq!(routed.len(), 1);
+        assert_eq!(routed[0]["name"], crate::routed::TOOL_NAME);
+        assert_eq!(routed[0]["annotations"]["readOnlyHint"], false);
+        let commands = routed[0]["inputSchema"]["properties"]["command"]["enum"].clone();
+        assert!(commands
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("mutate")));
+
+        let query_routed = listed(read_only()).await;
+        assert_eq!(query_routed.len(), 1);
+        assert_eq!(query_routed[0]["annotations"]["readOnlyHint"], true);
+        let commands = query_routed[0]["inputSchema"]["properties"]["command"]["enum"].clone();
+        assert!(!commands
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("mutate")));
+        assert!(query_routed[0]["description"]
+            .as_str()
+            .unwrap()
+            .contains("+N offsets"));
+
+        let source = |tools: &[serde_json::Value]| {
+            tools
+                .iter()
+                .find(|tool| tool["name"] == "get_entity_source")
+                .map(|tool| tool["description"].as_str().unwrap().to_string())
+                .unwrap()
+        };
+        assert_eq!(
+            source(&listed(query_config()).await),
+            crate::entity_lines::NUMBERED_SOURCE_DESCRIPTION
+        );
+        assert_ne!(
+            source(&listed(default_config()).await),
+            crate::entity_lines::NUMBERED_SOURCE_DESCRIPTION
+        );
+    }
+
+    async fn drive_daemon_loop_with_initializer(
+        client_messages: &[serde_json::Value],
+        config: McpServerConfig,
+        initializer: Option<crate::repository_init::RepoInitializer>,
+    ) -> Vec<serde_json::Value> {
+        let mut input = String::new();
+        for message in client_messages {
+            input.push_str(&message.to_string());
+            input.push('\n');
+        }
+        let mut reader = BufReader::new(input.as_bytes());
+        let mut written: Vec<u8> = Vec::new();
+        run_stdio_daemon_over(
+            &mut reader,
+            &mut written,
+            config,
+            None,
+            None,
+            None,
+            initializer,
+        )
+        .await
+        .expect("stdio loop must drain the scripted client session");
+        String::from_utf8(written)
+            .expect("server output is UTF-8")
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).expect("server output is JSON-RPC"))
+            .collect()
+    }
+
+    /// `kin_init` is answered by the stdio loop on the profiles that write,
+    /// named and routed, with the folder the client works in as its default,
+    /// and it runs only the initializer the launcher handed over. Setting a
+    /// folder up is a write: every read-only profile refuses it by every name
+    /// it could be reached by, and the initializer never runs for one.
+    #[tokio::test]
+    async fn kin_init_is_served_only_where_kin_writes() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<PathBuf>::new()));
+        let recorder = std::sync::Arc::clone(&seen);
+        let initializer: crate::repository_init::RepoInitializer =
+            std::sync::Arc::new(move |dir: PathBuf| {
+                recorder.lock().unwrap().push(dir);
+                Box::pin(async {
+                    crate::repository_init::InitOutcome::Initialized {
+                        report: Some(serde_json::json!({"initialized": true})),
+                    }
+                })
+            });
+        let call = |id: u32, name: &str, arguments: serde_json::Value| {
+            serde_json::json!({"jsonrpc": "2.0", "id": id, "method": "tools/call",
+                               "params": {"name": name, "arguments": arguments}})
+        };
+        let payload = |response: &serde_json::Value| -> serde_json::Value {
+            serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap()
+        };
+        let text = |response: &serde_json::Value| -> String {
+            response["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        };
+        let with_folder = |mut config: McpServerConfig| {
+            config.session_authority_mode = SessionAuthorityMode::DaemonRequired;
+            config.client_root = Some(PathBuf::from("/work/app"));
+            config
+        };
+
+        assert!(default_config().serves_init());
+        assert!(with_writes().serves_init());
+        assert!(
+            McpServerConfig::default().serves_init(),
+            "full serves every tool"
+        );
+        let named = drive_daemon_loop_with_initializer(
+            &[
+                call(1, "kin_init", serde_json::json!({})),
+                call(2, "kin_init", serde_json::json!({"path": "sub"})),
+            ],
+            with_folder(default_config()),
+            Some(initializer.clone()),
+        )
+        .await;
+        assert_eq!(payload(&named[0])["state"], "initialized", "{}", named[0]);
+        assert_eq!(payload(&named[0])["folder"], "/work/app");
+        assert!(payload(&named[0])["next_step"]
+            .as_str()
+            .unwrap()
+            .contains("find_references"));
+        assert!(payload(&named[0]).get(ENVELOPE_KEY).is_some());
+        assert_eq!(payload(&named[1])["folder"], "/work/app/sub");
+
+        let routed = drive_daemon_loop_with_initializer(
+            &[call(
+                3,
+                crate::routed::TOOL_NAME,
+                serde_json::json!({"command": "init"}),
+            )],
+            with_folder(with_writes()),
+            Some(initializer.clone()),
+        )
+        .await;
+        let answer = payload(&routed[0]);
+        assert_eq!(answer["state"], "initialized", "{answer}");
+        assert!(
+            answer["next_step"].as_str().unwrap().contains("kin refs"),
+            "a routed connection is told its own command: {answer}"
+        );
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            vec![
+                PathBuf::from("/work/app"),
+                PathBuf::from("/work/app/sub"),
+                PathBuf::from("/work/app"),
+            ]
+        );
+
+        // No initializer: the call is answered, and says where it is answered.
+        let without = drive_daemon_loop_with_initializer(
+            &[call(4, "kin_init", serde_json::json!({}))],
+            with_folder(default_config()),
+            None,
+        )
+        .await;
+        assert_eq!(without[0]["result"]["isError"], true);
+
+        // Every read-only profile, and the citable ones, refuse it.
+        let search = McpServerConfig {
+            allowed_tools: Some(crate::tools::name_set(
+                crate::tools::agent_search_tool_names(),
+            )),
+            agent_belt: true,
+            ..McpServerConfig::default()
+        };
+        let citable = |names: &[&str]| McpServerConfig {
+            allowed_tools: Some(crate::tools::name_set(names)),
+            citable: true,
+            ..McpServerConfig::default()
+        };
+        let refusals: Vec<(&str, McpServerConfig, serde_json::Value, &str)> = vec![
+            (
+                "agent-query",
+                query_config(),
+                call(5, "kin_init", serde_json::json!({})),
+                "not enabled in this MCP profile",
+            ),
+            (
+                "agent-search",
+                search.clone(),
+                call(6, "kin_init", serde_json::json!({})),
+                "not enabled in this MCP profile",
+            ),
+            (
+                "agent-search through its dispatcher",
+                search,
+                call(
+                    7,
+                    "kin_tool_call",
+                    serde_json::json!({"tool": "kin_init", "arguments": {}}),
+                ),
+                "kin_tool_call is read-only",
+            ),
+            (
+                "benchmark",
+                citable(crate::tools::benchmark_tool_names()),
+                call(8, "kin_init", serde_json::json!({})),
+                "not enabled in this MCP profile",
+            ),
+            (
+                "context-bench",
+                citable(crate::tools::context_bench_tool_names()),
+                call(9, "kin_init", serde_json::json!({})),
+                "not enabled in this MCP profile",
+            ),
+            (
+                "agent-routed-query init",
+                read_only(),
+                call(
+                    10,
+                    crate::routed::TOOL_NAME,
+                    serde_json::json!({"command": "init"}),
+                ),
+                "The agent-routed profile carries Kin's writes.",
+            ),
+            (
+                "agent-routed-query by the tool's name",
+                read_only(),
+                call(
+                    11,
+                    crate::routed::TOOL_NAME,
+                    serde_json::json!({"command": "kin_init"}),
+                ),
+                "The agent-routed profile carries Kin's writes.",
+            ),
+            (
+                "agent-routed-query through call",
+                read_only(),
+                call(
+                    12,
+                    crate::routed::TOOL_NAME,
+                    serde_json::json!({"command": "call", "args": {"tool": "kin_init", "arguments": {}}}),
+                ),
+                "The agent-routed profile carries Kin's writes.",
+            ),
+            (
+                "agent-routed-query named",
+                read_only(),
+                call(13, "kin_init", serde_json::json!({})),
+                "kin_init",
+            ),
+        ];
+        for (label, config, request, expected) in refusals {
+            assert!(!config.serves_init(), "{label}");
+            let answered = drive_daemon_loop_with_initializer(
+                &[request],
+                with_folder(config),
+                Some(initializer.clone()),
+            )
+            .await;
+            // Refused as a tool error, or, where a dispatcher rejects the
+            // arguments before any tool runs, as a JSON-RPC error.
+            let refusal = match answered[0].get("error") {
+                Some(error) => error.to_string(),
+                None => {
+                    assert_eq!(
+                        answered[0]["result"]["isError"], true,
+                        "{label}: {}",
+                        answered[0]
+                    );
+                    text(&answered[0])
+                }
+            };
+            assert!(refusal.contains(expected), "{label}: {}", answered[0]);
+        }
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            3,
+            "no read-only or citable profile ran the initializer"
+        );
+    }
+
+    /// The listing each profile serves carries `kin_init`, or the routed
+    /// `init` command, only where the profile writes.
+    #[test]
+    fn only_the_profiles_that_write_list_kin_init() {
+        let listed = |config: &McpServerConfig| -> Vec<String> {
+            served_tools_for(config)
+                .tools
+                .iter()
+                .map(|tool| tool.name.clone())
+                .collect()
+        };
+        assert!(listed(&default_config()).contains(&"kin_init".to_string()));
+        assert!(listed(&McpServerConfig::default()).contains(&"kin_init".to_string()));
+        for (label, config) in [
+            ("agent-query", query_config()),
+            (
+                "agent-search",
+                McpServerConfig {
+                    allowed_tools: Some(crate::tools::name_set(
+                        crate::tools::agent_search_tool_names(),
+                    )),
+                    ..McpServerConfig::default()
+                },
+            ),
+            (
+                "benchmark",
+                McpServerConfig {
+                    allowed_tools: Some(crate::tools::name_set(
+                        crate::tools::benchmark_tool_names(),
+                    )),
+                    ..McpServerConfig::default()
+                },
+            ),
+            (
+                "context-bench",
+                McpServerConfig {
+                    allowed_tools: Some(crate::tools::name_set(
+                        crate::tools::context_bench_tool_names(),
+                    )),
+                    ..McpServerConfig::default()
+                },
+            ),
+        ] {
+            assert!(
+                !listed(&config).contains(&"kin_init".to_string()),
+                "{label}"
+            );
+            assert!(!config.serves_init(), "{label}");
+        }
+        let routed_enum = |config: &McpServerConfig| -> Vec<String> {
+            served_tools_for(config).tools[0].input_schema["properties"]["command"]["enum"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|value| value.as_str().unwrap().to_string())
+                .collect()
+        };
+        assert!(routed_enum(&with_writes()).contains(&"init".to_string()));
+        assert!(!routed_enum(&read_only()).contains(&"init".to_string()));
+        assert!(
+            !served_tools_for(&with_writes()).tools[0]
+                .annotations
+                .read_only_hint
+        );
+        assert!(
+            served_tools_for(&read_only()).tools[0]
+                .annotations
+                .read_only_hint
+        );
+    }
+
+    /// Every answer on a connection whose client works in a folder inside the
+    /// bound repository leads with which repository answered, whatever
+    /// produced it; an answer from the client's own folder is left as it is.
+    #[test]
+    fn every_answer_for_a_nested_folder_leads_with_the_repository_that_answered() {
+        let answer = |text: &str| {
+            JsonRpcResponse::success(
+                Some(serde_json::json!(1)),
+                serde_json::json!({"content": [{"type": "text", "text": text}]}),
+            )
+        };
+        let text_of = |response: &JsonRpcResponse| -> String {
+            response.result.as_ref().unwrap()["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let nested = McpServerConfig {
+            client_root: Some(PathBuf::from("/work/repo/app")),
+            ..McpServerConfig::default()
+        };
+        let root = Path::new("/work/repo");
+
+        // A routed refusal answered here, with an envelope and no repository,
+        // in each wire format. The stamp keeps the format the answer already
+        // had, and the warning leads the envelope in both.
+        let refusal = serde_json::json!({"_kin": {"envelope_version": 2}, "message": "no"});
+        let pretty = serde_json::to_string_pretty(&refusal).unwrap();
+        let mut refused = answer(&pretty);
+        stamp_client_folder(&mut refused, Some(root), &nested);
+        let text = text_of(&refused);
+        let first = text.lines().nth(2).unwrap().trim_start();
+        assert!(first.starts_with("\"advice\": \"This answer comes from the Kin repository at /work/repo, not from /work/repo/app"), "{text}");
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["_kin"]["repository"]["root"], "/work/repo");
+        assert_eq!(value["_kin"]["repository"]["client_root"], "/work/repo/app");
+        assert_eq!(value["message"], "no");
+        let mut compact = answer(&refusal.to_string());
+        stamp_client_folder(&mut compact, Some(root), &nested);
+        let compact_text = text_of(&compact);
+        assert!(!compact_text.contains('\n'), "{compact_text}");
+        assert!(compact_text.starts_with("{\"_kin\":{\"advice\":\"This answer comes from the Kin repository at /work/repo, not from /work/repo/app"), "{compact_text}");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&compact_text).unwrap(),
+            value
+        );
+
+        // An answer with advice of its own keeps it, after the warning.
+        let mut advised = answer(r#"{"_kin": {"advice": "Missing: Go references."}, "hits": []}"#);
+        stamp_client_folder(&mut advised, Some(root), &nested);
+        let value: serde_json::Value = serde_json::from_str(&text_of(&advised)).unwrap();
+        let advice = value["_kin"]["advice"].as_str().unwrap();
+        assert!(
+            advice.starts_with("This answer comes from")
+                && advice.ends_with("Missing: Go references."),
+            "{advice}"
+        );
+
+        // An answer the daemon's health already stamped is not stamped twice.
+        let health = serde_json::json!({"repo_root": "/work/repo"});
+        let stamped_env = crate::envelope::Envelope::daemon().with_repository(
+            &health,
+            Some(Path::new("/work/repo/app")),
+            Path::to_path_buf,
+        );
+        let finalized = crate::envelope::finalize(
+            ToolCallResult::text(serde_json::json!({"references": []}).to_string()),
+            stamped_env,
+            "find_references",
+        );
+        let mut from_health = JsonRpcResponse::success(
+            Some(serde_json::json!(1)),
+            serde_json::to_value(&finalized).unwrap(),
+        );
+        let before = text_of(&from_health);
+        stamp_client_folder(&mut from_health, Some(root), &nested);
+        assert_eq!(text_of(&from_health), before);
+        let health_value: serde_json::Value = serde_json::from_str(&before).unwrap();
+        assert_eq!(
+            health_value["_kin"]["advice"]
+                .as_str()
+                .unwrap()
+                .matches("This answer comes from")
+                .count(),
+            1,
+            "{before}"
+        );
+
+        // Plain text gets the warning as its first line.
+        let mut plain = answer("tool 'x' is not enabled in this MCP profile");
+        stamp_client_folder(&mut plain, Some(root), &nested);
+        assert!(
+            text_of(&plain).starts_with("This answer comes from the Kin repository at /work/repo")
+        );
+
+        // The client's own folder, or no bound repository: nothing changes.
+        let own = McpServerConfig {
+            client_root: Some(PathBuf::from("/work/repo")),
+            ..McpServerConfig::default()
+        };
+        let mut same = answer(r#"{"message": "ok"}"#);
+        stamp_client_folder(&mut same, Some(root), &own);
+        assert_eq!(text_of(&same), r#"{"message": "ok"}"#);
+        let mut unbound = answer(r#"{"message": "ok"}"#);
+        stamp_client_folder(&mut unbound, None, &nested);
+        assert_eq!(text_of(&unbound), r#"{"message": "ok"}"#);
+    }
+
+    async fn drive_daemon_loop_with_config(
+        client_messages: &[serde_json::Value],
+        config: McpServerConfig,
+    ) -> Vec<serde_json::Value> {
+        drive_daemon_loop_with_initializer(client_messages, config, None).await
+    }
+
+    /// A client that asks for exact entity bodies when it connects, as `kin
+    /// agent run` does, is served them on a profile that would otherwise
+    /// number, and its listing says so; a client that does not ask is served
+    /// the numbered form.
+    #[tokio::test]
+    async fn a_client_that_asks_for_exact_bodies_is_served_them() {
+        let initialize = |capabilities: serde_json::Value| {
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": "2024-11-05", "capabilities": capabilities,
+                           "clientInfo": {"name": "kin-agent", "version": "0"}},
+            })
+        };
+        let list = serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"});
+        let exact = serde_json::json!({"experimental": {"kin": {"exactEntityBodies": true}}});
+        let mut daemon_query = query_config();
+        daemon_query.session_authority_mode = SessionAuthorityMode::DaemonRequired;
+        let mut daemon_routed = read_only();
+        daemon_routed.session_authority_mode = SessionAuthorityMode::DaemonRequired;
+        for (capabilities, numbered) in [(serde_json::json!({}), true), (exact, false)] {
+            let responses = drive_daemon_loop_with_config(
+                &[initialize(capabilities.clone()), list.clone()],
+                daemon_query.clone(),
+            )
+            .await;
+            let tools = responses[1]["result"]["tools"].as_array().unwrap();
+            let source = tools
+                .iter()
+                .find(|tool| tool["name"] == "get_entity_source")
+                .unwrap();
+            assert_eq!(
+                source["description"] == crate::entity_lines::NUMBERED_SOURCE_DESCRIPTION,
+                numbered,
+                "{capabilities}"
+            );
+            let responses = drive_daemon_loop_with_config(
+                &[initialize(capabilities.clone()), list.clone()],
+                daemon_routed.clone(),
+            )
+            .await;
+            let description = responses[1]["result"]["tools"][0]["description"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            assert_eq!(
+                description.contains("+N offsets"),
+                numbered,
+                "{description}"
+            );
+        }
+        let mut config = query_config();
+        config.serve_exact_entity_bodies();
+        assert!(!config.number_entity_lines);
+        let mut routed = read_only();
+        routed.serve_exact_entity_bodies();
+        assert!(!routed.number_entity_lines && !routed.routed.unwrap().numbered);
+    }
+
+    /// A routed dispatch's hints name the spellings that reach each tool
+    /// through the routed tool and in a shell, and its `_kin` envelope is
+    /// exactly the named answer's. The session command has no CLI spelling,
+    /// so its tool is named with `kin call`.
+    #[tokio::test]
+    async fn a_routed_answer_names_routed_commands_in_its_hints() {
+        let store = InMemoryGraph::default();
+        let sessions = SessionRegistry::new();
+        // Guarded, so the refusal whose hints are under test is the missing
+        // session's and not the operation's.
+        let arguments = serde_json::json!({
+            "operations": [guarded_update_operation("pub fn value() {}")]
+        });
+        let named = process_message(
+            &tools_call("kin_mutate", arguments.clone()),
+            &store,
+            &McpServerConfig {
+                session_authority_mode: SessionAuthorityMode::DaemonRequired,
+                ..default_config()
+            },
+            &sessions,
+        )
+        .await
+        .unwrap()
+        .result
+        .unwrap();
+        let mut daemon_routed = with_writes();
+        daemon_routed.session_authority_mode = SessionAuthorityMode::DaemonRequired;
+        let routed = process_daemon_message(
+            &tools_call(
+                crate::routed::TOOL_NAME,
+                serde_json::json!({"command": "mutate", "args": arguments}),
+            ),
+            &daemon_routed,
+        )
+        .await
+        .unwrap()
+        .result
+        .unwrap();
+        let text = |result: &serde_json::Value| {
+            serde_json::from_str::<serde_json::Value>(
+                result["content"][0]["text"].as_str().unwrap(),
+            )
+            .unwrap()
+        };
+        let (named_payload, routed_payload) = (text(&named), text(&routed));
+        let named_message = named_payload["message"].as_str().unwrap();
+        let routed_message = routed_payload["message"].as_str().unwrap();
+        assert!(
+            named_message.contains("kin_session_start"),
+            "{named_message}"
+        );
+        assert_eq!(
+            routed_message,
+            named_message.replace("kin_session_start", "kin call kin_session_start"),
+            "{routed_message}"
+        );
+        assert_eq!(routed_payload[ENVELOPE_KEY], named_payload[ENVELOPE_KEY]);
+    }
+
+    /// An entity's body is marked with each line's offset where the
+    /// connection numbers, and served exactly everywhere else: a profile that
+    /// can write through Kin, the full surface, the citable benchmark
+    /// profiles, and a client that asked. A whole-file read is never numbered.
+    #[test]
+    fn entity_bodies_are_numbered_only_where_the_connection_numbers() {
+        let record = serde_json::json!({
+            "id": "e1", "file_path": "src/lib.rs", "start_line": 40, "end_line": 42,
+            "body": "fn a() {\n    b();\n}",
+        });
+        let read = serde_json::json!({"path_label": "src/lib.rs", "text_utf8": "fn a() {\n}\n"});
+        let presented = |config: &McpServerConfig, tool: &str, payload: &serde_json::Value| {
+            let mut result = ToolCallResult::text(payload.to_string());
+            present_result(config, tool, &mut result);
+            let crate::types::ContentBlock::Text { text } = &result.content[0];
+            serde_json::from_str::<serde_json::Value>(text).unwrap()
+        };
+        let named = |names: Option<&[&str]>, belt: bool| McpServerConfig {
+            allowed_tools: names.map(crate::tools::name_set),
+            agent_belt: belt,
+            ..McpServerConfig::default()
+        };
+        let search = McpServerConfig {
+            number_entity_lines: true,
+            ..named(Some(crate::tools::agent_search_tool_names()), true)
+        };
+        for config in [read_only(), query_config(), search] {
+            for tool in ["get_entity_source", "get_entity_body"] {
+                let numbered = presented(&config, tool, &record);
+                assert_eq!(numbered["body"], "+0\tfn a() {\n+1\t    b();\n+2\t}");
+                assert_eq!(
+                    numbered[crate::entity_lines::NUMBERING_KEY],
+                    crate::entity_lines::NUMBERING_NOTE
+                );
+                assert_eq!(numbered["start_line"], 40, "the file location moved");
+                assert_eq!(numbered["end_line"], 42, "the file location moved");
+            }
+            assert_eq!(presented(&config, "unregistered_tool", &read), read);
+        }
+        let mut asked = query_config();
+        asked.serve_exact_entity_bodies();
+        for config in [
+            with_writes(),
+            default_config(),
+            named(Some(crate::tools::agent_default_tool_names()), true),
+            named(None, false),
+            named(Some(crate::tools::benchmark_tool_names()), false),
+            named(Some(crate::tools::context_bench_tool_names()), false),
+            asked,
+        ] {
+            assert_eq!(presented(&config, "get_entity_source", &record), record);
+        }
     }
 }
