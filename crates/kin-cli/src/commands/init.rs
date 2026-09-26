@@ -286,6 +286,11 @@ pub async fn run(
         InitBoundary::NativeUnborn
     };
 
+    // The logo opens a conversion a person is watching, once the refusals
+    // above have had their chance, so a refused `kin init` is still only its
+    // error. `--json` output is read by a program and never carries it.
+    crate::banner::print_once(!json);
+
     // Both boundaries honour adoption. A flag that worked on one of them and
     // was silently ignored on the other would produce a store that looks
     // adopted and pushes nowhere, which is the failure this whole path exists

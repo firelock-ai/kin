@@ -647,19 +647,19 @@ mod tests {
         );
     }
 
-    /// An executable file at `path`, so `which` accepts it.
+    /// An executable file at `path`, so `which` accepts it. Unix only, like
+    /// every test that uses it.
+    #[cfg(unix)]
     fn fake_executable(path: &Path) {
+        use std::os::unix::fs::PermissionsExt as _;
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, b"#!/bin/sh\nexit 0\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     /// Kin's managed directories for a fixture home, named rather than read
-    /// from the environment.
+    /// from the environment. Unix only, like every test that uses it.
+    #[cfg(unix)]
     fn fixture_managed(home: &Path) -> Vec<PathBuf> {
         vec![
             home.join(".kin/tools/bin"),

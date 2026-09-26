@@ -1782,8 +1782,34 @@ pub const EXIT_WORKING_COPY_UNMEASURED: i32 = 9;
 /// sentence that explains it in the same output.
 pub fn unmeasured_working_copy_banner(why: &str) -> String {
     format!(
-        "Working copy: NOT MEASURED, so no count below describes the files on disk: {why}. Exit          {EXIT_WORKING_COPY_UNMEASURED}: the numbers below are durable authority truth and are          not an answer about uncommitted work."
+        "Working copy: NOT MEASURED, so no count below describes the files on disk: {why}. Exit \
+         {EXIT_WORKING_COPY_UNMEASURED}: the numbers below are durable authority truth and are \
+         not an answer about uncommitted work."
     )
+}
+
+/// One line for an author refusal inside a status sentence.
+///
+/// The refusal itself is several paragraphs, written for `kin commit`, where it
+/// is the whole answer. Status quotes the reason in its banner and again beside
+/// the tree, so the full text landed mid-sentence twice. The first line says
+/// what is missing, and the fix follows it when the cause is a missing identity.
+fn author_refusal_summary(error: &anyhow::Error) -> String {
+    let rendered = error.to_string();
+    let first = rendered
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("no author identity")
+        .trim_end_matches('.');
+    if first.contains("no author identity") {
+        format!(
+            "{first}; set one with `git config --global user.name` and `git config --global \
+             user.email`, or `default_author` in .kin/config.toml"
+        )
+    } else {
+        first.to_string()
+    }
 }
 
 /// The exit code a surface owes its caller for the admission it got.
@@ -1906,8 +1932,9 @@ async fn admit_with_reading(
             Ok(actor) => actor,
             Err(error) => {
                 return StatusAdmission::Skipped(format!(
-                    "this store cannot name an author for an admission ({error}), so nothing \
-                     admitted the working copy"
+                    "this store cannot name an author for an admission ({}), so nothing \
+                     admitted the working copy",
+                    author_refusal_summary(&error)
                 ))
             }
         },
@@ -2264,6 +2291,36 @@ fn build_id(sha: &str, dirty: bool) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_unmeasured_banner_reads_as_one_sentence_with_single_spaces() {
+        let banner = super::unmeasured_working_copy_banner("because");
+        assert!(!banner.contains("  "), "{banner}");
+        assert!(banner.contains("Exit 9: the numbers below"), "{banner}");
+    }
+
+    #[test]
+    fn an_author_refusal_is_quoted_as_one_line_that_names_the_fix() {
+        let error = anyhow::anyhow!(
+            "config error: kin has no author identity to record for this change.\n\n\
+             Authorship is provenance.\n\nSet your Git identity:\n  git config --global \
+             user.name \"Your Name\""
+        );
+        let summary = super::author_refusal_summary(&error);
+        assert!(!summary.contains('\n'), "{summary}");
+        assert!(summary
+            .starts_with("config error: kin has no author identity to record for this change;"));
+        assert!(
+            summary.contains("git config --global user.name"),
+            "{summary}"
+        );
+        assert!(summary.contains("default_author"), "{summary}");
+        let other = anyhow::anyhow!("config error: .kin/config.toml is not valid TOML\n\ndetail");
+        assert_eq!(
+            super::author_refusal_summary(&other),
+            "config error: .kin/config.toml is not valid TOML"
+        );
+    }
+
     use super::*;
 
     /// A daemon that is up and still opening authority must never be reported as

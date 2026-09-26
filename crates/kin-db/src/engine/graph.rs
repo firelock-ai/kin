@@ -5108,6 +5108,7 @@ impl InMemoryGraph {
     /// Snapshotting an owner that already loaded its model uses that captured
     /// identity, never a fresh interpretation of mutable environment or paths.
     #[cfg(feature = "embeddings")]
+    #[cfg_attr(not(feature = "vector"), allow(dead_code))] // used by vector sidecar checks
     pub(crate) fn loaded_embedding_runtime(&self) -> Option<crate::embed::EmbeddingRuntimeConfig> {
         self.embedder
             .lock()

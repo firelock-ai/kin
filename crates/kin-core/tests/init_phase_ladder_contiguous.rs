@@ -148,8 +148,12 @@ where
 }
 
 fn git(repo: &Path, args: &[&str]) {
+    // No automatic maintenance: a detached `git maintenance` started by one of
+    // these commits can still hold a pack lock when init admits the fixture,
+    // and init rightly refuses a repository another process is mutating.
     let status = Command::new("git")
         .current_dir(repo)
+        .args(["-c", "maintenance.auto=false", "-c", "gc.auto=0"])
         .args(args)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")

@@ -3260,6 +3260,16 @@ fn parse_cli_or_report_retired_command() -> Cli {
                 );
                 std::process::exit(0);
             }
+            // A bare `kin` prints the command index, to stderr, and is the
+            // first screen a new user reaches without asking for help. The
+            // logo goes above it on stdout, and only when that index is going
+            // to a person too. `kin --help` is a `DisplayHelp` and never
+            // reaches here.
+            if err.kind() == clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+                && std::env::args_os().len() == 1
+            {
+                kin_cli::banner::print_once(std::io::stderr().is_terminal());
+            }
             if err.kind() == clap::error::ErrorKind::InvalidSubcommand {
                 let args: Vec<String> = std::env::args().skip(1).collect();
                 if let Some((path, guidance)) = retired_command_signpost(&args) {
@@ -6065,6 +6075,7 @@ mod tests {
             for paint in [
                 kin_cli::mark::Paint::Truecolor,
                 kin_cli::mark::Paint::Indexed,
+                kin_cli::mark::Paint::Basic,
                 kin_cli::mark::Paint::None,
             ] {
                 let style = kin_cli::mark::MarkStyle::new(kin_cli::mark::Glyphs::Unicode, paint);

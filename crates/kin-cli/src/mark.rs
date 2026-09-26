@@ -17,10 +17,11 @@
 //! leg's first, which is the only way the two strokes stay legible as two.
 //!
 //! The colours are the kit's own `gradient/kin-arm` and `gradient/kin-leg`
-//! stops. A terminal that advertises truecolor gets those hexes exactly; every
-//! other coloured terminal gets four 256-colour indices chosen to hold the same
+//! stops. A terminal that advertises truecolor gets those hexes exactly; a
+//! 256-colour terminal gets four indices chosen to hold the same
 //! magenta-to-blue ramp, because a nearest-cube mapping of the four stops
-//! collapses two of them onto one index and the ramp goes flat.
+//! collapses two of them onto one index and the ramp goes flat; a terminal
+//! that advertises neither gets the ANSI magenta and bright blue.
 //!
 //! Four ways out, in the order they are checked. Not a terminal: nothing is
 //! drawn and the caller's text is returned untouched, so a redirected or piped
@@ -63,12 +64,19 @@ const GUTTER_COLUMNS: usize = 2;
 const MIN_TERMINAL_COLUMNS: usize = 40;
 
 /// The brand kit's gradient stops, arm first then leg.
-const TRUECOLOR_STOPS: [(u8, u8, u8); 4] = [
+pub(crate) const TRUECOLOR_STOPS: [(u8, u8, u8); 4] = [
     (0xAE, 0x5A, 0xFF),
     (0x6C, 0x48, 0xFA),
     (0x5B, 0x55, 0xFD),
     (0x3B, 0x74, 0xFB),
 ];
+
+/// The arm and the leg in the sixteen ANSI colours: magenta, then bright blue.
+///
+/// Bright blue rather than blue because the plain ANSI blue is a dark navy in
+/// most palettes and all but disappears on a dark background.
+pub(crate) const BASIC_ARM: &str = "\u{1b}[35m";
+pub(crate) const BASIC_LEG: &str = "\u{1b}[94m";
 
 /// The same ramp in the 256-colour cube.
 ///
@@ -94,6 +102,8 @@ pub enum Paint {
     Truecolor,
     /// 256-colour indices holding the same ramp.
     Indexed,
+    /// The sixteen ANSI colours, for a terminal that advertises no more.
+    Basic,
     /// No escapes at all.
     None,
 }
@@ -152,6 +162,10 @@ impl MarkStyle {
             Paint::Indexed => {
                 let code = INDEXED_STOPS[index.min(INDEXED_STOPS.len() - 1)];
                 format!("\u{1b}[38;5;{code}m{row}\u{1b}[0m")
+            }
+            Paint::Basic => {
+                let code = if index < 2 { BASIC_ARM } else { BASIC_LEG };
+                format!("{code}{row}\u{1b}[0m")
             }
         }
     }
@@ -218,7 +232,7 @@ pub fn beside_or_plain(style: Option<MarkStyle>, text: &[&str]) -> Vec<String> {
 }
 
 /// This terminal's width, when it can be read.
-fn terminal_columns() -> Option<usize> {
+pub(crate) fn terminal_columns() -> Option<usize> {
     let (_, columns) = console::Term::stdout().size_checked()?;
     Some(usize::from(columns))
 }
@@ -244,7 +258,7 @@ fn detect_glyphs() -> Glyphs {
 /// binary can set an environment variable without racing every other test in
 /// it, and a test that asserts on a locale string it wrote itself proves
 /// nothing about the function that reads one.
-fn glyphs_for_locale(values: &[Option<String>]) -> Glyphs {
+pub(crate) fn glyphs_for_locale(values: &[Option<String>]) -> Glyphs {
     for value in values {
         let Some(value) = value else { continue };
         if value.is_empty() {
@@ -261,15 +275,44 @@ fn glyphs_for_locale(values: &[Option<String>]) -> Glyphs {
 
 /// How much colour to use, deferring to the CLI's one colour decision.
 fn detect_paint() -> Paint {
-    if !crate::output_style::enabled() {
+    paint_for(
+        crate::output_style::enabled(),
+        std::env::var("COLORTERM").ok().as_deref(),
+        std::env::var("TERM").ok().as_deref(),
+        std::env::var_os("WT_SESSION").is_some_and(|value| !value.is_empty()),
+    )
+}
+
+/// The colour depth for a given terminal, most capable first.
+///
+/// `COLORTERM=truecolor` (or `24bit`) is how a terminal says it takes 24-bit
+/// escapes. Windows Terminal takes them too but does not always say so, and it
+/// is recognized by the `WT_SESSION` it sets. Otherwise `TERM` decides: a name
+/// carrying `256` gets the 256-colour cube, and any other name gets the
+/// sixteen ANSI colours, because a terminal that names itself `xterm`, `screen`
+/// or `linux` has promised no more than that. No `TERM` at all is the Windows
+/// console, which reads the 256-colour escapes.
+///
+/// Split from the environment read so every arm is testable without setting a
+/// variable, which no test in this binary can do without racing the others.
+pub(crate) fn paint_for(
+    colour_enabled: bool,
+    colorterm: Option<&str>,
+    term: Option<&str>,
+    windows_terminal: bool,
+) -> Paint {
+    if !colour_enabled {
         return Paint::None;
     }
-    match std::env::var("COLORTERM") {
-        Ok(value)
-            if value.eq_ignore_ascii_case("truecolor") || value.eq_ignore_ascii_case("24bit") =>
-        {
-            Paint::Truecolor
-        }
+    let advertises_truecolor = colorterm.is_some_and(|value| {
+        value.eq_ignore_ascii_case("truecolor") || value.eq_ignore_ascii_case("24bit")
+    });
+    if advertises_truecolor || windows_terminal {
+        return Paint::Truecolor;
+    }
+    match term {
+        Some(term) if term.contains("256") => Paint::Indexed,
+        Some(term) if !term.is_empty() => Paint::Basic,
         _ => Paint::Indexed,
     }
 }
@@ -373,6 +416,64 @@ mod tests {
         );
     }
 
+    /// Sixteen colours paint the arm magenta and the leg bright blue.
+    #[test]
+    fn basic_paints_the_arm_and_the_leg_apart() {
+        let drawn = beside(MarkStyle::new(Glyphs::Unicode, Paint::Basic), &[]);
+        assert_eq!(
+            drawn,
+            vec![
+                "\u{1b}[35m  \u{2584}\u{2580}\u{1b}[0m".to_string(),
+                "\u{1b}[35m\u{2584}\u{2580}\u{1b}[0m".to_string(),
+                "\u{1b}[94m \u{2580}\u{2584}\u{1b}[0m".to_string(),
+                "\u{1b}[94m   \u{2580}\u{2584}\u{1b}[0m".to_string(),
+            ]
+        );
+    }
+
+    /// Each colour depth is reached by the terminal that advertises it.
+    #[test]
+    fn colour_depth_follows_what_the_terminal_advertises() {
+        let cases: [(bool, Option<&str>, Option<&str>, bool, Paint); 10] = [
+            (
+                false,
+                Some("truecolor"),
+                Some("xterm-256color"),
+                true,
+                Paint::None,
+            ),
+            (
+                true,
+                Some("truecolor"),
+                Some("xterm-256color"),
+                false,
+                Paint::Truecolor,
+            ),
+            (true, Some("24BIT"), Some("xterm"), false, Paint::Truecolor),
+            (true, None, None, true, Paint::Truecolor),
+            (true, None, Some("xterm-256color"), false, Paint::Indexed),
+            (true, None, Some("tmux-256color"), false, Paint::Indexed),
+            (
+                true,
+                Some("yes"),
+                Some("screen-256color"),
+                false,
+                Paint::Indexed,
+            ),
+            (true, None, Some("xterm"), false, Paint::Basic),
+            (true, None, Some("linux"), false, Paint::Basic),
+            (true, None, None, false, Paint::Indexed),
+        ];
+        for (enabled, colorterm, term, windows_terminal, expected) in cases {
+            assert_eq!(
+                paint_for(enabled, colorterm, term, windows_terminal),
+                expected,
+                "colour enabled {enabled}, COLORTERM {colorterm:?}, TERM {term:?}, \
+                 Windows Terminal {windows_terminal}"
+            );
+        }
+    }
+
     /// Every text line starts at the same column, whatever its row draws.
     #[test]
     fn text_beside_the_mark_is_left_aligned() {
@@ -440,6 +541,7 @@ mod tests {
             MarkStyle::new(Glyphs::Unicode, Paint::None),
             MarkStyle::new(Glyphs::Unicode, Paint::Truecolor),
             MarkStyle::new(Glyphs::Unicode, Paint::Indexed),
+            MarkStyle::new(Glyphs::Unicode, Paint::Basic),
             MarkStyle::new(Glyphs::Ascii, Paint::None),
         ] {
             for line in beside(style, &text) {
@@ -475,7 +577,7 @@ mod tests {
     fn stripping_the_escapes_yields_the_plain_block() {
         let text = ["", "kin 0.7.2", "", ""];
         let plain = beside(MarkStyle::new(Glyphs::Unicode, Paint::None), &text);
-        for paint in [Paint::Truecolor, Paint::Indexed] {
+        for paint in [Paint::Truecolor, Paint::Indexed, Paint::Basic] {
             let painted = beside(MarkStyle::new(Glyphs::Unicode, paint), &text);
             let stripped: Vec<String> = painted
                 .iter()

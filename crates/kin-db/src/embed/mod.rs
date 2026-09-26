@@ -692,6 +692,7 @@ pub struct CodeEmbedder {
     /// Captured when the model is loaded; later saves must not describe a live
     /// model using a newly edited environment or replacement artifact.
     #[cfg(feature = "embeddings")]
+    #[cfg_attr(not(feature = "vector"), allow(dead_code))] // read by vector sidecar checks
     runtime: Option<EmbeddingRuntimeConfig>,
 }
 
@@ -1305,6 +1306,7 @@ impl CodeEmbedder {
     }
 
     #[cfg(feature = "embeddings")]
+    #[cfg_attr(not(feature = "vector"), allow(dead_code))] // used by vector sidecar checks
     pub(crate) fn runtime_identity(&self) -> Option<&EmbeddingRuntimeConfig> {
         self.runtime.as_ref()
     }
@@ -2635,6 +2637,7 @@ pub fn resolved_embedding_runtime() -> Result<EmbeddingRuntimeConfig, KinDbError
 }
 
 #[cfg(feature = "embeddings")]
+#[cfg_attr(not(feature = "vector"), allow(dead_code))] // used by vector sidecar checks
 pub(crate) fn is_local_content_identity(model_id: &str) -> bool {
     model_id.starts_with(model_identity::LOCAL_CONTENT_PREFIX)
 }
