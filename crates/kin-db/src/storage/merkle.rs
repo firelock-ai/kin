@@ -1069,6 +1069,7 @@ pub fn compute_repo_truth_hash(snapshot: &GraphSnapshot) -> MerkleHash {
         materialized_graph: _,
         // Runtime-only capability is reconstructed from admitted authority.
         verified_binding_history: _,
+        resolution_records,
     } = snapshot;
 
     let mut hasher = Sha256::new();
@@ -1085,6 +1086,11 @@ pub fn compute_repo_truth_hash(snapshot: &GraphSnapshot) -> MerkleHash {
     hash_map_domain(&mut hasher, "entities", entities);
     hash_map_domain(&mut hasher, "relations", relations);
     hash_map_domain(&mut hasher, "external_references", external_references);
+    // Folded in only when present, so every repository that holds no record
+    // keeps the truth digest it always had.
+    if !resolution_records.is_empty() {
+        hash_map_domain(&mut hasher, "resolution_records", resolution_records);
+    }
 
     hash_map_domain(&mut hasher, "changes", changes);
     hash_map_domain(&mut hasher, "work_items", work_items);
@@ -2150,6 +2156,7 @@ mod tests {
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         };
         change.id =
             kin_model::compute_semantic_change_id(&change).expect("valid semantic change fixture");

@@ -218,7 +218,7 @@ fn require_entity_source_bases(
                 expected.entity_id
             ));
         }
-        let body = crate::repository_commit::load_native_source_blob(context, hash)
+        let body = crate::repository_commit::load_native_source_blob_from(authority, hash)
             .map_err(|error| error.to_string())?;
         let bytes = body
             .get(span.start_byte..span.end_byte)

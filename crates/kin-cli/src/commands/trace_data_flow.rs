@@ -484,6 +484,31 @@ pub struct TraceStep {
     /// that broke a consumer's parser twice.
     #[serde(default)]
     pub terminal: Option<String>,
+    /// What a step on a symbol outside the repository says about it, and null
+    /// on every step the repository owns, so the chain keeps one key set.
+    #[serde(flatten)]
+    pub outside: TraceOutsideFields,
+}
+
+/// The keys a step carries about a symbol outside the repository: the
+/// symbol's package, standard-library flag and SCIP descriptor chain, and the
+/// call's site state, proof and sites inside its parent. Each is serialized
+/// on every step, as null where the step is a repository entity, the same way
+/// the entity keys are serialized on an external step.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TraceOutsideFields {
+    #[serde(default)]
+    pub package: Option<serde_json::Value>,
+    #[serde(default)]
+    pub stdlib: Option<bool>,
+    #[serde(default)]
+    pub symbol: Option<String>,
+    #[serde(default)]
+    pub site_state: Option<String>,
+    #[serde(default)]
+    pub proof: Option<serde_json::Value>,
+    #[serde(default)]
+    pub sites: Option<Vec<serde_json::Value>>,
 }
 
 /// A node whose fan-out the per-step cap clipped, listed so a caller can repair
@@ -831,6 +856,23 @@ pub fn build_trace_data_flow_response_within(
     let bodies_included = request.bodies_included();
     let include_type_edges = request.type_edges_included();
 
+    // A symbol outside the repository is where a walk stops, never where one
+    // starts. It is refused by what it is, in the bytes the offline tool
+    // refuses it with, and never as a focal that matched nothing, which the
+    // daemon waits out as an absence. An address naming nothing held stays
+    // that miss below.
+    if let Some(node) = crate::commands::external_symbols::lookup(graph, trimmed)? {
+        let refusal = kin_mcp::handlers::external_symbols::external_not_served_text(
+            graph,
+            &node,
+            "trace_data_flow",
+            "focal",
+            kin_mcp::handlers::entities::TRACE_EXTERNAL_WHY,
+        )
+        .map_err(|error| anyhow::anyhow!("read external symbol {}: {error}", node.address()))?;
+        anyhow::bail!(refusal);
+    }
+
     // A member name several owners share names none of them, so the walk is
     // refused with every candidate rather than run from one of them.
     let shared = shared_member_candidates(graph, trimmed)?;
@@ -1054,6 +1096,17 @@ pub fn build_trace_data_flow_response_within(
     // language boundary crosses an extraction boundary with it.
     let mut step_language: HashMap<usize, kin_model::ids::LanguageId> = HashMap::new();
 
+    // Calls a language server proved into symbols outside the repository have
+    // no entity at the far end, so the relation read below never lists them.
+    // Each one is a leaf step, reached once however many nodes call it, and
+    // its sites quote the parent's own body.
+    let mut external_reader = kin_context::ExternalEdgeReader::new(graph);
+    let mut visited_external: HashSet<kin_model::ExternalReferenceId> = HashSet::new();
+    let parent_text = ParentBodyText {
+        projection: projection.as_ref(),
+        bodies: std::cell::RefCell::new(HashMap::new()),
+    };
+
     let mut frontier: Vec<FrontierNode> = vec![FrontierNode::rooted(&focal_entity)];
     let mut next_frontier: Vec<FrontierNode>;
 
@@ -1253,6 +1306,27 @@ pub fn build_trace_data_flow_response_within(
                 }
             }
 
+            let mut external_callees = if want_callees {
+                let (callees, admissible) =
+                    kin_mcp::handlers::external_symbols::trace_external_callees(
+                        &mut external_reader,
+                        &node.id,
+                        &allowed,
+                        &visited_external,
+                    )
+                    .map_err(|error| anyhow::anyhow!("read external calls: {error}"))?;
+                for _ in 0..admissible {
+                    if let Some(reason) = meter.charge_edge() {
+                        stop = reason;
+                        break 'walk;
+                    }
+                }
+                admissible_neighbors += admissible;
+                callees
+            } else {
+                Vec::new()
+            };
+
             // This node's relations were read to the end, so what the graph
             // held for it is now a fact rather than a guess.
             expansion.insert(
@@ -1274,6 +1348,13 @@ pub fn build_trace_data_flow_response_within(
                 apply_fanout_cap(&mut callees, node.file.as_deref(), limit_per_step);
             let (dropped_callers, crossing_callers) =
                 apply_fanout_cap(&mut callers, node.file.as_deref(), limit_per_step);
+            // An external call is a callee too, and takes a slot only after the
+            // repository's own callees, which are the hops a walk can continue
+            // through.
+            let external_room = limit_per_step.saturating_sub(callees.len());
+            let dropped_external = external_callees.len().saturating_sub(external_room);
+            external_callees.truncate(external_room);
+            let dropped_callees = dropped_callees + dropped_external;
 
             // Localize the cut on the node it happened at. A single top-level
             // flag names no node, so a caller cannot tell a complete step from a
@@ -1412,11 +1493,36 @@ pub fn build_trace_data_flow_response_within(
                     fanout_truncated: false,
                     fanout_dropped: 0,
                     terminal: terminal.map(|terminal| terminal.as_str().to_string()),
+                    outside: TraceOutsideFields::default(),
                 });
                 step_language.insert(step_index, candidate.entity.language);
 
                 if terminal.is_none() && next_depth < depth {
                     next_frontier.push(FrontierNode::at(step_index, next_depth, &candidate.entity));
+                }
+            }
+
+            if !external_callees.is_empty() {
+                let parent = graph
+                    .get_entity(&node.id)
+                    .context("load trace step entity")?;
+                for edge in external_callees {
+                    if chain.len() >= MAX_TOTAL_STEPS {
+                        truncated = true;
+                        break;
+                    }
+                    if !visited_external.insert(edge.target) {
+                        continue;
+                    }
+                    let step_index = chain.len() + 1;
+                    chain.push(external_step(
+                        step_index,
+                        node.step,
+                        node.depth + 1,
+                        &edge,
+                        parent.as_ref(),
+                        &parent_text,
+                    ));
                 }
             }
 
@@ -2004,6 +2110,95 @@ fn sort_by_relevance(candidates: &mut [FanoutCandidate], node: &FrontierNode) {
             .then_with(|| left.entity.name.cmp(&right.entity.name))
             .then_with(|| left.entity.id.0.cmp(&right.entity.id.0))
     });
+}
+
+/// The text at an external call's sites, cut from the parent's own body as
+/// the walk's one authority serves it, each parent read once.
+struct ParentBodyText<'a> {
+    projection: Option<&'a BodyProjection>,
+    bodies:
+        std::cell::RefCell<HashMap<EntityId, std::result::Result<(usize, String), &'static str>>>,
+}
+
+impl kin_mcp::handlers::external_symbols::SiteText for ParentBodyText<'_> {
+    fn quote(
+        &self,
+        caller: &Entity,
+        site: &kin_model::SourceSpan,
+    ) -> std::result::Result<String, &'static str> {
+        let mut bodies = self.bodies.borrow_mut();
+        let body = bodies.entry(caller.id).or_insert_with(|| {
+            source_record_or_none(self.projection, caller)
+                .map(|record| (record.start_byte, record.body))
+                .ok_or("caller_source_unavailable")
+        });
+        match &*body {
+            Ok((start, body)) => {
+                kin_mcp::handlers::external_symbols::quote_site(caller, site, body, *start)
+            }
+            Err(reason) => Err(*reason),
+        }
+    }
+}
+
+/// A chain step on a symbol outside the repository: a callee leaf with the
+/// keys every step carries, stopped at `external_reference`, its sites served
+/// inside the parent under `sites` rather than as file lines. The offline arm
+/// in kin-mcp builds the same step from the same record.
+fn external_step(
+    step: usize,
+    parent_step: usize,
+    depth: usize,
+    edge: &kin_context::ExternalEdge,
+    parent: Option<&Entity>,
+    text: &ParentBodyText<'_>,
+) -> TraceStep {
+    use kin_mcp::handlers::external_symbols as external;
+    let record = external::external_trace_record(edge, parent, text);
+    let field = |key: &str| record.get(key).cloned().filter(|value| !value.is_null());
+    let text_of = |key: &str| field(key).and_then(|value| value.as_str().map(str::to_string));
+    TraceStep {
+        step,
+        role: "callee".to_string(),
+        relation_kind: format!("{:?}", edge.relation.kind),
+        resolution: RelationResolution::of(&edge.relation).as_str().to_string(),
+        parent_step,
+        depth,
+        reference_lines: Vec::new(),
+        reference_lines_absent_reason: Some(
+            ReferenceLinesAbsent::SitesInEntity.as_str().to_string(),
+        ),
+        reference_lines_partial_reason: None,
+        entity: TraceEntityRecord {
+            entity_id: text_of("entity_id").unwrap_or_default(),
+            entity_name: text_of("entity_name").unwrap_or_default(),
+            entity_kind: external::EXTERNAL_SYMBOL_KIND.to_string(),
+            entity_role: "external".to_string(),
+            entity_file: None,
+            external: true,
+            start_line: None,
+            end_line: None,
+            signature: None,
+            body: None,
+            span_coherence: None,
+            crossing: Some(external::external_crossing(edge)),
+        },
+        fanout_truncated: false,
+        fanout_dropped: 0,
+        terminal: Some(
+            kin_ranking::entity_ranking::TraceTerminal::ExternalReference
+                .as_str()
+                .to_string(),
+        ),
+        outside: TraceOutsideFields {
+            package: field("package"),
+            stdlib: field("stdlib").and_then(|value| value.as_bool()),
+            symbol: text_of("symbol"),
+            site_state: text_of("site_state"),
+            proof: field("proof"),
+            sites: field("sites").and_then(|value| value.as_array().cloned()),
+        },
+    }
 }
 
 /// The one record shape every entity in a trace is reported in.
@@ -4265,6 +4460,7 @@ mod tests {
                 fanout_truncated: false,
                 fanout_dropped: 0,
                 terminal: None,
+                outside: TraceOutsideFields::default(),
             });
         }
         TraceDataFlowResponse {
@@ -4428,6 +4624,7 @@ mod tests {
                 fanout_truncated: false,
                 fanout_dropped: 0,
                 terminal: None,
+                outside: TraceOutsideFields::default(),
             });
         };
         for index in 1..=width {
@@ -5244,6 +5441,168 @@ mod tests {
             carrying[0].entity.entity_id,
             "the placeholder's id must not be what the response reports"
         );
+    }
+
+    /// A call a language server proved into a package outside the repository
+    /// is a leaf step on this arm too: named by the symbol's address, stopped
+    /// at `external_reference`, with the proof and the sites inside its parent,
+    /// and every step keeping one key set.
+    #[test]
+    fn a_proven_external_call_is_a_leaf_step_with_its_proof_and_sites() {
+        let (graph, focal_id) = redirect_graph();
+        let symbol = kin_model::ExternalSymbol::new(
+            kin_model::ScipPackage::new("python", "python-stdlib", "3.12").unwrap(),
+            vec![
+                kin_model::ScipDescriptor::namespace("urllib"),
+                kin_model::ScipDescriptor::namespace("parse"),
+                kin_model::ScipDescriptor::method("urlsplit"),
+            ],
+        )
+        .unwrap();
+        let node = symbol.to_reference().unwrap();
+        let context = kin_model::ResolutionRecord::ProofContext(kin_model::ProofContext {
+            language: LanguageId::Python,
+            resolver: "lsp:pyright".to_string(),
+            resolver_version: "1.1.400".to_string(),
+            configuration_hash: Hash256::from_bytes([3; 32]),
+            environment_hash: Hash256::from_bytes([4; 32]),
+            environment_summary: "python 3.12".to_string(),
+        });
+        let focal = graph.get_entity(&focal_id).unwrap().unwrap();
+        let span = focal.span.clone().unwrap();
+        let src = GraphNodeId::Entity(focal_id);
+        let dst = GraphNodeId::ExternalReference(node.id);
+        let call = Relation {
+            id: RelationId::resolver(RelationKind::Calls, &src, &dst),
+            kind: RelationKind::Calls,
+            src,
+            dst,
+            confidence: 1.0,
+            origin: RelationOrigin::Lsp,
+            created_in: None,
+            import_source: None,
+            evidence: vec![RelationEvidence {
+                source_span: Some(kin_model::entity::SourceSpan {
+                    file: span.file.clone(),
+                    start_byte: span.start_byte,
+                    end_byte: span.start_byte + 1,
+                    start_line: span.start_line + 1,
+                    start_col: 4,
+                    end_line: span.start_line + 1,
+                    end_col: 5,
+                }),
+                parser_rule: Some("lsp_definition".to_string()),
+                token: Some(context.id().context_token()),
+                occurrence_count: 1,
+                ..RelationEvidence::default()
+            }],
+        };
+        graph
+            .apply_transaction_delta(&kin_model::TransactionDelta {
+                relation_deltas: vec![kin_model::RelationDelta::Added { new: call }],
+                external_reference_deltas: vec![kin_model::ExternalReferenceDelta::Added {
+                    new: node.clone(),
+                }],
+                resolution_record_deltas: vec![kin_model::ResolutionRecordDelta::Added {
+                    new: context.clone(),
+                }],
+                ..kin_model::TransactionDelta::default()
+            })
+            .unwrap();
+        let (_t, binding) = empty_binding();
+
+        let response = build_trace_data_flow_response(
+            &RequestRepositoryAuthority::pinned(binding.clone()),
+            &graph,
+            &trace_request(&focal_id, 1, TraceDirection::Calls, 25),
+        )
+        .unwrap();
+        let address = format!("external_reference:{}", node.id);
+        let step = response
+            .chain
+            .iter()
+            .find(|step| step.entity.entity_id == address)
+            .unwrap_or_else(|| panic!("no external step: {:?}", step_names(&response)));
+        assert_eq!(step.entity.entity_name, "urlsplit");
+        assert_eq!(step.entity.entity_kind, "external_symbol");
+        assert!(step.entity.external);
+        assert!(step.entity.entity_file.is_none());
+        assert_eq!(step.terminal.as_deref(), Some("external_reference"));
+        assert_eq!(step.parent_step, 0);
+        assert!(step.reference_lines.is_empty());
+        assert_eq!(
+            step.reference_lines_absent_reason.as_deref(),
+            Some("sites_in_entity")
+        );
+        assert_eq!(step.outside.site_state.as_deref(), Some("proven_external"));
+        assert_eq!(step.outside.stdlib, Some(true));
+        assert_eq!(
+            step.outside.symbol.as_deref(),
+            Some("urllib/parse/urlsplit().")
+        );
+        let proof = step.outside.proof.as_ref().expect("proof");
+        assert_eq!(proof["resolver"], "lsp:pyright");
+        assert_eq!(proof["context"], context.id().0.to_string());
+        let sites = step.outside.sites.as_ref().expect("sites");
+        assert_eq!(sites.len(), 1);
+        assert_eq!(sites[0]["line_in_entity"], 1);
+        assert!(sites[0].get("callee").is_some(), "{sites:?}");
+
+        let json = serde_json::to_value(&response).unwrap();
+        let steps = json["chain"].as_array().unwrap();
+        let expected: Vec<&String> = steps[0].as_object().unwrap().keys().collect();
+        for step in steps {
+            let keys: Vec<&String> = step.as_object().unwrap().keys().collect();
+            assert_eq!(keys, expected, "every step carries one key set: {step}");
+        }
+        let admitted = steps
+            .iter()
+            .find(|step| step["entity_name"] == "get_redirect_target")
+            .unwrap();
+        for key in kin_mcp::handlers::external_symbols::EXTERNAL_TRACE_KEYS {
+            assert!(admitted[key].is_null(), "{key}: {admitted}");
+        }
+    }
+
+    /// A walk cannot start from a symbol whose body and edges are outside the
+    /// repository. The walk the daemon serves `trace_data_flow` and `kin
+    /// trace-data-flow` from refuses such a focal by what it is, in the bytes
+    /// the offline tool refuses it with, never as a focal that matched nothing,
+    /// which the daemon would wait out as an absence.
+    #[test]
+    fn an_external_focal_is_refused_by_what_it_is() {
+        let store = crate::commands::external_symbols::fixture::external_store(false);
+        let (_t, binding) = empty_binding();
+        for focal in [store.address(), store.node.id.to_string()] {
+            let error = match build_trace_data_flow_response(
+                &RequestRepositoryAuthority::pinned(binding.clone()),
+                &store.graph,
+                &TraceDataFlowRequest {
+                    focal: focal.clone(),
+                    depth: Some(2),
+                    direction: Some(TraceDirection::Callers),
+                    limit_per_step: None,
+                    include_body: None,
+                    max_response_chars: None,
+                    include_type_edges: None,
+                    target: None,
+                },
+            ) {
+                Ok(response) => panic!("{focal} was walked: {:?}", step_names(&response)),
+                Err(error) => error,
+            };
+            let text = error.to_string();
+            assert_ne!(text, focal_not_found_error(&focal).to_string());
+            let value: serde_json::Value =
+                serde_json::from_str(&text).unwrap_or_else(|_| panic!("not a refusal: {text}"));
+            assert_eq!(
+                value["error"]["code"], "external_symbol_not_served",
+                "{value:#}"
+            );
+            assert_eq!(value["error"]["tool"], "trace_data_flow", "{value:#}");
+            assert_eq!(value["error"]["id"], store.address(), "{value:#}");
+            assert_eq!(value["error"]["symbol"]["name"], "Array.map", "{value:#}");
+        }
     }
 
     /// The parser break, asserted structurally: one array, one key set, whatever

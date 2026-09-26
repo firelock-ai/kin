@@ -697,10 +697,12 @@ async fn mcp_trace_ships_its_smallest_walk_over_a_ceiling_it_cannot_reach_and_sa
 
 /// Budgets at which a different pass makes the cut on this fixture. At 2,000
 /// only the walk cuts, because it is already down to one step; at 6,000 the
-/// walk cuts and the envelope pass cuts the same chain again; at 12,000 only
+/// walk cuts and the envelope pass cuts the same chain again; at 13,000 only
 /// the envelope pass cuts, because the walk fits the budget before the
-/// envelope is added.
-const CUT_CEILINGS: [usize; 3] = [RESPONSE_MIN_MAX_CHARS, 6_000, 12_000];
+/// envelope is added. Every step carries the keys a call into a symbol outside
+/// the repository fills, as null here, which put this fixture's walk at about
+/// 12,500 characters, just over the 12,000 this arm used before.
+const CUT_CEILINGS: [usize; 3] = [RESPONSE_MIN_MAX_CHARS, 6_000, 13_000];
 
 /// The counters beside a cut chain describe the chain that ships, whichever
 /// pass cut it.
@@ -1986,4 +1988,50 @@ async fn a_spine_crossing_count_the_envelope_pass_cannot_read_whole_is_marked_a_
         "the route passes never withheld a clip record, so this grades nothing"
     );
     assert!(problems.is_empty(), "{problems:#?}");
+}
+
+/// A focal that names a symbol outside the repository is refused as one the
+/// walk does not serve, on the MCP route and on the command route, and never
+/// reported as a focal the graph lacks.
+#[tokio::test]
+async fn a_walk_from_an_external_symbol_is_refused_as_one_the_walk_does_not_serve() {
+    use kin_model::EntityStore as _;
+    let (_dir, state) = fixture().await;
+    let symbol = kin_model::ExternalSymbol::new(
+        kin_model::ScipPackage::new("npm", "typescript", "5.9.3").unwrap(),
+        vec![
+            kin_model::ScipDescriptor::namespace("lib.es5.d.ts"),
+            kin_model::ScipDescriptor::type_("Array"),
+            kin_model::ScipDescriptor::method("map"),
+        ],
+    )
+    .unwrap();
+    let node = symbol.to_reference().unwrap();
+    state
+        .graph
+        .apply_transaction_delta(&kin_model::TransactionDelta {
+            external_reference_deltas: vec![kin_model::ExternalReferenceDelta::Added {
+                new: node.clone(),
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+    let address = format!("external_reference:{}", node.id.0);
+
+    let (daemon, _) = served(&state, &json!({ "focal": address, "direction": "calls" })).await;
+    let answer = text(&daemon);
+    assert_eq!(daemon.is_error, Some(true), "{answer}");
+    assert!(answer.contains("external_symbol_not_served"), "{answer}");
+    assert!(answer.contains("Array.map"), "{answer}");
+    assert!(!answer.contains("no entity found"), "{answer}");
+
+    let (status, body) = post(
+        &state,
+        "/commands/trace-data-flow",
+        json!({ "focal": address }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(body.contains("external_symbol_not_served"), "{body}");
+    assert!(!body.contains("no entity found"), "{body}");
 }

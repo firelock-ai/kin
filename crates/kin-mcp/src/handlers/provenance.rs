@@ -172,6 +172,18 @@ pub fn handle_provenance_query<G: GraphStore>(
     store: &G,
 ) -> Result<ToolCallResult> {
     let id_str = get_string_param(args, "entity_id")?;
+    // No change in this repository touches a symbol declared outside it, so
+    // it is refused by what it is rather than as an id nothing is recorded
+    // against, which the refusal below would call invalid or stale.
+    if let Some(refusal) = super::external_symbols::external_id_refusal(
+        store,
+        &id_str,
+        "kin_provenance_query",
+        "entity_id",
+        "has no changes, approvals or audit events of it here to report",
+    )? {
+        return Ok(refusal);
+    }
     let entity_id = parse_entity_id(&id_str)?;
     let offset = get_optional_u64(args, "offset", 0) as usize;
     let limit =
@@ -375,6 +387,7 @@ mod tests {
             evidence: vec![],
             risk_summary: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         };
         change.id = kin_model::compute_semantic_change_id(&change).unwrap();
         change

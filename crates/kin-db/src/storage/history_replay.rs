@@ -43,8 +43,9 @@ use std::time::{Duration, Instant};
 
 use kin_model::{
     Entity, EntityDelta, EntityId, ExternalReference, ExternalReferenceDelta, ExternalReferenceId,
-    GraphNodeId, ModelError, Relation, RelationDelta, RelationId, ResolvedTree, SemanticChange,
-    SemanticChangeId, TreeDelta,
+    GraphNodeId, ModelError, Relation, RelationDelta, RelationId, ResolutionRecord,
+    ResolutionRecordDelta, ResolutionRecordId, ResolutionRecordPlan, ResolutionRecordSet,
+    ResolvedTree, SemanticChange, SemanticChangeId, TreeDelta,
 };
 
 use crate::error::KinDbError;
@@ -186,6 +187,7 @@ pub struct ResolvedCurrentGraph {
     pub relations: HashMap<RelationId, Relation>,
     pub external_references: HashMap<ExternalReferenceId, ExternalReference>,
     pub tree: ResolvedTree,
+    pub resolution_records: HashMap<ResolutionRecordId, ResolutionRecord>,
 }
 
 /// Resolve live state while retaining only lineage IDs and one change body.
@@ -225,6 +227,7 @@ pub fn resolve_current_graph(
         relations: state.relations,
         external_references: state.external_references,
         tree: state.tree,
+        resolution_records: state.records.into_records(),
     })
 }
 
@@ -244,6 +247,8 @@ struct ReplayState {
     /// instead of rescanning every relation in the graph.
     entity_referents: HashMap<EntityId, BTreeSet<RelationId>>,
     reference_referents: HashMap<ExternalReferenceId, BTreeSet<RelationId>>,
+    /// Resolution records, indexed by the nodes and records they name.
+    records: ResolutionRecordSet,
 }
 
 impl ReplayState {
@@ -254,6 +259,7 @@ impl ReplayState {
             && self.tree.is_empty()
             && self.entity_referents.is_empty()
             && self.reference_referents.is_empty()
+            && self.records.is_empty()
     }
 
     fn index_relation(&mut self, relation: &Relation) {
@@ -704,6 +710,7 @@ fn apply_change(
 }
 
 fn apply_forward(state: &mut ReplayState, change: &SemanticChange) -> Result<(), KinDbError> {
+    let record_plan = plan_change_records(state, change)?;
     for delta in &change.entity_deltas {
         apply_entity_delta(state, change.id, delta)?;
     }
@@ -714,10 +721,88 @@ fn apply_forward(state: &mut ReplayState, change: &SemanticChange) -> Result<(),
         apply_relation_delta(state, change.id, delta)?;
     }
     apply_tree_deltas(state, change.id, &change.tree_deltas)?;
-    validate_no_dangling_endpoints(state, change)
+    validate_no_dangling_endpoints(state, change)?;
+    apply_record_plan(state, change.id, &record_plan)
+}
+
+/// What `change` does to the replayed records, refused when it is not exact.
+///
+/// History carries every record transition explicitly: a change that modifies
+/// or removes a caller, or removes a node a record names, removes or rewrites
+/// those records itself. So a replay never infers a removal, which is what
+/// keeps the rewind below an exact inverse of the forward step.
+fn plan_change_records(
+    state: &ReplayState,
+    change: &SemanticChange,
+) -> Result<ResolutionRecordPlan, KinDbError> {
+    if change.resolution_record_deltas.is_empty() && state.records.is_empty() {
+        return Ok(ResolutionRecordPlan::default());
+    }
+    let plan = state
+        .records
+        .plan_parts(
+            &change.entity_deltas,
+            &change.external_reference_deltas,
+            &change.resolution_record_deltas,
+        )
+        .map_err(|error| {
+            ModelError::Conflict(format!(
+                "change {} moves resolution records it cannot: {error}",
+                change.id
+            ))
+        })?;
+    if let Some(retired) = plan.retired.first() {
+        return Err(ModelError::Conflict(format!(
+            "change {} leaves resolution record {retired} describing a node it changed or \
+             removed; history carries record removals explicitly",
+            change.id
+        ))
+        .into());
+    }
+    Ok(plan)
+}
+
+fn apply_record_plan(
+    state: &mut ReplayState,
+    change_id: SemanticChangeId,
+    plan: &ResolutionRecordPlan,
+) -> Result<(), KinDbError> {
+    if plan.is_empty() {
+        return Ok(());
+    }
+    state
+        .records
+        .check_references(plan, |node| match node {
+            GraphNodeId::Entity(id) => state.entities.contains_key(id),
+            GraphNodeId::ExternalReference(id) => state.external_references.contains_key(id),
+            GraphNodeId::Artifact(_)
+            | GraphNodeId::Test(_)
+            | GraphNodeId::Contract(_)
+            | GraphNodeId::Work(_)
+            | GraphNodeId::VerificationRun(_) => false,
+        })
+        .map_err(|error| {
+            ModelError::Conflict(format!(
+                "change {change_id} leaves resolution records naming what it does not hold: \
+                 {error}"
+            ))
+        })?;
+    state.records.apply(plan);
+    Ok(())
 }
 
 fn apply_rewind(state: &mut ReplayState, change: &SemanticChange) -> Result<(), KinDbError> {
+    if !change.resolution_record_deltas.is_empty() {
+        // The forward step retired nothing implicitly, so the inverse of the
+        // change's own record deltas is the exact inverse of that step.
+        let inverse: Vec<_> = change
+            .resolution_record_deltas
+            .iter()
+            .map(ResolutionRecordDelta::inverse)
+            .collect();
+        let plan = state.records.plan_parts(&[], &[], &inverse)?;
+        state.records.apply(&plan);
+    }
     let inverse_tree: Vec<TreeDelta> = change
         .tree_deltas
         .iter()
@@ -1237,6 +1322,7 @@ mod tests {
             spec_link: None,
             evidence: Vec::new(),
             risk_summary: None,
+            resolution_record_deltas: Vec::new(),
         };
         change.id = compute_semantic_change_id(&change).unwrap();
         change
@@ -1425,6 +1511,7 @@ mod tests {
             spec_link: None,
             evidence: Vec::new(),
             risk_summary: None,
+            resolution_record_deltas: Vec::new(),
         };
 
         let error = compute_semantic_change_id(&double)

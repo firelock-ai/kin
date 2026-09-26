@@ -185,3 +185,7 @@ KIN_DB_PREPARED_SESSION_FIXTURE
 # and its logs when explicitly requested by the relocation regression test.
 # The module is compiled only under cfg(all(test, unix)); no product reads it.
 KIN_BUILDINFO_RELOCATION_EVIDENCE
+# Names a real uv.lock for the lockfile parser's reporting-only sample test in
+# kin-lsp. The test does nothing when it is unset, no runtime behaviour keys on
+# it, and nothing an operator sets.
+KIN_TEST_UV_LOCK

@@ -1305,9 +1305,21 @@ fn resolve_relations(
             .filter(|_| {
                 // Receiver-shaped fields and unproven local method calls must
                 // reach the linker instead of capturing a bare free symbol.
+                //
+                // Python records the receiver of every attribute call whose
+                // owner the parser could not pin, so `settings.get(...)` and
+                // `@app.post(...)` arrive as the leaf `get` or `post` with a
+                // receiver. Such a call reaches a member of the receiver's
+                // type, never a module-level function that shares the leaf, and
+                // the linker already refuses that same-file match. Binding it
+                // here instead stamped it parser-certain.
                 !(crate::linker::is_go_selector_reference(rel, src.map(|entity| entity.language))
-                    || (src.is_some_and(|s| s.language == kin_model::LanguageId::Go)
-                        && rel.kind == kin_model::RelationKind::Calls
+                    || (src.is_some_and(|s| {
+                        matches!(
+                            s.language,
+                            kin_model::LanguageId::Go | kin_model::LanguageId::Python
+                        )
+                    }) && rel.kind == kin_model::RelationKind::Calls
                         && rel.receiver.is_some()
                         && !rel.dst_name.contains('.')))
             });

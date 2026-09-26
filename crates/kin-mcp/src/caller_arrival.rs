@@ -177,7 +177,7 @@ impl ArrivalState {
 }
 
 /// One family file whose call sites did not all become edges.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct UnaccountedFile {
     pub file: String,
     /// `None` when the file carries no parse-side count. An adapter that
@@ -200,6 +200,45 @@ pub struct UnaccountedFile {
     /// know which one this is.
     #[serde(default)]
     pub shortfall_is_floor: bool,
+    /// How the row was counted.
+    pub count_source: CountSource,
+    /// Whether `unaccounted_call_sites` is exact. True only for a row counted
+    /// from site ledgers, where it is the sites no resolver settled. A count
+    /// from parse against edges is a ceiling on the ambiguity at best, because
+    /// a call into a package the repository does not hold becomes no edge too.
+    pub count_exact: bool,
+    /// For a row counted from site ledgers, its unsettled sites by the state
+    /// each reads as.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub unsettled_by_state: std::collections::BTreeMap<&'static str, u64>,
+    /// Callers in the file that no current ledger describes, which is why a
+    /// row counted from parse against edges was not counted from ledgers.
+    pub owed_callers: u64,
+}
+
+/// How a family file's call sites were counted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CountSource {
+    /// Every caller in the file held a current call-site ledger, so each site
+    /// was read as the state its ledger records.
+    SiteLedgers,
+    /// Some caller held none, so the file's parse-side call count was set
+    /// against the call edges its entities hold.
+    #[default]
+    ParseVersusEdges,
+}
+
+/// A caller in the focal's family that no current ledger describes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OwedCaller {
+    /// The caller's entity id.
+    pub id: String,
+    pub name: String,
+    pub file: String,
+    /// What stands between the reading and its ledger: `owed_enrichment`,
+    /// `owed_derivation` or `proof_context_stale`.
+    pub reading: &'static str,
 }
 
 /// The reading itself.
@@ -213,6 +252,18 @@ pub struct CallerArrival {
     pub unaccounted: Vec<UnaccountedFile>,
     /// Why the state is `unmeasured`, when it is.
     pub unmeasured_reason: Option<String>,
+    /// Of the family files, how many were counted from site ledgers.
+    pub files_from_site_ledgers: usize,
+    /// Callers in the family that no current ledger describes.
+    pub owed_callers: Vec<OwedCaller>,
+    /// Every caller in the family, read through the one site-state reading,
+    /// or `None` when the family could not be established.
+    pub call_sites: Option<kin_model::CallSiteTally>,
+    /// Owed callers of the focal's language outside the family and the
+    /// focal's own file, or `None` when the entity index could not be read.
+    /// A caller can reach the focal without importing its file, so these
+    /// qualify a settled family: see [`crate::call_sites::owed_outside`].
+    pub owed_outside: Option<Vec<crate::call_sites::OwedFile>>,
 }
 
 impl CallerArrival {
@@ -223,6 +274,10 @@ impl CallerArrival {
             family_measured: 0,
             unaccounted: Vec::new(),
             unmeasured_reason: Some(reason.into()),
+            files_from_site_ledgers: 0,
+            owed_callers: Vec::new(),
+            call_sites: None,
+            owed_outside: Some(Vec::new()),
         }
     }
 
@@ -239,7 +294,7 @@ impl CallerArrival {
     /// An impact answer carries one of these per entity and its scope beside
     /// them, so the sentence is not repeated on every row.
     fn fields_json(&self) -> serde_json::Value {
-        json!({
+        let mut block = json!({
             "state": self.state.wire(),
             "family_files": self.family_files,
             "family_measured": self.family_measured,
@@ -261,7 +316,38 @@ impl CallerArrival {
                 .collect::<Vec<_>>(),
             "unaccounted_files_truncated": self.unaccounted.len() > EVIDENCE_ROW_CAP,
             "unmeasured_reason": self.unmeasured_reason,
-        })
+            // Whether every family file was counted from its callers' current
+            // site ledgers, which makes `unaccounted_file_count` and every
+            // row's `unaccounted_call_sites` exact. A reading that could not
+            // be taken is never exact.
+            "count_exact": self.state != ArrivalState::Unmeasured
+                && self.files_from_site_ledgers == self.family_files,
+            "files_counted_from_site_ledgers": self.files_from_site_ledgers,
+            // The callers that kept a file on the arithmetic: no current
+            // ledger describes them. Counted in full on every answer, and
+            // named up to the cap when there are any.
+            "owed_caller_count": self.owed_callers.len(),
+        });
+        match &self.owed_outside {
+            Some(files) if !files.is_empty() => {
+                block["owed_outside_scope"] = json!({
+                    "file_count": files.len(),
+                    "callers": files.iter().map(|file| file.callers).sum::<u64>(),
+                    "files": files.iter().take(EVIDENCE_ROW_CAP).collect::<Vec<_>>(),
+                });
+            }
+            Some(_) => {}
+            None => block["owed_outside_scope"] = json!({ "unreadable": true }),
+        }
+        if !self.owed_callers.is_empty() {
+            block["owed_callers"] = json!(self
+                .owed_callers
+                .iter()
+                .take(EVIDENCE_ROW_CAP)
+                .collect::<Vec<_>>());
+            block["owed_callers_truncated"] = json!(self.owed_callers.len() > EVIDENCE_ROW_CAP);
+        }
+        block
     }
 
     /// The one sentence the verdict prints when this reading limits the answer,
@@ -280,18 +366,26 @@ impl CallerArrival {
                     .unaccounted
                     .iter()
                     .take(5)
-                    .map(|file| match file.unaccounted_call_sites {
-                        Some(missing) => format!(
-                            "{} ({missing} of {} parsed call sites became no edge)",
-                            file.file,
-                            file.parsed_call_sites.unwrap_or(0)
-                        ),
-                        None => format!(
-                            "{} (the store holds no parse-side call count for this file, so \
+                    .map(
+                        |file| match (file.unaccounted_call_sites, file.count_exact) {
+                            (Some(missing), true) => format!(
+                                "{} ({missing} of {} call sites are not settled, an exact count \
+                             from site ledgers)",
+                                file.file,
+                                file.parsed_call_sites.unwrap_or(0)
+                            ),
+                            (Some(missing), false) => format!(
+                                "{} ({missing} of {} parsed call sites became no edge)",
+                                file.file,
+                                file.parsed_call_sites.unwrap_or(0)
+                            ),
+                            (None, _) => format!(
+                                "{} (the store holds no parse-side call count for this file, so \
                              its call sites could not be accounted for)",
-                            file.file
-                        ),
-                    })
+                                file.file
+                            ),
+                        },
+                    )
                     .collect();
                 // Joined with ", " and never with "; ", which is
                 // `crate::verdict::CLAUSE_SEPARATOR`. The rendered limiting
@@ -412,7 +506,7 @@ fn language_links_imports<G: GraphStore>(store: &G, language: kin_model::Languag
 fn file_entities<G: GraphStore>(
     store: &G,
     file: &FilePathId,
-) -> Option<(Vec<(EntityId, kin_model::EntityKind)>, Option<u64>)> {
+) -> Option<(Vec<Entity>, Option<u64>)> {
     let entities = store
         .query_entities(&EntityFilter {
             file_path: Some(file.clone()),
@@ -420,13 +514,72 @@ fn file_entities<G: GraphStore>(
         })
         .ok()?;
     let parsed = entities.iter().find_map(parsed_call_sites);
-    Some((
-        entities
-            .into_iter()
-            .map(|entity| (entity.id, entity.kind))
-            .collect(),
-        parsed,
-    ))
+    Some((entities, parsed))
+}
+
+/// What the current ledgers of one file's callers say about its sites.
+#[derive(Debug, Default)]
+struct LedgerCount {
+    /// Call expressions the ledgers hold.
+    census: u64,
+    /// Of those, the sites a resolver settled.
+    settled: u64,
+    /// The rest, by the state each reads as.
+    unsettled: std::collections::BTreeMap<&'static str, u64>,
+}
+
+/// Read every entity of one family file through the one site-state reading,
+/// adding each to `tally`.
+///
+/// `Some` when every entity with source text in the file holds a current
+/// ledger and at least one does, which makes the file's unsettled sites an
+/// exact count. `None` otherwise, with every caller no current ledger
+/// describes pushed onto `owed`. A file with no entity holding text is left to
+/// the arithmetic, because a count of nothing from ledgers would certify a file
+/// whose calls no entity holds.
+fn ledger_count<F: kin_model::CallSiteFacts + ?Sized>(
+    facts: &F,
+    file: &FilePathId,
+    entities: &[Entity],
+    tally: &mut kin_model::CallSiteTally,
+    owed: &mut Vec<OwedCaller>,
+) -> Option<LedgerCount> {
+    use kin_model::CallerSites;
+    let mut count = LedgerCount::default();
+    let mut ledgered = 0usize;
+    let mut owed_here = false;
+    for entity in entities {
+        let reading = kin_model::read_caller_sites(facts, entity);
+        tally.add(&reading);
+        match &reading {
+            CallerSites::NoSites => {}
+            CallerSites::Current(ledger) => {
+                ledgered += 1;
+                count.census += u64::from(ledger.census);
+                for site in &ledger.sites {
+                    let kind = reading.site_kind(site);
+                    if kind.is_settled() {
+                        count.settled += 1;
+                    } else {
+                        *count.unsettled.entry(kind.wire()).or_insert(0) += 1;
+                    }
+                }
+            }
+            CallerSites::OwedDerivation
+            | CallerSites::OwedEnrichment
+            | CallerSites::NoResolver { .. }
+            | CallerSites::Stale(_) => {
+                owed_here = true;
+                owed.push(OwedCaller {
+                    id: entity.id.to_string(),
+                    name: entity.name.clone(),
+                    file: file.0.clone(),
+                    reading: reading.wire(),
+                });
+            }
+        }
+    }
+    (!owed_here && ledgered > 0).then_some(count)
 }
 
 /// What one file's resolved side came to, or why it could not be taken.
@@ -557,12 +710,13 @@ fn file_shortfall(parsed: u64, sites: u64, spanless: u64) -> FileShortfall {
 fn resolved_call_sites<G: GraphStore>(
     store: &G,
     file: &FilePathId,
-    entity_ids: &[(EntityId, kin_model::EntityKind)],
+    entities: &[Entity],
 ) -> ResolvedSites {
     let mut sites: std::collections::HashMap<(usize, usize), u64> =
         std::collections::HashMap::new();
     let mut spanless = 0u64;
-    for (entity_id, _) in entity_ids {
+    for entity in entities {
+        let entity_id = &entity.id;
         let Ok(relations) = store.get_all_relations_for_entity(entity_id) else {
             return ResolvedSites::Unreadable;
         };
@@ -609,10 +763,10 @@ pub fn observe_file_call_sites<G: GraphStore>(
     store: &G,
     file: &FilePathId,
 ) -> Result<Option<UnaccountedFile>, String> {
-    let Some((entity_ids, parsed)) = file_entities(store, file) else {
+    let Some((entities, parsed)) = file_entities(store, file) else {
         return Err("the entity index could not be read for the focal's own file".to_string());
     };
-    let (sites, spanless) = match resolved_call_sites(store, file, &entity_ids) {
+    let (sites, spanless) = match resolved_call_sites(store, file, &entities) {
         ResolvedSites::Counted { sites, spanless } => (sites, spanless),
         ResolvedSites::Unreadable => {
             return Err("the relation index could not be read for the focal's own file".to_string())
@@ -638,6 +792,7 @@ pub fn observe_file_call_sites<G: GraphStore>(
         resolved_call_edges: sites + spanless,
         unaccounted_call_sites: missing,
         shortfall_is_floor: spanless > 0,
+        ..UnaccountedFile::default()
     }))
 }
 
@@ -663,14 +818,15 @@ pub fn observe_caller_arrival<G: GraphStore>(store: &G, focal: &Entity) -> Calle
             "the entity index could not be read for the focal's file",
         );
     };
-    let focal_owned: HashSet<EntityId> = focal_file_entities.iter().map(|(id, _)| *id).collect();
+    let focal_owned: HashSet<EntityId> =
+        focal_file_entities.iter().map(|entity| entity.id).collect();
     // The destinations a module binding may land on. Kept separate from
     // `focal_owned` so the widened edge class cannot admit a bare mention of a
     // function in this file as if it were an import of the file.
     let focal_modules: HashSet<EntityId> = focal_file_entities
         .iter()
-        .filter(|(_, kind)| *kind == kin_model::EntityKind::Module)
-        .map(|(id, _)| *id)
+        .filter(|entity| entity.kind == kin_model::EntityKind::Module)
+        .map(|entity| entity.id)
         .collect();
 
     // The family: files holding an import edge into an entity of the focal's
@@ -683,8 +839,8 @@ pub fn observe_caller_arrival<G: GraphStore>(store: &G, focal: &Entity) -> Calle
     // needed to establish it.
     let mut family: HashSet<FilePathId> = HashSet::new();
     let mut focal_file_imports_something = false;
-    for (entity_id, _) in &focal_file_entities {
-        let Ok(relations) = store.get_all_relations_for_entity(entity_id) else {
+    for entity in &focal_file_entities {
+        let Ok(relations) = store.get_all_relations_for_entity(&entity.id) else {
             return CallerArrival::unmeasured(
                 "the relation index could not be read for the focal's file",
             );
@@ -746,6 +902,15 @@ pub fn observe_caller_arrival<G: GraphStore>(store: &G, focal: &Entity) -> Calle
                 family_measured: 0,
                 unaccounted: Vec::new(),
                 unmeasured_reason: None,
+                files_from_site_ledgers: 0,
+                owed_callers: Vec::new(),
+                call_sites: Some(kin_model::CallSiteTally::default()),
+                owed_outside: crate::call_sites::owed_outside(
+                    store,
+                    focal.language,
+                    &std::collections::HashSet::from([focal_file.0.clone()]),
+                    &focal.name,
+                ),
             };
         }
         return CallerArrival::unmeasured(
@@ -770,16 +935,45 @@ pub fn observe_caller_arrival<G: GraphStore>(store: &G, focal: &Entity) -> Calle
 
     let mut unaccounted = Vec::new();
     let mut family_measured = 0usize;
+    // Every caller in the family, read through the one site-state reading the
+    // other surfaces share. Where every caller of a file holds a current
+    // ledger, the file is counted from them and the count is exact; otherwise
+    // the file keeps the arithmetic below and its owed callers are named.
+    let facts = crate::call_sites::GraphSiteFacts::new(store);
+    let mut tally = kin_model::CallSiteTally::default();
+    let mut owed_callers: Vec<OwedCaller> = Vec::new();
+    let mut files_from_site_ledgers = 0usize;
     for file in &family_files {
-        let Some((entity_ids, parsed)) = file_entities(store, file) else {
+        let Some((entities, parsed)) = file_entities(store, file) else {
             return CallerArrival::unmeasured(
                 "the entity index could not be read for a file in the focal's family",
             );
         };
+        let owed_before = owed_callers.len();
+        if let Some(count) = ledger_count(&facts, file, &entities, &mut tally, &mut owed_callers) {
+            family_measured += 1;
+            files_from_site_ledgers += 1;
+            let unsettled: u64 = count.unsettled.values().sum();
+            if unsettled > 0 {
+                unaccounted.push(UnaccountedFile {
+                    file: file.0.clone(),
+                    parsed_call_sites: Some(count.census),
+                    resolved_call_edges: count.settled,
+                    unaccounted_call_sites: Some(unsettled),
+                    shortfall_is_floor: false,
+                    count_source: CountSource::SiteLedgers,
+                    count_exact: true,
+                    unsettled_by_state: count.unsettled,
+                    owed_callers: 0,
+                });
+            }
+            continue;
+        }
+        let owed_here = (owed_callers.len() - owed_before) as u64;
         if parsed.is_some() {
             family_measured += 1;
         }
-        let (sites, spanless) = match resolved_call_sites(store, file, &entity_ids) {
+        let (sites, spanless) = match resolved_call_sites(store, file, &entities) {
             ResolvedSites::Counted { sites, spanless } => (sites, spanless),
             ResolvedSites::Unreadable => {
                 return CallerArrival::unmeasured(
@@ -819,6 +1013,8 @@ pub fn observe_caller_arrival<G: GraphStore>(store: &G, focal: &Entity) -> Calle
                 resolved_call_edges: sites + spanless,
                 unaccounted_call_sites: missing,
                 shortfall_is_floor: spanless > 0,
+                owed_callers: owed_here,
+                ..UnaccountedFile::default()
             });
         }
     }
@@ -833,6 +1029,19 @@ pub fn observe_caller_arrival<G: GraphStore>(store: &G, focal: &Entity) -> Calle
         family_measured,
         unaccounted,
         unmeasured_reason: None,
+        files_from_site_ledgers,
+        owed_callers,
+        call_sites: Some(tally),
+        owed_outside: crate::call_sites::owed_outside(
+            store,
+            focal.language,
+            &family_files
+                .iter()
+                .map(|file| file.0.clone())
+                .chain(std::iter::once(focal_file.0.clone()))
+                .collect(),
+            &focal.name,
+        ),
     }
 }
 
@@ -857,11 +1066,17 @@ pub fn arrival_gap(payload: &serde_json::Value) -> Option<String> {
                         .take(5)
                         .filter_map(|file| {
                             let path = file.get("file").and_then(serde_json::Value::as_str)?;
+                            let exact =
+                                file.get("count_exact").and_then(serde_json::Value::as_bool)
+                                    == Some(true);
                             Some(
                                 match file
                                     .get("unaccounted_call_sites")
                                     .and_then(serde_json::Value::as_u64)
                                 {
+                                    Some(missing) if exact => {
+                                        format!("{path} ({missing} unsettled, exact)")
+                                    }
                                     Some(missing) => format!("{path} ({missing} unaccounted)"),
                                     None => format!("{path} (no parse-side count in store)"),
                                 },
@@ -975,11 +1190,20 @@ pub fn absence_gap<G: GraphStore>(store: &G, focal: &Entity) -> Option<(&'static
                     file.unaccounted_call_sites
                         .filter(|missing| *missing > 0)
                         .map(|missing| {
-                            format!(
-                                "{} ({missing} of {} parsed call sites became no edge)",
-                                file.file,
-                                file.parsed_call_sites.unwrap_or(0)
-                            )
+                            if file.count_exact {
+                                format!(
+                                    "{} ({missing} of {} call sites are not settled, an exact \
+                                     count from site ledgers)",
+                                    file.file,
+                                    file.parsed_call_sites.unwrap_or(0)
+                                )
+                            } else {
+                                format!(
+                                    "{} ({missing} of {} parsed call sites became no edge)",
+                                    file.file,
+                                    file.parsed_call_sites.unwrap_or(0)
+                                )
+                            }
                         })
                 })
                 .collect();
@@ -1182,7 +1406,25 @@ pub fn observe_impact_arrival<G: GraphStore>(
         })
         .collect();
 
-    json!({
+    // Owed callers outside any examined entity's family, joined by file. A
+    // caller there can reach an entity without importing its file, so the
+    // zero consumer counts are not whole while one is owed.
+    let mut owed_outside: std::collections::BTreeMap<String, u64> =
+        std::collections::BTreeMap::new();
+    let mut owed_outside_unreadable = false;
+    for (_, _, _, arrival) in &entries {
+        match &arrival.owed_outside {
+            Some(files) => {
+                for file in files {
+                    let callers = owed_outside.entry(file.file.clone()).or_insert(0);
+                    *callers = (*callers).max(file.callers);
+                }
+            }
+            None => owed_outside_unreadable = true,
+        }
+    }
+
+    let mut block = json!({
         "state": state,
         "entities_examined": entries.len(),
         "unaccounted_entity_count": unaccounted,
@@ -1190,7 +1432,21 @@ pub fn observe_impact_arrival<G: GraphStore>(
         "entities": rows,
         "entities_truncated": entries.len() > EVIDENCE_ROW_CAP,
         "scope": ARRIVAL_READING_SCOPE,
-    })
+    });
+    if owed_outside_unreadable {
+        block["owed_outside_scope"] = json!({ "unreadable": true });
+    } else if !owed_outside.is_empty() {
+        block["owed_outside_scope"] = json!({
+            "file_count": owed_outside.len(),
+            "callers": owed_outside.values().sum::<u64>(),
+            "files": owed_outside
+                .iter()
+                .take(EVIDENCE_ROW_CAP)
+                .map(|(file, callers)| json!({ "file": file, "callers": callers }))
+                .collect::<Vec<_>>(),
+        });
+    }
+    block
 }
 
 /// What a certified absence says about this reading when the reading is one of
@@ -1244,16 +1500,37 @@ pub fn arrival_certification_clause(tool: &str, payload: &serde_json::Value) -> 
 ///
 /// A payload with no block is not gated here, exactly as [`arrival_gap`] leaves
 /// a reference answer with none. The handler publishes one on every answer.
+/// The gap a published arrival block states while owed callers outside the
+/// family could hold a call to the focal, or `None` when there are none.
+///
+/// Read off the block, the way [`arrival_gap`] reads it, so the verdict and
+/// the evidence a reader audits it against are the same object. The block is
+/// either one focal's reading or an impact answer's, which carry the field
+/// under the same name.
+pub fn owed_outside_gap(payload: &serde_json::Value) -> Option<String> {
+    let owed = payload.get(CALLER_ARRIVAL_KEY)?.get("owed_outside_scope")?;
+    if owed.get("unreadable").and_then(serde_json::Value::as_bool) == Some(true) {
+        return Some(crate::call_sites::owed_outside_unreadable_clause());
+    }
+    let files = owed.get("file_count").and_then(serde_json::Value::as_u64)?;
+    let callers = owed
+        .get("callers")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    (files > 0).then(|| crate::call_sites::owed_outside_counts_clause(files, callers))
+}
+
 pub fn impact_arrival_gaps(payload: &serde_json::Value) -> Vec<String> {
     let Some(block) = payload.get(CALLER_ARRIVAL_KEY) else {
         return Vec::new();
     };
     let state = block.get("state").and_then(serde_json::Value::as_str);
+    let owed_outside = owed_outside_gap(payload);
     if matches!(
         state,
         Some("accounted") | Some(IMPACT_ARRIVAL_NOT_APPLICABLE)
     ) {
-        return Vec::new();
+        return owed_outside.into_iter().collect();
     }
     let reported = state.map_or_else(|| "absent".to_string(), |state| format!("{state:?}"));
     if !matches!(state, Some("unaccounted") | Some("unmeasured")) {
@@ -1397,6 +1674,7 @@ pub fn impact_arrival_gaps(payload: &serde_json::Value) -> Vec<String> {
              consumer count cannot be read as whole"
         ));
     }
+    gaps.extend(owed_outside);
     gaps
 }
 
@@ -1999,6 +2277,17 @@ mod tests {
             resolved_call_edges: 2,
             unaccounted_call_sites: Some(1),
             shortfall_is_floor: false,
+            ..UnaccountedFile::default()
+        };
+        let ledgered = UnaccountedFile {
+            file: "tests/test_index.py".to_string(),
+            parsed_call_sites: Some(4),
+            resolved_call_edges: 2,
+            unaccounted_call_sites: Some(2),
+            count_source: CountSource::SiteLedgers,
+            count_exact: true,
+            unsettled_by_state: [("unresolved", 1), ("binding", 1)].into_iter().collect(),
+            ..UnaccountedFile::default()
         };
         let withheld = UnaccountedFile {
             file: "tests/test_linkgraph.py".to_string(),
@@ -2006,6 +2295,7 @@ mod tests {
             resolved_call_edges: 4,
             unaccounted_call_sites: None,
             shortfall_is_floor: false,
+            ..UnaccountedFile::default()
         };
         let many: Vec<UnaccountedFile> = (0..8)
             .map(|index| UnaccountedFile {
@@ -2014,6 +2304,7 @@ mod tests {
                 resolved_call_edges: 1,
                 unaccounted_call_sites: Some(index + 1),
                 shortfall_is_floor: false,
+                ..UnaccountedFile::default()
             })
             .collect();
         let build = |unaccounted: Vec<UnaccountedFile>| CallerArrival {
@@ -2022,11 +2313,23 @@ mod tests {
             family_measured: 0,
             unaccounted,
             unmeasured_reason: None,
+            files_from_site_ledgers: 0,
+            owed_callers: Vec::new(),
+            call_sites: None,
+            owed_outside: Some(Vec::new()),
         };
         vec![
             ("one shortfall file", build(vec![one.clone()])),
             ("one withheld-count file", build(vec![withheld.clone()])),
-            ("both kinds joined", build(vec![one, withheld])),
+            (
+                "both kinds joined",
+                build(vec![one.clone(), withheld.clone()]),
+            ),
+            ("a file counted from ledgers", build(vec![ledgered.clone()])),
+            (
+                "all three kinds joined",
+                build(vec![one, withheld, ledgered]),
+            ),
             ("more files than the factor names", build(many)),
             (
                 "unmeasured",
@@ -2804,5 +3107,164 @@ mod tests {
             gaps[0].starts_with("caller_arrival_state_unknown"),
             "{gaps:?}"
         );
+    }
+
+    /// The callers of the stranger's test file, as `store_with` minted them.
+    fn caller_file_entities(parsed: Option<u64>) -> (Entity, Entity) {
+        (
+            entity_in("test_storage", CALLER_FILE, parsed),
+            entity_in("test_bodies_round_trip", CALLER_FILE, parsed),
+        )
+    }
+
+    /// Ledgers for the test file's callers under one proof context: the
+    /// module's with no call, and the test's with one site per state.
+    fn ledgers_for(
+        store: &InMemoryGraph,
+        module: Option<&Entity>,
+        caller: Option<(&Entity, Vec<kin_model::CallSiteState>)>,
+    ) {
+        use crate::call_sites::fixture::{admit, id_of, ledger, proof_context};
+        let context = proof_context(LanguageId::Python, "1.1.400");
+        let context_id = id_of(&context);
+        let mut records = vec![context];
+        if let Some(module) = module {
+            records.push(ledger(module, "", context_id, Vec::new()));
+        }
+        if let Some((caller, states)) = caller {
+            let tokens = ["ab", "cd", "ef", "gh"];
+            records.push(ledger(
+                caller,
+                "abcdefghij",
+                context_id,
+                tokens.into_iter().zip(states).collect(),
+            ));
+        }
+        admit(store, &[], records);
+    }
+
+    fn find_note() -> Entity {
+        entity_in("find_note", FOCAL_FILE, Some(2))
+    }
+
+    #[test]
+    fn a_family_file_whose_callers_all_hold_ledgers_is_counted_exactly_from_them() {
+        use kin_model::CallSiteState;
+        // Three parsed sites and one edge, which the arithmetic reads as two
+        // sites that went nowhere. The ledgers say every one of the three was
+        // settled: one into the focal's sibling, two outside the repository.
+        let (store, focal) = store_with(Some(3), 1, true);
+        let (module, caller) = caller_file_entities(Some(3));
+        ledgers_for(
+            &store,
+            Some(&module),
+            Some((
+                &caller,
+                vec![
+                    CallSiteState::ProvenTarget {
+                        target: find_note().id,
+                    },
+                    CallSiteState::ProvenOutside,
+                    CallSiteState::ProvenOutside,
+                ],
+            )),
+        );
+        let arrival = observe_caller_arrival(&store, &focal);
+        let block = arrival.to_json();
+        assert_eq!(arrival.state, ArrivalState::Accounted, "{block}");
+        assert_eq!(block["count_exact"], true, "{block}");
+        assert_eq!(block["files_counted_from_site_ledgers"], 1, "{block}");
+        assert_eq!(block["owed_caller_count"], 0, "{block}");
+        let tally = arrival.call_sites.as_ref().expect("the family is tallied");
+        assert_eq!(tally.callers, 2);
+        assert_eq!(tally.sites, 3);
+        assert!(tally.is_settled());
+    }
+
+    #[test]
+    fn an_unsettled_site_in_a_ledgered_family_file_is_an_exact_count() {
+        use kin_model::CallSiteState;
+        let (store, focal) = store_with(Some(3), 1, true);
+        let (module, caller) = caller_file_entities(Some(3));
+        ledgers_for(
+            &store,
+            Some(&module),
+            Some((
+                &caller,
+                vec![
+                    CallSiteState::ProvenTarget {
+                        target: find_note().id,
+                    },
+                    CallSiteState::Unresolved {
+                        reason: kin_model::UnresolvedReason::NoAnswer,
+                    },
+                    CallSiteState::ProvenOutside,
+                ],
+            )),
+        );
+        let arrival = observe_caller_arrival(&store, &focal);
+        let block = arrival.to_json();
+        assert_eq!(arrival.state, ArrivalState::Unaccounted, "{block}");
+        let row = &block["unaccounted_files"][0];
+        assert_eq!(row["file"], CALLER_FILE, "{block}");
+        assert_eq!(row["count_source"], "site_ledgers", "{block}");
+        assert_eq!(row["count_exact"], true, "{block}");
+        assert_eq!(row["unaccounted_call_sites"], 1, "{block}");
+        assert_eq!(row["parsed_call_sites"], 3, "{block}");
+        assert_eq!(row["resolved_call_edges"], 2, "{block}");
+        assert_eq!(
+            row["unsettled_by_state"],
+            json!({"unresolved": 1}),
+            "{block}"
+        );
+        let factor = arrival
+            .limiting_factor()
+            .expect("an unsettled site limits the answer");
+        assert!(
+            factor.contains("1 of 3 call sites are not settled, an exact count from site ledgers"),
+            "{factor}"
+        );
+        assert!(!factor.contains("; "), "{factor}");
+        let gap = arrival_gap(&json!({ CALLER_ARRIVAL_KEY: block })).expect("the gate reads it");
+        assert!(gap.contains("1 unsettled, exact"), "{gap}");
+    }
+
+    #[test]
+    fn a_family_file_with_an_owed_caller_keeps_the_arithmetic_and_names_the_caller() {
+        use kin_model::CallSiteState;
+        let (store, focal) = store_with(Some(3), 1, true);
+        let (module, caller) = caller_file_entities(Some(3));
+        ledgers_for(
+            &store,
+            None,
+            Some((&caller, vec![CallSiteState::ProvenOutside; 3])),
+        );
+        let arrival = observe_caller_arrival(&store, &focal);
+        let block = arrival.to_json();
+        assert_eq!(arrival.state, ArrivalState::Unaccounted, "{block}");
+        assert_eq!(block["count_exact"], false, "{block}");
+        assert_eq!(block["files_counted_from_site_ledgers"], 0, "{block}");
+        let row = &block["unaccounted_files"][0];
+        assert_eq!(row["count_source"], "parse_versus_edges", "{block}");
+        assert_eq!(row["count_exact"], false, "{block}");
+        assert_eq!(
+            row["unaccounted_call_sites"], 2,
+            "the arithmetic stands: {block}"
+        );
+        assert_eq!(row["owed_callers"], 1, "{block}");
+        assert_eq!(block["owed_caller_count"], 1, "{block}");
+        assert_eq!(
+            block["owed_callers"],
+            json!([{
+                "id": module.id.to_string(),
+                "name": "test_storage",
+                "file": CALLER_FILE,
+                "reading": "owed_enrichment",
+            }]),
+            "{block}"
+        );
+        let tally = arrival.call_sites.as_ref().expect("the family is tallied");
+        assert_eq!(tally.callers_owed_enrichment, 1);
+        assert!(!tally.is_settled());
     }
 }

@@ -50,7 +50,10 @@
 //! One line of JSON per relation, appended as it is accepted, so a process that
 //! dies mid-write loses only the partial tail and every complete line before it
 //! still parses. A retirement is a line of its own naming the files whose
-//! recorded evidence it drops, applied in order at replay. Rewriting the whole
+//! recorded evidence it drops, applied in order at replay. A node line carries
+//! the external symbols and proof contexts accepted relations name, which
+//! replay installs before any relation so a recorded edge into a symbol
+//! outside the repository finds its endpoint. Rewriting the whole
 //! record for every retirement cost a full read and write of it per edited
 //! file, and a crash mid-rewrite lost the record entirely.
 
@@ -61,7 +64,10 @@ use std::sync::{Mutex, MutexGuard};
 
 use kin_core::KinLayout;
 use kin_db::InMemoryGraph;
-use kin_model::{EntityStore as _, Relation, RelationId};
+use kin_model::{
+    EntityStore as _, ExternalReference, ExternalReferenceDelta, Relation, RelationId,
+    ResolutionRecord, ResolutionRecordDelta,
+};
 use tracing::{debug, info, warn};
 
 /// Serializes every operation on a record in this process.
@@ -93,6 +99,23 @@ struct Retirement {
 /// first field, so the two can be told apart without parsing a line twice.
 const RETIREMENT_PREFIX: &[u8] = b"{\"retired_files\":";
 
+/// A line carrying the graph nodes and records accepted relations name.
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct AcceptedNodes {
+    accepted_nodes: NodeSet,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct NodeSet {
+    #[serde(default)]
+    external_references: Vec<ExternalReference>,
+    #[serde(default)]
+    resolution_records: Vec<ResolutionRecord>,
+}
+
+/// How every node line starts.
+const NODES_PREFIX: &[u8] = b"{\"accepted_nodes\":";
+
 fn encode_lines(relations: &[Relation]) -> serde_json::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     for relation in relations {
@@ -112,6 +135,7 @@ fn encode_lines(relations: &[Relation]) -> serde_json::Result<Vec<u8>> {
 enum Line {
     Relation(Relation),
     Retirement(Vec<String>),
+    Nodes(NodeSet),
     Blank,
     Unparsed,
 }
@@ -124,6 +148,10 @@ fn parse_line(line: &[u8]) -> Line {
         return serde_json::from_slice::<Retirement>(line).map_or(Line::Unparsed, |retirement| {
             Line::Retirement(retirement.retired_files)
         });
+    }
+    if line.starts_with(NODES_PREFIX) {
+        return serde_json::from_slice::<AcceptedNodes>(line)
+            .map_or(Line::Unparsed, |nodes| Line::Nodes(nodes.accepted_nodes));
     }
     serde_json::from_slice::<Relation>(line).map_or(Line::Unparsed, Line::Relation)
 }
@@ -279,6 +307,91 @@ pub(crate) fn record(layout: &KinLayout, accepted: &[Relation]) -> bool {
     }
 }
 
+/// Record the external symbols and proof contexts this store has just accepted
+/// into its live graph for relations that name them, so replay can install
+/// them before the relations. Answers whether they were recorded.
+pub(crate) fn record_nodes(
+    layout: &KinLayout,
+    external_references: &[ExternalReference],
+    resolution_records: &[ResolutionRecord],
+) -> bool {
+    if external_references.is_empty() && resolution_records.is_empty() {
+        return true;
+    }
+    let line = AcceptedNodes {
+        accepted_nodes: NodeSet {
+            external_references: external_references.to_vec(),
+            resolution_records: resolution_records.to_vec(),
+        },
+    };
+    let mut bytes = match serde_json::to_vec(&line) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            warn!(%error, "could not encode accepted external symbols and proof contexts");
+            return false;
+        }
+    };
+    bytes.push(b'\n');
+    let _io = record_io();
+    match append(layout, &bytes, true) {
+        Ok(()) => true,
+        Err(error) => {
+            warn!(
+                %error,
+                external_references = external_references.len(),
+                resolution_records = resolution_records.len(),
+                "could not record accepted external symbols and proof contexts; a crash before \
+                 the next publication loses the relations that name them"
+            );
+            false
+        }
+    }
+}
+
+/// Install every recorded node and record the graph does not hold yet, in one
+/// transaction, and answer the ones installed for the replacement record.
+fn install_recorded_nodes(graph: &InMemoryGraph, nodes: NodeSet) -> NodeSet {
+    let mut installed = NodeSet::default();
+    let mut seen_references = std::collections::HashSet::new();
+    for reference in nodes.external_references {
+        if seen_references.insert(reference.id)
+            && graph.get_external_reference(&reference.id).is_none()
+        {
+            installed.external_references.push(reference);
+        }
+    }
+    let mut seen_records = std::collections::HashSet::new();
+    for record in nodes.resolution_records {
+        let id = record.id();
+        if seen_records.insert(id) && graph.get_resolution_record(&id).is_none() {
+            installed.resolution_records.push(record);
+        }
+    }
+    if installed.external_references.is_empty() && installed.resolution_records.is_empty() {
+        return installed;
+    }
+    let delta = kin_model::TransactionDelta {
+        external_reference_deltas: installed
+            .external_references
+            .iter()
+            .cloned()
+            .map(|new| ExternalReferenceDelta::Added { new })
+            .collect(),
+        resolution_record_deltas: installed
+            .resolution_records
+            .iter()
+            .cloned()
+            .map(|new| ResolutionRecordDelta::Added { new })
+            .collect(),
+        ..Default::default()
+    };
+    if let Err(error) = graph.apply_transaction_delta(&delta) {
+        debug!(%error, "this graph refuses recorded external symbols or proof contexts; dropping them");
+        return NodeSet::default();
+    }
+    installed
+}
+
 /// Every relation a failed write leaves unrecorded, each as `id src->dst`.
 fn unrecorded_names(relations: &[Relation]) -> String {
     relations
@@ -314,6 +427,7 @@ fn replay_with_read(
 ) -> usize {
     let _io = record_io();
     let mut index = Index::default();
+    let mut nodes = NodeSet::default();
     let indexed = read_record(&mut |sequence, line| match parse_line(line) {
         Line::Relation(relation) => {
             index.lines += 1;
@@ -324,6 +438,11 @@ fn replay_with_read(
             for file in files {
                 index.retired_at.insert(file, sequence);
             }
+        }
+        Line::Nodes(set) => {
+            index.lines += 1;
+            nodes.external_references.extend(set.external_references);
+            nodes.resolution_records.extend(set.resolution_records);
         }
         Line::Unparsed => index.unparsed += 1,
         Line::Blank => {}
@@ -420,7 +539,25 @@ fn replay_with_read(
         }
     };
 
+    // The symbols and contexts go in first, so a recorded edge into one finds
+    // its endpoint; the ones installed stay recorded until a commit.
+    let installed_nodes = install_recorded_nodes(graph, nodes);
     let rewritten = rewrite(layout, |out| {
+        if !installed_nodes.external_references.is_empty()
+            || !installed_nodes.resolution_records.is_empty()
+        {
+            serde_json::to_writer(
+                &mut *out,
+                &AcceptedNodes {
+                    accepted_nodes: NodeSet {
+                        external_references: installed_nodes.external_references.clone(),
+                        resolution_records: installed_nodes.resolution_records.clone(),
+                    },
+                },
+            )
+            .map_err(std::io::Error::other)?;
+            out.write_all(b"\n")?;
+        }
         let mut failed = None;
         read_record(&mut |sequence, line| {
             if failed.is_none() {

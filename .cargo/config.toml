@@ -7,3 +7,11 @@
 [registries.kin]
 index = "sparse+https://kinlab.ai/registry/cargo/"
 
+
+# Nothing cargo runs fetches a language server's analysis environment: not a
+# test, not a daemon a test starts, not CI. Kin's own default is on, so a
+# developer who wants `cargo run` to fetch sets KIN_ANALYSIS_ENVIRONMENTS=1,
+# which wins over this value. The test `the_test_harness_never_fetches` in
+# kin-lsp fails if this is removed.
+[env]
+KIN_ANALYSIS_ENVIRONMENTS = "0"

@@ -13,7 +13,7 @@
 
 Functions, types, and the relationships between them are data you commit, branch, and merge. Exact source is preserved byte for byte, and filesystem projections let supported tools keep working with ordinary files.
 
-**Public alpha.** Start with a small repository you know well. Expect rough edges and breaking changes.
+**Public beta.** Try Kin on a real project you know well. Expect rough edges.
 
 [Quickstart](#quickstart) · [Documentation](docs/quickstart.md) · [Browser demo](https://kinlab.ai/demo)
 
@@ -44,13 +44,13 @@ For [Codex](plugins/kin-codex/README.md#install), add the marketplace and instal
 
 For Cursor, add the MCP server by hand; see [plugins/kin-cursor](plugins/kin-cursor/README.md#install) for the exact snippet.
 
-After installing, run `kin init .` in a small repository you know well; the `kin-setup` skill walks you through the rest.
+After installing, run `kin init .` in a fresh clone of a project you know well; the `kin-setup` skill walks you through the rest.
 
 Kin is not published on crates.io. The `kin` crate there is an unrelated project.
 
 ## Quickstart
 
-Use a disposable copy of a small Git repository. Import includes its full reachable history and can take substantial time and memory. **Shallow clones, submodules, and Git LFS are not supported.**
+Start in a fresh, full clone of a project you know well. `kin init` reads your Git history without changing it or your tracked files. It adds a `.kin` directory and one line to `.git/info/exclude`. Import covers every commit your branches and tags reach, so time, memory and disk grow with history rather than with the size of the checkout. Before it starts, `kin init` checks memory and free disk and stops with the numbers when it can already tell the machine is short. **Shallow clones, submodules and Git LFS are not supported**, and Git hooks, a sparse checkout or an unfinished merge or rebase also stop the import. `kin init` names the fix for each, and a fresh clone avoids most of them.
 
 ### 1. Install
 
@@ -77,7 +77,7 @@ exec "$SHELL" -l
 
 On native Windows x64, install from PowerShell with `irm https://get.kinlab.dev/install.ps1 | iex`.
 It installs the `kin` CLI and does not connect AI coding tools, because WSL2 remains the
-recommended path on Windows. The Windows entry under [Alpha limits](#alpha-limits)
+recommended path on Windows. The Windows entry under [Beta limits](#beta-limits)
 says what works there. No native Windows ARM64 build is published. On an ARM64 machine, run
 that line from x64 PowerShell to install the x86_64 build under emulation, or use WSL2.
 
@@ -147,13 +147,13 @@ Kin has its own commits, branches, merges, diffs, and history, including in repo
 
 [Native version-control walkthrough](docs/readme-reference.md#version-control-without-git) · [Git interoperability and export limits](docs/readme-reference.md#how-kin-relates-to-git)
 
-## Alpha limits
+## Beta limits
 
 **Coverage is incomplete.** Supported languages are parsed into entities and relationships; other files remain available as content and history. An empty result does not prove there are no callers or dependencies. Keep using your compiler, tests, and review. See [language support](docs/language-support.md).
 
-**Compatibility varies.** Filesystem projection has separate platform and tool restrictions. Check [platform notes](docs/readme-reference.md#platform-and-maturity) before relying on it.
+**Compatibility varies.** Release archives do not include the deprecated `kin-vfs` filesystem projection, so there is no transparent projection to rely on. Check [platform notes](docs/readme-reference.md#platform-and-maturity) for what each platform supports.
 
-**Preserve Kin-only state.** Deleting `.kin` and re-importing from Git does not recover commits, reviews, or other state that existed only in Kin. Read the [import, recovery, and upgrade notes](docs/readme-reference.md#what-is-real-today-and-what-is-alpha).
+**Back up Kin-only state.** Commits, branches, reviews and specs you record with Kin live in `.kin`, not in Git. Deleting `.kin` and re-importing from Git does not recover them, so run `kin backup create` first. Read the [import, recovery, and upgrade notes](docs/readme-reference.md#what-is-real-today-and-what-is-beta).
 
 **Windows.** Native Windows x86_64 support is early. Repository admission works: `kin init` imports a Git repository and publishes graph authority, and graph, lexical, and daemon-backed queries answer natively. The end-to-end install proof also runs agent setup on native Windows and gets graph-backed answers from the installed MCP server. Transparent filesystem projection is not shipped on Windows, and review workflows are not yet tested there, so WSL2 remains the recommended path for the full Kin experience.
 

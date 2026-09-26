@@ -40,6 +40,8 @@ const DAEMON_TEST_RUNTIME_PROCESS_GROUP_ENV: &str = "KIN_TEST_RUNTIME_CONTAINMEN
 pub fn isolate_daemon_test_command(command: &mut Command) {
     scrub_daemon_test_authority(command, is_daemon_test_authority);
     command.env("KIN_VFS_DISABLE", "1");
+    // A test daemon never fetches a language server's analysis environment.
+    command.env("KIN_ANALYSIS_ENVIRONMENTS", "0");
 }
 
 fn scrub_daemon_test_authority(command: &mut Command, predicate: fn(&std::ffi::OsStr) -> bool) {
@@ -253,6 +255,7 @@ fn scrub_daemon_test_guardian_environment(
         environment.env_remove(key);
     }
     environment.env("KIN_VFS_DISABLE", "1");
+    environment.env("KIN_ANALYSIS_ENVIRONMENTS", "0");
 }
 
 #[cfg(unix)]

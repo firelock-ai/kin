@@ -2711,6 +2711,16 @@ fn cross_repo_references_qualifier(payload: &Value) -> CrossRepoQualifier {
         // to have failed, and nothing about this repository's own graph is in
         // question (FIR-2633).
         Some("not_configured") => cross_repo_not_configured_note(),
+        // Not a gap either. The focal is a symbol outside every repository, and
+        // the spine federates references to repository entities, so there is
+        // no cross-repo authority to have asked.
+        Some(crate::handlers::external_symbols::CROSS_REPO_NOT_APPLICABLE) => {
+            CrossRepoQualifier::Note(
+                "cross_repo_not_applicable: the focal is a symbol outside every repository, \
+                 so this answer lists the callers this repository holds"
+                    .to_string(),
+            )
+        }
         Some(status) => CrossRepoQualifier::Gap(format!(
             "cross_repo_authority_unknown: unrecognized cross-repo authority status '{status}'"
         )),

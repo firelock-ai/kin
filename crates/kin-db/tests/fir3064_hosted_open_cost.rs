@@ -135,6 +135,7 @@ fn history_chain(changes: usize, shared: &SharedAdmissionPolicy) -> Vec<Semantic
             spec_link: None,
             evidence: Vec::new(),
             risk_summary: None,
+            resolution_record_deltas: Vec::new(),
         };
         change.id = compute_semantic_change_id(&change).expect("change id computes");
         parent = Some(change.id);

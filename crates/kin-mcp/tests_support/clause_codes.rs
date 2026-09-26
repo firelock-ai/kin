@@ -102,6 +102,34 @@ const PATTERNS: &[(&str, &[&str])] =
 /// Listed codes no literal names, each with the source that produces it.
 const SOURCED_ELSEWHERE: &[(&str, &str)] = &[
     (
+        "binding_unproven",
+        "kin-model call_site_reading.rs CallSiteTally::clauses, carried by the call_sites block",
+    ),
+    (
+        "call_sites_not_in_build",
+        "kin-model call_site_reading.rs CallSiteTally::clauses, carried by the call_sites block",
+    ),
+    (
+        "call_sites_owed",
+        "kin-model call_site_reading.rs CallSiteTally::clauses, carried by the call_sites block",
+    ),
+    (
+        "call_sites_server_failed",
+        "kin-model call_site_reading.rs CallSiteTally::clauses, carried by the call_sites block",
+    ),
+    (
+        "call_sites_unproven_no_resolver",
+        "kin-model call_site_reading.rs CallSiteTally::clauses, carried by the call_sites block",
+    ),
+    (
+        "call_sites_unresolved",
+        "kin-model call_site_reading.rs CallSiteTally::clauses, carried by the call_sites block",
+    ),
+    (
+        "proof_context_stale",
+        "kin-model call_site_reading.rs CallSiteTally::clauses, carried by the call_sites block",
+    ),
+    (
         "cross_repo_unavailable",
         "negative.rs cross_repo_unavailable_qualifier, the label for a spine answer naming no code",
     ),

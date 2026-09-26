@@ -21425,6 +21425,7 @@ mod tests {
             evidence: Vec::new(),
             risk_summary: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         };
         change.id = kin_core::compute_semantic_change_id(&change).unwrap();
         change
@@ -21572,6 +21573,7 @@ mod tests {
                     tree_deltas: vec![tree_delta],
                     admission_policy_delta: None,
                     external_reference_deltas: Vec::new(),
+                    resolution_record_deltas: Vec::new(),
                 })?;
             }
             EntityStore::upsert_opaque_artifact(self, artifact)

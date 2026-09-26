@@ -292,27 +292,112 @@ fn authority_semantics_divergence(
     None
 }
 
-/// Plan the daemon-side semantic transition of one repository command from the
-/// live query graph.
+/// The graph a transition moves to, by the domains a transition compares.
+#[derive(Clone, Copy)]
+pub(crate) struct TargetGraph<'a> {
+    pub(crate) entities: &'a std::collections::HashMap<kin_model::EntityId, kin_model::Entity>,
+    pub(crate) relations: &'a std::collections::HashMap<kin_model::RelationId, kin_model::Relation>,
+    pub(crate) external_references:
+        &'a std::collections::HashMap<kin_model::ExternalReferenceId, kin_model::ExternalReference>,
+    pub(crate) resolution_records:
+        &'a std::collections::HashMap<kin_model::ResolutionRecordId, kin_model::ResolutionRecord>,
+}
+
+impl<'a> TargetGraph<'a> {
+    pub(crate) fn of_state(state: &'a kin_model::graph::ResolvedGraphState) -> Self {
+        Self {
+            entities: &state.entities,
+            relations: &state.relations,
+            external_references: &state.external_references,
+            resolution_records: &state.resolution_records,
+        }
+    }
+
+    pub(crate) fn of_snapshot(snapshot: &'a kin_db::GraphSnapshot) -> Self {
+        Self {
+            entities: &snapshot.entities,
+            relations: &snapshot.relations,
+            external_references: &snapshot.external_references,
+            resolution_records: &snapshot.resolution_records,
+        }
+    }
+}
+
+/// A workspace semantic transition from `current` to `target`, external
+/// symbols and resolution records included: the target's, and those of the
+/// current graph a target relation still names.
+pub(crate) fn plan_workspace_graph_transition(
+    current: TargetGraph<'_>,
+    target: TargetGraph<'_>,
+) -> Result<kin_model::WorkspaceSemanticDelta> {
+    let semantic = kin_core::diff_workspace_semantics(
+        current.entities,
+        current.relations,
+        target.entities,
+        target.relations,
+    )?;
+    let (references, records) = kin_core::desired_resolution_nodes(
+        target.external_references,
+        target.resolution_records,
+        current.external_references,
+        current.resolution_records,
+        target.relations.values(),
+    );
+    Ok(kin_core::with_resolution_node_transition(
+        semantic,
+        current.external_references,
+        current.resolution_records,
+        &references,
+        &records,
+    )?)
+}
+
+/// Plan the daemon-side transition of one repository command from the live
+/// query graph: entities, relations, external symbols and resolution records.
+/// The daemon's graph ends holding the target's external symbols and records,
+/// and those of its own that a target relation still names.
 ///
 /// The authority-side delta of the same command is planned from the workspace
 /// lease. These are deliberately two different deltas over the same transition:
 /// the live graph carries derived enrichment that has not crossed the
 /// compare-and-swap, so reusing the authority delta would leave that enrichment
 /// installed and land the daemon on a graph that is not the exact target.
-pub(crate) fn plan_daemon_semantic_delta(
+pub(crate) fn plan_daemon_graph_transition(
     state: &DaemonState,
-    target_entities: &std::collections::HashMap<kin_model::EntityId, kin_model::Entity>,
-    target_relations: &std::collections::HashMap<kin_model::RelationId, kin_model::Relation>,
-) -> Result<kin_model::WorkspaceSemanticDelta> {
+    target: TargetGraph<'_>,
+) -> Result<kin_model::TransactionDelta> {
+    plan_daemon_graph_transition_from_tree(state, target).map(|(delta, _)| delta)
+}
+
+/// [`plan_daemon_graph_transition`], also answering the tree of the live graph
+/// the transition was planned from, for a caller that corrects the daemon's
+/// tree against that same state.
+pub(crate) fn plan_daemon_graph_transition_from_tree(
+    state: &DaemonState,
+    target: TargetGraph<'_>,
+) -> Result<(kin_model::TransactionDelta, kin_model::ResolvedTree)> {
     let live = state.graph.to_snapshot();
-    kin_core::diff_workspace_semantics(
+    let semantic = kin_core::diff_workspace_semantics(
         &live.entities,
         &live.relations,
-        target_entities,
-        target_relations,
-    )
-    .map_err(Into::into)
+        target.entities,
+        target.relations,
+    )?;
+    let (references, records) = kin_core::desired_resolution_nodes(
+        target.external_references,
+        target.resolution_records,
+        &live.external_references,
+        &live.resolution_records,
+        target.relations.values(),
+    );
+    let semantic = kin_core::with_resolution_node_transition(
+        semantic,
+        &live.external_references,
+        &live.resolution_records,
+        &references,
+        &records,
+    )?;
+    Ok((semantic.transaction_delta(), live.resolved_tree))
 }
 
 #[cfg(test)]

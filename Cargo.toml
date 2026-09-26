@@ -44,7 +44,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.8.0"
+version = "0.8.1"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["Troy Fortin <troy@firelock.ai>"]
@@ -143,7 +143,7 @@ pretty_assertions = "1"
 serial_test = "4"
 
 # Internal crates
-kin-model = { path = "crates/kin-model", version = "=0.7.28", registry = "kin" }
+kin-model = { path = "crates/kin-model", version = "=0.7.29", registry = "kin" }
 kin-blobs = { path = "crates/kin-blobs", version = "=0.1.5", registry = "kin" }
 kin-core = { path = "crates/kin-core" }
 kin-parser = { path = "crates/kin-parser" }
@@ -167,7 +167,7 @@ kin-daemon-spawn = { path = "crates/kin-daemon-spawn" }
 kin-mcp = { path = "crates/kin-mcp" }
 kin-spine = { path = "crates/kin-spine" }
 kin-registry = { path = "crates/kin-registry" }
-kin-lsp = { path = "crates/kin-lsp", version = "=0.7.19", registry = "kin" }
+kin-lsp = { path = "crates/kin-lsp", version = "=0.7.20", registry = "kin" }
 # Named here for the first time. Until this import kin-infer arrived only through
 # kin-db's features and one direct pin in crates/kin-migrate, which asked for
 # `>=0.2.1`; a workspace member can say `{ workspace = true }` only for a name this

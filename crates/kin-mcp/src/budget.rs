@@ -311,6 +311,11 @@ pub const ELISION_REASON_TOKEN_BUDGET: &str = "token_budget";
 /// it as one would send a caller to a lever that cannot help.
 pub const ELISION_REASON_DEPENDENTS_CAP: &str = "dependents_cap";
 
+/// The reason code an external call withheld by the per-list cap carries.
+/// Like the dependents cap, no budget parameter recovers it; `graph_neighborhood`
+/// with `direction: "out"` lists every one.
+pub const ELISION_REASON_EXTERNAL_CALLS_CAP: &str = "external_calls_cap";
+
 /// Where a payload publishes what its lists lost.
 pub const ELISIONS_KEY: &str = "elisions";
 
@@ -1373,10 +1378,18 @@ fn trim_context_output_inner(payload: &mut Value, reason: &str) -> bool {
         "contracts",
         "tests",
         "transitive_deps",
+        "external_calls",
+        CALL_SITE_ROWS,
         "dependents",
         "dependencies",
         "entities",
     ] {
+        if key == CALL_SITE_ROWS {
+            if trim_call_site_row(payload, reason) {
+                return true;
+            }
+            continue;
+        }
         let Some(rows) = payload.get_mut(key).and_then(Value::as_array_mut) else {
             continue;
         };
@@ -1402,12 +1415,12 @@ fn trim_context_output_inner(payload: &mut Value, reason: &str) -> bool {
             .unwrap_or(0);
         payload[format!("{key}_withheld")] = json!(count + 1);
         if let Some(selection) = payload.get_mut("dependency_selection") {
-            let field = if key == "dependents" {
-                "dependents_returned"
-            } else {
-                "returned"
+            let field = match key {
+                "dependents" => "dependents_returned",
+                "external_calls" => "external_calls_returned",
+                _ => "returned",
             };
-            if matches!(key, "dependencies" | "dependents") {
+            if matches!(key, "dependencies" | "dependents" | "external_calls") {
                 selection[field] = json!(kept);
             }
         }
@@ -1417,6 +1430,38 @@ fn trim_context_output_inner(payload: &mut Value, reason: &str) -> bool {
     // The core's whole bodies go only after its optional neighborhood. Identity
     // and route rows remain, and an impossible metadata floor still refuses.
     trim_context_bodies(payload, reason, false)
+}
+
+/// The name the focal's call-site rows are cut under, in `elisions`.
+///
+/// The rows live inside the `call_sites` block, whose tally the verdict reads
+/// and which is never cut: a row is evidence a reader audits the tally with,
+/// so rows go before any dependency row and before the focal's own body, and
+/// the block counts what went in `rows_withheld`.
+pub const CALL_SITE_ROWS: &str = "call_site_rows";
+
+/// Cut the last of the focal's call-site rows, when the block holds any.
+fn trim_call_site_row(payload: &mut Value, reason: &str) -> bool {
+    let key = crate::call_sites::CALL_SITES_KEY;
+    let Some(rows) = payload
+        .get_mut(key)
+        .and_then(|block| block.get_mut("rows"))
+        .and_then(Value::as_array_mut)
+    else {
+        return false;
+    };
+    if rows.pop().is_none() {
+        return false;
+    }
+    let kept = rows.len();
+    let block = &mut payload[key];
+    let withheld = block
+        .get("rows_withheld")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    block["rows_withheld"] = json!(withheld + 1);
+    record_elision_for(payload, CALL_SITE_ROWS, kept, 1, reason);
+    true
 }
 
 fn trim_context_bodies(payload: &mut Value, reason: &str, preserve_core: bool) -> bool {

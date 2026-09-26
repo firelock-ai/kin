@@ -145,6 +145,7 @@ fn generate_snapshot(n: usize, rels_per_entity: usize) -> (GraphSnapshot, Vec<En
         repository_authority: None,
         external_references: HashMap::new(),
         materialized_graph: None,
+        resolution_records: Default::default(),
     };
 
     (snapshot, entity_ids)

@@ -114,6 +114,30 @@ pub const CLAUSE_CODES: &[ClauseCode] = &[
         meaning: "The answer stopped early and returned part of what it found, so its counts are a floor.",
     },
     ClauseCode {
+        code: "binding_unproven",
+        meaning: "A call site in the answer's scope calls through a value binding, which proves no target, so where that call goes is not known.",
+    },
+    ClauseCode {
+        code: "call_sites_not_in_build",
+        meaning: "A call site in the answer's scope sits in a file no build of the repository compiles, so no resolver proved where that call goes.",
+    },
+    ClauseCode {
+        code: "call_sites_owed",
+        meaning: "A caller in the answer's scope has call sites the graph has not settled yet, because its derivation or its enrichment is still owed, so a call there is not accounted for.",
+    },
+    ClauseCode {
+        code: "call_sites_server_failed",
+        meaning: "The resolver timed out, crashed or broke protocol at a call site in the answer's scope, so where that call goes is not known.",
+    },
+    ClauseCode {
+        code: "call_sites_unproven_no_resolver",
+        meaning: "A caller in the answer's scope has call sites no resolver can prove on this host now, because language-server enrichment is switched off, no language server serves its language, or the one that does cannot start (its analysis environment is missing, say), so waiting for enrichment will not settle them; the clause names which.",
+    },
+    ClauseCode {
+        code: "call_sites_unresolved",
+        meaning: "The resolver answered at a call site in the answer's scope and its answer proves no target, so where that call goes is not known.",
+    },
+    ClauseCode {
         code: "caller_arrival_state_unknown",
         meaning: "The answer reported a caller-arrival state this build does not recognise, so an empty reference list cannot be read as whole.",
     },
@@ -168,6 +192,10 @@ pub const CLAUSE_CODES: &[ClauseCode] = &[
     ClauseCode {
         code: "cross_repo_authority_unknown",
         meaning: "The answer reported a cross-repo authority status this build does not recognise.",
+    },
+    ClauseCode {
+        code: "cross_repo_not_applicable",
+        meaning: "The focal is a symbol outside every repository, so no cross-repo authority applies and the answer lists the callers this repository holds.",
     },
     ClauseCode {
         code: "cross_repo_not_configured",
@@ -322,6 +350,10 @@ pub const CLAUSE_CODES: &[ClauseCode] = &[
     ClauseCode {
         code: "page_bounded",
         meaning: "The response holds one page of the file; follow `next_cursor` to the end before reading the set as whole.",
+    },
+    ClauseCode {
+        code: "proof_context_stale",
+        meaning: "A call site in the answer's scope was proven under a proof context its resolver no longer runs under, so the proof may not hold for the code as it builds now.",
     },
     ClauseCode {
         code: "ranking_is_bounded",
@@ -691,6 +723,10 @@ impl Verdict {
                 "caller_arrival",
                 caller_arrival_reading(tool, payload, makes_absence_claim),
             ),
+            // The sites in the answer's own scope, on every shape of answer: a
+            // site whose call no resolver settled bounds the rows an answer did
+            // return as much as the absence it did not.
+            ("call_sites", call_sites_reading(payload)),
             ("edge_coverage", edge_coverage_reading(tool, payload)),
             ("withheld_candidates", withheld_candidates_reading(payload)),
             ("degradations", degradations_reading(payload)),
@@ -766,6 +802,14 @@ impl Verdict {
                  the walk stopped"
                     .to_string(),
             );
+        }
+        // The answer's own call sites, so the absence object and the verdict
+        // read the same gap: a verdict refused on an unsettled site under an
+        // absence object that stayed authoritative would be two verdicts.
+        if let Some(block) = payload.get(crate::call_sites::CALL_SITES_KEY) {
+            if block.get("settled").and_then(Value::as_bool) == Some(false) {
+                gaps.extend(call_sites_clauses(block));
+            }
         }
         if withheld_candidate_count(payload).is_some_and(|withheld| withheld > 0)
             && !discloses_withheld_candidates(payload)
@@ -988,6 +1032,7 @@ fn caller_arrival_reading(tool: &str, payload: &Value, makes_absence_claim: bool
     let gaps: Vec<String> = match tool {
         "find_references" | "get_context_pack" => crate::caller_arrival::arrival_gap(payload)
             .into_iter()
+            .chain(crate::caller_arrival::owed_outside_gap(payload))
             .collect(),
         "impact_analysis" if state == crate::caller_arrival::IMPACT_ARRIVAL_NOT_APPLICABLE => {
             return Reading::Silent
@@ -999,6 +1044,50 @@ fn caller_arrival_reading(tool: &str, payload: &Value, makes_absence_claim: bool
         Reading::Certified
     } else {
         Reading::Inconclusive(gaps)
+    }
+}
+
+/// The `call_sites` block's reading: inconclusive with the block's own clauses
+/// while a site in its scope is not settled, certified when every one is, and
+/// silent on an answer that carries no block.
+///
+/// The block is [`crate::call_sites`]'s, taken over the answer's scope through
+/// the one site-state reading every surface shares, and it states its clauses
+/// itself, so this reading and the block cannot disagree about what is
+/// unsettled. A block that says it is unsettled and names no clause is one no
+/// producer here writes, and it still refuses rather than certifying on no
+/// evidence.
+fn call_sites_reading(payload: &Value) -> Reading {
+    let Some(block) = payload.get(crate::call_sites::CALL_SITES_KEY) else {
+        return Reading::Silent;
+    };
+    match block.get("settled").and_then(Value::as_bool) {
+        Some(true) => Reading::Certified,
+        Some(false) => Reading::Inconclusive(call_sites_clauses(block)),
+        None => Reading::Silent,
+    }
+}
+
+/// The clauses an unsettled `call_sites` block names, never none.
+fn call_sites_clauses(block: &Value) -> Vec<String> {
+    let clauses: Vec<String> = block
+        .get("clauses")
+        .and_then(Value::as_array)
+        .map(|clauses| {
+            clauses
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    if clauses.is_empty() {
+        vec![format!(
+            "{UNLISTED_CLAUSE_CODE}: the call_sites block reports its scope unsettled and names \
+             no clause"
+        )]
+    } else {
+        clauses
     }
 }
 
@@ -4078,5 +4167,193 @@ mod tests {
             json!(NOT_APPLICABLE),
             "an input with nothing to say stays silent rather than certifying: {verdict}"
         );
+    }
+
+    /// The `call_sites` block is a named input of its own. While a site in the
+    /// block's scope is owed, unresolved, server-failed, not in any build, a
+    /// binding or proven under a stale proof context, the answer is
+    /// inconclusive under that state's code; a settled scope certifies; and an
+    /// answer that carries no block is not qualified by one.
+    mod call_sites {
+        use super::*;
+        use kin_model::{
+            CallSite, CallSiteLedger, CallSiteState, CallSiteTally, CallerSites, EntityId,
+            ExternalReferenceId, Hash256, ResolutionRecordId, ServerFailure, UnresolvedReason,
+        };
+
+        fn ledger_of(states: Vec<CallSiteState>) -> CallSiteLedger {
+            CallSiteLedger {
+                caller: EntityId(uuid::Uuid::from_u128(1)),
+                behavior_hash: Hash256::from_bytes([0; 32]),
+                body_hash: Hash256::from_bytes([0; 32]),
+                context: ResolutionRecordId(uuid::Uuid::from_u128(2)),
+                census: states.len() as u32,
+                sites: states
+                    .into_iter()
+                    .enumerate()
+                    .map(|(at, state)| CallSite {
+                        offset: at as u32 * 4,
+                        length: 3,
+                        state,
+                    })
+                    .collect(),
+            }
+        }
+
+        fn tally_of(reading: CallerSites) -> CallSiteTally {
+            let mut tally = CallSiteTally::default();
+            tally.add(&reading);
+            tally
+        }
+
+        fn current(states: Vec<CallSiteState>) -> CallSiteTally {
+            tally_of(CallerSites::Current(ledger_of(states)))
+        }
+
+        fn settled() -> CallSiteTally {
+            current(vec![
+                CallSiteState::ProvenTarget {
+                    target: EntityId(uuid::Uuid::from_u128(3)),
+                },
+                CallSiteState::ProvenExternal {
+                    target: ExternalReferenceId(uuid::Uuid::from_u128(4)),
+                },
+                CallSiteState::ProvenOutside,
+            ])
+        }
+
+        /// Every unsettled kind, each with the one code it calls for.
+        fn unsettled() -> Vec<(CallSiteTally, &'static str)> {
+            vec![
+                (
+                    current(vec![CallSiteState::Unresolved {
+                        reason: UnresolvedReason::NoAnswer,
+                    }]),
+                    "call_sites_unresolved",
+                ),
+                (
+                    current(vec![CallSiteState::ServerFailed {
+                        reason: ServerFailure::Timeout,
+                    }]),
+                    "call_sites_server_failed",
+                ),
+                (
+                    current(vec![CallSiteState::NotInBuild {
+                        reason: "no target compiles this file".to_string(),
+                    }]),
+                    "call_sites_not_in_build",
+                ),
+                (
+                    current(vec![CallSiteState::Binding { may_call: None }]),
+                    "binding_unproven",
+                ),
+                (
+                    tally_of(CallerSites::Stale(ledger_of(vec![
+                        CallSiteState::ProvenOutside,
+                    ]))),
+                    "proof_context_stale",
+                ),
+                (tally_of(CallerSites::OwedEnrichment), "call_sites_owed"),
+                (tally_of(CallerSites::OwedDerivation), "call_sites_owed"),
+                (
+                    tally_of(CallerSites::NoResolver {
+                        language: kin_model::LanguageId::Python,
+                        why: kin_model::NoResolver::EnrichmentOff,
+                    }),
+                    "call_sites_unproven_no_resolver",
+                ),
+                (
+                    tally_of(CallerSites::NoResolver {
+                        language: kin_model::LanguageId::Go,
+                        why: kin_model::NoResolver::ServerCannotStart {
+                            reason: "gopls: no Go toolchain; install Go".to_string(),
+                        },
+                    }),
+                    "call_sites_unproven_no_resolver",
+                ),
+            ]
+        }
+
+        fn verdict_over(block: Option<Value>) -> Value {
+            let mut payload = populated_reference_payload("present");
+            if let Some(block) = block {
+                payload[crate::call_sites::CALL_SITES_KEY] = block;
+            }
+            Verdict::compute("find_references", &payload, &Envelope::daemon(), None)
+                .expect("a retrieval payload carries a verdict")
+                .to_value()
+        }
+
+        #[test]
+        fn each_unsettled_state_makes_the_answer_inconclusive_under_its_own_code() {
+            for (tally, code) in unsettled() {
+                let block = crate::call_sites::block_json(&tally, "the focal's own body");
+                assert_eq!(block["settled"], json!(false), "{code}: {block}");
+                let verdict = verdict_over(Some(block));
+                assert_eq!(verdict["state"], json!(INCONCLUSIVE), "{code}: {verdict}");
+                assert_eq!(
+                    verdict["inputs"]["call_sites"],
+                    json!(INCONCLUSIVE),
+                    "{code}: the block is the input that refused: {verdict}"
+                );
+                assert_eq!(
+                    verdict["limiting_factor"],
+                    json!(code),
+                    "{code}: the factor is the state's own code and nothing else: {verdict}"
+                );
+                assert!(
+                    CLAUSE_CODES.iter().any(|entry| entry.code == code),
+                    "{code} is a listed code"
+                );
+            }
+        }
+
+        #[test]
+        fn a_settled_block_certifies_and_an_answer_without_one_is_not_qualified_by_it() {
+            let block = crate::call_sites::block_json(&settled(), "the focal's own body");
+            assert_eq!(block["settled"], json!(true), "{block}");
+            assert_eq!(block["clauses"], json!([]), "{block}");
+            let verdict = verdict_over(Some(block));
+            assert_eq!(verdict["state"], json!(CERTIFIED), "{verdict}");
+            assert_eq!(
+                verdict["inputs"]["call_sites"],
+                json!(CERTIFIED),
+                "{verdict}"
+            );
+
+            let verdict = verdict_over(None);
+            assert_eq!(verdict["state"], json!(CERTIFIED), "{verdict}");
+            assert_eq!(
+                verdict["inputs"]["call_sites"],
+                json!(NOT_APPLICABLE),
+                "an answer with no block has nothing to say about its sites: {verdict}"
+            );
+        }
+
+        #[test]
+        fn two_unsettled_states_are_both_named_and_no_clause_carries_the_separator() {
+            let mut tally = current(vec![
+                CallSiteState::Binding { may_call: None },
+                CallSiteState::Unresolved {
+                    reason: UnresolvedReason::NoAnswer,
+                },
+            ]);
+            tally.add(&CallerSites::OwedEnrichment);
+            let block =
+                crate::call_sites::block_json(&tally, "the files that import the focal's file");
+            for clause in block["clauses"].as_array().expect("clauses") {
+                let clause = clause.as_str().expect("a clause is a string");
+                assert!(
+                    !clause.contains(CLAUSE_SEPARATOR),
+                    "a clause carries the separator: {clause}"
+                );
+            }
+            let verdict = verdict_over(Some(block));
+            assert_eq!(
+                verdict["limiting_factor"],
+                json!("binding_unproven; call_sites_owed; call_sites_unresolved"),
+                "{verdict}"
+            );
+        }
     }
 }

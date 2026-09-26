@@ -102,7 +102,7 @@ async fn start_fake_server(root: &Path) -> (kin_lsp::lifecycle::LspServer, [u32;
             record.display().to_string(),
         ],
         root,
-        None,
+        kin_lsp::adapters::ServerLaunch::default(),
     )
     .await
     .expect("the daemon starts the fake language server");

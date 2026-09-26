@@ -181,6 +181,35 @@ fn verdict(payload: &Value) -> (String, Option<String>) {
     )
 }
 
+/// The factor's codes, less `call_sites_unproven_no_resolver` when this
+/// daemon's switched-off language-server enrichment is the whole reason for it.
+///
+/// A daemon started with `KIN_DAEMON_DISABLE_LSP=1` sweeps nothing and so
+/// writes no call-site ledger, and every caller in an answer's scope reads as
+/// unproven because enrichment is switched off: no resolver will ever prove
+/// it, so it is not owed. That says nothing about what this file tests. It is
+/// excused only while the block holds no site at all and names no other
+/// reason: a caller a ledger does describe, any unsettled site it holds, and
+/// a caller owed a sweep still limit the answer.
+fn codes_past_unswept_call_sites<'f>(answer: &Value, factor: &'f str) -> Vec<&'f str> {
+    let block = &answer["call_sites"];
+    let callers = block["callers_unproven_no_resolver"].as_u64().unwrap_or(0);
+    let switched_off = block["no_resolver"].as_object().is_some_and(|reasons| {
+        !reasons.is_empty()
+            && reasons
+                .keys()
+                .all(|reason| reason.ends_with("language-server enrichment is switched off"))
+    });
+    let unswept = block["sites"] == 0
+        && callers > 0
+        && block["callers_unproven_no_resolver"] == block["callers"]
+        && switched_off;
+    factor
+        .split("; ")
+        .filter(|code| !(unswept && *code == "call_sites_unproven_no_resolver"))
+        .collect()
+}
+
 /// The last lines of a repository's daemon log, for a failure message.
 fn daemon_log_tail(repo: &Path) -> String {
     let log = fs::read(repo.join(".kin/daemon.log")).unwrap_or_default();
@@ -199,7 +228,9 @@ fn daemon_log_tail(repo: &Path) -> String {
 /// that window reads `cross_repo_authority_incomplete`. The call is asked again
 /// while that factor is the whole of it, for at most a minute. The defect this
 /// file covers held that factor for the rest of the daemon's life, so it fails
-/// here at the deadline. Any other factor fails at once.
+/// here at the deadline. Any other factor fails at once, except
+/// `call_sites_unproven_no_resolver` over a scope holding no site, which is
+/// what this daemon's switched-off enrichment leaves (see [`codes_past_unswept_call_sites`]).
 fn certified_references(
     runtime: &IsolatedDaemonRuntime,
     repo: &Path,
@@ -211,8 +242,13 @@ fn certified_references(
         let answer = find_references(runtime, repo, name, relation_kinds);
         match verdict(&answer) {
             (state, None) if state == "certified" => return answer,
+            (_, Some(factor)) if codes_past_unswept_call_sites(&answer, &factor).is_empty() => {
+                return answer
+            }
             (_, Some(factor))
-                if factor == "cross_repo_authority_incomplete" && Instant::now() < deadline =>
+                if codes_past_unswept_call_sites(&answer, &factor)
+                    == ["cross_repo_authority_incomplete"]
+                    && Instant::now() < deadline =>
             {
                 std::thread::sleep(Duration::from_secs(1));
             }

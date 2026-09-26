@@ -5973,6 +5973,7 @@ mod tests {
             evidence: vec![],
             risk_summary: None,
             external_reference_deltas: vec![],
+            resolution_record_deltas: Vec::new(),
         };
         change.id = kin_model::compute_semantic_change_id(&change).unwrap();
         change

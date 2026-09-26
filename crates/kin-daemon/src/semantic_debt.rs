@@ -224,6 +224,23 @@ pub(crate) fn owed_against_tree(
     owed
 }
 
+/// Whether the owed derivation ledger this daemon already holds names no path
+/// the answering graph still has to parse.
+///
+/// Read from the records the daemon holds, never through a store open, so a
+/// caller on the reconcile tick pays nothing for asking. `false` when the
+/// daemon holds no ledger yet: a ledger nobody has read is not an empty one.
+pub(crate) fn nothing_owed_in_held_ledger(state: &DaemonState) -> bool {
+    let Some(records) = crate::api::held_owed_derivations(state) else {
+        return false;
+    };
+    let recorded: Vec<SemanticDebt> = records
+        .iter()
+        .filter_map(SemanticDebt::from_record)
+        .collect();
+    owed_against_tree(state, &recorded).is_empty()
+}
+
 /// Name source whose bytes reached authority and whose parse is still owed.
 ///
 /// A complete admission records untracked host paths as empty once the tree
@@ -297,7 +314,7 @@ pub(crate) fn disclose_underived_source(
 /// for one that declares plenty, and writes none for a parse that did not read
 /// the file cleanly. A certificate bound to an earlier body, or none at all,
 /// leaves the path owed.
-fn answering_graph_parsed(
+pub(crate) fn answering_graph_parsed(
     state: &DaemonState,
     tree: &kin_model::ResolvedTree,
     path: &RepoPath,

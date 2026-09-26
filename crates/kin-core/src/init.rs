@@ -6064,6 +6064,7 @@ mod tests {
                 origin: ChangeOrigin::Native,
                 admission_policy_delta: None,
                 external_reference_deltas: vec![],
+                resolution_record_deltas: Vec::new(),
             };
             change.id = compute_semantic_change_id(&change).unwrap();
             parent = Some(change.id);
@@ -6368,6 +6369,7 @@ mod tests {
             origin: ChangeOrigin::Native,
             admission_policy_delta: Some(AdmissionPolicyDelta::initialize(shared_policy.clone())),
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         };
         initial_change.id = compute_semantic_change_id(&initial_change).unwrap();
 

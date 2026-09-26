@@ -383,6 +383,25 @@ pub fn handle_annotation_add<G: GraphStore>(
         .parse()
         .map_err(|e: String| McpError::InvalidParams(e))?;
 
+    // An annotation is anchored to what the graph holds. A target naming a
+    // symbol outside the repository, or an entity id nothing carries, is
+    // refused before anything is written, so no annotation is stored that no
+    // read will ever recall.
+    if let Some(serde_json::Value::Array(raw_targets)) =
+        args.get("targets").or_else(|| args.get("scopes"))
+    {
+        for raw in raw_targets.iter().filter_map(serde_json::Value::as_str) {
+            if let Some(unanchored) = unanchored_annotation_target(store, raw)? {
+                return unanchored_annotation_refusal(
+                    store,
+                    unanchored,
+                    "kin_annotation_add",
+                    "targets",
+                );
+            }
+        }
+    }
+
     let targets = parse_annotation_targets(args)?;
     if targets.is_empty() {
         return Err(McpError::InvalidParams(
@@ -440,6 +459,51 @@ pub fn handle_annotation_add<G: GraphStore>(
     });
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
     Ok(ToolCallResult::text(json))
+}
+
+/// Why an annotation cannot be anchored to a symbol outside the repository,
+/// in the words that finish its refusal.
+pub const ANNOTATION_EXTERNAL_WHY: &str = "anchors an annotation to a repository entity and \
+     has nothing of it here to anchor one to; annotate one of its callers instead";
+
+/// The refusal an annotation write gives a target the graph holds nothing to
+/// anchor to: the shared external-symbol refusal, the absence `get_entity`
+/// reports for an address naming nothing, or [`ENTITY_NOT_IN_GRAPH`] for an
+/// entity id nothing carries.
+///
+/// [`ENTITY_NOT_IN_GRAPH`]: super::external_symbols::ENTITY_NOT_IN_GRAPH
+fn unanchored_annotation_refusal<G: GraphStore>(
+    store: &G,
+    target: UnanchoredTarget,
+    tool: &str,
+    argument: &str,
+) -> Result<ToolCallResult> {
+    match target {
+        UnanchoredTarget::External(node) => super::external_symbols::external_not_served(
+            store,
+            &node,
+            tool,
+            argument,
+            ANNOTATION_EXTERNAL_WHY,
+        ),
+        UnanchoredTarget::UnknownExternalAddress(text) => {
+            Ok(super::external_symbols::external_symbol_not_found(&text))
+        }
+        UnanchoredTarget::NotInGraph(entity_id) => Ok(ToolCallResult::error(
+            serde_json::json!({"error": {
+                "code": super::external_symbols::ENTITY_NOT_IN_GRAPH,
+                "tool": tool,
+                "argument": argument,
+                "id": entity_id.to_string(),
+                "message": format!(
+                    "entity:{entity_id} names nothing this graph holds, so an annotation on it \
+                     would anchor to nothing any read recalls. Resolve the id with \
+                     semantic_locate or get_entity and annotate the entity it returns."
+                ),
+            }})
+            .to_string(),
+        )),
+    }
 }
 
 pub const ANNOTATION_LIST_DESC: &str = "\

@@ -462,6 +462,15 @@ pub(crate) struct DrainMap<K, V> {
     _marker: std::marker::PhantomData<(K, V)>,
 }
 
+impl<K, V> Default for DrainMap<K, V> {
+    fn default() -> Self {
+        Self {
+            len: 0,
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
 impl<'de, K, V> serde::Deserialize<'de> for DrainMap<K, V>
 where
     K: serde::Deserialize<'de>,
@@ -592,6 +601,9 @@ pub(crate) struct GraphSnapshotRoundTripProof {
     /// reads a v13 body exactly as the real decoder does.
     #[serde(default)]
     pub(crate) materialized_graph: Option<MaterializedGraphSection>,
+    /// Mirrors the appended v23 field, defaulted for the same reason.
+    #[serde(default)]
+    pub(crate) resolution_records: DrainMap<ResolutionRecordId, ResolutionRecord>,
 }
 
 /// Schema of [`MaterializedGraphSection`] itself.
@@ -696,7 +708,10 @@ impl std::fmt::Display for MaterializedGraphRefusal {
 ///
 /// This is the on-disk format. We use std::collections::HashMap here
 /// (not hashbrown) for stable serde compatibility.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Serialize` is written by hand below, because the section slot is written
+/// as an absent value whenever resolution records follow it.
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GraphSnapshot {
     /// Runtime-only capability admitted against one exact workspace graph.
@@ -786,8 +801,87 @@ pub struct GraphSnapshot {
     /// successor clones the pointer instead of deep-copying this measured-large
     /// derived section; serde still writes the contained value in the same v14
     /// field shape.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub materialized_graph: Option<Arc<MaterializedGraphSection>>,
+    /// Resolution records a graph holds outside any repository authority: a
+    /// live mutable graph's, or a legacy graph-only store's. An authority
+    /// snapshot holds none here; its records live in history and workspace
+    /// overlays like its entities do.
+    ///
+    /// Appended after every v22 field. A body that carries records anywhere,
+    /// here or inside the envelope, is v23 (v24 with a section), or v25 (v26)
+    /// when one of them is a call-site ledger, and 37 elements wide, with the
+    /// section slot written absent when there is no section, so width stays a
+    /// function of the version.
+    #[serde(default)]
+    pub resolution_records: HashMap<ResolutionRecordId, ResolutionRecord>,
+}
+
+/// The positional body the derive would write, with one difference: the
+/// section slot is written, as an absent value, whenever the resolution-record
+/// slot follows it, because on a positional encoding a skipped slot would move
+/// the records into the section's place.
+///
+/// Which slots a body carries is a function of its version alone
+/// ([`GraphSnapshot::body_width`]), and this writes exactly that many.
+impl Serialize for GraphSnapshot {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let positional = !serializer.is_human_readable();
+        let has_records = !self.resolution_records.is_empty()
+            || (positional && GraphSnapshot::version_carries_resolution_records(self.version));
+        let has_section = self.materialized_graph.is_some() || (positional && has_records);
+        let mut out = serializer.serialize_struct(
+            "GraphSnapshot",
+            GRAPH_SNAPSHOT_V13_FIELD_COUNT + usize::from(has_section) + usize::from(has_records),
+        )?;
+        out.serialize_field("version", &self.version)?;
+        out.serialize_field("entities", &self.entities)?;
+        out.serialize_field("relations", &self.relations)?;
+        out.serialize_field("outgoing", &self.outgoing)?;
+        out.serialize_field("incoming", &self.incoming)?;
+        out.serialize_field("changes", &self.changes)?;
+        out.serialize_field("change_children", &self.change_children)?;
+        out.serialize_field("work_items", &self.work_items)?;
+        out.serialize_field("annotations", &self.annotations)?;
+        out.serialize_field("work_links", &self.work_links)?;
+        out.serialize_field("reviews", &self.reviews)?;
+        out.serialize_field("review_decisions", &self.review_decisions)?;
+        out.serialize_field("review_notes", &self.review_notes)?;
+        out.serialize_field("review_discussions", &self.review_discussions)?;
+        out.serialize_field("review_assignments", &self.review_assignments)?;
+        out.serialize_field("test_cases", &self.test_cases)?;
+        out.serialize_field("assertions", &self.assertions)?;
+        out.serialize_field("verification_runs", &self.verification_runs)?;
+        out.serialize_field("mock_hints", &self.mock_hints)?;
+        out.serialize_field("contracts", &self.contracts)?;
+        out.serialize_field("actors", &self.actors)?;
+        out.serialize_field("delegations", &self.delegations)?;
+        out.serialize_field("approvals", &self.approvals)?;
+        out.serialize_field("audit_events", &self.audit_events)?;
+        out.serialize_field("shallow_files", &self.shallow_files)?;
+        out.serialize_field("file_layouts", &self.file_layouts)?;
+        out.serialize_field("structured_artifacts", &self.structured_artifacts)?;
+        out.serialize_field("opaque_artifacts", &self.opaque_artifacts)?;
+        out.serialize_field("resolved_tree", &self.resolved_tree)?;
+        out.serialize_field("sessions", &self.sessions)?;
+        out.serialize_field("intents", &self.intents)?;
+        out.serialize_field("downstream_warnings", &self.downstream_warnings)?;
+        out.serialize_field("entity_revisions", &self.entity_revisions)?;
+        out.serialize_field("repository_authority", &self.repository_authority)?;
+        out.serialize_field("external_references", &self.external_references)?;
+        if has_section {
+            out.serialize_field("materialized_graph", &self.materialized_graph)?;
+        } else {
+            out.skip_field("materialized_graph")?;
+        }
+        if has_records {
+            out.serialize_field("resolution_records", &self.resolution_records)?;
+        } else {
+            out.skip_field("resolution_records")?;
+        }
+        out.end()
+    }
 }
 
 fn deserialize_required_repository_authority<'de, D>(
@@ -820,6 +914,7 @@ pub struct WorkspaceGraphFacts {
     pub relations: HashMap<RelationId, Relation>,
     pub external_references: HashMap<ExternalReferenceId, ExternalReference>,
     pub resolved_tree: ResolvedTree,
+    pub resolution_records: HashMap<ResolutionRecordId, ResolutionRecord>,
 }
 
 impl WorkspaceGraphFacts {
@@ -834,6 +929,7 @@ impl WorkspaceGraphFacts {
             relations: snapshot.relations,
             external_references: snapshot.external_references,
             resolved_tree: snapshot.resolved_tree,
+            resolution_records: snapshot.resolution_records,
         }
     }
 }
@@ -904,7 +1000,27 @@ impl GraphSnapshot {
     /// section), at any envelope schema: an older binary would otherwise drop
     /// owed work it cannot decode, so it refuses at the header instead. A
     /// store whose ledger is empty keeps the version and the bytes it had.
-    pub const CURRENT_VERSION: u32 = Self::OWED_DERIVATION_SECTION_VERSION;
+    /// v21/v22 carry language-server enrichment marks (without/with a
+    /// section): a workspace holding some, or a logged operation that recorded
+    /// or retired some. Marks sit inside positional workspace and delta arrays,
+    /// so an older binary would fail deep inside the envelope with serde
+    /// reporting an array of the wrong length; it refuses at the header
+    /// instead. A store that carries no marks keeps the version and the bytes
+    /// it had.
+    /// v23/v24 carry resolution records (without/with a section): in the
+    /// top-level record slot, in a workspace overlay, in a logged operation
+    /// that moved some, or in a change of the history. They sit inside
+    /// positional arrays an older binary decodes at a fixed length, so it
+    /// refuses at the header instead. Both are 37 elements wide, the section
+    /// slot written absent in v23. A store that carries no records keeps the
+    /// version and the bytes it had.
+    /// v25/v26 carry a call-site ledger (without/with a section) in any place
+    /// v23/v24 carry records, and change no layout. A binary that reads at
+    /// most v24 was built before anything wrote a ledger, and it would decode
+    /// one and then mishandle it, so it refuses at the header instead. A store
+    /// whose records are proof contexts or dispatch sets only keeps v23/v24 and
+    /// the bytes it had.
+    pub const CURRENT_VERSION: u32 = Self::CALL_SITE_LEDGERS_SECTION_VERSION;
 
     pub const LEGACY_SECTION_TRIMMED_VERSION: u32 = 16;
     pub const BINDING_HISTORY_VERSION: u32 = 17;
@@ -917,6 +1033,26 @@ impl GraphSnapshot {
 
     /// A non-empty owed derivation ledger and a section.
     pub const OWED_DERIVATION_SECTION_VERSION: u32 = 20;
+
+    /// Language-server enrichment marks and no section.
+    pub const ENRICHMENT_MARKS_VERSION: u32 = 21;
+
+    /// Language-server enrichment marks and a section.
+    pub const ENRICHMENT_MARKS_SECTION_VERSION: u32 = 22;
+
+    /// Resolution records and no section.
+    pub const RESOLUTION_RECORDS_VERSION: u32 = 23;
+
+    /// Resolution records and a section.
+    pub const RESOLUTION_RECORDS_SECTION_VERSION: u32 = 24;
+
+    /// Resolution records, at least one of them a call-site ledger, and no
+    /// section.
+    pub const CALL_SITE_LEDGERS_VERSION: u32 = 25;
+
+    /// Resolution records, at least one of them a call-site ledger, and a
+    /// section.
+    pub const CALL_SITE_LEDGERS_SECTION_VERSION: u32 = 26;
 
     /// A section, and receipts that still embed their operation records.
     pub const SECTION_VERSION: u32 = 14;
@@ -939,8 +1075,35 @@ impl GraphSnapshot {
     ///
     /// Owed derivation work outranks both axes. Every binary that reads v19
     /// reads every receipt shape and every envelope schema, so only the section
-    /// still decides the width.
+    /// still decides the width. Enrichment marks outrank owed derivation work
+    /// the same way: every binary that reads v21 reads a ledger too, and
+    /// resolution records outrank marks: every binary that reads v23 reads
+    /// marks too. Call-site ledgers outrank the other records the same way:
+    /// every binary that reads v25 reads v23 too. A ledger is a record, so
+    /// only a store that carries records is asked whether it carries one.
     pub fn wire_version(&self) -> u32 {
+        if self.carries_resolution_records() {
+            return match (
+                self.carries_call_site_ledgers(),
+                self.materialized_graph.is_some(),
+            ) {
+                (true, true) => Self::CALL_SITE_LEDGERS_SECTION_VERSION,
+                (true, false) => Self::CALL_SITE_LEDGERS_VERSION,
+                (false, true) => Self::RESOLUTION_RECORDS_SECTION_VERSION,
+                (false, false) => Self::RESOLUTION_RECORDS_VERSION,
+            };
+        }
+        if self
+            .repository_authority
+            .as_ref()
+            .is_some_and(|a| a.carries_enrichment_marks())
+        {
+            return if self.materialized_graph.is_some() {
+                Self::ENRICHMENT_MARKS_SECTION_VERSION
+            } else {
+                Self::ENRICHMENT_MARKS_VERSION
+            };
+        }
         if self
             .repository_authority
             .as_ref()
@@ -972,6 +1135,57 @@ impl GraphSnapshot {
         }
     }
 
+    /// Whether these contents carry resolution records anywhere a reader older
+    /// than them would have to decode: the top-level record slot, the
+    /// authority envelope, or the history.
+    ///
+    /// History read from disk and not decoded since is taken to carry records
+    /// when the store it came from was written at a records version, so a
+    /// store keeps that version once it has had records rather than paying a
+    /// history decode to find out whether it still does.
+    pub fn carries_resolution_records(&self) -> bool {
+        !self.resolution_records.is_empty()
+            || self
+                .repository_authority
+                .as_ref()
+                .is_some_and(|a| a.carries_resolution_records())
+            || self.changes.may_carry_resolution_records()
+    }
+
+    /// Whether these contents carry a call-site ledger anywhere a reader older
+    /// than ledgers would decode it: the top-level record slot, a workspace
+    /// overlay or a logged operation in the authority envelope, or a change
+    /// of the history.
+    ///
+    /// History read from disk and not decoded since answers from what the
+    /// open that streamed it saw, exactly as it does for records, so it never
+    /// pays a history decode to find out.
+    pub fn carries_call_site_ledgers(&self) -> bool {
+        self.resolution_records.values().any(is_call_site_ledger)
+            || self
+                .repository_authority
+                .as_ref()
+                .is_some_and(|a| a.carries_call_site_ledgers())
+            || self.changes.may_carry_call_site_ledgers()
+    }
+
+    /// The version of a graph-only body, one with no repository authority and
+    /// no section, whose resolution records are `records` in the top-level
+    /// slot: v13 without records, v23 with them, and v25 when one of them is a
+    /// call-site ledger.
+    pub(crate) fn graph_only_version<'a>(
+        records: impl IntoIterator<Item = &'a ResolutionRecord>,
+    ) -> u32 {
+        let mut records = records.into_iter().peekable();
+        if records.peek().is_none() {
+            Self::MIN_SUPPORTED_VERSION
+        } else if records.any(is_call_site_ledger) {
+            Self::CALL_SITE_LEDGERS_VERSION
+        } else {
+            Self::RESOLUTION_RECORDS_VERSION
+        }
+    }
+
     /// Whether any persisted receipt names its operation rather than carrying
     /// it, which is what a pre-v15 reader cannot decode.
     fn persists_a_trimmed_receipt(&self) -> bool {
@@ -997,7 +1211,38 @@ impl GraphSnapshot {
                 | Self::LEGACY_SECTION_TRIMMED_VERSION
                 | Self::BINDING_HISTORY_SECTION_VERSION
                 | Self::OWED_DERIVATION_SECTION_VERSION
+                | Self::ENRICHMENT_MARKS_SECTION_VERSION
+                | Self::RESOLUTION_RECORDS_SECTION_VERSION
+                | Self::CALL_SITE_LEDGERS_SECTION_VERSION
         )
+    }
+
+    /// Whether a body at this version carries the resolution-record slot: the
+    /// records rungs and the ledger rungs above them.
+    pub(crate) const fn version_carries_resolution_records(version: u32) -> bool {
+        matches!(
+            version,
+            Self::RESOLUTION_RECORDS_VERSION
+                | Self::RESOLUTION_RECORDS_SECTION_VERSION
+                | Self::CALL_SITE_LEDGERS_VERSION
+                | Self::CALL_SITE_LEDGERS_SECTION_VERSION
+        )
+    }
+
+    /// How many top-level elements a body at this version carries.
+    ///
+    /// The one place the version-to-width mapping lives: 35 without a
+    /// section, 36 with one, and 37 whenever the resolution-record slot is
+    /// present, in which case the section slot is always written, absent or
+    /// not.
+    pub(crate) const fn body_width(version: u32) -> usize {
+        if Self::version_carries_resolution_records(version) {
+            GRAPH_SNAPSHOT_RECORDS_FIELD_COUNT
+        } else if Self::version_carries_a_section(version) {
+            GRAPH_SNAPSHOT_FIELD_COUNT
+        } else {
+            GRAPH_SNAPSHOT_V13_FIELD_COUNT
+        }
     }
 
     /// The newest on-disk format version this binary READS.
@@ -1008,10 +1253,16 @@ impl GraphSnapshot {
     /// the top level alone and change only what each persisted receipt carries,
     /// which the receipt's own trailing `serde(default)` reads either way. v19
     /// and v20 append one trailing element inside the envelope, which its own
-    /// `serde(default)` reads as an empty ledger when it is absent. One
-    /// decoder reads every rung and no second copy of the field list exists to
-    /// drift.
-    pub const MAX_SUPPORTED_VERSION: u32 = Self::OWED_DERIVATION_SECTION_VERSION;
+    /// `serde(default)` reads as an empty ledger when it is absent. v21 and
+    /// v22 append trailing elements inside each workspace and each logged
+    /// workspace delta, which their own `serde(default)` read as no marks. v23
+    /// and v24 append the resolution-record slot at the top level and trailing
+    /// elements inside workspace deltas and changes, which their own
+    /// `serde(default)` read as no records. v25 and v26 are v23 and v24
+    /// declared by a store that carries a call-site ledger, so they add no
+    /// element and are read by the same decoder. One decoder reads every rung
+    /// and no second copy of the field list exists to drift.
+    pub const MAX_SUPPORTED_VERSION: u32 = Self::CALL_SITE_LEDGERS_SECTION_VERSION;
 
     /// Magic bytes for the file header: "KNDB"
     pub const MAGIC: [u8; 4] = *b"KNDB";
@@ -1067,6 +1318,7 @@ impl GraphSnapshot {
             entity_revisions: HashMap::new(),
             repository_authority: None,
             external_references: HashMap::new(),
+            resolution_records: HashMap::new(),
         }
     }
 
@@ -1145,6 +1397,29 @@ impl GraphSnapshot {
         self.relations
             .retain(|_, rel| graph_node_ids.contains(rel.src) && graph_node_ids.contains(rel.dst));
         stats.orphaned_relations_removed = before - self.relations.len();
+
+        // 1b. Remove resolution records that name a missing node, then, until
+        // nothing moves, the ones that name a removed record.
+        self.resolution_records.retain(|_, record| {
+            record
+                .named_nodes()
+                .iter()
+                .all(|node| graph_node_ids.contains(*node))
+        });
+        loop {
+            let held: HashSet<ResolutionRecordId> =
+                self.resolution_records.keys().copied().collect();
+            let before = self.resolution_records.len();
+            self.resolution_records.retain(|_, record| {
+                record
+                    .referenced_records()
+                    .iter()
+                    .all(|referenced| held.contains(referenced))
+            });
+            if self.resolution_records.len() == before {
+                break;
+            }
+        }
 
         // 2. Clean outgoing edge lists
         let live_relations: HashSet<RelationId> = self.relations.keys().copied().collect();
@@ -1242,12 +1517,21 @@ impl GraphSnapshot {
         if self.version != wire_version {
             return Err(crate::error::KinDbError::StorageError(format!(
                 "refusing to serialize a snapshot whose body declares v{} while its contents \
-                 serialize as v{}; owed derivation work requires v{}/v{} without/with a section; \
+                 serialize as v{}; call-site ledgers require v{}/v{} without/with a section; \
+                 other resolution records require v{}/v{} without/with a section; \
+                 enrichment marks require v{}/v{} without/with a section; \
+                 owed derivation work requires v{}/v{} without/with a section; \
                  schema5 requires v17/v18 without/with a section; legacy section plus trimmed receipts makes v{}, trimmed \
                  receipts alone make it v{}, a section alone makes it v{}, and neither makes \
                  it v{}",
                 self.version,
                 wire_version,
+                Self::CALL_SITE_LEDGERS_VERSION,
+                Self::CALL_SITE_LEDGERS_SECTION_VERSION,
+                Self::RESOLUTION_RECORDS_VERSION,
+                Self::RESOLUTION_RECORDS_SECTION_VERSION,
+                Self::ENRICHMENT_MARKS_VERSION,
+                Self::ENRICHMENT_MARKS_SECTION_VERSION,
                 Self::OWED_DERIVATION_VERSION,
                 Self::OWED_DERIVATION_SECTION_VERSION,
                 Self::LEGACY_SECTION_TRIMMED_VERSION,
@@ -1402,11 +1686,7 @@ impl GraphSnapshot {
             let _span = tracing::info_span!("kindb.snapshot.walk_body_elements").entered();
             top_level_element_ranges(frame.body)?
         };
-        let expected_width = if Self::version_carries_a_section(frame.version) {
-            GRAPH_SNAPSHOT_FIELD_COUNT
-        } else {
-            GRAPH_SNAPSHOT_V13_FIELD_COUNT
-        };
+        let expected_width = Self::body_width(frame.version);
         if ranges.len() != expected_width {
             return Err(crate::error::KinDbError::StorageError(format!(
                 "snapshot body declares v{} but carries {} elements where {expected_width} were expected",
@@ -1417,6 +1697,8 @@ impl GraphSnapshot {
         let changes = ranges[CHANGES_FIELD_INDEX].clone();
         let element = &frame.body[changes.clone()];
         let change_count = map_entry_count(element)?;
+        let mut history_carries_records = false;
+        let mut history_carries_ledgers = false;
         let index = {
             let _span = tracing::info_span!(
                 "kindb.snapshot.stream_change_map",
@@ -1424,7 +1706,12 @@ impl GraphSnapshot {
                 encoded_bytes = element.len()
             )
             .entered();
-            let index = stream_change_map(element, 16 + changes.start, visit_change)?;
+            let index = stream_change_map(element, 16 + changes.start, &mut |change| {
+                history_carries_records |= !change.resolution_record_deltas.is_empty();
+                history_carries_ledgers = history_carries_ledgers
+                    || moves_call_site_ledgers(&change.resolution_record_deltas);
+                visit_change(change)
+            })?;
             if index.len() != change_count {
                 return Err(crate::error::KinDbError::StorageError(format!(
                     "snapshot change map declares {change_count} entries and streamed {}",
@@ -1452,10 +1739,13 @@ impl GraphSnapshot {
                 frame.version, snapshot.version
             )));
         }
-        debug_assert_eq!(snapshot.version, snapshot.wire_version());
         snapshot.changes = ChangeMap::encoded(
-            EncodedChanges::new(source, changes, change_count, body_checksum).with_index(index),
+            EncodedChanges::new(source, changes, change_count, body_checksum)
+                .with_index(index)
+                .with_resolution_records(history_carries_records)
+                .with_call_site_ledgers(history_carries_ledgers),
         );
+        debug_assert_eq!(snapshot.version, snapshot.wire_version());
         let persisted_root_hash = Self::decode_root_hash_trailer(data, &frame)?;
         Ok((snapshot, persisted_root_hash))
     }
@@ -1619,40 +1909,53 @@ impl GraphSnapshot {
         }
         let body = &data[16..body_end];
 
-        match version {
-            // Every version in the supported range shares one frame layout;
-            // they differ only in how wide the MessagePack body array is. The
-            // label is derived from the version rather than written as a
-            // literal, because a hardcoded "v13" in a v14 refusal names the
-            // wrong format at exactly the moment a reader needs the right one.
-            Self::MIN_SUPPORTED_VERSION..=Self::MAX_SUPPORTED_VERSION => {
-                let label = format!("v{version}");
-                let checksum_end = Self::require_checksum_slot(data, body_len, &label)?;
-                let body_checksum = if verify_checksum {
-                    Some(Self::verify_checksum(data, body_len, &label)?)
-                } else {
-                    None
-                };
-                Ok(SnapshotFrame {
-                    version,
-                    body,
-                    body_checksum,
-                    checksum_end,
-                })
-            }
-            version if version < Self::MIN_SUPPORTED_VERSION => {
-                Err(crate::error::KinDbError::snapshot_schema_too_old(
-                    version,
-                    Self::MIN_SUPPORTED_VERSION,
-                    Self::CURRENT_VERSION,
-                ))
-            }
-            _ => Err(crate::error::KinDbError::snapshot_schema_too_new(
+        Self::check_readable_version(version, Self::MAX_SUPPORTED_VERSION)?;
+        // Every version in the supported range shares one frame layout; they
+        // differ only in how wide the MessagePack body array is. The label is
+        // derived from the version rather than written as a literal, because a
+        // hardcoded "v13" in a v14 refusal names the wrong format at exactly
+        // the moment a reader needs the right one.
+        let label = format!("v{version}");
+        let checksum_end = Self::require_checksum_slot(data, body_len, &label)?;
+        let body_checksum = if verify_checksum {
+            Some(Self::verify_checksum(data, body_len, &label)?)
+        } else {
+            None
+        };
+        Ok(SnapshotFrame {
+            version,
+            body,
+            body_checksum,
+            checksum_end,
+        })
+    }
+
+    /// Refuse a header version that a reader whose newest readable version is
+    /// `newest_readable` does not open, naming the version and the range.
+    ///
+    /// Every open checks with [`Self::MAX_SUPPORTED_VERSION`]. Checking with
+    /// an older binary's maximum instead shows what that binary does with the
+    /// bytes this one writes, which is how a new rung proves an older reader
+    /// refuses it at the header.
+    pub(crate) fn check_readable_version(
+        version: u32,
+        newest_readable: u32,
+    ) -> Result<(), crate::error::KinDbError> {
+        if version < Self::MIN_SUPPORTED_VERSION {
+            return Err(crate::error::KinDbError::snapshot_schema_too_old(
                 version,
                 Self::MIN_SUPPORTED_VERSION,
-                Self::CURRENT_VERSION,
-            )),
+                newest_readable,
+            ));
         }
+        if version > newest_readable {
+            return Err(crate::error::KinDbError::snapshot_schema_too_new(
+                version,
+                Self::MIN_SUPPORTED_VERSION,
+                newest_readable,
+            ));
+        }
+        Ok(())
     }
 
     fn decode_current_snapshot(body: &[u8]) -> Result<Self, crate::error::KinDbError> {
@@ -1842,6 +2145,11 @@ impl GraphSnapshot {
                 }
             }
         }
+        validate_snapshot_resolution_records(
+            &self.resolution_records,
+            &graph_node_ids,
+            "snapshot",
+        )?;
         let relation_endpoints_ms = timer.lap_ms();
         let envelope_to_validate = match envelope {
             AuthorityEnvelope::Validated => self.repository_authority.as_ref(),
@@ -2275,7 +2583,8 @@ impl<'de> Deserialize<'de> for LocateGraphSnapshot {
                 // named constant one screen up said 36.
                 let width = match seq.size_hint() {
                     Some(width @ GRAPH_SNAPSHOT_V13_FIELD_COUNT)
-                    | Some(width @ GRAPH_SNAPSHOT_FIELD_COUNT) => width,
+                    | Some(width @ GRAPH_SNAPSHOT_FIELD_COUNT)
+                    | Some(width @ GRAPH_SNAPSHOT_RECORDS_FIELD_COUNT) => width,
                     other => {
                         return Err(serde::de::Error::invalid_length(
                             other.unwrap_or_default(),
@@ -2342,9 +2651,15 @@ impl<'de> Deserialize<'de> for LocateGraphSnapshot {
                 let external_references = seq
                     .next_element()?
                     .ok_or_else(|| serde::de::Error::invalid_length(34, &self))?;
-                if width == GRAPH_SNAPSHOT_FIELD_COUNT {
+                if width >= GRAPH_SNAPSHOT_FIELD_COUNT {
                     let _: IgnoredAny = seq.next_element()?.ok_or_else(|| {
                         serde::de::Error::invalid_length(MATERIALIZED_GRAPH_FIELD_INDEX, &self)
+                    })?;
+                }
+                // Locate reads no resolution record.
+                if width == GRAPH_SNAPSHOT_RECORDS_FIELD_COUNT {
+                    let _: IgnoredAny = seq.next_element()?.ok_or_else(|| {
+                        serde::de::Error::invalid_length(RESOLUTION_RECORDS_FIELD_INDEX, &self)
                     })?;
                 }
 
@@ -2500,7 +2815,8 @@ impl<'de> Deserialize<'de> for AuthorityEnvelopeSnapshot {
                 // authority.
                 let width = match seq.size_hint() {
                     Some(width @ GRAPH_SNAPSHOT_V13_FIELD_COUNT)
-                    | Some(width @ GRAPH_SNAPSHOT_FIELD_COUNT) => width,
+                    | Some(width @ GRAPH_SNAPSHOT_FIELD_COUNT)
+                    | Some(width @ GRAPH_SNAPSHOT_RECORDS_FIELD_COUNT) => width,
                     other => {
                         return Err(serde::de::Error::invalid_length(
                             other.unwrap_or_default(),
@@ -2516,12 +2832,7 @@ impl<'de> Deserialize<'de> for AuthorityEnvelopeSnapshot {
                 // made them agree. Requiring them to agree here is what stops a
                 // body that claims v13 while carrying a section, or claims v14
                 // while carrying none, from decoding as either.
-                let expected_width = if GraphSnapshot::version_carries_a_section(version) {
-                    GRAPH_SNAPSHOT_FIELD_COUNT
-                } else {
-                    GRAPH_SNAPSHOT_V13_FIELD_COUNT
-                };
-                if width != expected_width {
+                if width != GraphSnapshot::body_width(version) {
                     return Err(serde::de::Error::invalid_length(width, &self));
                 }
                 for index in 1..REPOSITORY_AUTHORITY_FIELD_INDEX {
@@ -2535,13 +2846,21 @@ impl<'de> Deserialize<'de> for AuthorityEnvelopeSnapshot {
                 let _: IgnoredAny = seq.next_element()?.ok_or_else(|| {
                     serde::de::Error::invalid_length(REPOSITORY_AUTHORITY_FIELD_INDEX + 1, &self)
                 })?;
-                let materialized_graph = if width == GRAPH_SNAPSHOT_FIELD_COUNT {
+                let materialized_graph = if width >= GRAPH_SNAPSHOT_FIELD_COUNT {
                     seq.next_element()?.ok_or_else(|| {
                         serde::de::Error::invalid_length(MATERIALIZED_GRAPH_FIELD_INDEX, &self)
                     })?
                 } else {
                     None
                 };
+                // An authority snapshot holds its records in history and
+                // workspace overlays, which the envelope carries; the
+                // top-level slot is walked past.
+                if width == GRAPH_SNAPSHOT_RECORDS_FIELD_COUNT {
+                    let _: IgnoredAny = seq.next_element()?.ok_or_else(|| {
+                        serde::de::Error::invalid_length(RESOLUTION_RECORDS_FIELD_INDEX, &self)
+                    })?;
+                }
 
                 Ok(AuthorityEnvelopeSnapshot {
                     version,
@@ -2568,11 +2887,14 @@ pub(crate) const GRAPH_SNAPSHOT_FIELD_COUNT: usize = 36;
 /// append has to state what the older widths were instead of silently
 /// redefining one of them.
 pub(crate) const GRAPH_SNAPSHOT_V13_FIELD_COUNT: usize = 35;
+/// The width of a body that carries the resolution-record slot, v23 to v26.
+pub(crate) const GRAPH_SNAPSHOT_RECORDS_FIELD_COUNT: usize = 37;
 /// Where the change map sits in the positional body, pinned to the struct by
 /// `the_change_field_index_names_the_change_map`.
 pub(crate) const CHANGES_FIELD_INDEX: usize = 5;
 pub(crate) const REPOSITORY_AUTHORITY_FIELD_INDEX: usize = 33;
 pub(crate) const MATERIALIZED_GRAPH_FIELD_INDEX: usize = 35;
+pub(crate) const RESOLUTION_RECORDS_FIELD_INDEX: usize = 36;
 
 struct SnapshotFrame<'a> {
     version: u32,
@@ -2605,6 +2927,7 @@ pub struct BorrowedGraphSnapshot<'a> {
     pub structured_artifacts: &'a hashbrown::HashMap<FilePathId, StructuredArtifact>,
     pub opaque_artifacts: &'a hashbrown::HashMap<FilePathId, OpaqueArtifact>,
     pub external_references: &'a hashbrown::HashMap<ExternalReferenceId, ExternalReference>,
+    pub resolution_records: &'a ResolutionRecordSet,
     // ChangeData fields
     pub changes: &'a ChangeMap,
     pub change_children: &'a hashbrown::HashMap<SemanticChangeId, Vec<SemanticChangeId>>,
@@ -2646,12 +2969,15 @@ impl<'a> Serialize for BorrowedGraphSnapshot<'a> {
         //
         // A live mutable graph never carries a materialized section, so this is
         // a v13 body by the same rule `wire_version` applies: 35 elements, no
-        // trailing field, and the version to match.
+        // trailing field, and the version to match. A graph that holds
+        // resolution records is a v23 body instead, or a v25 body when one of
+        // them is a call-site ledger: 37 elements, the section slot absent.
+        let version = self.version();
         let mut state =
-            serializer.serialize_struct("GraphSnapshot", GRAPH_SNAPSHOT_V13_FIELD_COUNT)?;
+            serializer.serialize_struct("GraphSnapshot", GraphSnapshot::body_width(version))?;
 
         // 1. version
-        state.serialize_field("version", &GraphSnapshot::MIN_SUPPORTED_VERSION)?;
+        state.serialize_field("version", &version)?;
         // 2. entities  (hashbrown::HashMap → map)
         state.serialize_field("entities", self.entities)?;
         // 3. relations
@@ -2732,15 +3058,30 @@ impl<'a> Serialize for BorrowedGraphSnapshot<'a> {
         )?;
         // 35. Resolved external symbols (append-only v13 field).
         state.serialize_field("external_references", self.external_references)?;
-        // There is no 36th. A live mutable graph is not a published repository
-        // authority, so it has no change to claim as the one it resolves at and
-        // never carries a section; skipping the field is what makes these bytes
-        // a v13 body rather than a v14 body holding nil.
+        // A live mutable graph is not a published repository authority, so it
+        // has no change to claim as the one it resolves at and never carries a
+        // section. Without resolution records there is no 36th element, which
+        // is what makes these bytes a v13 body rather than a v14 body holding
+        // nil. With them, the section slot is written absent so the records
+        // take the 37th place.
+        if GraphSnapshot::version_carries_resolution_records(version) {
+            state.serialize_field(
+                "materialized_graph",
+                &Option::<Arc<MaterializedGraphSection>>::None,
+            )?;
+            state.serialize_field("resolution_records", self.resolution_records.records())?;
+        }
         state.end()
     }
 }
 
 impl<'a> BorrowedGraphSnapshot<'a> {
+    /// The version these contents serialize as: v13, v23 when the graph holds
+    /// resolution records, or v25 when one of them is a call-site ledger.
+    pub fn version(&self) -> u32 {
+        GraphSnapshot::graph_only_version(self.resolution_records.records().values())
+    }
+
     /// Serialize to the on-disk binary format (KNDB header + msgpack body + checksum).
     ///
     /// Produces bytes identical in structure to [`GraphSnapshot::to_bytes`] but
@@ -2767,12 +3108,7 @@ impl<'a> BorrowedGraphSnapshot<'a> {
         // The same one-buffer assembly the owned snapshot uses, for the same
         // reason: this is the daemon's own save path over a live graph, and it
         // held two whole encodings of the store at once.
-        assemble_snapshot_frame(
-            self,
-            GraphSnapshot::MIN_SUPPORTED_VERSION,
-            persisted_root_hash,
-            trailer_len,
-        )
+        assemble_snapshot_frame(self, self.version(), persisted_root_hash, trailer_len)
     }
 
     fn validate_storage_admission(&self) -> Result<(), crate::error::KinDbError> {
@@ -2830,6 +3166,11 @@ impl<'a> BorrowedGraphSnapshot<'a> {
                 }
             }
         }
+        validate_snapshot_resolution_records(
+            self.resolution_records.records(),
+            &graph_node_ids,
+            "borrowed snapshot",
+        )?;
         Ok(())
     }
 }
@@ -2866,6 +3207,48 @@ impl GraphNodeIds<'_> {
             GraphNodeId::ExternalReference(id) => self.external_references.contains(&id),
         }
     }
+}
+
+/// Whether `record` is a call-site ledger, the record a binary older than the
+/// ledger rung decodes and then mishandles.
+pub(crate) fn is_call_site_ledger(record: &ResolutionRecord) -> bool {
+    record.as_call_sites().is_some()
+}
+
+/// Whether any of `deltas` carries a call-site ledger, as the state it adds,
+/// rewrites or removes. A removal carries the whole removed record, so a reader
+/// decodes that ledger as surely as an added one.
+pub(crate) fn moves_call_site_ledgers(deltas: &[ResolutionRecordDelta]) -> bool {
+    deltas.iter().any(|delta| {
+        delta
+            .old_state()
+            .into_iter()
+            .chain(delta.new_state())
+            .any(is_call_site_ledger)
+    })
+}
+
+/// Whether a logged operation's workspace mutation moves a call-site ledger.
+pub(crate) fn operation_moves_call_site_ledgers(
+    operation: &kin_model::RepositoryOperationRecord,
+) -> bool {
+    operation
+        .workspace_mutation
+        .as_ref()
+        .is_some_and(|mutation| {
+            moves_call_site_ledgers(mutation.semantic_delta.resolution_record_deltas())
+        })
+}
+
+/// Every record's shape, that its key is its identity, and that every node and
+/// record it names is admitted beside it.
+fn validate_snapshot_resolution_records<S: std::hash::BuildHasher>(
+    records: &std::collections::HashMap<ResolutionRecordId, ResolutionRecord, S>,
+    graph_node_ids: &GraphNodeIds<'_>,
+    context: &str,
+) -> Result<(), crate::error::KinDbError> {
+    kin_model::validate_resolution_records(records, |node| graph_node_ids.contains(*node))
+        .map_err(|error| crate::error::KinDbError::StorageError(format!("{context} {error}")))
 }
 
 fn validate_external_reference_entry(
@@ -3013,6 +3396,7 @@ mod tests {
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         });
 
         let mut snapshot = GraphSnapshot::empty();
@@ -4116,6 +4500,7 @@ mod tests {
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         });
         snapshot.changes.insert(change.id, change.clone());
         snapshot
@@ -4797,12 +5182,13 @@ mod tests {
             GRAPH_SNAPSHOT_FIELD_COUNT - 1,
             "v14 appends exactly one element to v13"
         );
-        // Eight contiguous rungs, including the required-capability pair and
-        // the owed-derivation pair; the width is a function of the version
-        // rather than a second opinion about it. Asserted rather than
-        // described, because the reader's width check reads the version and
-        // would silently demand the wrong element count if a rung were added
-        // without updating it.
+        // Fourteen contiguous rungs, including the required-capability pair,
+        // the owed-derivation pair, the enrichment-marks pair, the
+        // resolution-records pair and the call-site-ledgers pair; the width is
+        // a function of the version rather than a second opinion about it.
+        // Asserted rather than described, because the reader's width check
+        // reads the version and would silently demand the wrong element count
+        // if a rung were added without updating it.
         assert_eq!(
             [
                 GraphSnapshot::MIN_SUPPORTED_VERSION,
@@ -4813,8 +5199,14 @@ mod tests {
                 GraphSnapshot::BINDING_HISTORY_SECTION_VERSION,
                 GraphSnapshot::OWED_DERIVATION_VERSION,
                 GraphSnapshot::OWED_DERIVATION_SECTION_VERSION,
+                GraphSnapshot::ENRICHMENT_MARKS_VERSION,
+                GraphSnapshot::ENRICHMENT_MARKS_SECTION_VERSION,
+                GraphSnapshot::RESOLUTION_RECORDS_VERSION,
+                GraphSnapshot::RESOLUTION_RECORDS_SECTION_VERSION,
+                GraphSnapshot::CALL_SITE_LEDGERS_VERSION,
+                GraphSnapshot::CALL_SITE_LEDGERS_SECTION_VERSION,
             ],
-            [13, 14, 15, 16, 17, 18, 19, 20],
+            [13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26],
             "the ladder is contiguous, which is what lets one decoder read every \
              rung with defaulted trailing fields"
         );
@@ -4834,13 +5226,301 @@ mod tests {
             (GraphSnapshot::BINDING_HISTORY_SECTION_VERSION, true),
             (GraphSnapshot::OWED_DERIVATION_VERSION, false),
             (GraphSnapshot::OWED_DERIVATION_SECTION_VERSION, true),
+            (GraphSnapshot::ENRICHMENT_MARKS_VERSION, false),
+            (GraphSnapshot::ENRICHMENT_MARKS_SECTION_VERSION, true),
+            (GraphSnapshot::RESOLUTION_RECORDS_VERSION, false),
+            (GraphSnapshot::RESOLUTION_RECORDS_SECTION_VERSION, true),
+            (GraphSnapshot::CALL_SITE_LEDGERS_VERSION, false),
+            (GraphSnapshot::CALL_SITE_LEDGERS_SECTION_VERSION, true),
         ] {
             assert_eq!(
                 GraphSnapshot::version_carries_a_section(version),
                 wide,
                 "v{version} disagrees with the ladder about whether it carries a section"
             );
+            let width = match (
+                GraphSnapshot::version_carries_resolution_records(version),
+                wide,
+            ) {
+                (true, _) => GRAPH_SNAPSHOT_RECORDS_FIELD_COUNT,
+                (false, true) => GRAPH_SNAPSHOT_FIELD_COUNT,
+                (false, false) => GRAPH_SNAPSHOT_V13_FIELD_COUNT,
+            };
+            assert_eq!(
+                GraphSnapshot::body_width(version),
+                width,
+                "v{version} width"
+            );
         }
+        assert_eq!(
+            RESOLUTION_RECORDS_FIELD_INDEX,
+            GRAPH_SNAPSHOT_RECORDS_FIELD_COUNT - 1
+        );
+        // The ledger rungs change no layout: each is its records rung,
+        // declared by a store that carries a call-site ledger.
+        for (ledgers, records) in [
+            (
+                GraphSnapshot::CALL_SITE_LEDGERS_VERSION,
+                GraphSnapshot::RESOLUTION_RECORDS_VERSION,
+            ),
+            (
+                GraphSnapshot::CALL_SITE_LEDGERS_SECTION_VERSION,
+                GraphSnapshot::RESOLUTION_RECORDS_SECTION_VERSION,
+            ),
+        ] {
+            assert!(GraphSnapshot::version_carries_resolution_records(ledgers));
+            assert_eq!(
+                GraphSnapshot::body_width(ledgers),
+                GRAPH_SNAPSHOT_RECORDS_FIELD_COUNT,
+                "v{ledgers} is as wide as v{records}"
+            );
+            assert_eq!(
+                GraphSnapshot::version_carries_a_section(ledgers),
+                GraphSnapshot::version_carries_a_section(records),
+                "v{ledgers} carries a section exactly when v{records} does"
+            );
+        }
+        assert_eq!(
+            GraphSnapshot::MAX_SUPPORTED_VERSION,
+            GraphSnapshot::CALL_SITE_LEDGERS_SECTION_VERSION,
+            "a reader of the ledger rungs reads every earlier rung"
+        );
+    }
+
+    fn ledger_test_context() -> ResolutionRecord {
+        ResolutionRecord::ProofContext(kin_model::ProofContext {
+            language: LanguageId::Rust,
+            resolver: "lsp:rust-analyzer".to_string(),
+            resolver_version: "0.3.2600".to_string(),
+            configuration_hash: Hash256::from_bytes([0x61; 32]),
+            environment_hash: Hash256::from_bytes([0x62; 32]),
+            environment_summary: String::new(),
+        })
+    }
+
+    fn ledger_test_ledger(caller: EntityId, context: ResolutionRecordId) -> ResolutionRecord {
+        ResolutionRecord::CallSites(kin_model::CallSiteLedger {
+            caller,
+            behavior_hash: Hash256::from_bytes([0; 32]),
+            body_hash: Hash256::from_bytes([0x63; 32]),
+            context,
+            census: 1,
+            sites: vec![kin_model::CallSite {
+                offset: 3,
+                length: 5,
+                state: kin_model::CallSiteState::ProvenOutside,
+            }],
+        })
+    }
+
+    fn ledger_test_header(bytes: &[u8]) -> u32 {
+        u32::from_le_bytes(bytes[4..8].try_into().unwrap())
+    }
+
+    /// What a binary whose newest readable version is v24, the records rung,
+    /// says about a header: it opens a records store and refuses a ledger
+    /// store by name.
+    fn ledger_test_older_reader(version: u32) -> Result<(), crate::error::KinDbError> {
+        GraphSnapshot::check_readable_version(
+            version,
+            GraphSnapshot::RESOLUTION_RECORDS_SECTION_VERSION,
+        )
+    }
+
+    fn assert_refused_by_the_older_reader(version: u32) {
+        let error = ledger_test_older_reader(version)
+            .expect_err("a reader of at most v24 refuses a ledger store at the header");
+        assert!(
+            matches!(
+                error,
+                crate::error::KinDbError::IncompatibleSnapshotVersion { found, max: 24, .. }
+                    if found == version
+            ),
+            "{error:?}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!("version {version} is newer than"))
+                && message.contains("versions 13 through 24"),
+            "{message}"
+        );
+    }
+
+    /// A call-site ledger in the top-level record slot, where a graph-only
+    /// store keeps its records, writes v25: the records layout, 37 elements
+    /// wide, refused at the header by a reader of at most v24, and reopened
+    /// with the ledger intact. The same store holding only its proof context
+    /// is v23, which that reader opens, and without records it is v13.
+    #[test]
+    fn a_top_level_ledger_writes_the_ledger_rung() {
+        let mut caller = test_entity("caller");
+        caller.file_origin = None;
+        let context = ledger_test_context();
+        let ledger = ledger_test_ledger(caller.id, context.id());
+        let mut snapshot = GraphSnapshot::empty();
+        snapshot.entities.insert(caller.id, caller);
+        let plain_bytes = snapshot.to_bytes().unwrap();
+        assert_eq!(
+            ledger_test_header(&plain_bytes),
+            GraphSnapshot::MIN_SUPPORTED_VERSION
+        );
+
+        snapshot
+            .resolution_records
+            .insert(context.id(), context.clone());
+        snapshot.version = snapshot.wire_version();
+        let records_bytes = snapshot.to_bytes().unwrap();
+        assert_eq!(
+            ledger_test_header(&records_bytes),
+            GraphSnapshot::RESOLUTION_RECORDS_VERSION
+        );
+        ledger_test_older_reader(ledger_test_header(&records_bytes))
+            .expect("a reader older than ledgers opens a records-only store");
+        assert_eq!(
+            GraphSnapshot::from_bytes(&records_bytes)
+                .unwrap()
+                .to_bytes()
+                .unwrap(),
+            records_bytes
+        );
+
+        snapshot
+            .resolution_records
+            .insert(ledger.id(), ledger.clone());
+        let mut understated = snapshot.clone();
+        snapshot.version = snapshot.wire_version();
+        assert_eq!(snapshot.version, GraphSnapshot::CALL_SITE_LEDGERS_VERSION);
+        let bytes = snapshot.to_bytes().unwrap();
+        assert_eq!(
+            ledger_test_header(&bytes),
+            GraphSnapshot::CALL_SITE_LEDGERS_VERSION
+        );
+        assert_eq!(
+            top_level_element_ranges(&bytes[16..bytes.len() - GraphSnapshot::CHECKSUM_LEN])
+                .unwrap()
+                .len(),
+            GRAPH_SNAPSHOT_RECORDS_FIELD_COUNT
+        );
+        assert_refused_by_the_older_reader(ledger_test_header(&bytes));
+        GraphSnapshot::prove_pre_validated_round_trip(&bytes).unwrap();
+        let reopened = GraphSnapshot::from_bytes(&bytes).unwrap();
+        assert_eq!(reopened.version, GraphSnapshot::CALL_SITE_LEDGERS_VERSION);
+        assert_eq!(reopened.resolution_records.get(&ledger.id()), Some(&ledger));
+        // Compared by value: the two records sit in a hash map, which writes
+        // its entries in the order of the map that holds them.
+        assert_eq!(reopened.resolution_records, snapshot.resolution_records);
+        assert_eq!(
+            ledger_test_header(&reopened.to_bytes().unwrap()),
+            GraphSnapshot::CALL_SITE_LEDGERS_VERSION
+        );
+
+        // A body that holds a ledger and declares the records rung is refused
+        // rather than written where a reader older than ledgers would open it.
+        understated.version = GraphSnapshot::RESOLUTION_RECORDS_VERSION;
+        let error = understated.to_bytes().unwrap_err().to_string();
+        assert!(
+            error.contains("declares v23 while its contents serialize as v25"),
+            "{error}"
+        );
+    }
+
+    /// A change of the history that moves a call-site ledger makes the store a
+    /// ledger store. The open that leaves the history on disk knows it without
+    /// decoding a change, as it knows about records, and an appended change
+    /// that moves a ledger moves the version the same way. A change that moves
+    /// only a proof context keeps the records rung.
+    #[test]
+    fn a_ledger_in_history_moves_the_version_without_decoding_it() {
+        let context = ledger_test_context();
+        let ledger = ledger_test_ledger(EntityId::new(), context.id());
+        let moving =
+            |index: usize, parent: Option<SemanticChangeId>, deltas: Vec<ResolutionRecordDelta>| {
+                let mut change = a_history_change(index, parent);
+                change.resolution_record_deltas = deltas;
+                seal_change(change)
+            };
+
+        let mut records_only = a_snapshot_with_history(3);
+        let proven = moving(
+            10,
+            None,
+            vec![ResolutionRecordDelta::Added {
+                new: context.clone(),
+            }],
+        );
+        records_only.changes.insert(proven.id, proven.clone());
+        records_only.version = records_only.wire_version();
+        assert_eq!(
+            records_only.version,
+            GraphSnapshot::RESOLUTION_RECORDS_VERSION
+        );
+        let records_frame = encode_snapshot_without_admission_validation(&records_only);
+        ledger_test_older_reader(ledger_test_header(&records_frame))
+            .expect("a reader older than ledgers opens records-only history");
+
+        let recorded = moving(
+            11,
+            Some(proven.id),
+            vec![ResolutionRecordDelta::Added {
+                new: ledger.clone(),
+            }],
+        );
+        let mut ledgered = records_only.clone();
+        ledgered.changes.insert(recorded.id, recorded.clone());
+        assert_eq!(
+            ledgered.wire_version(),
+            GraphSnapshot::CALL_SITE_LEDGERS_VERSION,
+            "decoded history"
+        );
+        ledgered.version = ledgered.wire_version();
+        let frame = encode_snapshot_without_admission_validation(&ledgered);
+        assert_eq!(
+            ledger_test_header(&frame),
+            GraphSnapshot::CALL_SITE_LEDGERS_VERSION
+        );
+        assert_refused_by_the_older_reader(ledger_test_header(&frame));
+
+        let (opened, _) = decode_lazily(&frame, memory_source(&frame));
+        let before = decoded_on_this_thread();
+        assert_eq!(
+            opened.wire_version(),
+            GraphSnapshot::CALL_SITE_LEDGERS_VERSION,
+            "history still on disk"
+        );
+        assert!(!opened.changes.is_decoded());
+        assert_eq!(decoded_on_this_thread(), before);
+        assert_eq!(
+            opened
+                .changes
+                .read_change(&recorded.id)
+                .unwrap()
+                .unwrap()
+                .resolution_record_deltas,
+            vec![ResolutionRecordDelta::Added {
+                new: ledger.clone()
+            }],
+            "the ledger reads back intact"
+        );
+
+        let (records_opened, _) = decode_lazily(&records_frame, memory_source(&records_frame));
+        assert_eq!(
+            records_opened.wire_version(),
+            GraphSnapshot::RESOLUTION_RECORDS_VERSION,
+            "records-only history on disk keeps the records rung"
+        );
+        let mut appended = records_opened.clone();
+        appended.changes.append_change(recorded.clone()).unwrap();
+        assert!(!appended.changes.is_decoded());
+        assert_eq!(
+            appended.wire_version(),
+            GraphSnapshot::CALL_SITE_LEDGERS_VERSION,
+            "an appended change"
+        );
+        assert_eq!(
+            records_opened.wire_version(),
+            GraphSnapshot::RESOLUTION_RECORDS_VERSION,
+            "the history the append was made over is unchanged"
+        );
     }
 
     // FIR-3064: an open leaves the change map on disk.
@@ -4862,6 +5542,7 @@ mod tests {
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         })
     }
 

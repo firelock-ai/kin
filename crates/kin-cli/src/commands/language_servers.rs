@@ -150,13 +150,24 @@ impl LanguageServerRecipe {
             .any(|binary| which::which(binary).is_ok())
     }
 
-    /// Whether the tool that performs the install exists on this host.
+    /// Whether the tool that performs the install is on the user's own `PATH`.
     ///
     /// Reported separately from the install itself so a host without `npm`
     /// gets told that rather than a subprocess spawn error, which reads like a
     /// Kin defect.
+    ///
+    /// Asked of the `PATH` this process inherited, not the one Kin widened at
+    /// startup. The widened one also searches the usual install places, and a
+    /// first run on a clean account found `/opt/homebrew/bin/npm` there with
+    /// npm nowhere on the user's `PATH`, then ran `npm install -g pyright` into
+    /// the Homebrew prefix. An installer the user has not put on `PATH` is not
+    /// one Kin runs; [`installer_found_off_path`] names it instead.
     pub(crate) fn installer_available(&self) -> bool {
-        which::which(self.program).is_ok()
+        program_on(
+            self.program,
+            kin_core::tool_prefix::inherited_path().as_deref(),
+        )
+        .is_some()
     }
 
     /// Whether this recipe redirects with `GOBIN` rather than an installer flag.
@@ -309,6 +320,72 @@ pub(crate) fn resolve_route(recipe: &LanguageServerRecipe) -> Option<InstallRout
     choose_route(recipe, resolve_host_routes(recipe))
 }
 
+/// Where `program` resolves on `path`, if it does.
+fn program_on(program: &str, path: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    let path = path?;
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+    which::which_in(program, Some(path), &cwd).ok()
+}
+
+/// Where Kin found `program` when it is not on the user's own `PATH`.
+///
+/// `inherited` is the `PATH` this process was started with and `searched` the
+/// one Kin widened with the usual install places. A program only the second
+/// one finds is a tool the user has not chosen to use from this shell, so Kin
+/// does not run it as an installer. Both are arguments so the rule is testable
+/// without the tools a test machine happens to have.
+pub(crate) fn installer_found_only_off_path(
+    program: &str,
+    inherited: Option<&std::ffi::OsStr>,
+    searched: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
+    if program_on(program, inherited).is_some() {
+        return None;
+    }
+    program_on(program, searched)
+}
+
+/// [`installer_found_only_off_path`] for this process.
+pub(crate) fn installer_found_off_path(recipe: &LanguageServerRecipe) -> Option<PathBuf> {
+    installer_found_only_off_path(
+        recipe.program,
+        kin_core::tool_prefix::inherited_path().as_deref(),
+        std::env::var_os("PATH").as_deref(),
+    )
+}
+
+/// What to tell a user whose installer Kin found only outside their `PATH`.
+///
+/// Kin does not run it, because the recipe's own install writes into that
+/// tool's global prefix and the user never pointed Kin at it. The user gets
+/// the two ways to do it themselves, plainly.
+pub(crate) fn off_path_installer_lines(
+    recipe: &LanguageServerRecipe,
+    found: &Path,
+) -> (String, Vec<String>) {
+    let dir = found
+        .parent()
+        .map(|dir| dir.display().to_string())
+        .unwrap_or_else(|| found.display().to_string());
+    let reason = format!(
+        "`{}` is not on your PATH. Kin found {} and did not run it, because its install writes \
+         outside {}",
+        recipe.program,
+        found.display(),
+        kin_core::registry::managed_kin_home().display()
+    );
+    let own_command = if recipe.args.is_empty() {
+        found.display().to_string()
+    } else {
+        format!("{} {}", found.display(), recipe.args.join(" "))
+    };
+    let remediation = vec![
+        format!("add {dir} to your PATH, then run `{INSTALL_FIX_COMMAND}` again"),
+        format!("or install it yourself: {own_command}"),
+    ];
+    (reason, remediation)
+}
+
 /// The typescript package `typescript-language-server` is installed beside.
 ///
 /// Pinned to 5.x, and the pin is load-bearing. `typescript-language-server`
@@ -440,12 +517,10 @@ pub(crate) fn install_commands_for(missing: &[LanguageId]) -> Vec<String> {
 
 /// Every language this build enriches whose server is absent from this host.
 ///
-/// Scoped to the build rather than to the repository on purpose. The per-repo
-/// list is the better one to WARN about, and the coverage row already uses it,
-/// but it is measured through a running daemon and this is the repair that has
-/// to work on a host where nothing is running yet. Consent is per install
-/// command, so an operator on a Python-only machine still declines the Rust
-/// one rather than being handed a toolchain they did not ask for.
+/// Scoped to the build, as a fact about the host. The surfaces that install
+/// narrow it to the repository's languages with [`LanguageScope::select`]
+/// first: a Go-only repository used to get rust-analyzer and a global pyright
+/// as well, and a Rust-only one exited 1 over four languages it does not use.
 pub(crate) fn missing_enrichable_languages() -> Vec<LanguageId> {
     LANGUAGE_SERVERS
         .iter()
@@ -614,33 +689,348 @@ pub(crate) fn install_commands_for_names(names: &[&str]) -> Vec<String> {
     seen
 }
 
-/// What Kin would actually do for each missing language on THIS host,
-/// deduplicated.
+/// The one command that installs what a repository's languages need.
 ///
-/// The sibling of [`install_commands_for`], and the one to print at a person.
-/// That function answers "what does this recipe say", which is the right answer
-/// for a doc and the wrong one at a terminal: on a host with no rustup it prints
-/// `rustup component add rust-analyzer`, an instruction to install a toolchain
-/// in order to read somebody else's code. This one probes the host and prints
-/// the route Kin has, which on that host is a pinned download.
-pub(crate) fn route_commands_for(missing: &[LanguageId]) -> Vec<String> {
-    let mut seen: Vec<String> = Vec::new();
-    for language in missing {
-        let Some(recipe) = recipe_for(*language) else {
-            continue;
-        };
-        let command = match resolve_route(recipe) {
-            Some(route) => recipe.route_command_line(route),
-            // No route at all. The recipe's own command is still the honest
-            // thing to print, because installing what it names is exactly what
-            // would open one.
-            None => recipe.command_line(),
-        };
-        if !seen.contains(&command) {
-            seen.push(command);
+/// Printed wherever a server is skipped or missing, rather than the route's
+/// own install line. The route line for a pinned download reads "download
+/// rust-analyzer 2026-08-24 from ...", which is a description and not a
+/// command, and a first run printed it after "run" as though it were one.
+pub(crate) const INSTALL_FIX_COMMAND: &str = "kin doctor --fix --install-language-servers";
+
+/// `rust` for one language, `rust and go` for two, `rust, python and go`
+/// beyond that.
+fn and_list(names: &[String]) -> String {
+    match names.split_last() {
+        None => String::new(),
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
+fn language_names(languages: &[LanguageId]) -> Vec<String> {
+    languages
+        .iter()
+        .map(|language| language.to_string())
+        .collect()
+}
+
+/// The line for a language server someone chose not to install now.
+///
+/// Names Kin's own command rather than the route's, so it is always something a
+/// reader can paste, and says where to run it because the command installs
+/// what the repository it runs in needs.
+pub(crate) fn declined_line(language: LanguageId) -> String {
+    format!(
+        "skipped the {language} language server; to install it later, run \
+         `{INSTALL_FIX_COMMAND}` in your repository"
+    )
+}
+
+/// What a run that may not install anything says about the servers missing.
+pub(crate) fn withheld_lines(missing: &[LanguageId]) -> Vec<String> {
+    if missing.is_empty() {
+        return Vec::new();
+    }
+    let them = if missing.len() == 1 { "it" } else { "them" };
+    vec![
+        format!(
+            "no language server for {}, so cross-file references are unavailable for {them}",
+            and_list(&language_names(missing))
+        ),
+        format!("run `{INSTALL_FIX_COMMAND}` in your repository to install {them}"),
+    ]
+}
+
+/// The program a language's server needs at run time to do its job.
+///
+/// rust-analyzer reads a Rust project through `cargo metadata`, the npm-served
+/// servers run on Node, and gopls loads packages with the Go toolchain.
+pub(crate) fn server_runtime(language: LanguageId) -> Option<&'static str> {
+    match language {
+        LanguageId::Rust => Some("cargo"),
+        LanguageId::Python | LanguageId::TypeScript | LanguageId::JavaScript => Some("node"),
+        LanguageId::Go => Some("go"),
+        _ => None,
+    }
+}
+
+/// Whether the install prompt defaults to yes for this server.
+///
+/// Yes when the program the server needs to do its job is here, so pressing
+/// Enter through setup ends with working cross-file references. It used to
+/// default to no for every server, and a first run that accepted every default
+/// finished with none. No when that program is missing, because then the
+/// server installs and cannot read the project, and the prompt says why.
+pub(crate) fn install_by_default(
+    recipe: &LanguageServerRecipe,
+    present: impl Fn(&str) -> bool,
+) -> bool {
+    server_runtime(recipe.language).is_some_and(present)
+}
+
+/// Why the prompt for this server defaults to no, when it does.
+pub(crate) fn default_no_reason(recipe: &LanguageServerRecipe) -> Option<String> {
+    let runtime = server_runtime(recipe.language)?;
+    Some(format!(
+        "`{runtime}` is not on this machine, so the {} server could not read a project yet",
+        recipe.language
+    ))
+}
+
+/// Which languages a language-server install is for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LanguageScope {
+    /// The repository holds these languages this build enriches, in
+    /// [`LANGUAGE_SERVERS`] order. Empty when it holds none of them.
+    Repository(Vec<LanguageId>),
+    /// Kin could not tell which languages matter.
+    Unknown(UnknownScope),
+}
+
+/// Why a [`LanguageScope`] is unknown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnknownScope {
+    /// Not inside a repository.
+    NoRepository,
+    /// The repository has more files than a scan reads, so the count stopped.
+    TooLarge,
+}
+
+impl LanguageScope {
+    /// The servers in `missing` this scope asks for, in `missing`'s order.
+    ///
+    /// A known repository gets only its own languages. An unknown scope keeps
+    /// every one, which is what every run did before the scope existed, and
+    /// [`Self::describe`] says so.
+    pub(crate) fn select(&self, missing: &[LanguageId]) -> Vec<LanguageId> {
+        match self {
+            Self::Repository(languages) => missing
+                .iter()
+                .copied()
+                .filter(|language| languages.contains(language))
+                .collect(),
+            Self::Unknown(_) => missing.to_vec(),
         }
     }
-    seen
+
+    /// One line saying which languages this run covers, and why.
+    pub(crate) fn describe(&self) -> String {
+        match self {
+            Self::Repository(languages) if languages.is_empty() => format!(
+                "This repository uses none of the languages Kin has language servers for ({}).",
+                and_list(&language_names(&enrichable_languages()))
+            ),
+            Self::Repository(languages) => format!(
+                "This repository uses {}; servers for other languages are left alone.",
+                and_list(&language_names(languages))
+            ),
+            Self::Unknown(UnknownScope::NoRepository) => {
+                "Not inside a repository, so Kin cannot tell which languages you use; this covers \
+                 every language it has a server for."
+                    .to_string()
+            }
+            Self::Unknown(UnknownScope::TooLarge) => format!(
+                "This repository has more than {LANGUAGE_SCAN_BUDGET} files, so Kin did not count \
+                 its languages; this covers every language it has a server for."
+            ),
+        }
+    }
+}
+
+/// How many directory entries a language scan reads before it stops.
+const LANGUAGE_SCAN_BUDGET: usize = 200_000;
+
+/// Directories a language scan skips: dependencies and build output say
+/// nothing about the languages a repository is written in.
+const SCAN_SKIPPED_DIRS: &[&str] = &[
+    "node_modules",
+    "target",
+    "vendor",
+    "dist",
+    "build",
+    "__pycache__",
+    "venv",
+];
+
+/// Each file extension a language this build has a server for claims, read
+/// from the parser's adapters so the scan and admission agree on what a file
+/// is.
+fn enrichable_extensions() -> Vec<(String, LanguageId)> {
+    kin_parser::AdapterRegistry::new()
+        .supported_languages_with_extensions()
+        .into_iter()
+        .filter(|(language, _)| recipe_for(*language).is_some())
+        .flat_map(|(language, extensions)| {
+            extensions
+                .iter()
+                .map(move |extension| (extension.to_ascii_lowercase(), language))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// The languages this build has a server for that appear under `root`.
+///
+/// A configuration read, not a semantic answer: it decides which installs to
+/// offer, before any graph exists to ask. Hidden directories, dependencies and
+/// build output are skipped. `None` when the scan read `budget` entries
+/// without finishing, because a partial count could leave out a language the
+/// repository does use.
+pub(crate) fn scan_languages(root: &Path, budget: usize) -> Option<Vec<LanguageId>> {
+    let extensions = enrichable_extensions();
+    let every = enrichable_languages();
+    let mut found: Vec<LanguageId> = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    let mut read = 0usize;
+    'scan: while let Some(dir) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            read += 1;
+            if read > budget {
+                return None;
+            }
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if name.starts_with('.') {
+                continue;
+            }
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                if !SCAN_SKIPPED_DIRS.contains(&name) {
+                    pending.push(entry.path());
+                }
+                continue;
+            }
+            if !kind.is_file() {
+                continue;
+            }
+            let Some(extension) = Path::new(name).extension().and_then(|ext| ext.to_str()) else {
+                continue;
+            };
+            let extension = extension.to_ascii_lowercase();
+            if let Some((_, language)) =
+                extensions.iter().find(|(claimed, _)| *claimed == extension)
+            {
+                if !found.contains(language) {
+                    found.push(*language);
+                    if every.iter().all(|language| found.contains(language)) {
+                        break 'scan;
+                    }
+                }
+            }
+        }
+    }
+    Some(
+        every
+            .into_iter()
+            .filter(|language| found.contains(language))
+            .collect(),
+    )
+}
+
+/// The directory whose files are the repository `cwd` is in: a Kin
+/// repository's working directory, or the nearest enclosing Git working tree.
+///
+/// `None` outside both. The search stops at `home`, because a home directory
+/// kept under Git is not a project and scanning it would offer servers for
+/// every language anywhere in it.
+pub(crate) fn repository_root(cwd: &Path, home: Option<&Path>) -> Option<PathBuf> {
+    if let Some(layout) = kin_core::KinLayout::discover(cwd) {
+        return Some(layout.working_dir().to_path_buf());
+    }
+    let mut current = Some(cwd);
+    while let Some(dir) = current {
+        if Some(dir) == home {
+            return None;
+        }
+        if dir.join(".git").exists() {
+            return Some(dir.to_path_buf());
+        }
+        current = dir.parent();
+    }
+    None
+}
+
+/// The languages a repository uses, named by the graph's own census.
+///
+/// Names this build has no server for are dropped, and the rest come back in
+/// [`LANGUAGE_SERVERS`] order.
+pub(crate) fn languages_named(names: &[String]) -> Vec<LanguageId> {
+    enrichable_languages()
+        .into_iter()
+        .filter(|language| names.iter().any(|name| *name == language.to_string()))
+        .collect()
+}
+
+/// Which languages an install run for `cwd` covers.
+///
+/// `census` is the graph's list of the languages it holds entities in, when
+/// this run already read it. The graph is the authority, so a census that
+/// names anything decides the scope. Without one, the repository's files are
+/// scanned with the parser's own extensions; that is the only source before
+/// `kin init` has built a graph, and when no daemon is serving one.
+pub(crate) fn language_scope(cwd: &Path, census: Option<&[String]>) -> LanguageScope {
+    if let Some(names) = census.filter(|names| !names.is_empty()) {
+        return LanguageScope::Repository(languages_named(names));
+    }
+    let home = crate::commands::setup::home_dir().ok();
+    let Some(root) = repository_root(cwd, home.as_deref()) else {
+        return LanguageScope::Unknown(UnknownScope::NoRepository);
+    };
+    match scan_languages(&root, LANGUAGE_SCAN_BUDGET) {
+        Some(languages) => LanguageScope::Repository(languages),
+        None => LanguageScope::Unknown(UnknownScope::TooLarge),
+    }
+}
+
+/// The repair for a sweep that could not serve languages because no server
+/// for them is installed.
+///
+/// `skipped` pairs each language the sweep could not serve with the daemon's
+/// reason. Only a reason that says no server is installed counts, because a
+/// server that is installed and would not start is not repaired by an install.
+pub(crate) fn sweep_install_repair<'a>(
+    skipped: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Option<String> {
+    let missing: Vec<String> = skipped
+        .into_iter()
+        .filter(|(_, reason)| kin_core::reference_coverage::skip_reason_is_missing_server(reason))
+        .map(|(language, _)| language.to_string())
+        .collect();
+    if missing.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "no language server is installed for {}: run `{INSTALL_FIX_COMMAND}`, then `kin daemon \
+         sweep`",
+        and_list(&missing)
+    ))
+}
+
+/// The end of a sweep summary that names what closes it.
+///
+/// The install command when servers are missing, the note above for a server
+/// that is installed and would not start, and both when a sweep saw both.
+pub(crate) fn sweep_repair<'a>(
+    skipped: impl IntoIterator<Item = (&'a str, &'a str)> + Clone,
+) -> String {
+    let broken = skipped
+        .clone()
+        .into_iter()
+        .any(|(_, reason)| !kin_core::reference_coverage::skip_reason_is_missing_server(reason));
+    match (sweep_install_repair(skipped), broken) {
+        (Some(install), false) => install,
+        (Some(install), true) => format!("{install}; the note above names what the others need"),
+        (None, _) => "the note above names what each one needs, and `kin daemon sweep` retries \
+                      once that is repaired"
+            .to_string(),
+    }
 }
 
 /// The fix line for a set of languages whose servers are missing.
@@ -676,23 +1066,33 @@ pub(crate) fn install_fix_line(missing_names: &[&str]) -> String {
 /// digest and the directory rather than a sentence about a toolchain they do
 /// not have.
 pub(crate) fn route_disclosure(recipe: &LanguageServerRecipe, route: InstallRoute) -> String {
+    let kin_home = kin_core::registry::managed_kin_home();
     match route {
-        InstallRoute::Installer => recipe.disclosure.to_string(),
+        // Every recipe's own installer writes into that tool's own prefix, so
+        // the sentence says so before anything runs rather than leaving a
+        // reader to find the package in their Homebrew prefix afterwards.
+        InstallRoute::Installer => format!(
+            "{}. This writes outside {}.",
+            recipe.disclosure,
+            kin_home.display()
+        ),
         // The Go route is not a redirected npm install and must not describe
         // itself as one. It builds from source with the operator's own
         // toolchain, and the reason it redirects is a PATH gap rather than a
         // permission one. Different spend, different repair, different sentence.
         InstallRoute::ManagedPrefix if recipe.redirects_through_gobin() => format!(
-            "builds gopls from source with your Go toolchain and installs it into {}, a \
-             directory Kin owns under KIN_HOME and already appends to PATH. An ordinary `go \
-             install` writes into your Go bin directory instead, which this host's PATH does \
-             not carry, and the daemon starts a language server with a bare `gopls`",
-            kin_core::tool_prefix::managed_tool_bin_dir().display()
+            "builds gopls from source with your Go toolchain and installs it into {}, which Kin \
+             adds to PATH for its own processes. Go keeps its downloads and build cache in its \
+             own directories, outside {}.",
+            kin_core::tool_prefix::managed_tool_bin_dir().display(),
+            kin_home.display()
         ),
         InstallRoute::ManagedPrefix => format!(
-            "runs the same install against {}, a prefix Kin owns under KIN_HOME, because this \
-             host's global npm prefix refuses this user",
-            kin_core::tool_prefix::managed_node_prefix().display()
+            "runs the same install against {}, a prefix Kin owns, because this host's global npm \
+             prefix refuses this user. npm keeps its download cache in its own directory, \
+             outside {}.",
+            kin_core::tool_prefix::managed_node_prefix().display(),
+            kin_home.display()
         ),
         InstallRoute::PinnedRelease => match recipe.fallback {
             Fallback::PinnedRelease(release) => format!(
@@ -705,9 +1105,21 @@ pub(crate) fn route_disclosure(recipe: &LanguageServerRecipe, route: InstallRout
                 kin_core::tool_prefix::managed_tool_bin_dir().display(),
                 recipe.program,
             ),
-            Fallback::ManagedPrefix => recipe.disclosure.to_string(),
+            Fallback::ManagedPrefix => format!(
+                "{}. This writes outside {}.",
+                recipe.disclosure,
+                kin_home.display()
+            ),
         },
     }
+}
+
+/// Whether a route's line is a command a person could type.
+///
+/// The pinned route's line describes a download Kin performs itself; printed
+/// after "Command:" it read as one.
+pub(crate) fn route_is_a_command(route: InstallRoute) -> bool {
+    !matches!(route, InstallRoute::PinnedRelease)
 }
 
 /// Whether Kin may install a language server, and on whose say-so.
@@ -759,8 +1171,8 @@ pub(crate) enum InstallOutcome {
     ///
     /// `evidence` is what the run can show for it: for a download Kin performed
     /// itself, the URL the bytes came from and the digest verified before they
-    /// were written. Empty for a route where the disclosure belongs to the
-    /// installer, which printed its own output live.
+    /// were written. Empty for the recipe's own installer, whose disclosure was
+    /// printed before it ran.
     Installed {
         command: String,
         evidence: Vec<String>,
@@ -1473,16 +1885,17 @@ pub(crate) fn run_install(
     }
 }
 
-/// Run one installer, streaming its own output and keeping its words on a
-/// failure.
+/// Run one installer, keeping its output to itself unless it fails.
 ///
-/// Two things happen here that a bare `status()` cannot do. Stderr is teed
-/// rather than inherited, so the operator still reads the installer live while
-/// a failure keeps the installer's own words for the report at the end: a
-/// reason that says only "exited with 243" sends someone back to scroll a
-/// terminal for the cause (FIR-2547). And the command as an operator would type
-/// it is passed in rather than recomposed, so a redirected install reports the
-/// command that actually ran.
+/// Both streams are captured. A successful install prints nothing of its own:
+/// a first run's `kin doctor --fix` scrolled npm's upgrade notice and
+/// forty lines of `go: downloading` past the reader, and the lines that
+/// mattered were lost among them. A failure prints the installer's last lines
+/// under the command, and keeps its own words for the report at the end,
+/// because a reason that says only "exited with 243" sends someone back to
+/// scroll a terminal for the cause. The command as an operator
+/// would type it is passed in rather than recomposed, so a redirected install
+/// reports the command that actually ran.
 fn run_program(
     recipe: &LanguageServerRecipe,
     program: &str,
@@ -1491,43 +1904,73 @@ fn run_program(
     command_line: &str,
 ) -> Result<(), InstallProblem> {
     let _ = recipe;
+    run_program_to(
+        program,
+        args,
+        environment,
+        command_line,
+        &mut std::io::stderr(),
+    )
+}
+
+/// [`run_program`], writing a failed installer's own lines to `shown`.
+fn run_program_to(
+    program: &str,
+    args: &[String],
+    environment: &[(String, String)],
+    command_line: &str,
+    shown: &mut dyn Write,
+) -> Result<(), InstallProblem> {
     // Set rather than inherited, because one route's redirect lives here: `go
     // install` takes no prefix argument and writes wherever GOBIN says. The npm
     // routes pass an empty slice and keep the environment they already had.
-    let mut child = Command::new(program)
+    // Stdin is closed so an installer that wants to ask something fails rather
+    // than waiting on a prompt nobody can see.
+    let output = Command::new(program)
         .args(args)
         .envs(environment.iter().cloned())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .output()
         .map_err(|error| InstallProblem::Failed {
             reason: format!("could not run `{command_line}`: {error}"),
         })?;
-    let mut stderr_lines: Vec<String> = Vec::new();
-    if let Some(stderr) = child.stderr.take() {
-        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-            // Written rather than `eprintln!`, and the error dropped on
-            // purpose. Rust ignores SIGPIPE, so `eprintln!` panics when the
-            // reader has gone away, and the process exits 101. A caller who
-            // piped this run into `head` would then get a panic exit out of an
-            // install that completed, which is the same lie as the exit 0 this
-            // ticket is about, told in the other direction. An echoed progress
-            // line is not worth an exit code.
-            let _ = writeln!(std::io::stderr(), "{line}");
-            if stderr_lines.len() < MAX_RETAINED_INSTALLER_LINES {
-                stderr_lines.push(line);
-            }
-        }
+    if output.status.success() {
+        return Ok(());
     }
-    let status = child.wait().map_err(|error| InstallProblem::Failed {
-        reason: format!("could not wait for `{command_line}`: {error}"),
-    })?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(InstallProblem::Failed {
-            reason: installer_failure_reason(command_line, status.code(), &stderr_lines),
-        })
+    let stderr_lines = retained_lines(&output.stderr);
+    let mut said = retained_lines(&output.stdout);
+    said.extend(stderr_lines.iter().cloned());
+    let start = said.len().saturating_sub(MAX_SHOWN_INSTALLER_LINES);
+    // Written rather than `eprintln!`, and the error dropped on purpose. Rust
+    // ignores SIGPIPE, so `eprintln!` panics when the reader has gone away and
+    // the process exits 101, which would turn a reported failure into a crash.
+    let _ = writeln!(shown, "    `{command_line}` said:");
+    for line in &said[start..] {
+        let _ = writeln!(shown, "      {line}");
     }
+    Err(InstallProblem::Failed {
+        reason: installer_failure_reason(command_line, output.status.code(), &stderr_lines),
+    })
+}
+
+/// How many of a failed installer's own lines are shown under it.
+const MAX_SHOWN_INSTALLER_LINES: usize = 20;
+
+/// The last non-empty lines of one captured stream, up to the retention cap.
+///
+/// The end rather than the start, because an installer states its failure
+/// last, after whatever it downloaded on the way there.
+fn retained_lines(bytes: &[u8]) -> Vec<String> {
+    let mut lines: Vec<String> = BufReader::new(bytes)
+        .lines()
+        .map_while(Result::ok)
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    let start = lines.len().saturating_sub(MAX_RETAINED_INSTALLER_LINES);
+    lines.drain(..start);
+    lines
 }
 
 /// A dependency the installed server itself needs, which Kin did not install.
@@ -2948,11 +3391,43 @@ mod tests {
             "the download must not be described as a toolchain change: {disclosure}"
         );
 
-        // Control: the installer route keeps the recipe's own sentence.
-        assert_eq!(
-            route_disclosure(rust, InstallRoute::Installer),
-            rust.disclosure
+        // Control: the installer route keeps the recipe's own sentence, and
+        // says it writes outside Kin's directory.
+        let installer = route_disclosure(rust, InstallRoute::Installer);
+        assert!(installer.starts_with(rust.disclosure), "{installer}");
+        assert!(installer.contains("This writes outside"), "{installer}");
+        assert!(
+            !disclosure.contains("writes outside"),
+            "the pinned download lands under Kin's own directory: {disclosure}"
         );
+    }
+
+    /// Every route that writes outside Kin's own directory says so before it
+    /// runs.
+    ///
+    /// A first run's `kin doctor --fix --install-language-servers` wrote
+    /// pyright into the Homebrew prefix and said nothing about it until npm's
+    /// own output scrolled past.
+    #[test]
+    fn a_route_that_writes_outside_kin_home_says_so() {
+        let kin_home = kin_core::registry::managed_kin_home().display().to_string();
+        for recipe in LANGUAGE_SERVERS {
+            let installer = route_disclosure(recipe, InstallRoute::Installer);
+            assert!(
+                installer.contains(&format!("writes outside {kin_home}")),
+                "{}: {installer}",
+                recipe.language
+            );
+        }
+        for language in [LanguageId::Python, LanguageId::Go] {
+            let recipe = recipe_for(language).expect("recipe must exist");
+            let managed = route_disclosure(recipe, InstallRoute::ManagedPrefix);
+            assert!(
+                managed.contains(&format!("outside {kin_home}")),
+                "{language}: the managed route still fills a cache outside Kin's directory: \
+                 {managed}"
+            );
+        }
     }
 
     /// The restart sentence must stay pessimistic and must name the command.
@@ -3001,6 +3476,316 @@ mod tests {
             "each directory once, in the order its first name resolved"
         );
         assert!(language_tool_dirs_on(None).is_empty());
+    }
+
+    // ---- first-run defaults (the 0.8.0 first-run pass) ---------------------
+
+    #[cfg(unix)]
+    fn stub(dir: &Path, name: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::create_dir_all(dir).unwrap();
+        let file = dir.join(name);
+        std::fs::write(&file, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+        file
+    }
+
+    /// A skipped server is told the one command that installs it later, and
+    /// never a route's description of a download.
+    ///
+    /// A first run printed "run `download rust-analyzer 2026-08-24 from the
+    /// rust-lang/rust-analyzer release binaries` to install it later", which
+    /// is not a command.
+    #[test]
+    fn a_skipped_server_is_told_a_real_command() {
+        for recipe in LANGUAGE_SERVERS {
+            let line = declined_line(recipe.language);
+            assert!(line.contains(INSTALL_FIX_COMMAND), "{line}");
+            assert!(!line.contains("download"), "{line}");
+            assert!(!line.contains(RUST_ANALYZER_RELEASE.tag), "{line}");
+        }
+        let withheld = withheld_lines(&[LanguageId::Rust, LanguageId::Go]).join("\n");
+        assert!(withheld.contains("rust and go"), "{withheld}");
+        assert!(withheld.contains(INSTALL_FIX_COMMAND), "{withheld}");
+        assert!(!withheld.contains(RUST_ANALYZER_RELEASE.tag), "{withheld}");
+        assert!(withheld_lines(&[]).is_empty());
+    }
+
+    /// The pinned route's line is a description, so the prompt does not label
+    /// it a command; every other route's line is one.
+    #[test]
+    fn only_a_route_that_is_a_command_is_shown_as_one() {
+        assert!(!route_is_a_command(InstallRoute::PinnedRelease));
+        assert!(route_is_a_command(InstallRoute::Installer));
+        assert!(route_is_a_command(InstallRoute::ManagedPrefix));
+    }
+
+    /// Pressing Enter installs a server wherever it can do its job here.
+    ///
+    /// Every prompt defaulted to no, and a first run that accepted every
+    /// default finished with no cross-file references at all.
+    #[test]
+    fn the_prompt_defaults_to_yes_where_the_server_can_work() {
+        let rust = recipe_for(LanguageId::Rust).expect("rust must have a recipe");
+        let python = recipe_for(LanguageId::Python).expect("python must have a recipe");
+        let go = recipe_for(LanguageId::Go).expect("go must have a recipe");
+        let typescript = recipe_for(LanguageId::TypeScript).expect("typescript recipe");
+
+        assert!(install_by_default(rust, |program| program == "cargo"));
+        assert!(install_by_default(python, |program| program == "node"));
+        assert!(install_by_default(typescript, |program| program == "node"));
+        assert!(install_by_default(go, |program| program == "go"));
+
+        // Controls: without what the server needs, the default is no and the
+        // prompt says why.
+        assert!(!install_by_default(rust, |_| false));
+        assert!(!install_by_default(go, |program| program == "node"));
+        let reason = default_no_reason(rust).expect("rust names what it needs");
+        assert!(reason.contains("`cargo`"), "{reason}");
+    }
+
+    /// An installer the user has not put on PATH is named, not run.
+    ///
+    /// A first run with npm nowhere on PATH found `/opt/homebrew/bin/npm` in
+    /// Kin's usual install places and ran `npm install -g pyright` into the
+    /// Homebrew prefix.
+    #[cfg(unix)]
+    #[test]
+    fn an_installer_found_only_off_path_is_not_the_users() {
+        let root = tempfile::tempdir().unwrap();
+        let own = root.path().join("own-bin");
+        let usual = root.path().join("usual-bin");
+        std::fs::create_dir_all(&own).unwrap();
+        let npm = stub(&usual, "npm");
+        let inherited = std::env::join_paths([&own]).unwrap();
+        let widened = std::env::join_paths([&own, &usual]).unwrap();
+
+        assert_eq!(
+            installer_found_only_off_path("npm", Some(&inherited), Some(&widened)),
+            Some(npm.clone())
+        );
+        // Control: on the user's own PATH it is theirs, and nothing is named.
+        let theirs = std::env::join_paths([&usual]).unwrap();
+        assert_eq!(
+            installer_found_only_off_path("npm", Some(&theirs), Some(&widened)),
+            None
+        );
+        // Control: found nowhere is the no-installer case, not this one.
+        assert_eq!(
+            installer_found_only_off_path("npm", Some(&inherited), Some(&inherited)),
+            None
+        );
+
+        let python = recipe_for(LanguageId::Python).expect("python must have a recipe");
+        let (reason, remediation) = off_path_installer_lines(python, &npm);
+        assert!(reason.contains("not on your PATH"), "{reason}");
+        assert!(reason.contains(&npm.display().to_string()), "{reason}");
+        let remediation = remediation.join("\n");
+        assert!(remediation.contains(INSTALL_FIX_COMMAND), "{remediation}");
+        assert!(
+            remediation.contains(&format!("{} install -g pyright", npm.display())),
+            "the user gets the command to run themselves: {remediation}"
+        );
+    }
+
+    /// An installer's output is kept to itself when it succeeds and shown
+    /// when it fails.
+    ///
+    /// A first run's `kin doctor --fix` scrolled npm's upgrade notice and
+    /// forty lines of `go: downloading` past the reader.
+    #[cfg(unix)]
+    #[test]
+    fn installer_output_is_shown_only_on_failure() {
+        let args = |script: &str| vec!["-c".to_string(), script.to_string()];
+
+        let mut shown: Vec<u8> = Vec::new();
+        run_program_to(
+            "sh",
+            &args("echo 'added 1 package in 14s'; echo 'npm notice New major version' >&2"),
+            &[],
+            "npm install -g pyright",
+            &mut shown,
+        )
+        .expect("a zero exit is a success");
+        assert!(
+            shown.is_empty(),
+            "a successful install printed its own output: {}",
+            String::from_utf8_lossy(&shown)
+        );
+
+        let mut shown: Vec<u8> = Vec::new();
+        let failure = run_program_to(
+            "sh",
+            &args("echo 'go: downloading x'; echo 'npm error code E403' >&2; exit 3"),
+            &[],
+            "npm install -g pyright",
+            &mut shown,
+        )
+        .expect_err("a non-zero exit is a failure");
+        let shown = String::from_utf8_lossy(&shown);
+        assert!(shown.contains("npm error code E403"), "{shown}");
+        assert!(shown.contains("go: downloading x"), "{shown}");
+        match failure {
+            InstallProblem::Failed { reason } => {
+                assert!(reason.contains("E403"), "{reason}");
+                assert!(reason.contains("exited with 3"), "{reason}");
+            }
+            other => panic!("unexpected problem {other:?}"),
+        }
+    }
+
+    /// A repository's scope keeps only its own languages; an unknown scope
+    /// keeps every one, and says so.
+    #[test]
+    fn a_scope_selects_the_repositorys_languages_and_says_which() {
+        let missing = vec![LanguageId::Rust, LanguageId::Python, LanguageId::Go];
+        let go_only = LanguageScope::Repository(vec![LanguageId::Go]);
+        assert_eq!(go_only.select(&missing), vec![LanguageId::Go]);
+        assert!(
+            go_only.describe().contains("uses go"),
+            "{}",
+            go_only.describe()
+        );
+
+        let none = LanguageScope::Repository(Vec::new());
+        assert!(none.select(&missing).is_empty());
+
+        let outside = LanguageScope::Unknown(UnknownScope::NoRepository);
+        assert_eq!(outside.select(&missing), missing);
+        assert!(
+            outside.describe().contains("Not inside a repository"),
+            "{}",
+            outside.describe()
+        );
+        for scope in [
+            go_only,
+            none,
+            outside,
+            LanguageScope::Unknown(UnknownScope::TooLarge),
+        ] {
+            assert!(
+                !scope.describe().contains('\u{2014}'),
+                "{}",
+                scope.describe()
+            );
+        }
+    }
+
+    /// The graph's census decides the scope when it names anything, and names
+    /// this build has no server for drop out.
+    #[test]
+    fn the_graph_census_decides_the_scope() {
+        let names = vec!["go".to_string(), "ruby".to_string()];
+        assert_eq!(
+            language_scope(Path::new("/nonexistent"), Some(&names)),
+            LanguageScope::Repository(vec![LanguageId::Go])
+        );
+        assert_eq!(
+            languages_named(&["typescript".to_string(), "rust".to_string()]),
+            vec![LanguageId::Rust, LanguageId::TypeScript],
+            "in the order the recipes list them"
+        );
+    }
+
+    /// With no graph to ask, a repository's files name its languages, and
+    /// dependencies, build output and hidden directories do not.
+    #[test]
+    fn a_scan_counts_the_repositorys_own_files() {
+        let root = tempfile::tempdir().unwrap();
+        let write = |relative: &str| {
+            let path = root.path().join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"").unwrap();
+        };
+        write("cmd/uuid/main.go");
+        write("node_modules/left-pad/index.js");
+        write("target/debug/build.rs");
+        write(".git/hooks/hook.py");
+        write("vendor/lib/lib.ts");
+        write("README.md");
+        assert_eq!(
+            scan_languages(root.path(), LANGUAGE_SCAN_BUDGET),
+            Some(vec![LanguageId::Go])
+        );
+        // A scan that runs out of budget does not guess.
+        assert_eq!(scan_languages(root.path(), 1), None);
+    }
+
+    /// The repository is the nearest Git working tree, and a home directory
+    /// kept under Git is not one.
+    #[test]
+    fn the_repository_is_the_nearest_git_tree_below_home() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let project = home.join("code/uuid");
+        std::fs::create_dir_all(project.join(".git")).unwrap();
+        std::fs::create_dir_all(project.join("cmd")).unwrap();
+        std::fs::create_dir_all(home.join(".git")).unwrap();
+        std::fs::create_dir_all(home.join("Downloads")).unwrap();
+
+        assert_eq!(
+            repository_root(&project.join("cmd"), Some(&home)),
+            Some(project.clone())
+        );
+        assert_eq!(
+            repository_root(&home.join("Downloads"), Some(&home)),
+            None,
+            "a dotfiles repository in HOME is not the project setup runs for"
+        );
+    }
+
+    /// A sweep that found no server names the command that installs one, in
+    /// the note and in the summary line `kin init` ends on.
+    ///
+    /// A first run's `kin init` on a Go repository with no gopls said the
+    /// sweep "enriched none" and pointed at "the note above", which named the
+    /// cause and never the command.
+    #[test]
+    fn a_sweep_that_found_no_server_names_the_install_command() {
+        let reason = format!(
+            "the `gopls` language server did not start ({}), so nothing in this language was \
+             enriched",
+            kin_core::reference_coverage::no_server_on_daemon_path(Some("gopls"))
+        );
+        let status = serde_json::json!({
+            "languages_skipped": [{ "language": "go", "files": 22, "reason": reason }]
+        });
+        let skipped = crate::commands::init::skipped_languages_from_status(&status);
+        let (line, outcome) = crate::commands::init::cross_file_enrichment_outcome(
+            0,
+            22,
+            22,
+            &skipped,
+            &crate::commands::init::SweepOwed::default(),
+        );
+        assert!(line.contains(INSTALL_FIX_COMMAND), "{line}");
+        match outcome {
+            crate::commands::init::CrossFileEnrichment::Withheld { pending, .. } => {
+                assert!(pending.contains(INSTALL_FIX_COMMAND), "{pending}");
+                assert!(pending.contains("kin daemon sweep"), "{pending}");
+            }
+            other => panic!("a sweep that enriched nothing is withheld: {other:?}"),
+        }
+
+        // Control: a server that is installed and would not start is not
+        // repaired by an install, so the command is not offered for it.
+        let broken = serde_json::json!({
+            "languages_skipped": [{
+                "language": "python",
+                "files": 5,
+                "reason": "the `pyright-langserver` language server did not start (initialize \
+                           failed), so nothing in this language was enriched"
+            }]
+        });
+        let skipped = crate::commands::init::skipped_languages_from_status(&broken);
+        let (line, _) = crate::commands::init::cross_file_enrichment_outcome(
+            0,
+            5,
+            5,
+            &skipped,
+            &crate::commands::init::SweepOwed::default(),
+        );
+        assert!(!line.contains(INSTALL_FIX_COMMAND), "{line}");
     }
 }
 

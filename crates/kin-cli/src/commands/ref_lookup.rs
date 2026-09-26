@@ -368,6 +368,21 @@ where
     G: GraphStore,
     <G as GraphStore>::Error: std::fmt::Display + Send + Sync + 'static,
 {
+    // A symbol outside the repository has no revisions here, at the head or
+    // at any ref. Asked of the live graph, where its identity is recorded, and
+    // refused as the wrong kind of argument, or as an absence when the address
+    // names nothing.
+    if let Some(argument) = crate::commands::external_symbols::external_argument(
+        graph,
+        entity_query,
+        "`kin blame` and `kin history` have no revisions of it to read",
+    )? {
+        let absent = argument.is_absent();
+        return Err(anyhow::Error::new(EntityQueryRefusal {
+            lines: argument.into_lines(),
+            absent,
+        }));
+    }
     if reference.is_none() {
         let resolution = crate::entity_identity::resolve_entity(
             graph,
@@ -714,6 +729,7 @@ mod tests {
             evidence: Vec::new(),
             risk_summary: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         }
     }
 
@@ -1037,5 +1053,44 @@ mod tests {
                 "never the bare line: {text}"
             );
         }
+    }
+
+    /// `kin blame` and `kin history` read an entity's revisions, which a symbol
+    /// outside the repository has none of here. Refused by what it is, as a
+    /// request for the wrong kind of thing rather than an absence, at the head
+    /// and at a named ref alike; an address the graph holds no symbol under is
+    /// an absence.
+    #[test]
+    fn a_timeline_refuses_an_external_symbol_and_names_kin_refs() {
+        let store = crate::commands::external_symbols::fixture::external_store(false);
+        let head = change_id(7);
+        for reference in [None, Some("main")] {
+            for entity in [store.address(), store.node.id.to_string()] {
+                let error = match resolve_entity_timeline(&store.graph, &entity, &head, reference) {
+                    Ok(_) => panic!("{entity} resolved to an entity timeline"),
+                    Err(error) => error,
+                };
+                let refusal = entity_query_refusal(&error)
+                    .unwrap_or_else(|| panic!("not a query refusal: {error:#}"));
+                assert!(!refusal.absent, "{refusal}");
+                let text = refusal.to_string();
+                assert!(text.contains("Array.map"), "{text}");
+                assert!(
+                    text.contains(&format!("kin refs {}", store.address())),
+                    "{text}"
+                );
+            }
+        }
+        let error = match resolve_entity_timeline(
+            &store.graph,
+            "external_reference:00000000-0000-8000-8000-000000000000",
+            &head,
+            None,
+        ) {
+            Ok(_) => panic!("an unknown address resolved"),
+            Err(error) => error,
+        };
+        let refusal = entity_query_refusal(&error).expect("a query refusal");
+        assert!(refusal.absent, "{refusal}");
     }
 }

@@ -3,6 +3,7 @@
 
 pub mod agent_belt;
 pub mod budget;
+pub mod call_sites;
 pub mod caller_arrival;
 pub mod command_shape;
 pub mod daemon_delegate;
@@ -41,6 +42,9 @@ pub use agent_belt::{
 };
 pub use budget::{
     is_budgeted as is_budgeted_tool, BudgetAccounting, ResponseBudget, RESPONSE_DEFAULT_MAX_CHARS,
+};
+pub use call_sites::{
+    publish_current_proof_contexts, published_current_proof_contexts, CALL_SITES_KEY,
 };
 pub use daemon_delegate::note_startup_repository;
 pub use edge_coverage::EDGE_COVERAGE_KEY;

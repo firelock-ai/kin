@@ -122,10 +122,13 @@ it: `kin doctor --fix --install-language-servers` sets `GOBIN` to a directory
 under `KIN_HOME` that both Kin binaries append to PATH at startup, which is the
 one destination the daemon is guaranteed to find.
 
-`kin setup` and `kin doctor --fix` will offer to run these for you. Neither
-installs without consent: interactively they ask once per command with the
-download disclosed, and non-interactively they change nothing unless
-`--install-language-servers` is passed.
+`kin setup` and `kin doctor --fix` will offer to run these for you, for the
+languages the repository uses and no others. Neither installs without consent:
+interactively they ask once per command with the download disclosed, and the
+answer defaults to yes when the toolchain the server needs is installed.
+Non-interactively they change nothing unless `--install-language-servers` is
+passed. Kin runs an installer only when it is on your own PATH; one it finds
+only in a usual install place is named with the command to run yourself.
 
 A missing server used to be skipped silently. `kin doctor` now reports it as an
 actionable gap naming the language, what the gap costs, and the exact command

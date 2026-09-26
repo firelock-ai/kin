@@ -170,7 +170,8 @@ fn nominated_sources_retire_only_after_all_admitted_reads_succeed() {
             &keep.entities,
             &keep.extracted_relations,
             &keep.imports,
-            ParseCompleteness::Full
+            ParseCompleteness::Full,
+            Dependents::Rebind,
         )
         .is_err());
     assert!(fixture.live.knows_file("gone.py"));
@@ -186,6 +187,7 @@ fn nominated_sources_retire_only_after_all_admitted_reads_succeed() {
             &keep.extracted_relations,
             &keep.imports,
             ParseCompleteness::Full,
+            Dependents::Rebind,
         )
         .unwrap();
     assert!(pass.failure.is_none(), "{:?}", pass.failure);

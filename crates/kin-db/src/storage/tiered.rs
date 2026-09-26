@@ -155,6 +155,7 @@ struct ManagedHotScope {
     entity_ids: HashSet<EntityId>,
     relation_ids: HashSet<RelationId>,
     external_reference_ids: HashSet<ExternalReferenceId>,
+    resolution_record_ids: HashSet<ResolutionRecordId>,
 }
 
 impl ManagedHotScope {
@@ -169,6 +170,30 @@ impl ManagedHotScope {
         self.relation_ids.extend(snapshot.relations.keys().copied());
         self.external_reference_ids
             .extend(snapshot.external_references.keys().copied());
+        self.resolution_record_ids
+            .extend(snapshot.resolution_records.keys().copied());
+    }
+}
+
+/// Keep only the records whose named nodes `node_held` answers for and whose
+/// named records are kept too, which is what a graph built over them admits.
+fn retain_closed_records(
+    records: &mut std::collections::HashMap<ResolutionRecordId, ResolutionRecord>,
+    node_held: impl Fn(&GraphNodeId) -> bool,
+) {
+    records.retain(|_, record| record.named_nodes().iter().all(&node_held));
+    loop {
+        let held: HashSet<ResolutionRecordId> = records.keys().copied().collect();
+        let before = records.len();
+        records.retain(|_, record| {
+            record
+                .referenced_records()
+                .iter()
+                .all(|referenced| held.contains(referenced))
+        });
+        if records.len() == before {
+            break;
+        }
     }
 }
 
@@ -523,6 +548,15 @@ fn hydrate_graph_partial(
         }
     }
 
+    // Resolution records join the hot scope when every node they name did.
+    hot.resolution_records = snapshot.resolution_records.clone();
+    retain_closed_records(&mut hot.resolution_records, |node| match node {
+        GraphNodeId::Entity(id) => hot.entities.contains_key(id),
+        GraphNodeId::ExternalReference(id) => hot.external_references.contains_key(id),
+        _ => false,
+    });
+    hot.version = hot.wire_version();
+
     rebuild_relation_indexes(&mut hot);
     hydrate_graph(hot)
 }
@@ -537,7 +571,6 @@ fn merge_hot_into_cold(
     // section is dropped rather than carried into a claim nobody checked. The
     // version follows the contents: no section means v13.
     cold.materialized_graph = None;
-    cold.version = GraphSnapshot::MIN_SUPPORTED_VERSION;
     let hot_entity_ids: HashSet<_> = hot.entities.keys().copied().collect();
     let deleted_managed_entities: HashSet<_> = scope
         .entity_ids
@@ -691,6 +724,23 @@ fn merge_hot_into_cold(
                 .filter(|w| !existing.contains(w)),
         );
     }
+    // The hot graph owns the records in its scope; cold records outside it
+    // stay only while every node and record they name survived the merge.
+    cold.resolution_records
+        .retain(|record_id, _| !scope.resolution_record_ids.contains(record_id));
+    cold.resolution_records.extend(hot.resolution_records);
+    let merged_external_references: HashSet<ExternalReferenceId> =
+        cold.external_references.keys().copied().collect();
+    let merged_entities: HashSet<EntityId> = cold.entities.keys().copied().collect();
+    retain_closed_records(&mut cold.resolution_records, |node| match node {
+        GraphNodeId::Entity(id) => merged_entities.contains(id),
+        GraphNodeId::ExternalReference(id) => merged_external_references.contains(id),
+        _ => false,
+    });
+    // The version follows the contents: no section, so v13, v23 when the
+    // merged graph holds resolution records, or v25 when one of them is a
+    // call-site ledger.
+    cold.version = cold.wire_version();
     rebuild_relation_indexes(&mut cold);
     cold.validate_storage_admission()?;
     Ok(cold)
@@ -1451,6 +1501,7 @@ mod tests {
                         new: new_standalone.clone(),
                     },
                 ],
+                resolution_record_deltas: Vec::new(),
             })
             .unwrap();
         tiered.save().unwrap();
@@ -1486,6 +1537,7 @@ mod tests {
                 external_reference_deltas: vec![ExternalReferenceDelta::Removed {
                     old: new_standalone.clone(),
                 }],
+                resolution_record_deltas: Vec::new(),
             })
             .unwrap();
         tiered.save().unwrap();

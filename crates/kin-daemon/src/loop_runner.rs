@@ -480,6 +480,99 @@ fn host_entry_matches_entry(
     Ok(observed == expected)
 }
 
+/// Whether every event in one watcher batch names a source file the daemon
+/// already holds exactly as the host does, with nothing a round would repair.
+///
+/// Held means: the host bytes are the ones the daemon's tree holds, the
+/// answering graph's semantics carry a certificate bound to those bytes, the
+/// file's layout is a complete parse whose declaration regions are the spans
+/// the graph holds, no earlier parse is retained for it, no facet of another
+/// kind is left over from an earlier classification, and the owed derivation
+/// ledger names nothing to parse. A round over such a batch would admit no tree
+/// transition and would re-derive a file the graph already holds, which is not
+/// a no-op: it re-adds the file's own call guesses that a language server
+/// retired after they were linked.
+///
+/// Only a change to entity source qualifies, because only its derivation
+/// carries a certificate of the bytes it came from. A removal, a symlink, other
+/// content and anything unreadable take the ordinary round, and so does a held
+/// file with anything left to repair.
+fn batch_is_already_held(state: &DaemonState, batch: &[FileEvent]) -> bool {
+    if batch.is_empty() || !crate::semantic_debt::nothing_owed_in_held_ledger(state) {
+        return false;
+    }
+    let retained = kin_core::retained_parse::read(&state.layout);
+    if matches!(
+        retained,
+        kin_core::retained_parse::RetainedParseRead::Unreadable(_)
+    ) {
+        return false;
+    }
+    let tree = state.graph.resolved_tree();
+    batch.iter().all(|event| {
+        let FileEvent::Changed(host) = event else {
+            return false;
+        };
+        let Ok(Some(path)) = repo_path(host, state.layout.working_dir()) else {
+            return false;
+        };
+        let Some(file) = path.as_utf8() else {
+            return false;
+        };
+        let Some(artifact) = tree.artifact_at_path(&path) else {
+            return false;
+        };
+        if !matches!(artifact.entry, TreeEntry::Blob { .. })
+            || !matches!(
+                FileClassifier::classify(Path::new(file)),
+                FileClassification::EntitySource
+            )
+            || retained.errors_for(file).is_some()
+        {
+            return false;
+        }
+        let file_id = FilePathId::new(file);
+        matches!(host_entry_matches_tree(state, host, &path, &tree), Ok(true))
+            && crate::semantic_debt::answering_graph_parsed(state, &tree, &path)
+            && layout_is_held(state, &file_id)
+            && no_facet_of_another_kind(state, &file_id)
+    })
+}
+
+/// Whether `file_id` has a complete layout whose declaration regions are
+/// exactly the spans the graph holds for those declarations.
+fn layout_is_held(state: &DaemonState, file_id: &FilePathId) -> bool {
+    let Ok(Some(layout)) = state.graph.get_file_layout(file_id) else {
+        return false;
+    };
+    matches!(layout.parse_completeness, ParseCompleteness::Full)
+        && layout.regions.iter().all(|region| match region {
+            kin_model::layout::SourceRegion::EntityRef {
+                entity_id,
+                byte_range,
+            } => state
+                .graph
+                .get_entity(entity_id)
+                .ok()
+                .flatten()
+                .is_some_and(|entity| {
+                    entity.file_origin.as_ref() == Some(file_id)
+                        && entity.span.as_ref().is_some_and(|span| {
+                            span.start_byte == byte_range.start && span.end_byte == byte_range.end
+                        })
+                }),
+            kin_model::layout::SourceRegion::Trivia { .. } => true,
+        })
+}
+
+/// Whether `file_id` carries no shallow, structured or opaque record, which an
+/// entity-source round would clear.
+fn no_facet_of_another_kind(state: &DaemonState, file_id: &FilePathId) -> bool {
+    matches!(state.graph.get_shallow_file(file_id), Ok(None))
+        && matches!(state.graph.get_structured_artifact(file_id), Ok(None))
+        && matches!(state.graph.get_opaque_artifact(file_id), Ok(None))
+}
+
 /// Report whether one host event names a path beneath a graph-only member.
 ///
 /// An unreadable or unmappable event is deliberately reported as not beneath
@@ -5486,6 +5579,59 @@ pub async fn run_loop_armed(
         // exclusion boundary.
         let coordination = state.coordination_gate.lock().await;
 
+        // A round whose every event names bytes the daemon already holds,
+        // already parsed, with nothing owed, has nothing to reconcile. The
+        // common one is the echo of a commit: the commit wrote the working
+        // copy, published the same bytes and their semantics, and the watcher
+        // reports the write a few seconds later. Reconciling it anyway opened a
+        // graph mutation, which moved the authority epoch and threw away every
+        // language-server pass captured before it as stale, and it re-derived
+        // the files that bind against the edited one, bringing back the call
+        // guesses those passes had retired. Decided under the coordination
+        // gate, so no commit can move the tree between this reading and the
+        // round that would otherwise have run.
+        if catch_up_owed.is_empty() && batch_is_already_held(&state, &watcher_batch) {
+            drop(coordination);
+            for event in &watcher_batch {
+                let (FileEvent::Changed(path) | FileEvent::Removed(path)) = event;
+                retry_lane.forget(path);
+            }
+            let settled = watcher_batch
+                .iter()
+                .filter_map(|event| {
+                    let (FileEvent::Changed(path) | FileEvent::Removed(path)) = event;
+                    repo_path(path, state.layout.working_dir()).ok().flatten()
+                })
+                .collect::<Vec<_>>();
+            state
+                .background_work
+                .reconcile()
+                .settle_changed_paths(settled.iter());
+            if pending_events.is_empty() {
+                queued_mark.release();
+            }
+            debug!(
+                events = watcher_batch.len(),
+                "every watched path holds the bytes the daemon already reconciled; nothing to do"
+            );
+            pass.advanced(watcher_batch.len() as u64, Instant::now());
+            let backlog_remains = !pending_events.is_empty() || !retry_lane.is_empty();
+            state
+                .background_work
+                .reconcile()
+                .observe_backlog(backlog_remains, Instant::now());
+            if !backlog_remains {
+                state
+                    .reconciliation_status
+                    .store(RECON_IDLE, Ordering::Relaxed);
+            }
+            if !state.is_initialized.load(Ordering::Relaxed) {
+                state.is_initialized.store(true, Ordering::Relaxed);
+                info!("daemon initialized after first reconciliation cycle");
+            }
+            continue;
+        }
+
         // Acquire the reconciler lock. Reconciliation derives one validated
         // TransactionDelta which is applied atomically to the live graph
         // staging view; there is no second mutable overlay authority.
@@ -6431,6 +6577,7 @@ mod tests {
     include!("loop_runner/tests/startup_rederivation.rs");
     include!("loop_runner/tests/catch_up_completion.rs");
     include!("loop_runner/tests/reference_read_admission.rs");
+    include!("loop_runner/tests/already_held_round.rs");
     include!("loop_runner/tests/offline_tracked_changes.rs");
     include!("loop_runner/tests/single_source_scope.rs");
 

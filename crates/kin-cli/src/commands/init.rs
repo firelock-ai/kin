@@ -54,9 +54,16 @@ struct InitResultPayload<'a> {
     authority: &'static str,
     source_boundary: &'static str,
     history: &'static str,
-    /// Durable generation-bound enrichment committed by admission. This is
-    /// carried from the bootstrap lease, not reopened after publication.
-    semantic_enrichment: SemanticEnrichmentStatus,
+    /// Which durable state `semantic_enrichment`, the generations, the
+    /// workspace fields and `roots` describe: `enrichment_end` when they were
+    /// read from the store after the enrichment phase ended, `admission` when
+    /// nothing this command started could publish after admission,
+    /// `enrichment_running` when they are admission's while the sweep keeps
+    /// publishing in the daemon, and `enrichment_unread` when the store could
+    /// not be read again. Additive to this schema version.
+    authority_as_of: AuthorityAsOf,
+    /// Durable generation-bound enrichment, as of `authority_as_of`.
+    semantic_enrichment: &'a SemanticEnrichmentStatus,
     /// What this run did about cross-file reference enrichment, the phase after
     /// admission that asks a language server for the reference, override and
     /// type-use edges a single-file parse cannot derive.
@@ -334,12 +341,10 @@ pub async fn run(
         );
     }
 
-    let enrichment =
-        SemanticEnrichmentStatus::from_durable_summary(&result.authority.semantic_enrichment);
-
-    if let Err(error) =
-        kin_migrate::update_registry(result.layout.working_dir(), enrichment.entity_count)
-    {
+    if let Err(error) = kin_migrate::update_registry(
+        result.layout.working_dir(),
+        result.authority.semantic_enrichment.entity_count,
+    ) {
         eprintln!(
             "warning: {} was not added to the local repository registry, so cross-repo \
              commands (`kin deps`, `kin xref`) will not see it from sibling repositories: \
@@ -384,6 +389,10 @@ pub async fn run(
     };
     let enrichment_elapsed = enrichment_started.elapsed();
 
+    // After the phase, never before it: a sweep publishes as it goes, so what
+    // admission published is not what the store holds once the phase ends.
+    let reported = ReportedAuthority::after_enrichment(&result, &cross_file);
+
     // Read once, here, and handed to whichever surface reports it. The kill
     // happens during the enrichment phase above and leaves nothing in this
     // process, so it has to come off the store's own records; reading it twice,
@@ -395,7 +404,7 @@ pub async fn run(
         print_json_result(
             &result,
             boundary,
-            enrichment,
+            &reported,
             cross_file.payload(enrichment_elapsed),
             &graph_section_materialization,
             daemon_death.as_ref(),
@@ -404,7 +413,7 @@ pub async fn run(
         print_human_result(
             &result,
             boundary,
-            &enrichment,
+            &reported,
             &cross_file,
             &graph_section_materialization,
             &model_before,
@@ -484,24 +493,94 @@ fn parse_adopted_repository_id(value: Option<&str>) -> Result<Option<kin_model::
 /// repository over anyway.
 ///
 /// Bounded because a language server can hang and a conversion that never
-/// returns is worse than one that finishes thin: the sweep is resumable, so
-/// what this budget cuts short the next daemon start continues. Generous
-/// because the alternative failure is worse, an enrichment abandoned at 80% on
-/// a large repository every single time.
+/// returns is worse than one that finishes thin. Only the wait is bounded: a
+/// sweep still running when it ends keeps running in the daemon, which this
+/// command then leaves to finish (see [`ConversionDaemonExit`]). Generous
+/// because the conversion reports what it hands over, and a graph handed over
+/// at 80% of its sweep is thinner than one handed over whole.
 const ENRICH_BUDGET: std::time::Duration = std::time::Duration::from_secs(900);
 
-/// Stop the daemon the conversion phase started, and only that one.
+/// How the conversion phase ends the daemon it started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConversionDaemonExit {
+    /// The sweep ended, or never ran, so nothing the daemon is doing belongs
+    /// to this conversion. Stop it now.
+    StopNow,
+    /// This command stopped waiting on a sweep that is still running. Ask the
+    /// daemon to exit once nothing needs it, which keeps it up until the sweep
+    /// has finished and published.
+    ///
+    /// It used to be stopped here like any other. On a 3,590-file TypeScript
+    /// repository whose sweep takes 47 minutes, that stop landed at file 1,603
+    /// of every attempt: the sweep never published, the next daemon started it
+    /// again from the first file, and the conversion's own summary said it
+    /// "resumes on the next daemon start".
+    RetireWhenSweepEnds,
+}
+
+impl ConversionDaemonExit {
+    fn after(outcome: &CrossFileEnrichment) -> Self {
+        match outcome {
+            CrossFileEnrichment::Withheld {
+                reason: CrossFileShortfall::SweepBudgetSpent,
+                ..
+            } => Self::RetireWhenSweepEnds,
+            _ => Self::StopNow,
+        }
+    }
+}
+
+/// End the daemon the conversion phase started, and only that one.
 ///
-/// Called after the sweep has completed or its budget expired, never mid-pass:
-/// a sweep killed halfway is the failure this whole area exists to prevent, and
-/// the marker only makes it resumable, not free.
-async fn stop_conversion_daemon(borrowed_existing: bool, kin_root: &Path) {
+/// Stopped once the sweep has completed, never mid-pass: a sweep killed halfway
+/// is the failure this whole area exists to prevent. A sweep still running when
+/// this command's wait ran out is not stopped at all; the daemon is asked to
+/// exit once it has finished.
+async fn stop_conversion_daemon(
+    borrowed_existing: bool,
+    kin_root: &Path,
+    exit: ConversionDaemonExit,
+) {
     if borrowed_existing {
         return;
     }
-    if let Err(error) = crate::commands::daemon::stop_current_repo_quiet(kin_root).await {
-        note!("note: the conversion daemon could not be stopped: {error:#}");
+    match exit {
+        ConversionDaemonExit::StopNow => {
+            if let Err(error) = crate::commands::daemon::stop_current_repo_quiet(kin_root).await {
+                note!("note: the conversion daemon could not be stopped: {error:#}");
+            }
+        }
+        ConversionDaemonExit::RetireWhenSweepEnds => {
+            if let Some(line) = conversion_daemon_retirement_note(
+                crate::commands::daemon::retire_current_repo_quiet(kin_root).await,
+            ) {
+                note!("{line}");
+            }
+        }
     }
+}
+
+/// The note, if any, owed after asking the conversion daemon to exit once its
+/// sweep ends.
+///
+/// Nothing is owed when the daemon took the request, whichever way it
+/// answered: the budget note above already said the sweep keeps running. When
+/// the request did not reach it, the daemon is still running as it was, and
+/// its idle clock does not count a running sweep, so the sentence says that
+/// rather than claim a stop that did not happen.
+fn conversion_daemon_retirement_note(
+    answer: Result<crate::commands::daemon::RetirementAnswer>,
+) -> Option<String> {
+    use crate::commands::daemon::RetirementAnswer;
+    let cause = match answer {
+        Ok(RetirementAnswer::Gone | RetirementAnswer::StaysUntilDone(_)) => return None,
+        Ok(RetirementAnswer::NotAsked(cause)) => cause,
+        Err(error) => format!("{error:#}"),
+    };
+    Some(format!(
+        "note: the conversion daemon could not be asked to exit after its sweep ({cause}); it \
+         keeps sweeping, and exits on its idle timeout once the sweep has ended"
+    ))
 }
 
 /// How long the conversion phase waits for the first embedding pass to settle
@@ -1025,6 +1104,174 @@ impl CrossFileEnrichment {
     }
 }
 
+/// Which durable state a result's generations, roots, workspace and
+/// enrichment counts describe.
+///
+/// Admission publishes one state, and the enrichment phase after it can
+/// publish several more, because every checkpoint of a language-server sweep
+/// is a commit. The result used to carry admission's values whatever the
+/// phase did: on a repository the sweep enriched it reported generation 1 over
+/// a store at generation 7, and `kin status` a second later disagreed with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum AuthorityAsOf {
+    /// Admission's values, and nothing this command started can publish after
+    /// them: the phase was not requested, or was refused before it started a
+    /// daemon.
+    Admission,
+    /// Read from the store once the enrichment phase had ended, so these are
+    /// the values the store ended at.
+    EnrichmentEnd,
+    /// Admission's values, while the sweep this command stopped waiting on
+    /// keeps running in the daemon and publishes newer generations. Reading
+    /// the store again would wait on that sweep's commits, and this command's
+    /// budget for waiting is spent.
+    EnrichmentRunning,
+    /// Admission's values, because the store could not be read again after
+    /// the enrichment phase. Newer generations may exist, and `kin status`
+    /// reads them.
+    EnrichmentUnread,
+}
+
+impl AuthorityAsOf {
+    /// What a result may report after an enrichment phase that ended with
+    /// `outcome`: admission's values as they stand, or a fresh read.
+    fn after(outcome: &CrossFileEnrichment) -> Option<Self> {
+        match outcome {
+            CrossFileEnrichment::Withheld { reason, .. } => match reason {
+                CrossFileShortfall::NotRequested
+                | CrossFileShortfall::DaemonSpawnDisabled
+                | CrossFileShortfall::LoopbackBlocked
+                | CrossFileShortfall::StoreUnreadable => Some(Self::Admission),
+                CrossFileShortfall::SweepBudgetSpent => Some(Self::EnrichmentRunning),
+                // A daemon was started, or may have been, and a daemon can
+                // publish whether or not its sweep ran.
+                CrossFileShortfall::DaemonUnavailable
+                | CrossFileShortfall::SweepNotStarted
+                | CrossFileShortfall::LanguageServerUnavailable
+                | CrossFileShortfall::SweepEnrichedNothing
+                | CrossFileShortfall::SweepLanguagesUnserved
+                | CrossFileShortfall::SweepFilesOwed
+                | CrossFileShortfall::SweepOutcomeUnreadable => None,
+            },
+            CrossFileEnrichment::Produced => None,
+        }
+    }
+
+    /// The qualifier the human result prints beside the authority generation,
+    /// when the values are not the ones the store ended at.
+    fn human_qualifier(self) -> Option<&'static str> {
+        match self {
+            Self::Admission | Self::EnrichmentEnd => None,
+            Self::EnrichmentRunning => Some(
+                "at admission; the sweep still running publishes newer generations, and \
+                 `kin status` reads them",
+            ),
+            Self::EnrichmentUnread => Some(
+                "at admission; this command could not read the store again after enrichment, \
+                 and `kin status` reads the current generation",
+            ),
+        }
+    }
+}
+
+/// The durable authority values one result reports, and when they were read.
+///
+/// Owned rather than borrowed from the admission result, because after an
+/// enrichment phase they come from reading the store again.
+#[derive(Debug, Clone)]
+struct ReportedAuthority {
+    as_of: AuthorityAsOf,
+    authority_generation: u64,
+    workspace_generation: u64,
+    workspace_head: kin_model::WorkspaceHead,
+    base_target: Option<kin_model::RefTarget>,
+    base_tree_hash: Option<kin_model::Hash256>,
+    workspace_tree_hash: kin_model::Hash256,
+    roots: kin_model::RootBundle,
+    semantic_enrichment: SemanticEnrichmentStatus,
+}
+
+impl ReportedAuthority {
+    /// The values admission published, labelled `as_of`.
+    fn admission(result: &kin_core::InitResult, as_of: AuthorityAsOf) -> Self {
+        let workspace = &result.authority.workspace;
+        Self {
+            as_of,
+            authority_generation: result.authority.receipt.generation,
+            workspace_generation: workspace.workspace_generation,
+            workspace_head: workspace.workspace_head.clone(),
+            base_target: workspace.base_target.clone(),
+            base_tree_hash: workspace.base_tree_hash,
+            workspace_tree_hash: workspace.workspace_tree_hash,
+            roots: result.authority.receipt.roots_after.clone(),
+            semantic_enrichment: SemanticEnrichmentStatus::from_durable_summary(
+                &result.authority.semantic_enrichment,
+            ),
+        }
+    }
+
+    /// The values to report once the enrichment phase has ended with
+    /// `outcome`.
+    ///
+    /// Read again whenever the phase may have published, so the result names
+    /// the generation the store ended at rather than the one admission left.
+    /// That read is one authority open, the same one `kin status` pays, and it
+    /// is skipped where the phase started nothing and where its sweep is still
+    /// running. A read that fails keeps admission's values and says so, since
+    /// the store itself is not in question.
+    fn after_enrichment(result: &kin_core::InitResult, outcome: &CrossFileEnrichment) -> Self {
+        if let Some(as_of) = AuthorityAsOf::after(outcome) {
+            return Self::admission(result, as_of);
+        }
+        match Self::read(&result.layout) {
+            Ok(reported) => reported,
+            Err(error) => {
+                note!(
+                    "note: the store could not be read again after enrichment, so this result \
+                     reports the generation admission published; `kin status` reads the current \
+                     one: {error:#}"
+                );
+                Self::admission(result, AuthorityAsOf::EnrichmentUnread)
+            }
+        }
+    }
+
+    /// Read the values the store holds now, through the same authority open
+    /// and the same enrichment summary `kin status` reports.
+    fn read(layout: &kin_core::KinLayout) -> Result<Self> {
+        let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(layout)?;
+        let authority = super::repository_authority::ActiveRepositoryAuthority::open(&binding)?;
+        let lease = authority.manager().read_authority();
+        let roots = lease.roots().clone();
+        let workspace = lease
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == authority.workspace_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "repository {} has no workspace {} in its authority",
+                    authority.repository_id,
+                    authority.workspace_id
+                )
+            })?;
+        let semantic_enrichment =
+            super::status::semantic_enrichment_from_authority(&lease, &authority.workspace_id)?;
+        Ok(Self {
+            as_of: AuthorityAsOf::EnrichmentEnd,
+            authority_generation: roots.generation,
+            workspace_generation: workspace.generation,
+            workspace_head: workspace.head.clone(),
+            base_target: workspace.base_target.clone(),
+            base_tree_hash: workspace.base_tree_hash,
+            workspace_tree_hash: workspace.tree_hash,
+            roots,
+            semantic_enrichment,
+        })
+    }
+}
+
 /// Whether this process can run the cross-file sweep at all, decided before it
 /// starts anything.
 ///
@@ -1256,6 +1503,15 @@ pub(crate) fn cross_file_enrichment_outcome(
         .iter()
         .map(|entry| entry.language.as_str())
         .collect();
+    // Named wherever a language went unserved because no server is installed,
+    // so a reader is handed the command rather than "the note above".
+    let reasons = || {
+        skipped
+            .iter()
+            .map(|entry| (entry.language.as_str(), entry.reason.as_str()))
+    };
+    let install = crate::commands::language_servers::sweep_install_repair(reasons());
+    let repair = crate::commands::language_servers::sweep_repair(reasons());
 
     // A sweep that enriched nothing reported the same sentence as one that had
     // nothing left to do, and on a JavaScript repository with 66 admitted files
@@ -1275,6 +1531,7 @@ pub(crate) fn cross_file_enrichment_outcome(
         if !skipped.is_empty() {
             lines.extend(skipped_detail_lines(blocked, skipped));
         }
+        lines.extend(install.iter().map(|line| format!("    {line}")));
         lines.extend(owed_detail_line(owed));
         let pending = if languages.is_empty() {
             format!(
@@ -1286,8 +1543,7 @@ pub(crate) fn cross_file_enrichment_outcome(
             format!(
                 "the sweep walked {total} files and enriched none of them, so cross-file \
                  reference and override edges are not in this graph, and it could not serve \
-                 {} at all: {}; the note above names what each one needs, and `kin daemon \
-                 sweep` retries once that is repaired",
+                 {} at all: {}; {repair}",
                 plural_count(languages.len() as u64, "language", "languages"),
                 languages.join(", ")
             )
@@ -1305,15 +1561,14 @@ pub(crate) fn cross_file_enrichment_outcome(
             plural_count(skipped.len() as u64, "language", "languages")
         )];
         lines.extend(skipped_detail_lines(blocked, skipped));
+        lines.extend(install.iter().map(|line| format!("    {line}")));
         lines.extend(owed_detail_line(owed));
         let line = lines.join("\n");
         let outcome = CrossFileEnrichment::withheld(
             CrossFileShortfall::SweepLanguagesUnserved,
             format!(
                 "the sweep enriched {done} of {total} files and could not serve {}, so \
-                 cross-file reference and override edges for {} are not in this graph; the note \
-                 above names what each one needs, and `kin daemon sweep` retries once that is \
-                 repaired",
+                 cross-file reference and override edges for {} are not in this graph; {repair}",
                 plural_count(skipped.len() as u64, "language", "languages"),
                 languages.join(", ")
             ),
@@ -1436,12 +1691,16 @@ async fn enrich_after_init_with(
     // waits for the sweep for exactly this reason, and gave the embedding pass
     // no such wait. Skipped when this phase borrowed a daemon somebody else
     // started, because then there is no stop to protect against.
-    if !borrowed_existing {
+    //
+    // A daemon asked to exit only once nothing needs it keeps draining the
+    // embedding queue as well as the sweep, so it is owed no such wait.
+    let exit = ConversionDaemonExit::after(&outcome);
+    if !borrowed_existing && exit == ConversionDaemonExit::StopNow {
         if let Some(line) = settle_first_embed_pass(&layout).await.note() {
             note!("{line}");
         }
     }
-    stop_conversion_daemon(borrowed_existing, kin_root).await;
+    stop_conversion_daemon(borrowed_existing, kin_root, exit).await;
     outcome
 }
 
@@ -1639,23 +1898,45 @@ async fn enrich_phase(kin_root: &Path, layout: &kin_core::KinLayout) -> CrossFil
             return outcome;
         }
         if std::time::Instant::now() >= deadline {
-            note!(
-                "note: cross-file enrichment did not finish within {}s and was left running; it \
-                 resumes from where it stopped on the next daemon start",
-                ENRICH_BUDGET.as_secs()
-            );
-            return CrossFileEnrichment::withheld(
-                CrossFileShortfall::SweepBudgetSpent,
-                format!(
-                    "the sweep reached {last_reported} files and did not finish within {}s, so \
-                     the cross-file edges it has not got to are not in this graph; it resumes on \
-                     the next daemon start",
-                    ENRICH_BUDGET.as_secs()
-                ),
-            );
+            let (note, outcome) = sweep_budget_spent(ENRICH_BUDGET, done, total);
+            note!("{note}");
+            return outcome;
         }
     }
 }
+/// The note and the outcome for a conversion that stopped waiting on a sweep
+/// still running.
+///
+/// Both used to say the sweep was "left running" and "resumes on the next
+/// daemon start", and then the conversion stopped the daemon it had started.
+/// The sweep now keeps running (see [`ConversionDaemonExit`]), and these say
+/// so: where it had reached, that the daemon keeps going and publishes the rest
+/// itself, and what happens if that daemon is stopped first.
+fn sweep_budget_spent(
+    budget: std::time::Duration,
+    done: u64,
+    total: u64,
+) -> (String, CrossFileEnrichment) {
+    let secs = budget.as_secs();
+    let resumes = crate::commands::daemon::SWEEP_INTERRUPTED_RESUMES;
+    (
+        format!(
+            "note: cross-file enrichment reached {done}/{total} files in the {secs}s this \
+             command waits. The daemon keeps sweeping in the background and exits once the \
+             sweep has finished and published; `kin daemon sweep` waits for it. {resumes}"
+        ),
+        CrossFileEnrichment::withheld(
+            CrossFileShortfall::SweepBudgetSpent,
+            format!(
+                "the sweep had reached {done} of {total} files when this command stopped waiting \
+                 after {secs}s, so the cross-file edges it has not reached are not in this graph \
+                 yet; the daemon keeps sweeping and publishes them when it finishes, and `kin \
+                 daemon sweep` waits for it"
+            ),
+        ),
+    )
+}
+
 fn ensure_directory(dir: &Path) -> Result<()> {
     match std::fs::symlink_metadata(dir) {
         Ok(metadata) if metadata.file_type().is_dir() => Ok(()),
@@ -2028,33 +2309,33 @@ fn path_exists(path: &Path) -> Result<bool> {
 fn print_json_result(
     result: &kin_core::InitResult,
     boundary: InitBoundary,
-    semantic_enrichment: SemanticEnrichmentStatus,
+    reported: &ReportedAuthority,
     cross_file_enrichment: CrossFileEnrichmentPayload<'_>,
     graph_section_materialization: &InitGraphSectionMaterialization,
     daemon_death: Option<&kin_daemon_spawn::DaemonKillRecord>,
 ) -> Result<()> {
-    let workspace = &result.authority.workspace;
     let default_ref = initialized_default_ref(result);
     let payload = InitResultPayload {
         schema: "kin.init-result.v6",
         authority: "repository-v6",
         source_boundary: boundary.source_boundary(),
         history: boundary.history(),
-        semantic_enrichment,
+        authority_as_of: reported.as_of,
+        semantic_enrichment: &reported.semantic_enrichment,
         cross_file_enrichment,
         repo_root: result.layout.working_dir().display().to_string(),
         kin_dir: result.layout.root().display().to_string(),
         repository_id: &result.repository_id,
         workspace_id: result.workspace_id,
         default_ref,
-        authority_generation: result.authority.receipt.generation,
-        workspace_generation: workspace.workspace_generation,
-        workspace_head: &workspace.workspace_head,
+        authority_generation: reported.authority_generation,
+        workspace_generation: reported.workspace_generation,
+        workspace_head: &reported.workspace_head,
         raw_git_head: initialized_raw_git_head(result),
-        base_target: workspace.base_target.as_ref(),
-        base_tree_hash: workspace.base_tree_hash,
-        workspace_tree_hash: workspace.workspace_tree_hash,
-        roots: &result.authority.receipt.roots_after,
+        base_target: reported.base_target.as_ref(),
+        base_tree_hash: reported.base_tree_hash,
+        workspace_tree_hash: reported.workspace_tree_hash,
+        roots: &reported.roots,
         initial_change_id: result.authority.initial_change_id.as_ref(),
         exact_reachable_git_history: boundary == InitBoundary::ExactGit,
         store_footprint: StoreFootprint::measure(&result.layout),
@@ -2094,7 +2375,7 @@ fn uncommitted_worktree_payload(
 fn print_human_result(
     result: &kin_core::InitResult,
     boundary: InitBoundary,
-    semantic_enrichment: &SemanticEnrichmentStatus,
+    reported: &ReportedAuthority,
     cross_file: &CrossFileEnrichment,
     graph_section_materialization: &InitGraphSectionMaterialization,
     model_before: &crate::embed_model::EmbedModelFetch,
@@ -2103,7 +2384,7 @@ fn print_human_result(
     emit(&render_human_result(
         result,
         boundary,
-        semantic_enrichment,
+        reported,
         cross_file,
         graph_section_materialization,
         model_before,
@@ -2133,7 +2414,7 @@ fn emit(rendered: &str) -> Result<()> {
 fn render_human_result(
     result: &kin_core::InitResult,
     boundary: InitBoundary,
-    semantic_enrichment: &SemanticEnrichmentStatus,
+    reported: &ReportedAuthority,
     cross_file: &CrossFileEnrichment,
     graph_section_materialization: &InitGraphSectionMaterialization,
     model_before: &crate::embed_model::EmbedModelFetch,
@@ -2177,21 +2458,24 @@ fn render_human_result(
         Some(default_ref) => writeln!(out, "  Default ref: {default_ref}")?,
         None => writeln!(out, "  Default ref: none (detached workspace)")?,
     }
-    writeln!(
-        out,
-        "  Authority generation: {}",
-        result.authority.receipt.generation
-    )?;
+    match reported.as_of.human_qualifier() {
+        Some(qualifier) => writeln!(
+            out,
+            "  Authority generation: {} ({qualifier})",
+            reported.authority_generation
+        )?,
+        None => writeln!(
+            out,
+            "  Authority generation: {}",
+            reported.authority_generation
+        )?,
+    }
     writeln!(
         out,
         "  Workspace generation: {}",
-        result.authority.workspace.workspace_generation
+        reported.workspace_generation
     )?;
-    writeln!(
-        out,
-        "{}",
-        workspace_head_line(&result.authority.workspace.workspace_head)
-    )?;
+    writeln!(out, "{}", workspace_head_line(&reported.workspace_head))?;
     writeln!(
         out,
         "  Graph reopen: {}",
@@ -2217,6 +2501,7 @@ fn render_human_result(
     // death beside it is: the refusal is written by a daemon during the
     // enrichment phase and leaves nothing in this process.
     let embed_refusal = embed_refusal_for(result.layout.root());
+    let semantic_enrichment = &reported.semantic_enrichment;
     let guidance = ordered_init_guidance_lines(
         format!(
             "  Semantic enrichment: {}",
@@ -5083,6 +5368,270 @@ mod tests {
                 all.len(),
                 "two reasons share a code: {codes:?}"
             );
+        }
+    }
+
+    /// What a conversion does with its daemon when its wait for the sweep ends,
+    /// and what it says about the sweep.
+    mod a_sweep_that_outlasts_the_conversion {
+        use super::super::{
+            conversion_daemon_retirement_note, sweep_budget_spent, ConversionDaemonExit,
+            CrossFileEnrichment, CrossFileShortfall,
+        };
+        use crate::commands::daemon::RetirementAnswer;
+        use std::time::Duration;
+
+        /// The conversion stopped the daemon it started as soon as its wait ran
+        /// out, and that stop ended the sweep partway. On a 3,590-file
+        /// TypeScript repository the sweep never once reached its end this way,
+        /// and the next daemon started it over. A sweep still running when the
+        /// wait ends must be left to finish.
+        #[test]
+        fn a_sweep_still_running_is_left_to_finish_rather_than_stopped() {
+            let (_, outcome) = sweep_budget_spent(Duration::from_secs(900), 1603, 3590);
+            assert_eq!(
+                ConversionDaemonExit::after(&outcome),
+                ConversionDaemonExit::RetireWhenSweepEnds
+            );
+        }
+
+        /// Every other ending still stops the daemon, because nothing it is
+        /// doing belongs to this conversion any more.
+        #[test]
+        fn a_finished_or_unrun_sweep_still_stops_the_daemon() {
+            for outcome in [
+                CrossFileEnrichment::Produced,
+                CrossFileEnrichment::unreadable(),
+                CrossFileEnrichment::withheld(CrossFileShortfall::SweepEnrichedNothing, "none"),
+                CrossFileEnrichment::withheld(CrossFileShortfall::DaemonUnavailable, "none"),
+            ] {
+                assert_eq!(
+                    ConversionDaemonExit::after(&outcome),
+                    ConversionDaemonExit::StopNow,
+                    "{outcome:?}"
+                );
+            }
+        }
+
+        /// The note and the summary line say what the daemon does next: it
+        /// keeps sweeping and publishes the rest. They used to say the sweep
+        /// resumes on the next daemon start, over a daemon this command was
+        /// about to stop.
+        #[test]
+        fn the_budget_note_says_the_daemon_keeps_sweeping() {
+            let (note, outcome) = sweep_budget_spent(Duration::from_secs(900), 1603, 3590);
+            let CrossFileEnrichment::Withheld {
+                reason, pending, ..
+            } = &outcome
+            else {
+                panic!("a sweep cut short by the wait is not a produced one")
+            };
+            assert_eq!(*reason, CrossFileShortfall::SweepBudgetSpent);
+            for said in [&note, pending] {
+                assert!(said.contains("1603"), "{said}");
+                assert!(said.contains("3590"), "{said}");
+                assert!(said.contains("keeps sweeping"), "{said}");
+                assert!(said.contains("`kin daemon sweep` waits for it"), "{said}");
+                assert!(!said.contains("left running"), "{said}");
+                assert!(!said.contains("resumes on the next daemon start"), "{said}");
+                assert!(
+                    !said.contains("resumes from where it stopped on the next daemon start"),
+                    "{said}"
+                );
+            }
+            assert_eq!(
+                serde_json::to_value(outcome.payload(Duration::ZERO)).unwrap()["reason"],
+                "sweep_budget_spent",
+                "the code is a contract and does not move with the sentence"
+            );
+        }
+
+        /// A daemon that took the request needs no second sentence. One the
+        /// request never reached is still running and still sweeping, and the
+        /// note must not call it stopped.
+        #[test]
+        fn a_retirement_that_did_not_reach_the_daemon_says_it_keeps_sweeping() {
+            assert_eq!(
+                conversion_daemon_retirement_note(Ok(RetirementAnswer::StaysUntilDone(vec![
+                    "language-server enrichment is running".to_string()
+                ]))),
+                None
+            );
+            assert_eq!(
+                conversion_daemon_retirement_note(Ok(RetirementAnswer::Gone)),
+                None
+            );
+            let note = conversion_daemon_retirement_note(Ok(RetirementAnswer::NotAsked(
+                "no recorded port".to_string(),
+            )))
+            .expect("a request that did not arrive is reported");
+            assert!(note.contains("no recorded port"), "{note}");
+            assert!(note.contains("keeps sweeping"), "{note}");
+            assert!(!note.contains("stopped"), "{note}");
+        }
+    }
+
+    /// Which durable state a result reports, after each way the enrichment
+    /// phase can end.
+    ///
+    /// A result that printed admission's values over a store its own sweep had
+    /// carried on from disagreed with `kin status` a second later: on fastapi
+    /// it said generation 1 over a store at generation 7.
+    mod reported_authority {
+        use super::*;
+
+        fn native_store() -> (tempfile::TempDir, kin_core::InitResult) {
+            let dir = tempfile::tempdir().unwrap();
+            let result = kin_core::init(dir.path()).unwrap();
+            (dir, result)
+        }
+
+        /// A phase that may have published is read again, one that started
+        /// nothing keeps admission's values as they stand, and one whose sweep
+        /// is still running says so rather than waiting on it.
+        #[test]
+        fn every_phase_ending_names_when_its_values_were_read() {
+            assert_eq!(AuthorityAsOf::after(&CrossFileEnrichment::Produced), None);
+            for (reason, expected) in [
+                (
+                    CrossFileShortfall::NotRequested,
+                    Some(AuthorityAsOf::Admission),
+                ),
+                (
+                    CrossFileShortfall::DaemonSpawnDisabled,
+                    Some(AuthorityAsOf::Admission),
+                ),
+                (
+                    CrossFileShortfall::LoopbackBlocked,
+                    Some(AuthorityAsOf::Admission),
+                ),
+                (
+                    CrossFileShortfall::StoreUnreadable,
+                    Some(AuthorityAsOf::Admission),
+                ),
+                (
+                    CrossFileShortfall::SweepBudgetSpent,
+                    Some(AuthorityAsOf::EnrichmentRunning),
+                ),
+                (CrossFileShortfall::DaemonUnavailable, None),
+                (CrossFileShortfall::SweepNotStarted, None),
+                (CrossFileShortfall::LanguageServerUnavailable, None),
+                (CrossFileShortfall::SweepEnrichedNothing, None),
+                (CrossFileShortfall::SweepLanguagesUnserved, None),
+                (CrossFileShortfall::SweepFilesOwed, None),
+                (CrossFileShortfall::SweepOutcomeUnreadable, None),
+            ] {
+                assert_eq!(
+                    AuthorityAsOf::after(&CrossFileEnrichment::withheld(reason, "pending")),
+                    expected,
+                    "{}",
+                    reason.code()
+                );
+            }
+            for (as_of, code) in [
+                (AuthorityAsOf::Admission, "admission"),
+                (AuthorityAsOf::EnrichmentEnd, "enrichment_end"),
+                (AuthorityAsOf::EnrichmentRunning, "enrichment_running"),
+                (AuthorityAsOf::EnrichmentUnread, "enrichment_unread"),
+            ] {
+                assert_eq!(serde_json::to_value(as_of).unwrap(), code);
+            }
+        }
+
+        /// A read after the phase goes through the authority open and summary
+        /// `kin status` reports, and a sweep still running is not waited on.
+        #[test]
+        fn a_phase_that_may_have_published_is_read_again_and_a_running_sweep_is_not() {
+            let (_dir, result) = native_store();
+            let admission = ReportedAuthority::admission(&result, AuthorityAsOf::Admission);
+
+            let read = ReportedAuthority::after_enrichment(&result, &CrossFileEnrichment::Produced);
+            assert_eq!(read.as_of, AuthorityAsOf::EnrichmentEnd);
+            let binding =
+                kin_core::LocalRepositoryAuthorityBinding::from_layout(&result.layout).unwrap();
+            let status = crate::commands::status::inspect(
+                &result.layout,
+                &binding,
+                crate::commands::status::EmbeddingCoverage::unobserved(
+                    crate::commands::status::EmbeddingCoverageUnobserved::NoRunningDaemon,
+                ),
+            )
+            .unwrap();
+            assert_eq!(read.authority_generation, status.repository.generation);
+            assert_eq!(read.roots, status.repository.roots);
+            assert_eq!(read.workspace_generation, status.workspace.generation);
+            assert_eq!(read.workspace_tree_hash, status.workspace.tree_hash);
+            assert_eq!(read.semantic_enrichment, status.semantic_enrichment);
+            // Nothing published here, so the read agrees with admission too.
+            assert_eq!(read.authority_generation, admission.authority_generation);
+
+            let running = ReportedAuthority::after_enrichment(
+                &result,
+                &CrossFileEnrichment::withheld(CrossFileShortfall::SweepBudgetSpent, "pending"),
+            );
+            assert_eq!(running.as_of, AuthorityAsOf::EnrichmentRunning);
+            assert_eq!(running.authority_generation, admission.authority_generation);
+            assert_eq!(running.semantic_enrichment, admission.semantic_enrichment);
+        }
+
+        /// A store that cannot be read again keeps admission's values and
+        /// says it could not read, rather than failing an admission that
+        /// succeeded or reporting its values as the current ones.
+        #[test]
+        fn a_store_that_cannot_be_read_again_reports_admission_as_unread() {
+            let (_dir, result) = native_store();
+            let record = result
+                .layout
+                .kindb_namespace_path(result.repository_id.as_str())
+                .join("authority.json");
+            std::fs::write(&record, b"not a record").unwrap();
+
+            let reported =
+                ReportedAuthority::after_enrichment(&result, &CrossFileEnrichment::Produced);
+            assert_eq!(reported.as_of, AuthorityAsOf::EnrichmentUnread);
+            assert_eq!(
+                reported.authority_generation,
+                result.authority.receipt.generation
+            );
+        }
+
+        /// The human result qualifies a generation exactly when it is not the
+        /// one the store ended at, and names the command that reads that one.
+        #[test]
+        fn the_human_result_qualifies_a_generation_it_did_not_read_last() {
+            let (_dir, result) = native_store();
+            let render = |as_of| {
+                render_human_result(
+                    &result,
+                    InitBoundary::NativeUnborn,
+                    &ReportedAuthority::admission(&result, as_of),
+                    &CrossFileEnrichment::Produced,
+                    &InitGraphSectionMaterialization::failed(&anyhow::anyhow!("not under test")),
+                    &crate::embed_model::EmbedModelFetch::default(),
+                    None,
+                )
+                .unwrap()
+            };
+            let generation = result.authority.receipt.generation;
+            for as_of in [AuthorityAsOf::Admission, AuthorityAsOf::EnrichmentEnd] {
+                let rendered = render(as_of);
+                assert!(
+                    rendered.contains(&format!("  Authority generation: {generation}\n")),
+                    "{rendered}"
+                );
+            }
+            for as_of in [
+                AuthorityAsOf::EnrichmentRunning,
+                AuthorityAsOf::EnrichmentUnread,
+            ] {
+                let rendered = render(as_of);
+                let line = rendered
+                    .lines()
+                    .find(|line| line.starts_with("  Authority generation: "))
+                    .expect("the generation line");
+                assert!(line.contains("at admission"), "{line}");
+                assert!(line.contains("`kin status`"), "{line}");
+            }
         }
     }
 }

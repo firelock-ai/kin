@@ -130,6 +130,7 @@ fn change_from(delta: &TransactionDelta) -> SemanticChange {
         evidence: vec![],
         risk_summary: None,
         external_reference_deltas: Vec::new(),
+        resolution_record_deltas: Vec::new(),
     }
 }
 

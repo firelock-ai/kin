@@ -3127,6 +3127,7 @@ mod tests {
             evidence: Vec::new(),
             risk_summary: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         };
         change.id = compute_semantic_change_id(&change).unwrap();
         change
@@ -3423,6 +3424,7 @@ mod tests {
             evidence: Vec::new(),
             risk_summary: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         };
         parent.id = compute_semantic_change_id(&parent).unwrap();
         let mut imported_head = SemanticChange {
@@ -3443,6 +3445,7 @@ mod tests {
             evidence: Vec::new(),
             risk_summary: None,
             external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
         };
         imported_head.id = compute_semantic_change_id(&imported_head).unwrap();
         let aliases = vec![

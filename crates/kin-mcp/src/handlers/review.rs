@@ -29,6 +29,14 @@ pub fn handle_semantic_diff<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
 ) -> Result<ToolCallResult> {
+    if let Some(refusal) = external_entity_ids_refusal(
+        args,
+        store,
+        "semantic_diff",
+        "has no revisions of it here to diff",
+    )? {
+        return Ok(refusal);
+    }
     let diff = resolve_diff(args, store)?;
     let formatted = kin_review::format_diff(&diff);
     text_answer(formatted, args, "semantic_diff")
@@ -66,6 +74,26 @@ fn text_answer(
     record_files_deprecation(&mut result, tool);
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
     Ok(ToolCallResult::text(json))
+}
+
+/// The refusal a change tool gives an `entity_ids` list naming a symbol
+/// outside the repository, or an address naming nothing held.
+///
+/// Asked before the diff is built, because the diff reads an id no entity
+/// carries as a removed entity, and a symbol declared outside the repository
+/// was never removed from it. The whole call is refused, so no answer about
+/// the other ids reads as covering it.
+fn external_entity_ids_refusal<G: GraphStore>(
+    args: &HashMap<String, serde_json::Value>,
+    store: &G,
+    tool: &str,
+    why: &str,
+) -> Result<Option<ToolCallResult>> {
+    let Some(ids) = get_optional_string_array(args, "entity_ids").filter(|ids| !ids.is_empty())
+    else {
+        return Ok(None);
+    };
+    super::external_symbols::external_ids_refusal(store, &ids, tool, "entity_ids", why)
 }
 
 pub const IMPACT_ANALYSIS_DESC: &str = "\
@@ -190,6 +218,19 @@ pub async fn handle_impact_analysis<G: GraphStore>(
     store: &G,
     sessions: &SessionRegistry,
 ) -> Result<ToolCallResult> {
+    // What a change to a symbol outside the repository reaches is its callers
+    // here, and find_references lists them with each call's proof. The
+    // impact walk and the consumer counts it reports are keyed by repository
+    // entities, so the symbol is refused by what it is.
+    if let Some(refusal) = external_entity_ids_refusal(
+        args,
+        store,
+        "impact_analysis",
+        "has no change of its own here to analyze, and what a change to it reaches is \
+         its callers",
+    )? {
+        return Ok(refusal);
+    }
     let include_traffic = get_optional_bool(args, "include_traffic", true);
     let depth = get_optional_u64(args, "depth", 3) as u32;
     let diff = resolve_diff(args, store)?;
@@ -340,6 +381,14 @@ pub fn handle_semantic_review<G: GraphStore>(
     store: &G,
     sessions: &SessionRegistry,
 ) -> Result<ToolCallResult> {
+    if let Some(refusal) = external_entity_ids_refusal(
+        args,
+        store,
+        "semantic_review",
+        "has no change of its own here to review",
+    )? {
+        return Ok(refusal);
+    }
     let include_traffic = get_optional_bool(args, "include_traffic", true);
     let format = get_optional_string_param(args, "format").unwrap_or_else(|| "text".into());
     let diff = resolve_diff(args, store)?;
@@ -625,6 +674,15 @@ pub fn handle_entity_history<G: GraphStore>(
     store: &G,
 ) -> Result<ToolCallResult> {
     let id_str = get_string_param(args, "entity_id")?;
+    if let Some(refusal) = super::external_symbols::external_id_refusal(
+        store,
+        &id_str,
+        "entity_history",
+        "entity_id",
+        "has no revisions of it here to list",
+    )? {
+        return Ok(refusal);
+    }
     let entity_id = parse_entity_id(&id_str)?;
     let problems = history_parameter_problems(args);
     if !problems.is_empty() {
@@ -753,7 +811,7 @@ pub fn handle_review_create<G: GraphStore>(
 
 fn plan_review_create<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
-    _store: &G,
+    store: &G,
 ) -> Result<PlannedReviewTool> {
     use kin_model::review::{
         Review, ReviewAssignment, ReviewCompletionState, ReviewDecisionState, ReviewId,
@@ -763,7 +821,7 @@ fn plan_review_create<G: GraphStore>(
     let title = get_string_param(args, "title")?;
     let base = get_optional_string_param(args, "base").unwrap_or_else(|| "working-tree".into());
     let head = get_optional_string_param(args, "head").unwrap_or_else(|| "working-tree".into());
-    let scopes = parse_review_create_scopes(args)?;
+    let scopes = parse_review_create_scopes(args, store)?;
     let created_by = parse_identity_arg(args, "created_by", "created_by_kind", "mcp-client");
     // Optional, as the tool's schema says: a review may open with no reviewer.
     let reviewers = parse_optional_reviewer_list(args)?;
@@ -1572,8 +1630,9 @@ fn record_path_anchor_deprecations(
     }
 }
 
-fn parse_review_create_scopes(
+fn parse_review_create_scopes<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
+    store: &G,
 ) -> Result<Vec<kin_model::WorkScope>> {
     let scopes = parse_work_scopes(args.get("scopes"))?;
     if !scopes.is_empty() {
@@ -1590,6 +1649,25 @@ fn parse_review_create_scopes(
             let raw = value.as_str().ok_or_else(|| {
                 McpError::InvalidParams("entity_ids entries must be strings".into())
             })?;
+            // A symbol outside the repository is no review scope. Its address
+            // would otherwise be stored as a file path below, and its bare id
+            // as an entity no review reaches.
+            if let Some(node) = super::external_symbols::lookup_external_symbol(store, raw)? {
+                return Err(McpError::InvalidParams(
+                    super::external_symbols::external_not_served_message(
+                        &node,
+                        "kin_review_create",
+                        "scopes a review to repository entities and has nothing of it here to \
+                         review",
+                    ),
+                ));
+            }
+            if super::external_symbols::is_external_address(raw) {
+                return Err(McpError::InvalidParams(format!(
+                    "External symbol not found: {}",
+                    raw.trim()
+                )));
+            }
             if raw.starts_with("entity:")
                 || raw.starts_with("artifact:")
                 || raw.starts_with("contract:")
@@ -2018,7 +2096,7 @@ mod tests {
         let mut args = HashMap::new();
         args.insert("scopes".into(), serde_json::json!(["src/a.rs"]));
         assert!(
-            parse_review_create_scopes(&args).is_err(),
+            parse_review_create_scopes(&args, &kin_db::InMemoryGraph::new()).is_err(),
             "a misspelled scopes entry must refuse, not fall through to entity_ids"
         );
     }
@@ -2150,7 +2228,7 @@ mod tests {
             serde_json::json!([entity_id, "src/lib.rs", "artifact:README.md"]),
         );
 
-        let scopes = parse_review_create_scopes(&args).unwrap();
+        let scopes = parse_review_create_scopes(&args, &kin_db::InMemoryGraph::new()).unwrap();
         assert_eq!(scopes.len(), 3);
         assert!(matches!(scopes[0], kin_model::WorkScope::Entity(_)));
         assert_eq!(scopes[1].to_string(), "artifact:src/lib.rs");
@@ -2257,6 +2335,7 @@ mod tests {
             evidence: vec![],
             risk_summary: None,
             external_reference_deltas: vec![],
+            resolution_record_deltas: Vec::new(),
         };
         change.id = kin_model::compute_semantic_change_id(&change).unwrap();
         change

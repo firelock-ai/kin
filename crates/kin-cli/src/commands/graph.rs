@@ -81,6 +81,15 @@ pub struct GraphCommandResponse {
     /// older daemon sends none at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversion_source: Option<ConversionSourceReport>,
+    /// The call sites the graph's ledgers hold, by the state each reads as,
+    /// for the status request: the `call_sites` block `kin_graph_status`
+    /// serves, with each state's share of the census and the callers no
+    /// current ledger describes.
+    ///
+    /// Structural for the reason the fields above are, and optional because
+    /// every other request reports none and an older daemon sends none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_sites: Option<serde_json::Value>,
 }
 
 /// One file's persisted conversion coverage, as `kin doctor
@@ -294,8 +303,8 @@ pub enum EntitySourceOutcome {
     },
 }
 
-/// `kin graph status` — quick health check of the semantic graph.
-pub async fn status() -> Result<()> {
+/// `kin graph status [--json]`: a quick health check of the semantic graph.
+pub async fn status(json: bool) -> Result<()> {
     let layout = crate::commands::require_repository_layout()?;
     let mut response = run_daemon_graph(&layout, &GraphCommandRequest::Status).await?;
     append_freshness_line(
@@ -315,6 +324,15 @@ pub async fn status() -> Result<()> {
         "ℹ {}",
         crate::commands::projection::status_line(layout.root())
     ));
+    if json {
+        // The whole response, lines included, so a script reads the same
+        // report a person does. A critical issue still exits non-zero.
+        println!("{}", serde_json::to_string_pretty(&response)?);
+        if let Some(error) = response.error {
+            anyhow::bail!(error);
+        }
+        return Ok(());
+    }
     print_graph_response(response)
 }
 
@@ -723,6 +741,7 @@ fn build_conversion_source_response(
                 relation_census: None,
                 graph_section: None,
                 conversion_source: None,
+                call_sites: None,
             });
         }
         Err(error) => {
@@ -738,6 +757,7 @@ fn build_conversion_source_response(
         relation_census: None,
         graph_section: None,
         conversion_source: Some(report),
+        call_sites: None,
     })
 }
 
@@ -1486,6 +1506,13 @@ fn build_graph_status_response_for_store(
             warnings.push(warning);
         }
     }
+    // The call sites the ledgers hold, by the state each reads as, from the
+    // block `kin_graph_status` serves, so the two report one store alike. A
+    // section of the report rather than a health note, so it carries no note
+    // mark and `kin graph validate` does not repeat it.
+    let call_sites = kin_mcp::call_sites::store_block_over(graph, &entities);
+    lines.push(String::new());
+    lines.extend(kin_mcp::call_sites::text_lines(&call_sites));
     if warnings.is_empty() && criticals.is_empty() {
         lines.push(String::new());
         lines.push("✓ No issues detected.".to_string());
@@ -1520,6 +1547,7 @@ fn build_graph_status_response_for_store(
         relation_census: Some(census_comparison),
         graph_section: Some(graph_section),
         conversion_source: None,
+        call_sites: Some(call_sites),
     })
 }
 
@@ -1809,6 +1837,7 @@ fn build_graph_validate_response_with_census(
         relation_census: Some(census_comparison),
         graph_section: None,
         conversion_source: None,
+        call_sites: None,
     })
 }
 
@@ -1816,6 +1845,24 @@ fn build_graph_inspect_response(
     graph: &kin_db::InMemoryGraph,
     name: &str,
 ) -> Result<GraphCommandResponse> {
+    // A symbol outside the repository has no entity record here, and its
+    // relations are its callers, which `kin refs` lists with their proofs.
+    if let Some(lines) = crate::commands::external_symbols::entity_argument_refusal(
+        graph,
+        name,
+        "`kin graph inspect` has no entity record of its own here to show",
+    )? {
+        return Ok(GraphCommandResponse {
+            error: lines.first().cloned(),
+            lines,
+            source: None,
+            reference_edge_coverage: None,
+            relation_census: None,
+            graph_section: None,
+            conversion_source: None,
+            call_sites: None,
+        });
+    }
     let entities = graph.list_all_entities()?;
     // Inspect lists every entity a name reaches, so it keeps its own gather (an
     // exact name, or a `.name` suffix). A `#kind@path:line` suffix narrows that
@@ -1875,6 +1922,7 @@ fn build_graph_inspect_response(
             relation_census: None,
             graph_section: None,
             conversion_source: None,
+            call_sites: None,
         });
     }
 
@@ -1933,6 +1981,7 @@ fn build_graph_inspect_response(
         relation_census: None,
         graph_section: None,
         conversion_source: None,
+        call_sites: None,
     })
 }
 
@@ -2062,6 +2111,16 @@ fn build_entity_source_outcome_for_view(
     entity_query: &str,
     mint_current_source_base: bool,
 ) -> Result<EntitySourceOutcome> {
+    // A symbol outside the repository has no source in this graph, and none is
+    // looked for anywhere else. The refusal is the one the MCP tool answers
+    // offline, carried as this outcome's message so both routes send one text.
+    if let Some(node) =
+        kin_mcp::handlers::external_symbols::lookup_external_symbol(graph, entity_query)?
+    {
+        return Ok(EntitySourceOutcome::NoSource(
+            kin_mcp::handlers::external_symbols::external_source_refusal_text(&node),
+        ));
+    }
     let entity = match resolve_source_query(graph, entity_query)? {
         SourceQuery::One(e) => e,
         SourceQuery::Candidates(reason, candidates) => {
@@ -2184,6 +2243,7 @@ pub fn build_graph_source_response(
                 relation_census: None,
                 graph_section: None,
                 conversion_source: None,
+                call_sites: None,
             });
         }
     };
@@ -2216,6 +2276,7 @@ pub fn build_graph_source_response(
                 relation_census: None,
                 graph_section: None,
                 conversion_source: None,
+                call_sites: None,
             })
         }
         EntitySourceOutcome::NotFound(message) => Ok(GraphCommandResponse {
@@ -2226,6 +2287,7 @@ pub fn build_graph_source_response(
             relation_census: None,
             graph_section: None,
             conversion_source: None,
+            call_sites: None,
         }),
         // A valid entity with no retrievable source is an error for the text/`?`
         // command paths (the CLI `kin graph source` and `trace_data_flow`, which
@@ -2247,6 +2309,7 @@ pub fn build_graph_source_response(
                 relation_census: None,
                 graph_section: None,
                 conversion_source: None,
+                call_sites: None,
             })
         }
     }
@@ -3368,6 +3431,70 @@ mod tests {
                 .is_some_and(|census| !census.reports_loss()),
             "and reports no loss to doctor either"
         );
+    }
+
+    /// `kin graph status` counts the call sites the graph's ledgers hold by the
+    /// state each reads as, with each state's share of that census, in its
+    /// lines and in its structured half, from the same block
+    /// `kin_graph_status` serves.
+    #[test]
+    fn graph_status_prints_the_call_site_shares_by_state() {
+        use crate::commands::call_site_fixture::{admit, spanned};
+        use kin_model::{CallSiteState, UnresolvedReason};
+        let (_temp, binding, graph) = graph_validation_fixture();
+        let run_body = "def run(db):\n    load(db)\n    save(db)\n    render(db)\n";
+        let run = spanned("run", "app.py", 0, run_body);
+        let later = spanned("later", "lib/tools.py", 0, "def later():\n    go()\n");
+        admit(
+            &graph,
+            &[&run, &later],
+            vec![(
+                &run,
+                run_body,
+                vec![
+                    ("load", CallSiteState::ProvenOutside),
+                    ("save", CallSiteState::ProvenOutside),
+                    (
+                        "render",
+                        CallSiteState::Unresolved {
+                            reason: UnresolvedReason::NoAnswer,
+                        },
+                    ),
+                ],
+            )],
+        );
+
+        let response = build_graph_status_response(
+            &pinned(&binding),
+            &graph,
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+        )
+        .unwrap();
+        let rendered = response.lines.join("\n");
+        assert!(
+            rendered.contains("Call sites in the store: 3 across 2 caller(s), 1 caller(s) owed"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("by state: proven_outside 2 (67%), unresolved 1 (33%)"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("owed enrichment: lib/tools.py (1 caller(s))"),
+            "{rendered}"
+        );
+        let block = response.call_sites.as_ref().expect("the structured half");
+        assert_eq!(block["census"], 3, "{block}");
+        let total: u64 = block["shares"]
+            .as_object()
+            .expect("shares")
+            .values()
+            .map(|share| share["sites"].as_u64().unwrap_or(0))
+            .sum();
+        assert_eq!(total, 3, "the shares add up to the census: {block}");
+        assert_eq!(block["callers_owed"], 1, "{block}");
     }
 
     /// The exact reported failure. `kin graph status` on the umbrella store
@@ -5279,6 +5406,26 @@ mod tests {
             .any(|line| line == &format!("  ID: {id}")));
     }
 
+    /// `kin graph inspect` shows an entity's record and relations. A symbol
+    /// outside the repository is refused by what it is, with the command that
+    /// lists its callers, never reported as a missing entity.
+    #[test]
+    fn graph_inspect_refuses_an_external_symbol_and_names_kin_refs() {
+        let store = crate::commands::external_symbols::fixture::external_store(false);
+        for query in [store.address(), store.node.id.to_string()] {
+            let response = build_graph_inspect_response(&store.graph, &query).unwrap();
+            let error = response.error.expect("a refusal");
+            let text = response.lines.join("\n");
+            assert!(text.contains("Array.map"), "{text}");
+            assert!(
+                text.contains(&format!("kin refs {}", store.address())),
+                "{text}"
+            );
+            assert!(!text.contains("not found"), "{text}");
+            assert!(!error.contains("no entity found"), "{error}");
+        }
+    }
+
     struct GraphSourceFixture {
         _temp: tempfile::TempDir,
         layout: kin_core::KinLayout,
@@ -5753,6 +5900,55 @@ mod tests {
                 assert!(message.contains("will not succeed"), "{message}");
             }
             other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    /// The daemon's source route refuses a symbol outside the repository with
+    /// the refusal the MCP tool answers offline, by its address or its bare id,
+    /// and reads nothing to do it.
+    #[test]
+    fn entity_source_outcome_refuses_an_external_symbol() {
+        let fixture = graph_source_fixture(Some(b"fn x() {}\n"));
+        let symbol = kin_model::ExternalSymbol::new(
+            kin_model::ScipPackage::new("cargo", "std", "1.96.0").unwrap(),
+            vec![
+                kin_model::ScipDescriptor::namespace("vec"),
+                kin_model::ScipDescriptor::type_("Vec"),
+                kin_model::ScipDescriptor::method("push"),
+            ],
+        )
+        .unwrap();
+        let node = symbol.to_reference().unwrap();
+        fixture
+            .graph
+            .apply_transaction_delta(&kin_model::TransactionDelta {
+                external_reference_deltas: vec![kin_model::ExternalReferenceDelta::Added {
+                    new: node.clone(),
+                }],
+                ..kin_model::TransactionDelta::default()
+            })
+            .unwrap();
+
+        for query in [
+            format!("external_reference:{}", node.id),
+            node.id.to_string(),
+        ] {
+            match build_entity_source_outcome(&fixture.authority(), &fixture.graph, &query).unwrap()
+            {
+                EntitySourceOutcome::NoSource(message) => {
+                    let (code, sentence) =
+                        kin_mcp::handlers::external_symbols::external_source_refusal_parts(
+                            &message,
+                        )
+                        .unwrap_or_else(|| panic!("not the external refusal: {message}"));
+                    assert_eq!(
+                        code,
+                        kin_mcp::handlers::external_symbols::EXTERNAL_SYMBOL_NO_SOURCE
+                    );
+                    assert!(sentence.contains("Vec.push"), "{sentence}");
+                }
+                other => panic!("expected NoSource, got {other:?}"),
+            }
         }
     }
 

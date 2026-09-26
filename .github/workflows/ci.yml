@@ -3077,13 +3077,13 @@ jobs:
           tool: cargo-tarpaulin
 
       # The exit-0 contract here is unchanged from main. Tarpaulin is
-      # non-blocking for the public alpha and this change neither hardens nor
+      # non-blocking for the public beta and this change neither hardens nor
       # softens that; hardening it belongs after a run proves tarpaulin can
       # finish, which none of the 39 sampled runs did. What is new is that a
       # failure now says WHICH failure it was. A tarpaulin nonzero next to a
       # near-empty disk is a runner infrastructure failure and says so by name,
       # rc=124 is the 30m bound rather than a defect, and anything else keeps
-      # the alpha warning.
+      # the non-blocking warning.
       #
       # This can only speak when the step itself survives. When the disk kills
       # the runner's worker process instead, no step-level line is ever written,
@@ -3108,7 +3108,7 @@ jobs:
             elif [ "$rc" -eq 124 ]; then
               echo "::warning::Tarpaulin exceeded its 30m bound (rc=124) with disk to spare, so the bound is what stopped it."
             else
-              echo "::warning::Tarpaulin is currently non-blocking in CI for the public alpha (rc=$rc)."
+              echo "::warning::Tarpaulin is currently non-blocking in CI for the public beta (rc=$rc)."
             fi
           fi
 

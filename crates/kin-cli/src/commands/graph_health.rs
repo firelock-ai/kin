@@ -1057,6 +1057,7 @@ mod tests {
                 ],
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             })
             .unwrap();
         // Exactly the facet the extractor writes for these bytes, hash and all.
@@ -1134,6 +1135,7 @@ mod tests {
                 ],
                 admission_policy_delta: None,
                 external_reference_deltas: Vec::new(),
+                resolution_record_deltas: Vec::new(),
             })
             .unwrap();
         graph
