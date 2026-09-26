@@ -31,10 +31,21 @@ pub const BOLD: &str = "\x1b[1m";
 pub fn enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::io::stdout().is_terminal()
-            && std::env::var_os("NO_COLOR").is_none()
-            && !std::env::var("TERM").is_ok_and(|term| term == "dumb")
+        wanted(
+            std::io::stdout().is_terminal(),
+            std::env::var_os("NO_COLOR").is_some(),
+            std::env::var("TERM").ok().as_deref(),
+        )
     })
+}
+
+/// The colour decision for given inputs, split from the environment read so a
+/// caller that gathers its own inputs, and a test, reach the same rule.
+///
+/// A set `NO_COLOR` turns colour off whatever its value, and so does
+/// `TERM=dumb`.
+pub(crate) fn wanted(stdout_is_terminal: bool, no_color: bool, term: Option<&str>) -> bool {
+    stdout_is_terminal && !no_color && term != Some("dumb")
 }
 
 pub fn paint_refs_line(line: &str) -> String {

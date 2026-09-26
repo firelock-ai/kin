@@ -8,6 +8,7 @@
 #[macro_use]
 pub mod broken_pipe;
 pub mod backend;
+pub mod banner;
 pub mod capability;
 pub mod commands;
 pub mod daemon_client;

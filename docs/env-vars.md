@@ -3,7 +3,7 @@
 
 # Kin environment variables
 
-This is the authoritative list of supported `KIN_*` environment variables (553 total, 365 correctness-relevant), generated from the central registry in `kin-core`.
+This is the authoritative list of supported `KIN_*` environment variables (554 total, 365 correctness-relevant), generated from the central registry in `kin-core`.
 
 At CLI and daemon startup Kin validates this surface (`KIN_ENV_VALIDATION`, default `warn`):
 
@@ -43,6 +43,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_MCP_REPO` | path | *(unset)* | operational | bind `kin mcp start` to this repository instead of the launch directory |
 | `KIN_MCP_TOOL_PROFILE` | string | agent-default | operational | MCP tool surface: agent-default (curated, the default), agent-query (the same belt with no session or transaction tools), agent-search (the measured always-on set, the rest reached through kin_tool_search), agent-routed (one kin tool whose commands reach the agent belt, writes included, and every other tool through describe and call, for clients that send every tool with every request), agent-routed-query (that tool without a write path), full (every tool), benchmark, context-bench |
 | `KIN_MCP_TOOL_PROFILE_PINNED` | bool | false | operational | written by `kin setup` beside KIN_MCP_TOOL_PROFILE in a client's MCP entry when the profile was chosen, with `--tool-profile` or by hand: later `kin setup` and `kin update` runs keep it rather than moving it to the client's default |
+| `KIN_NO_BANNER` | bool | false | operational | hide the Kin logo that interactive `kin setup`, human-mode `kin init` and a bare `kin` print on a terminal when set truthy |
 | `KIN_NO_PROVISION` | bool | false | operational | forbid network provisioning by the @kinlab/kin launcher |
 | `KIN_NO_SETUP` | bool | false | operational | skip the installer's post-install setup wizard when set truthy |
 | `KIN_REGISTRY_REPAIR` | bool | false | operational | allow the POSIX installer to repair safe registry ownership modes |

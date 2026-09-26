@@ -19,6 +19,8 @@ use std::io::IsTerminal;
 /// TTY-aware progress writer.
 pub struct Progress {
     is_tty: bool,
+    /// Terminal width in columns, when stderr is a terminal that reports one.
+    width: Option<usize>,
     /// How many updates have been emitted (for throttling non-TTY output).
     updates: usize,
 }
@@ -26,8 +28,14 @@ pub struct Progress {
 impl Progress {
     /// Create a progress writer that targets stderr.
     pub fn stderr() -> Self {
+        let is_tty = std::io::stderr().is_terminal();
+        let width = is_tty
+            .then(|| console::Term::stderr().size_checked())
+            .flatten()
+            .map(|(_, columns)| usize::from(columns));
         Self {
-            is_tty: std::io::stderr().is_terminal(),
+            is_tty,
+            width,
             updates: 0,
         }
     }
@@ -38,12 +46,12 @@ impl Progress {
         self.updates += 1;
 
         if self.is_tty {
-            eprint!("{}", rendered_update(true, &msg.to_string()));
+            eprint!("{}", rendered_update(true, self.width, &msg.to_string()));
         } else {
             // Non-TTY: print every 10th update as a full line
             // (avoids flooding CI/pipe output with hundreds of lines)
             if self.updates <= 1 || self.updates.is_multiple_of(10) {
-                eprint!("{}", rendered_update(false, &msg.to_string()));
+                eprint!("{}", rendered_update(false, None, &msg.to_string()));
             }
         }
     }
@@ -62,10 +70,10 @@ impl Progress {
     /// `kin daemon ready in 6.7s` over a phase line more than twice its length.
     pub fn finish_with(&self, msg: std::fmt::Arguments<'_>) {
         if self.is_tty {
-            eprint!("{}", rendered_update(true, &msg.to_string()));
+            eprint!("{}", rendered_update(true, self.width, &msg.to_string()));
             eprintln!();
         } else {
-            eprint!("{}", rendered_update(false, &msg.to_string()));
+            eprint!("{}", rendered_update(false, None, &msg.to_string()));
         }
     }
 }
@@ -83,8 +91,17 @@ impl Progress {
 /// and every test that drives a CLI reads a pipe, which takes the newline
 /// branch, so the carriage-return branch had no coverage at all: the defect
 /// this prevents was invisible to exactly the tests written to catch it.
-fn rendered_update(is_tty: bool, msg: &str) -> String {
+///
+/// On a terminal the line is also clipped to its width. A carriage return
+/// reaches only the last row of a wrapped line, so an update wider than the
+/// terminal left its first rows behind for good, mid-word, above the next
+/// update. The clip keeps one column spare so the cursor never wraps.
+fn rendered_update(is_tty: bool, width: Option<usize>, msg: &str) -> String {
     if is_tty {
+        let msg = match width {
+            Some(width) if width > 3 => console::truncate_str(msg, width - 3, "…"),
+            _ => std::borrow::Cow::Borrowed(msg),
+        };
         format!("\r  {msg}\x1b[K")
     } else {
         format!("  {msg}\n")
@@ -101,9 +118,10 @@ mod tests {
     fn a_shorter_terminal_update_erases_the_line_it_replaces() {
         let long = rendered_update(
             true,
+            None,
             "phase: the daemon is listening and finishing readiness checks (15.9s)",
         );
-        let short = rendered_update(true, "kin daemon ready in 6.7s");
+        let short = rendered_update(true, None, "kin daemon ready in 6.7s");
 
         assert!(
             short.len() < long.len(),
@@ -124,7 +142,7 @@ mod tests {
     /// stderr, and the two branches cannot be satisfied by one rendering.
     #[test]
     fn the_piped_branch_carries_no_escape_sequence() {
-        let piped = rendered_update(false, "kin daemon ready in 6.7s");
+        let piped = rendered_update(false, None, "kin daemon ready in 6.7s");
         assert!(
             !piped.contains('\x1b'),
             "a redirected stream is read as text and must carry no escape: {piped:?}"
@@ -132,6 +150,30 @@ mod tests {
         assert!(
             piped.ends_with('\n') && !piped.contains('\r'),
             "and it ends its own line rather than returning to the start of one: {piped:?}"
+        );
+    }
+
+    /// A terminal update never wraps. The daemon-start notice is 107 columns,
+    /// and on an 80-column terminal its first row used to stay on screen.
+    #[test]
+    fn a_terminal_update_is_clipped_to_the_terminal_width() {
+        let notice = "starting the kin daemon for this repository; the first query after a start \
+                      waits for it to load the graph";
+        let rendered = rendered_update(true, Some(80), notice);
+        let visible = console::strip_ansi_codes(&rendered);
+        let visible = visible.trim_start_matches('\r');
+        assert!(
+            console::measure_text_width(visible) < 80,
+            "a clipped update fits the terminal: {visible:?}"
+        );
+        assert!(
+            visible.ends_with('…'),
+            "and says it was clipped: {visible:?}"
+        );
+        let piped = rendered_update(false, None, notice);
+        assert!(
+            piped.contains("load the graph"),
+            "a pipe keeps the whole line: {piped:?}"
         );
     }
 }

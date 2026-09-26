@@ -13926,7 +13926,11 @@ fn print_skipped_decisions(skipped: &[SkippedDecision], interactive: bool) {
 pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
     let interactive = !opts.no_interactive && is_tty();
 
-    println!();
+    // The logo opens an interactive run, and brings the blank line this
+    // welcome would otherwise open with.
+    if !crate::banner::print_once(interactive) {
+        println!();
+    }
     println!("Welcome to Kin setup. Let's get you to value in a few questions.");
     println!();
 

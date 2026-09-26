@@ -2566,24 +2566,27 @@ fn unsupported_counter_cannot_bypass_first_request_heuristic_admission() {
 
 #[test]
 fn counting_and_generation_share_the_run_deadline() {
+    // Counting takes half the run deadline, so the generation request is sent
+    // with time left on a slow host, and a second deadline for generation alone
+    // would end no earlier than 800 + 1600 ms, past the bound below.
     let mut script = counted_prompt(100);
-    script[0].delay = Duration::from_millis(150);
-    script[1].delay = Duration::from_millis(150);
+    script[0].delay = Duration::from_millis(400);
+    script[1].delay = Duration::from_millis(400);
     let mut slow = count_step(
         "/v1/chat/completions",
         completion_with_usage("Too late", None, 100, 20),
     );
-    slow.delay = Duration::from_millis(700);
+    slow.delay = Duration::from_millis(2400);
     script.push(slow);
     let endpoint = CountingEndpoint::start(script);
     let (_dir, mut cfg) = accounting_config(&endpoint.base_url);
-    cfg.deadline = Duration::from_millis(600);
+    cfg.deadline = Duration::from_millis(1600);
     let started = std::time::Instant::now();
     let outcome =
         kin_agent::run_with_accounting(cfg, kin_agent::RequestAccounting::LlamaCpp).unwrap();
     assert_eq!(outcome.status, ExitStatus::Deadline);
     assert!(
-        started.elapsed() < Duration::from_millis(950),
+        started.elapsed() < Duration::from_millis(2300),
         "counting must not add a second generation deadline"
     );
     let seen = endpoint.requests();
