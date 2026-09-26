@@ -56,6 +56,11 @@ COPIED = (
     PREPARE_SUITE,
     PROOF,
     PROOF_SUITE,
+    # The prepare suite also checks that the checked-in MCP Registry entry
+    # names the workspace version, which reads these from the tree it runs in.
+    "Cargo.toml",
+    "server.json",
+    "packages/kin/package.json",
 )
 
 

@@ -926,11 +926,15 @@ jobs:
           set +e
           kin status > "$captures/kin-status.txt" 2>&1
           status_rc=$?
-          kin status --json > "$captures/kin-status.json" 2>&1
+          # Stdout only: the file is parsed as JSON below, and a diagnostic the
+          # command writes to stderr, such as the missing .kinignore warning,
+          # is kept beside it instead of inside it.
+          kin status --json > "$captures/kin-status.json" 2> "$captures/kin-status-json.stderr.txt"
           status_json_rc=$?
           set -e
           cat "$captures/kin-status.txt"
           cat "$captures/kin-status.json"
+          cat "$captures/kin-status-json.stderr.txt" >&2
           printf 'kin status rc=%s / kin status --json rc=%s (9 = working copy unmeasured)\n' \
             "$status_rc" "$status_json_rc" > "$captures/kin-status-exit.txt"
           cat "$captures/kin-status-exit.txt"

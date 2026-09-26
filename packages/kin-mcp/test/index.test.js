@@ -1254,8 +1254,67 @@ function firstLaunchEnv(tmpDir, overrides = {}) {
   };
 }
 
-/** Run the published entrypoint and read its stdout as MCP messages. */
-function startWrapper({ cwd, env }) {
+const deferredCleanups = new WeakMap();
+
+/**
+ * Run `cleanup` when test `t` ends, before every cleanup the test deferred
+ * earlier.
+ *
+ * node:test runs a test's `after` hooks in the order they were added and skips
+ * the rest once one throws. A first-launch test makes its directory before it
+ * starts the mirror and the wrapper, so with plain hooks the directory was
+ * removed while the wrapper still ran in it. Windows refuses that with EBUSY,
+ * and the hooks it skipped left the wrapper and the mirror holding the test
+ * process open. Deferred cleanups run last-deferred first, each one runs even
+ * when an earlier one failed, and the first failure fails the test after all
+ * of them ran.
+ */
+function deferCleanup(t, cleanup) {
+  let pending = deferredCleanups.get(t);
+  if (pending === undefined) {
+    pending = [];
+    deferredCleanups.set(t, pending);
+    t.after(async () => {
+      let failure = null;
+      while (pending.length > 0) {
+        try {
+          await pending.pop()();
+        } catch (error) {
+          failure ??= error;
+        }
+      }
+      if (failure !== null) {
+        throw failure;
+      }
+    });
+  }
+  pending.push(cleanup);
+}
+
+/**
+ * A temporary directory for a first-launch test, removed when the test ends
+ * and only after the wrappers and mirrors it started have stopped.
+ */
+async function firstLaunchTmpDir(t, prefix) {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
+  deferCleanup(t, () =>
+    fs.rm(tmpDir, {
+      recursive: true,
+      force: true,
+      // Windows can report a directory busy for a moment after the process
+      // that held it exited, so removal retries there with Node's own
+      // bounded backoff.
+      maxRetries: process.platform === 'win32' ? 5 : 0
+    })
+  );
+  return tmpDir;
+}
+
+/**
+ * Run the published entrypoint and read its stdout as MCP messages. The
+ * wrapper is stopped, and its exit awaited, when test `t` ends.
+ */
+function startWrapper(t, { cwd, env }) {
   const child = cp.spawn(process.execPath, [wrapperBin], {
     cwd,
     env,
@@ -1279,12 +1338,19 @@ function startWrapper({ cwd, env }) {
   const exited = new Promise(resolve => {
     child.on('close', (code, signal) => resolve({ code, signal }));
   });
-  return {
+  const wrapper = {
     child,
     received,
     exited,
     get stderr() {
       return stderr;
+    },
+    /** Kill the wrapper if it still runs, and wait until it has exited. */
+    async stop() {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill('SIGKILL');
+      }
+      await exited;
     },
     send(message, framed = false) {
       child.stdin.write(encodeFrame(message, framed));
@@ -1308,6 +1374,8 @@ function startWrapper({ cwd, env }) {
       });
     }
   };
+  deferCleanup(t, () => wrapper.stop());
+  return wrapper;
 }
 
 /**
@@ -1336,7 +1404,7 @@ async function startMirror(t, handler) {
     }
     throw error;
   }
-  t.after(async () => {
+  deferCleanup(t, async () => {
     server.closeAllConnections();
     await new Promise(resolve => server.close(resolve));
   });
@@ -1476,8 +1544,7 @@ test('a first launch answers the handshake while the release download is still p
     t.skip(`no Kin release is published for ${process.platform}/${process.arch}`);
     return;
   }
-  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'kin-mcp-first-launch-'));
-  t.after(() => fs.rm(tmpDir, { recursive: true, force: true }));
+  const tmpDir = await firstLaunchTmpDir(t, 'kin-mcp-first-launch-');
   const tag = resolveReleaseTag(PACKAGE_VERSION);
   let archiveRequested = false;
   // The checksum is served at once. The archive announces 47 MiB, sends three,
@@ -1497,11 +1564,10 @@ test('a first launch answers the handshake while the release download is still p
   if (baseUrl === null) return;
   const repoDir = path.join(tmpDir, 'repo');
   await fs.mkdir(path.join(repoDir, '.kin'), { recursive: true });
-  const wrapper = startWrapper({
+  const wrapper = startWrapper(t, {
     cwd: repoDir,
     env: firstLaunchEnv(tmpDir, { KIN_MCP_RELEASE_BASE_URL: baseUrl })
   });
-  t.after(() => wrapper.child.kill('SIGKILL'));
 
   const sentAt = performance.now();
   wrapper.send(initializeRequest(1), true);
@@ -1571,8 +1637,7 @@ test('a first launch hands out the instructions for the profile kin mcp start wi
     t.skip(`no Kin release is published for ${process.platform}/${process.arch}`);
     return;
   }
-  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'kin-mcp-first-launch-profile-'));
-  t.after(() => fs.rm(tmpDir, { recursive: true, force: true }));
+  const tmpDir = await firstLaunchTmpDir(t, 'kin-mcp-first-launch-profile-');
   const tag = resolveReleaseTag(PACKAGE_VERSION);
   // The download never finishes, so every answer is the first launch's own.
   const baseUrl = await startMirror(t, (request, response) => {
@@ -1603,7 +1668,7 @@ test('a first launch hands out the instructions for the profile kin mcp start wi
     if (value !== undefined) {
       overrides.KIN_MCP_TOOL_PROFILE = value;
     }
-    const wrapper = startWrapper({
+    const wrapper = startWrapper(t, {
       cwd: repoDir,
       env: firstLaunchEnv(path.join(tmpDir, `launch-${index}`), overrides)
     });
@@ -1620,8 +1685,7 @@ test('a first launch hands out the instructions for the profile kin mcp start wi
         `KIN_MCP_TOOL_PROFILE=${JSON.stringify(value)} is served as ${served}`
       );
     } finally {
-      wrapper.child.kill('SIGKILL');
-      await wrapper.exited;
+      await wrapper.stop();
     }
   }
   // Every text the server picks from was handed out above, so none of them is
@@ -1640,8 +1704,7 @@ test('a failed first-launch download is reported in the answer to every tool cal
     t.skip(`no Kin release is published for ${process.platform}/${process.arch}`);
     return;
   }
-  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'kin-mcp-first-launch-fail-'));
-  t.after(() => fs.rm(tmpDir, { recursive: true, force: true }));
+  const tmpDir = await firstLaunchTmpDir(t, 'kin-mcp-first-launch-fail-');
   // The mirror refuses only once the client has its session. A failure before
   // any client spoke is reported on stderr and ends the process, as it did
   // before there was a session to report it into.
@@ -1655,11 +1718,10 @@ test('a failed first-launch download is reported in the answer to every tool cal
   if (baseUrl === null) return;
   const repoDir = path.join(tmpDir, 'repo');
   await fs.mkdir(path.join(repoDir, '.kin'), { recursive: true });
-  const wrapper = startWrapper({
+  const wrapper = startWrapper(t, {
     cwd: repoDir,
     env: firstLaunchEnv(tmpDir, { KIN_MCP_RELEASE_BASE_URL: baseUrl })
   });
-  t.after(() => wrapper.child.kill('SIGKILL'));
 
   wrapper.send(initializeRequest(1));
   await wrapper.waitFor(m => m.id === 1, HANDSHAKE_BOUND_MS, 'initialize');
@@ -1842,8 +1904,7 @@ test(
   onlyWithTarballs,
   async t => {
     const asset = resolveReleaseAsset(process.platform, process.arch);
-    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'kin-mcp-first-launch-handoff-'));
-    t.after(() => fs.rm(tmpDir, { recursive: true, force: true }));
+    const tmpDir = await firstLaunchTmpDir(t, 'kin-mcp-first-launch-handoff-');
     const serverLog = path.join(tmpDir, 'server.log');
     const initializeHold = path.join(tmpDir, 'answer-initialize');
     const mirror = await startArchiveMirror(t, asset, await buildFakeKinArchive(tmpDir, asset));
@@ -1851,7 +1912,7 @@ test(
 
     const repoDir = path.join(tmpDir, 'repo');
     await fs.mkdir(path.join(repoDir, '.kin'), { recursive: true });
-    const wrapper = startWrapper({
+    const wrapper = startWrapper(t, {
       cwd: repoDir,
       env: firstLaunchEnv(tmpDir, {
         KIN_MCP_RELEASE_BASE_URL: mirror.baseUrl,
@@ -1859,7 +1920,6 @@ test(
         KIN_MCP_FAKE_HOLD_INITIALIZE: initializeHold
       })
     });
-    t.after(() => wrapper.child.kill('SIGKILL'));
 
     wrapper.send(initializeRequest(1));
     wrapper.send({ jsonrpc: '2.0', method: 'notifications/initialized' });
@@ -1944,14 +2004,13 @@ test(
   onlyWithTarballs,
   async t => {
     const asset = resolveReleaseAsset(process.platform, process.arch);
-    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'kin-mcp-first-launch-refused-'));
-    t.after(() => fs.rm(tmpDir, { recursive: true, force: true }));
+    const tmpDir = await firstLaunchTmpDir(t, 'kin-mcp-first-launch-refused-');
     const serverLog = path.join(tmpDir, 'server.log');
     const mirror = await startArchiveMirror(t, asset, await buildFakeKinArchive(tmpDir, asset));
     if (mirror === null) return;
     const repoDir = path.join(tmpDir, 'repo');
     await fs.mkdir(path.join(repoDir, '.kin'), { recursive: true });
-    const wrapper = startWrapper({
+    const wrapper = startWrapper(t, {
       cwd: repoDir,
       env: firstLaunchEnv(tmpDir, {
         KIN_MCP_RELEASE_BASE_URL: mirror.baseUrl,
@@ -1959,7 +2018,6 @@ test(
         KIN_MCP_FAKE_REFUSE_INITIALIZE: '1'
       })
     });
-    t.after(() => wrapper.child.kill('SIGKILL'));
 
     wrapper.send(initializeRequest(1));
     wrapper.send({ jsonrpc: '2.0', method: 'notifications/initialized' });
@@ -2000,15 +2058,14 @@ test(
   onlyWithTarballs,
   async t => {
     const asset = resolveReleaseAsset(process.platform, process.arch);
-    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'kin-mcp-first-launch-init-'));
-    t.after(() => fs.rm(tmpDir, { recursive: true, force: true }));
+    const tmpDir = await firstLaunchTmpDir(t, 'kin-mcp-first-launch-init-');
     const serverLog = path.join(tmpDir, 'server.log');
     const initHold = path.join(tmpDir, 'finish-init');
     const mirror = await startArchiveMirror(t, asset, await buildFakeKinArchive(tmpDir, asset));
     if (mirror === null) return;
     const repoDir = path.join(tmpDir, 'repo');
     await fs.mkdir(repoDir, { recursive: true });
-    const wrapper = startWrapper({
+    const wrapper = startWrapper(t, {
       cwd: repoDir,
       env: firstLaunchEnv(tmpDir, {
         KIN_MCP_RELEASE_BASE_URL: mirror.baseUrl,
@@ -2018,7 +2075,6 @@ test(
         KIN_MCP_FAKE_INIT_EXIT: '3'
       })
     });
-    t.after(() => wrapper.child.kill('SIGKILL'));
 
     wrapper.send(initializeRequest(1));
     await wrapper.waitFor(m => m.id === 1, HANDSHAKE_BOUND_MS, 'initialize');
@@ -2067,8 +2123,7 @@ test(
   onlyWithTarballs,
   async t => {
     const asset = resolveReleaseAsset(process.platform, process.arch);
-    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'kin-mcp-first-launch-silent-'));
-    t.after(() => fs.rm(tmpDir, { recursive: true, force: true }));
+    const tmpDir = await firstLaunchTmpDir(t, 'kin-mcp-first-launch-silent-');
     const serverLog = path.join(tmpDir, 'server.log');
     const { archiveBytes, checksum } = await buildFakeKinArchive(tmpDir, asset);
     const baseUrl = mockReleaseFetch(t, PACKAGE_VERSION, asset.archiveName, archiveBytes, checksum);
