@@ -2834,7 +2834,10 @@ jobs:
       && needs.changes.outputs.docs_only != 'true'
       && github.event_name != 'pull_request' }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    # Two full kin-daemon feature suites, every library on minimal features,
+    # and featureless kin-cli and kin-daemon, one after another. The 0.8.0
+    # suites outgrew 60 minutes on both legs while every step still passed.
+    timeout-minutes: 120
     # Same bounds as Check & Test: the feature permutations compile the same
     # workspace and would otherwise retain more than a hosted runner's
     # available disk in incremental objects and debug symbols.
