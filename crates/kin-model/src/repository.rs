@@ -749,7 +749,7 @@ impl WorkspaceSemanticOverlay {
     /// [`RelationOrigin::Lsp`](crate::RelationOrigin::Lsp). An overlay that
     /// holds exactly that is Kin's own derived state rather than work anyone
     /// has not committed yet, and so are the external symbols its proofs name
-    /// and the resolution records it adds. An entity, any other external
+    /// and the resolution records it adds, replaces or retires. An entity, any other external
     /// reference, a removal, or a relation of any other origin is something
     /// else, and makes this false.
     /// An empty overlay holds no enrichment either, so it is false too.
@@ -766,10 +766,20 @@ impl WorkspaceSemanticOverlay {
                         if new.resolution_namespace == crate::EXTERNAL_SYMBOL_NAMESPACE
                 )
             })
-            && self
-                .resolution_record_deltas()
-                .iter()
-                .all(|delta| matches!(delta, ResolutionRecordDelta::Added { .. }))
+            // Resolution records are written only by Kin's resolvers, never by
+            // an author, so retiring or replacing one is the same derived
+            // housekeeping as adding one. A branch switch retires the
+            // call-site ledger of a caller whose body it changed back, and an
+            // overlay holding only that retirement refused every merge after
+            // the switch whenever the retirement landed first.
+            && self.resolution_record_deltas().iter().all(|delta| {
+                matches!(
+                    delta,
+                    ResolutionRecordDelta::Added { .. }
+                        | ResolutionRecordDelta::Modified { .. }
+                        | ResolutionRecordDelta::Removed { .. }
+                )
+            })
             && self.relation_deltas().iter().all(|delta| match delta {
                 RelationDelta::Added { new } | RelationDelta::Modified { new, .. } => {
                     new.origin == crate::RelationOrigin::Lsp
@@ -4442,6 +4452,37 @@ mod tests {
         .unwrap();
         assert!(!referenced.is_language_server_enrichment_only());
         assert!(workspace(tree_hash, referenced).holds_uncommitted_work());
+
+        // A resolution record's retirement is the resolvers' own bookkeeping,
+        // alone or beside the enrichment. Measured after a branch
+        // switch: the overlay held one retired call-site ledger and nothing
+        // else, and the merge that followed refused it as uncommitted work.
+        let proof_context = |version: &str| {
+            crate::resolution::ResolutionRecord::ProofContext(crate::resolution::ProofContext {
+                language: crate::LanguageId::Python,
+                resolver: "lsp:pyright".to_string(),
+                resolver_version: version.to_string(),
+                configuration_hash: Hash256::from_bytes([0x61; 32]),
+                environment_hash: Hash256::from_bytes([0x62; 32]),
+                environment_summary: "python 3.12; locked by uv.lock".to_string(),
+            })
+        };
+        let retired = ResolutionRecordDelta::Removed {
+            old: proof_context("1.1.390"),
+        };
+        let alone = WorkspaceSemanticOverlay::default()
+            .with_resolution_records(vec![retired.clone()])
+            .unwrap();
+        assert!(alone.is_language_server_enrichment_only());
+        assert!(!workspace(tree_hash, alone).holds_uncommitted_work());
+        let beside = WorkspaceSemanticOverlay::new(
+            Vec::new(),
+            vec![RelationDelta::Added { new: lsp.clone() }],
+        )
+        .unwrap()
+        .with_resolution_records(vec![retired])
+        .unwrap();
+        assert!(beside.is_language_server_enrichment_only());
 
         // A tree off its base is uncommitted work whatever the overlay holds.
         let enrichment = WorkspaceSemanticOverlay::new(
