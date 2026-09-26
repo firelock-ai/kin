@@ -43,6 +43,6 @@
   "fixtures/recorded-fixed/orphan.py": "4606c3a9405e3fca4541326a2f337c4a75a1aea108fef45f73935a5a38c43487",
   "fixtures/recorded-fixed/sentinel.py": "34a1dcc6016547f2e309a65ba900b08d707f9551c2699e187d45dc738d558704",
   "fixtures/recorded-fixed-receipt.json": "d8afdc71ac7018f7e36dd202cfccb622e3c900b0683c6d00fc3784aa868dffc1",
-  "probe_startup_binary.py": "7dd9948acfc86bcb6dd977a2035825811eb2abc804bc3c5f3d05b35e952c2f50",
+  "probe_startup_binary.py": "3f5eedb83ca73377b515e371c4feb70e11c0e87ab79a898b5a0bd3d47d1da62b",
   "run.py": "5b5e13298fbf775116e6a8e14ab936c8ed83728dca8d654c69f359effcc41eb3"
 }
