@@ -83,7 +83,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   focal's own body, the callers in the files that import the focal's file,
   or the whole store. While a caller in that scope has sites a sweep has not
   settled, the verdict is inconclusive under `call_sites_owed` and the
-  terminal output prints a `not settled:` line. A caller no resolver can
+  terminal output prints a `not settled:` line. An owed caller whose whole
+  body never spells a name a call to the focal uses cannot call it by that
+  name and is not counted. A member is matched by each segment of its name,
+  such as `send` or `Session` for `Session.send`, never by the qualified name
+  no call spells. `kin refs` gates its absence on the same
+  readings, so it never certifies an absence `find_references` refuses. A
+  caller no resolver can
   prove on this host, because enrichment is switched off, no language server
   serves its language or the one that does cannot start, reads
   `call_sites_unproven_no_resolver` instead, with the reason. A caller can
@@ -94,6 +100,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   answer names those files, says it may be missing a caller, and its verdict
   is inconclusive under `call_sites_owed` until `kin daemon sweep` settles
   them. `kin init` waits for the sweep by default.
+- A commit made after language-server enrichment no longer fails with
+  `has unadmitted destination endpoint external_reference:...`. The workspace
+  a commit moves now carries the external symbols and proof contexts its
+  edges name, as the change it publishes already did.
+- A guarded entity edit no longer comes back `source_base_conflict` when
+  enrichment landed between the read and the write, a daemon restart that
+  flushed pending enrichment included. A source base now compares the
+  workspace's repository, head and tree, as a repository base does, and the
+  entity's own artifact, bytes, span and body; a workspace generation that
+  advanced with no source change is not a conflict.
 - An interrupted sweep resumes from per-file completion marks kept in the
   store's authority instead of starting over. Sweep checkpoints no longer
   grow with the store and are spaced to cost about 5% of a sweep.
@@ -115,6 +131,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Setup no longer warns that the VFS shim is missing on an install that ships
   no filesystem projection. It prints one line saying projection is not part
   of the install.
+- `kin_graph_status` no longer reports saved work as `recorded` from a reading
+  taken before the latest admission. While the graph is changing it now waits,
+  up to five seconds, for writers and the pending admission to finish, and a
+  reading it still has to replay reports durability `unknown` instead of an
+  all-clear.
 
 ## [0.8.0] - 2026-09-26
 

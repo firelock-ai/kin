@@ -3280,18 +3280,28 @@ const XREF_STABLE_READ_ATTEMPTS: usize = 3;
 /// [`crate::state::XREF_WRITER_DRAIN_CEILING`] runs out. An edit admission
 /// holds authority far longer than one round lasts.
 const XREF_CURRENCY_ATTEMPTS: usize = XREF_STABLE_READ_ATTEMPTS + 1;
+/// How many attempts a status call spends on the embedding-work fence before
+/// it replays the settled reading.
+///
+/// Only that fence. A status attempt that graph authority blocked waits for
+/// the writer instead, up to [`crate::state::GRAPH_STATUS_DRAIN_CEILING`],
+/// because an admission pass holds authority for longer than these attempts
+/// last and ends at a known moment. An embedding batch holds its fence for the
+/// whole batch and signals nothing when it ends.
 const GRAPH_STATUS_STABLE_READ_ATTEMPTS: usize = 3;
 const GRAPH_STATUS_WRITER_SETTLE_FLOOR: Duration = Duration::from_millis(50);
-/// How long a contended status attempt waits before trying again.
+/// How long a status attempt the embedding-work fence refused waits before
+/// trying again.
 ///
-/// The wait is the cheap half of FIR-2135: an embedding batch or a reconcile
-/// step that is merely between lock-points settles inside a few tens of
+/// The wait is the cheap half of answering a busy store: an embedding batch
+/// that is merely between lock-points settles inside a few tens of
 /// milliseconds, and answering live is always better than answering stale. It
 /// is deliberately small because status is what settle loops poll, and it
 /// doubles per attempt, so with three attempts a fully contended call waits
-/// 25 ms then 50 ms, 75 ms in total, and nothing is held while it elapses.
-/// The last attempt does not wait at all: the loop exits immediately after it,
-/// so a backoff there would buy the writer no time and cost the caller 100 ms.
+/// 25 ms then 50 ms, 75 ms in total, and nothing is held while it elapses. The
+/// last attempt does not wait at all: the loop exits immediately after it, so
+/// a backoff there would buy the embedding pass no time and cost the caller
+/// 100 ms.
 const GRAPH_STATUS_ATTEMPT_BACKOFF: Duration = Duration::from_millis(25);
 
 /// How many consecutive status calls must fail to sample live before this
@@ -3480,12 +3490,27 @@ async fn mcp_graph_status_with_stable_authority(
     authority: RequestGraphAuthority,
     scope: kin_mcp::handlers::entities::GraphStatusScope,
 ) -> kin_mcp::Result<kin_mcp::ToolCallResult> {
-    let mut blocked = GraphStatusBlocked::SelectedGraphChanging;
-    for attempt in 0..GRAPH_STATUS_STABLE_READ_ATTEMPTS {
-        let Some(authority_epoch) = state.stable_graph_authority_epoch() else {
+    // Set on every path that leaves the loop without an answer, so the reply
+    // names the state that blocked the last attempt.
+    let mut blocked: GraphStatusBlocked;
+    let deadline = tokio::time::Instant::now() + state.graph_status_drain_ceiling();
+    let mut attempts = 0_usize;
+    // Attempts spent on a refusal no writer's progress ends: the embedding
+    // fence, or a selected graph this daemon no longer serves for the scope.
+    // They keep the short, count-bounded budget.
+    let mut brief_retries = 0_usize;
+    loop {
+        attempts += 1;
+        // The settled epoch, not only the writer-free one. The durability
+        // reading this sample becomes is a claim that authority records the
+        // working copy, and working-copy changes the reconcile loop has picked
+        // up and not yet published are on their way into the graph this reads.
+        let Some(authority_epoch) = state.settled_read_epoch() else {
             blocked = GraphStatusBlocked::SelectedGraphChanging;
-            graph_status_attempt_backoff(attempt).await;
-            continue;
+            if graph_status_wait_out_authority(state, deadline).await {
+                continue;
+            }
+            break;
         };
 
         // The try-lock result is resolved to a plain Option before anything is
@@ -3536,23 +3561,41 @@ async fn mcp_graph_status_with_stable_authority(
             // mid-embed never reached the second attempt and the caller was
             // told to do the retrying the loop was built to do.
             blocked = GraphStatusBlocked::EmbeddingCoverageChanging;
-            graph_status_attempt_backoff(attempt).await;
+            brief_retries += 1;
+            if brief_retries >= GRAPH_STATUS_STABLE_READ_ATTEMPTS {
+                break;
+            }
+            graph_status_attempt_backoff(brief_retries - 1).await;
             continue;
         };
 
-        if !state.graph_authority_epoch_is_current(authority_epoch) {
+        if !state.settled_read_epoch_is_current(authority_epoch) {
             blocked = GraphStatusBlocked::SelectedGraphChanging;
-            graph_status_attempt_backoff(attempt).await;
-            continue;
+            if graph_status_wait_out_authority(state, deadline).await {
+                continue;
+            }
+            break;
         }
         if !state
             .graph_authority_is_current(session_id, selected_graph, authority)
             .await
-            || !state.graph_authority_epoch_is_current(authority_epoch)
         {
+            // The request's graph is no longer the one this daemon serves for
+            // its scope, which no writer finishing will change.
             blocked = GraphStatusBlocked::SelectedGraphChanging;
-            graph_status_attempt_backoff(attempt).await;
+            brief_retries += 1;
+            if brief_retries >= GRAPH_STATUS_STABLE_READ_ATTEMPTS {
+                break;
+            }
+            graph_status_attempt_backoff(brief_retries - 1).await;
             continue;
+        }
+        if !state.settled_read_epoch_is_current(authority_epoch) {
+            blocked = GraphStatusBlocked::SelectedGraphChanging;
+            if graph_status_wait_out_authority(state, deadline).await {
+                continue;
+            }
+            break;
         }
 
         // Recorded after the fence is released and only for a reading that
@@ -3587,7 +3630,7 @@ async fn mcp_graph_status_with_stable_authority(
              calls; its repo health surface reports attention until one succeeds"
         );
     }
-    let attempts = u32::try_from(GRAPH_STATUS_STABLE_READ_ATTEMPTS).unwrap_or(u32::MAX);
+    let attempts = u32::try_from(attempts).unwrap_or(u32::MAX);
     let observed_authority_epoch = state.stable_graph_authority_epoch();
     let Some((observation, age)) = state.graph_status_settled.get(scope, selected_graph) else {
         // The one case with no honest reading to publish: this daemon has never
@@ -3669,11 +3712,44 @@ impl GraphStatusBlocked {
     }
 }
 
-/// Wait a bounded, doubling moment between contended status attempts.
+/// Wait out the graph-authority writer, or the reconcile loop's pending
+/// admission, that kept a status attempt from settling. `false` once the
+/// status deadline has passed, and the call then replays the settled reading.
+///
+/// Holds nothing while it waits. A drain wakes it the moment the last writer
+/// finishes, so the next attempt samples in the quiet that follows rather than
+/// at a fixed interval that may land inside the next write. A writer that
+/// began and finished inside the attempt leaves nothing to wait for, and a
+/// short nap then keeps steady churn from spinning until the deadline.
+async fn graph_status_wait_out_authority(
+    state: &DaemonState,
+    deadline: tokio::time::Instant,
+) -> bool {
+    match state
+        .wait_for_graph_authority_drain(
+            deadline,
+            crate::state::SettleScope::WritersAndPendingAdmissions,
+        )
+        .await
+    {
+        crate::state::GraphAuthorityDrain::DeadlinePassed(_) => return false,
+        crate::state::GraphAuthorityDrain::Drained => {}
+        crate::state::GraphAuthorityDrain::NoWriter => {
+            let nap_ends = tokio::time::Instant::now() + GRAPH_STATUS_WRITER_SETTLE_FLOOR;
+            tokio::time::sleep_until(nap_ends.min(deadline)).await;
+        }
+    }
+    // Tokio polls the notified future before the timer, so a drain observed
+    // after the deadline must not authorize another attempt.
+    tokio::time::Instant::now() < deadline
+}
+
+/// Wait a bounded, doubling moment between status attempts the embedding-work
+/// fence refused.
 ///
 /// Nothing is held across it: the embedding fence is already released and the
-/// counters have not been read, so this yields the daemon to the writer whose
-/// progress is the thing that unblocks the sample.
+/// counters have not been read, so this yields the daemon to the embedding
+/// pass whose progress is the thing that unblocks the sample.
 async fn graph_status_attempt_backoff(attempt: usize) {
     tokio::task::yield_now().await;
     // Nothing follows the final attempt but the answer, so sleeping after it
@@ -53635,6 +53711,9 @@ pub(crate) mod tests {
     async fn graph_status_replays_the_settled_reading_during_graph_authority_mutation() {
         let state = test_state();
         let graph = Arc::clone(&state.graph);
+        // A writer that outlasts the whole wait, reached without spending the
+        // production ceiling on it.
+        state.set_graph_status_drain_ceiling_for_test(Duration::from_millis(200));
 
         let settled = parse_graph_status(&head_graph_status(&state, &graph).await);
 
@@ -53653,6 +53732,88 @@ pub(crate) mod tests {
             kin_mcp::handlers::entities::GraphStatusStaleReason::SelectedGraphChanging
         );
         assert_eq!(report.entity_count, settled.entity_count);
+    }
+
+    /// A writer that finishes inside the wait is waited out, and the call
+    /// answers live with what it wrote.
+    ///
+    /// This is the admission of a module a daemon has just picked up. The
+    /// sampler used to spend three attempts over 75 ms and then replay the
+    /// reading from before the module, so a status call landing in a few
+    /// hundred milliseconds of admission reported the graph without it, beside
+    /// a working copy reading that no longer named the file.
+    #[tokio::test]
+    async fn graph_status_waits_out_a_writer_that_finishes_and_answers_live() {
+        let state = test_state();
+        let graph = Arc::clone(&state.graph);
+        state
+            .graph
+            .upsert_entity(&test_entity("handler", "src/lib.py"))
+            .unwrap();
+        let settled = parse_graph_status(&head_graph_status(&state, &graph).await);
+
+        let guard = state.begin_graph_authority_mutation();
+        let writer = async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            state
+                .graph
+                .upsert_entity(&test_entity("admitted", "src/new.py"))
+                .unwrap();
+            drop(guard);
+        };
+        let (result, ()) = tokio::join!(head_graph_status(&state, &graph), writer);
+
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        let report = parse_graph_status(&result);
+        assert_eq!(
+            report.sampling,
+            kin_mcp::handlers::entities::GraphStatusSampling::PointInTimeSelectedGraph,
+            "{report:?}"
+        );
+        assert!(report.stale.is_none(), "{report:?}");
+        assert_eq!(
+            report.entity_count,
+            settled.entity_count + 1,
+            "the answer has to carry what the writer admitted: {report:?}"
+        );
+    }
+
+    /// The reconcile loop's mark over working-copy changes it picked up and has
+    /// not yet published is waited out the same way. The durability reading a
+    /// status sample becomes is a claim about the working copy, and those
+    /// changes are on their way into the graph it reads.
+    #[tokio::test]
+    async fn graph_status_waits_out_a_pending_admission_and_answers_live() {
+        let state = test_state();
+        let graph = Arc::clone(&state.graph);
+        let settled = parse_graph_status(&head_graph_status(&state, &graph).await);
+
+        let pending = state.begin_pending_admission();
+        let admission = async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            {
+                let _writer = state.begin_graph_authority_mutation();
+                state
+                    .graph
+                    .upsert_entity(&test_entity("admitted", "src/new.py"))
+                    .unwrap();
+            }
+            drop(pending);
+        };
+        let (result, ()) = tokio::join!(head_graph_status(&state, &graph), admission);
+
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        let report = parse_graph_status(&result);
+        assert_eq!(
+            report.sampling,
+            kin_mcp::handlers::entities::GraphStatusSampling::PointInTimeSelectedGraph,
+            "{report:?}"
+        );
+        assert_eq!(
+            report.entity_count,
+            settled.entity_count + 1,
+            "the answer has to carry what the admission published: {report:?}"
+        );
     }
 
     /// The one case with nothing honest to publish still must not answer with a

@@ -208,7 +208,20 @@ mod tests {
                 .expect("spawn the owned native image fixture"),
         );
         let pid = child.0.id();
-        let metadata = std::fs::metadata(format!("/proc/{pid}/exe")).unwrap();
+        // spawn returns once the child is inside execve, but the kernel wakes
+        // the parent before it swaps the child's memory map, so for a moment
+        // /proc/<pid>/exe can still name this test executable. Wait for the
+        // exec to land rather than reading that window as a wrong image.
+        let exec_deadline = Instant::now() + Duration::from_secs(5);
+        let metadata = loop {
+            let metadata = std::fs::metadata(format!("/proc/{pid}/exe")).unwrap();
+            if (metadata.dev(), metadata.ino()) == (expected.dev(), expected.ino())
+                || Instant::now() >= exec_deadline
+            {
+                break metadata;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        };
         assert_eq!(
             (metadata.dev(), metadata.ino()),
             (expected.dev(), expected.ino()),

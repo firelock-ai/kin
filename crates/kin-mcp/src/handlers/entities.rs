@@ -4773,9 +4773,8 @@ async fn build_reference_reply_for_focal<G: GraphStore>(
     // which `caller_arrival` already says.
     // Qualified by the owed callers outside the family, since a caller can
     // reach the focal without importing its file.
-    if let Some(tally) = arrival.call_sites.as_ref() {
-        result[crate::call_sites::CALL_SITES_KEY] =
-            crate::call_sites::family_block(tally, arrival.owed_outside.as_deref());
+    if let Some(block) = arrival.call_sites_block() {
+        result[crate::call_sites::CALL_SITES_KEY] = block;
     }
     disclose_withheld_candidates(&mut result);
     disclose_interface_dispatch_candidates(&mut result);

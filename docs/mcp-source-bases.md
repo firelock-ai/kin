@@ -73,8 +73,12 @@ V1 binds repository and workspace identity, workspace generation, selected-head
 identity, workspace tree, entity and artifact IDs, source blob hash, exact byte
 range and body hash. The head and body hashes use Kin's BLAKE3 blob digest. These
 are optimistic concurrency expectations, not authorization credentials. V1
-conservatively refuses any workspace advance, including unrelated source changes.
-It does not silently rebase an old body onto the newest entity.
+conservatively refuses any advance of the workspace head or tree, including
+unrelated source changes. A workspace generation that advanced over the same head
+and tree, such as language-server enrichment publishing what it proved, changed no
+source bytes and is not a conflict; the entity, artifact, byte range and body
+checks still apply. A base naming a generation the workspace has not reached is
+refused. It does not silently rebase an old body onto the newest entity.
 
 The exact daemon writer checks this expectation under its coordination and
 authority mutation locks, before creating the publication fence. A conflict returns

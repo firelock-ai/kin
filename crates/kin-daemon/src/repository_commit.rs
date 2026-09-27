@@ -2324,11 +2324,26 @@ fn plan_native_commit_inner(
         let desired_workspace_graph =
             crate::mcp_commit::timed_commit_phase("plan_snapshot_clone", || graph.to_snapshot());
         crate::mcp_commit::timed_commit_phase("plan_diff_semantics", || {
-            kin_core::diff_workspace_semantics(
+            let semantic = kin_core::diff_workspace_semantics(
                 &authority_workspace_graph.entities,
                 &authority_workspace_graph.relations,
                 &desired_workspace_graph.entities,
                 &desired_workspace_graph.relations,
+            )?;
+            // The external symbols and resolution records move with the
+            // relations and callers that name them. Enrichment installs both in
+            // the live graph beside the edges it proves, and the workspace
+            // authority holds neither until a publication carries them, so a
+            // workspace delta of entities and relations alone asks authority
+            // to admit an edge into an external symbol it has never held. The
+            // change this commit publishes carries the same transition, taken
+            // against its parent, in `compute_deltas_vs_repository_authority`.
+            kin_core::with_resolution_node_transition(
+                semantic,
+                &authority_workspace_graph.external_references,
+                &authority_workspace_graph.resolution_records,
+                &desired_workspace_graph.external_references,
+                &desired_workspace_graph.resolution_records,
             )
         })?
     };
@@ -6593,6 +6608,117 @@ mod tests {
             plan.entity_count > 0,
             "the re-derived spans must reach the change as entity deltas, or the commit is still \
              recording bytes with no semantics"
+        );
+    }
+
+    /// Enrichment installs an external symbol, its proof context and the edge
+    /// into it in the live graph, and none of them has crossed into workspace
+    /// authority when the next commit is planned. The commit carries all three
+    /// into the workspace as well as into the change, so authority admits the
+    /// edge with its endpoint instead of refusing the whole transaction.
+    #[test]
+    fn a_commit_after_enrichment_carries_the_external_symbols_its_edges_name() {
+        let root = tempfile::tempdir().unwrap();
+        let init = kin_core::init(root.path()).unwrap();
+        let blobs = kin_blobs::BlobStore::new(init.layout.ingest_cas_dir()).unwrap();
+        let graph = kin_db::InMemoryGraph::new();
+
+        let held = commit_then_move_bytes_without_reparsing(&init, &graph, &blobs, SESSIONS_AFTER);
+        replace_entities_in_graph(&graph, &blobs, "sessions.py", &held, SESSIONS_AFTER);
+        let caller = graph
+            .list_all_entities()
+            .unwrap()
+            .into_iter()
+            .find(|entity| entity.name == "alpha")
+            .expect("the fixture declares alpha");
+
+        let reference = kin_model::ExternalSymbol::new(
+            kin_model::ScipPackage::new("pypi", "python-stdlib", "3.12").unwrap(),
+            vec![
+                kin_model::ScipDescriptor::namespace("time"),
+                kin_model::ScipDescriptor::method("sleep"),
+            ],
+        )
+        .unwrap()
+        .to_reference()
+        .unwrap();
+        let context = kin_model::ResolutionRecord::ProofContext(kin_model::ProofContext {
+            language: kin_model::LanguageId::Python,
+            resolver: "lsp:pyright".to_string(),
+            resolver_version: "1.1.400".to_string(),
+            configuration_hash: Hash256::from_bytes([3; 32]),
+            environment_hash: Hash256::from_bytes([4; 32]),
+            environment_summary: "python 3.12".to_string(),
+        });
+        let edge = kin_lsp::call_sites::proven_external_call(
+            caller.id,
+            reference.id,
+            vec![kin_model::RelationEvidence {
+                parser_rule: Some(kin_lsp::call_sites::DEFINITION_RULE.to_string()),
+                token: Some(context.id().context_token()),
+                ..Default::default()
+            }],
+        );
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                relation_deltas: vec![kin_model::RelationDelta::Added { new: edge.clone() }],
+                external_reference_deltas: vec![kin_model::ExternalReferenceDelta::Added {
+                    new: reference.clone(),
+                }],
+                resolution_record_deltas: vec![kin_model::ResolutionRecordDelta::Added {
+                    new: context.clone(),
+                }],
+                ..TransactionDelta::default()
+            })
+            .unwrap();
+
+        let plan = plan_native_commit(
+            &init.layout,
+            &graph,
+            &blobs,
+            OperationId::new(),
+            fixed_timestamp(),
+            AuthorId::new("enrichment"),
+            "document the module".to_string(),
+        )
+        .unwrap();
+        let workspace_delta = &plan
+            .transaction
+            .workspace_mutation
+            .as_ref()
+            .expect("a native commit moves its workspace")
+            .semantic_delta;
+        assert_eq!(
+            workspace_delta.external_reference_deltas(),
+            [kin_model::ExternalReferenceDelta::Added {
+                new: reference.clone()
+            }],
+            "the workspace delta carries the external symbol its new edge names"
+        );
+        assert_eq!(
+            workspace_delta.resolution_record_deltas(),
+            [kin_model::ResolutionRecordDelta::Added {
+                new: context.clone()
+            }],
+            "the workspace delta carries the proof context its new edge names"
+        );
+
+        commit_native_plan_with_projection(&init.layout, &blobs, plan)
+            .expect("authority admits an edge whose external endpoint the commit carries");
+        let authority = reopen(&init);
+        let lease = authority.read_authority();
+        let workspace = lease
+            .workspace_graph_snapshot(&init.workspace_id)
+            .unwrap()
+            .expect("the workspace has a graph");
+        assert_eq!(workspace.relations.get(&edge.id), Some(&edge));
+        assert_eq!(
+            workspace.external_references.get(&reference.id),
+            Some(&reference)
+        );
+        assert_eq!(
+            workspace.resolution_records.get(&context.id()),
+            Some(&context)
         );
     }
 }

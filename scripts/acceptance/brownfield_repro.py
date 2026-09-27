@@ -283,6 +283,19 @@ APP_HANDLE_FABRICATED = [
     "res.send",
     "escapeHtml",
 ]
+# Object.create is a GENUINE callee: app.handle sets `res.locals =
+# Object.create(null)` at lib/application.js:174 in the pinned tree, and a language
+# server resolves it to the TypeScript library's ObjectConstructor.create. The bare
+# "create" entry above is for in-repo entities named create that a bare-name guess
+# reached, so only this exact external reference, taken straight from the focal, is
+# exempt from it.
+APP_HANDLE_GENUINE_EXTERNAL = "ObjectConstructor.create"
+
+
+def genuine_external_callee(name, entity_id, parent_step):
+    return (name == APP_HANDLE_GENUINE_EXTERNAL
+            and str(entity_id or "").startswith("external_reference:")
+            and parent_step == 0)
 
 # express, task 6. Ten exports in lib/express.js and none is dead: the shipped build
 # called four of them unused. The graph names the entity `Router` and its signature is
@@ -1381,6 +1394,8 @@ def complete_trace_clips(suite, repo, payload, steps):
                 continue
             if not any(name_matches(name, bad) for bad in APP_HANDLE_FABRICATED):
                 continue
+            if genuine_external_callee(name, dst, 0):
+                continue
             focused = suite.cached(repo, "trace_data_flow",
                                    {"focal": focal, "target": dst, "direction": "calls",
                                     "depth": 1, "include_body": False,
@@ -1511,7 +1526,9 @@ def check_4(suite):
 
     fabricated_counted = sorted({"%s (%s)" % (n, descent(s)) for n, s in counted
                                  if any(name_matches(n, f)
-                                        for f in APP_HANDLE_FABRICATED)})
+                                        for f in APP_HANDLE_FABRICATED)
+                                 and not genuine_external_callee(
+                                     n, s.get("entity_id"), s.get("parent_step"))})
     fabricated_counted.extend("%s (focused trace confirmation)" % step_name(row)
                               for row in confirmed)
     if fabricated_counted:
@@ -2402,6 +2419,20 @@ def self_test():
     def expect(label, got, want):
         if got != want:
             failures.append("%s: got %r, wanted %r" % (label, got, want))
+
+    # Object.create(null) inside app.handle is a real call, so only that exact
+    # external reference taken straight from the focal escapes the bare "create"
+    # entry. An in-repo create, or one reached through another step, stays caught.
+    expect("genuine external create from the focal",
+           genuine_external_callee("ObjectConstructor.create",
+                                   "external_reference:b7e8d69d", 0), True)
+    expect("in-repo create is still fabricated",
+           genuine_external_callee("create", "entity:1234", 0), False)
+    expect("an in-repo entity cannot borrow the external name",
+           genuine_external_callee("ObjectConstructor.create", "entity:1234", 0), False)
+    expect("an external create reached through another step is not exempt",
+           genuine_external_callee("ObjectConstructor.create",
+                                   "external_reference:b7e8d69d", 2), False)
 
     # The shipped v0.5.42 find_references shape: negative refuses, completeness
     # certifies. One payload, two verdicts, which is the defect FIR-2463 names.

@@ -491,6 +491,65 @@ async fn mcp_source_base_binds_artifact_span_and_body_even_at_the_same_workspace
     source_base_commit_operation(&state, source_base_operation(&source)).await;
 }
 
+/// Language-server enrichment publishes a finished file's completion mark as a
+/// workspace mutation of its own, which advances the workspace generation over
+/// the same head and tree. A guarded edit read before that publication still
+/// names the exact bytes it replaces, so it lands.
+#[tokio::test]
+async fn mcp_source_base_lands_over_a_generation_that_advanced_with_no_source_change() {
+    let (dir, state, source) = source_base_fixture().await;
+    let workspace_context = |state: &DaemonState| {
+        let workspace_id = state
+            .local_repository_authority_binding()
+            .unwrap()
+            .workspace_id();
+        let authority = crate::local_repository_authority::ActiveLocalRepositoryAuthority::open(state)
+            .unwrap();
+        let lease = authority.manager.read_authority();
+        let workspace = lease
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == workspace_id)
+            .unwrap()
+            .clone();
+        kin_mcp::source_base::SourceBaseContext::from_workspace(&workspace).unwrap()
+    };
+    let read = workspace_context(&state);
+    assert_eq!(
+        source["source_base"]["context"]["workspace_generation"],
+        read.workspace_generation
+    );
+
+    let path = kin_model::RepoPath::from_utf8("src/value.rs".to_string()).unwrap();
+    let blob = state
+        .graph
+        .resolved_tree()
+        .artifact_at_path(&path)
+        .and_then(|artifact| artifact.entry.blob_identity())
+        .expect("the fixture's source file is a blob");
+    assert!(crate::daemon::record_sweep_file_completed(
+        &state,
+        "src/value.rs",
+        blob,
+        crate::daemon::current_marker_epoch(&state),
+    ));
+    state.save_snapshot().unwrap();
+    let advanced = workspace_context(&state);
+    assert!(
+        advanced.workspace_generation > read.workspace_generation,
+        "the completion mark publishes as a workspace mutation: {read:?} -> {advanced:?}"
+    );
+    assert_eq!(advanced.workspace_head_hash, read.workspace_head_hash);
+    assert_eq!(advanced.workspace_tree_hash, read.workspace_tree_hash);
+
+    source_base_commit_operation(&state, source_base_operation(&source)).await;
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("src/value.rs")).unwrap(),
+        SOURCE_BASE_ORIGINAL.replacen("{ 1 }", "{ 2 }", 1)
+    );
+}
+
 #[tokio::test]
 async fn mcp_source_base_historical_sessions_never_receive_a_current_write_expectation() {
     let (_dir, state, source) = source_base_fixture().await;

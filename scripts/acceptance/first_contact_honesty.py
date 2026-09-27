@@ -1095,19 +1095,21 @@ def check_4(suite):
             env.pop(name, None)
 
         work = suite.scratch("toolchain-free-repo")
-        # The repair installs servers only for the languages the repository
-        # uses, so the fixture has to hold Rust for the Rust route to be taken.
-        os.makedirs(os.path.join(work, "src"))
-        with open(os.path.join(work, "Cargo.toml"), "w") as manifest:
-            manifest.write('[package]\nname = "fixture"\nversion = "0.1.0"\nedition = "2021"\n')
-        with open(os.path.join(work, "src", "lib.rs"), "w") as source:
-            source.write("pub fn answer() -> u32 {\n    42\n}\n")
         suite.own(work, env)
         rc, out, err = run([suite.kin, "init", "."], cwd=work, env=env, timeout=900)
         if rc != 0:
             res.unknown("kin init exited %d in the fixture repository: %s"
                         % (rc, flatten(err)[:220]))
             return res
+        # The repair installs servers only for the languages the repository
+        # uses, so the fixture has to hold Rust for the Rust route to be taken.
+        # The files are written after `kin init`, which admits a directory
+        # that already holds files only through Git.
+        os.makedirs(os.path.join(work, "src"))
+        with open(os.path.join(work, "Cargo.toml"), "w") as manifest:
+            manifest.write('[package]\nname = "fixture"\nversion = "0.1.0"\nedition = "2021"\n')
+        with open(os.path.join(work, "src", "lib.rs"), "w") as source:
+            source.write("pub fn answer() -> u32 {\n    42\n}\n")
         rc, out, err = run(
             [suite.kin, "doctor", "--fix", "--install-language-servers"],
             cwd=work, env=env, timeout=900)

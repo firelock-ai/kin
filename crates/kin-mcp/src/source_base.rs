@@ -12,9 +12,12 @@ pub enum SourceBaseSchema {
     V1,
 }
 
-/// One local workspace instant. V1 conservatively refuses any workspace advance,
-/// including unrelated edits. A generation alone cannot identify a repository
-/// or distinguish branches with identical source bytes.
+/// One local workspace instant. V1 conservatively refuses any advance of the
+/// workspace head or tree, including unrelated edits. A generation that
+/// advanced over the same head and tree, such as language-server enrichment
+/// publishing what it proved, changed no source bytes and is not a conflict.
+/// A generation alone cannot identify a repository or distinguish branches
+/// with identical source bytes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourceBaseContext {

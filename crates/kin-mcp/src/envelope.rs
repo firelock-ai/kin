@@ -726,8 +726,8 @@ pub struct Durability {
     /// `recorded` when durable authority carries every entity AND every relation
     /// the selected graph holds, `live_uncommitted` when it carries fewer of
     /// either, `unknown` when the daemon reported no durable observation for one
-    /// of them, reported no relation reading at all, or either pair cannot be
-    /// reconciled.
+    /// of them, reported no relation reading at all, either pair cannot be
+    /// reconciled, or the counts replay an earlier sample of the graph.
     ///
     /// One word over two readings, the most pessimistic winning, for the reason
     /// [`crate::verdict::Verdict`] carries one verdict over its inputs: two
@@ -2607,12 +2607,15 @@ impl Envelope {
         // Requalified rather than replaced. This runs on the graph-status path,
         // which may set durability after `with_health` has already read the
         // reconcile block, and a plain assignment there would restore the
-        // all-clear that block exists to withdraw.
-        self.durability = Some(if self.behind.is_some() {
-            durability.withdraw_all_clear()
-        } else {
-            durability
-        });
+        // all-clear that block exists to withdraw. A replayed sample withdraws
+        // it too, whichever of the two calls ran first.
+        self.durability = Some(
+            if self.behind.is_some() || self.freshness_is_replayed_sample() {
+                durability.withdraw_all_clear()
+            } else {
+                durability
+            },
+        );
         self.graph_state = GraphState {
             entity_count: Some(counts.live_entities),
             ..GraphState::default()
@@ -2648,7 +2651,16 @@ impl Envelope {
     }
 
     /// Replace an unrelated HEAD admission clock with the selected graph's own
-    /// stale-sample disclosure.
+    /// stale-sample disclosure, and withdraw the durability all-clear.
+    ///
+    /// A replayed sample's counts describe the graph as it stood when that
+    /// sample settled, while `_kin.behind` beside them is read from the
+    /// working copy now. Reducing the two to one state mixes two instants. A
+    /// daemon that has just picked up a new module shows the gap: the working
+    /// copy reading no longer names the file, because admission took it, and
+    /// the replayed counts predate the entities admission added. `recorded`
+    /// with zero live-only entities is then a claim about neither instant. The
+    /// counts stay as observed, and `freshness` says how old they are.
     pub fn with_selected_graph_staleness(
         mut self,
         reason: impl Into<String>,
@@ -2663,7 +2675,14 @@ impl Envelope {
             observed_authority_epoch,
             live_attempts,
         });
+        self.durability = self.durability.take().map(Durability::withdraw_all_clear);
         self
+    }
+
+    /// Whether this envelope reports a replayed selected-graph sample rather
+    /// than a live one.
+    fn freshness_is_replayed_sample(&self) -> bool {
+        matches!(self.freshness, Some(GraphFreshness::Stale { .. }))
     }
 
     /// Stamp what this store recorded about daemons of its own that were
@@ -4607,6 +4626,48 @@ mod tests {
         let durability = env.durability.expect("graph status reports the counts");
         assert_eq!(durability.state, DURABILITY_RECORDED);
         assert_eq!(durability.live_only_entities, Some(0));
+    }
+
+    /// The same level store and the same measured working copy, answered from
+    /// a replayed sample. The working copy reading is current and the counts
+    /// are not, which is the exact response a daemon published while admitting
+    /// a module it had just picked up: the file no longer counted as
+    /// unadmitted, the replayed counts predated its entities, and the block
+    /// read `recorded` with zero live-only entities over an uncommitted module.
+    /// Either call order has to withdraw it, and the counts stay as observed.
+    #[test]
+    fn a_replayed_graph_status_sample_does_not_certify_recorded() {
+        let measured_level = serde_json::json!({
+            "reconcile": {
+                "untracked_path_count": 0,
+                "untracked_observed_age_seconds": 0,
+            },
+        });
+        let replayed = Envelope::daemon()
+            .with_working_copy_health(&measured_level)
+            .with_selected_graph_observation(level_counts(6, 6), 6, 0, 6)
+            .with_selected_graph_staleness("selected_graph_changing", 2_023, None, 3);
+        assert!(
+            replayed.behind.is_none(),
+            "the working copy reading is level"
+        );
+        let durability = replayed
+            .durability
+            .expect("graph status reports the counts");
+        assert_eq!(durability.state, DURABILITY_UNKNOWN, "{durability:?}");
+        assert_eq!(durability.live_only_entities, None, "{durability:?}");
+        assert_eq!(durability.live_only_relations, None, "{durability:?}");
+        assert_eq!(durability.live_entities, Some(6), "{durability:?}");
+        assert_eq!(durability.durable_entities, Some(6), "{durability:?}");
+
+        let reversed = Envelope::daemon()
+            .with_working_copy_health(&measured_level)
+            .with_selected_graph_staleness("selected_graph_changing", 2_023, None, 3)
+            .with_selected_graph_observation(level_counts(6, 6), 6, 0, 6)
+            .durability
+            .expect("graph status reports the counts");
+        assert_eq!(reversed.state, DURABILITY_UNKNOWN, "{reversed:?}");
+        assert_eq!(reversed.live_only_entities, None, "{reversed:?}");
     }
 
     /// FIR-2820, the review's second finding. A zero nobody measured is not a
