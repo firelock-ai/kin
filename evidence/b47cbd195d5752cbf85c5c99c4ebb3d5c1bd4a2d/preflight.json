@@ -1,0 +1,1612 @@
+{
+  "schema": "kin.release-preflight.v1",
+  "citable": false,
+  "lane": "HOSTED-CI",
+  "run": "merged:20260927T082353Z+20260927T082356Z+20260927T082410Z",
+  "host": "github-actions:Linux 6.17.0-1022-azure aarch64+Linux 6.17.0-1022-azure x86_64+Darwin 25.6.0 arm64",
+  "lock_lane": "release-proof",
+  "verdict": "PASS",
+  "allow_dirty": false,
+  "cpu_embed": true,
+  "tooling": {
+    "source": "2 checkouts @ b47cbd195d5752cbf85c5c99c4ebb3d5c1bd4a2d",
+    "validator_ported_from_sha256": "747950dd57c9c71b14ea5d293632dab147fad241fc7c612818203897af3a70b0",
+    "workflow_sha256_at_ref": "747950dd57c9c71b14ea5d293632dab147fad241fc7c612818203897af3a70b0"
+  },
+  "provenance": [
+    "archive:      /home/runner/work/_temp/rc/kin-linux-aarch64/kin-linux-aarch64.tar.gz (sha256 2d604354ae7219f625453f78151e111d5a829d42d66b28849357496355bf0f36)",
+    "kin:        kin 0.8.1 (b47cbd195d5752cbf85c5c99c4ebb3d5c1bd4a2d release/v0.8.1-candidate 2026-09-27T07:01:56Z)",
+    "kin-daemon: kin-daemon 0.8.1 (b47cbd195d5752cbf85c5c99c4ebb3d5c1bd4a2d release/v0.8.1-candidate 2026-09-27T07:01:56Z)",
+    "expected:     commit b47cbd195d5752cbf85c5c99c4ebb3d5c1bd4a2d (--expect-commit); Cargo.lock sha256 953b2e2d9232b90564f9b76f5e112d9124488c6964c574ebfcd663a422b206e0",
+    "archive:      /home/runner/work/_temp/rc/kin-linux-x86_64/kin-linux-x86_64.tar.gz (sha256 9b5fe9fe6432331bb346e50f18896e400ec941c95cd73a0c54e4eaaaf0f497a8)",
+    "kin:        kin 0.8.1 (b47cbd195d5752cbf85c5c99c4ebb3d5c1bd4a2d release/v0.8.1-candidate 2026-09-27T07:02:41Z)",
+    "kin-daemon: kin-daemon 0.8.1 (b47cbd195d5752cbf85c5c99c4ebb3d5c1bd4a2d release/v0.8.1-candidate 2026-09-27T07:02:41Z)",
+    "expected:     commit b47cbd195d5752cbf85c5c99c4ebb3d5c1bd4a2d (--expect-commit); Cargo.lock sha256 953b2e2d9232b90564f9b76f5e112d9124488c6964c574ebfcd663a422b206e0",
+    "archive:      /Users/runner/work/_temp/rc/kin-macos-aarch64/kin-macos-aarch64.tar.gz (sha256 9d92fa1fd4367ad1df6769e485713773d2e48fa224d7080477c296ae53392552)",
+    "kin:        kin 0.8.1 (b47cbd195d5752cbf85c5c99c4ebb3d5c1bd4a2d release/v0.8.1-candidate 2026-09-27T07:02:54Z)",
+    "kin-daemon: kin-daemon 0.8.1 (b47cbd195d5752cbf85c5c99c4ebb3d5c1bd4a2d release/v0.8.1-candidate 2026-09-27T07:02:54Z)",
+    "expected:     commit b47cbd195d5752cbf85c5c99c4ebb3d5c1bd4a2d (--expect-commit); Cargo.lock sha256 953b2e2d9232b90564f9b76f5e112d9124488c6964c574ebfcd663a422b206e0"
+  ],
+  "skipped": [],
+  "legs": [
+    {
+      "name": "host (linux-aarch64, archive)",
+      "kind": "host",
+      "target": "kin-linux-aarch64",
+      "archive": "/home/runner/work/_temp/rc/kin-linux-aarch64/kin-linux-aarch64.tar.gz",
+      "verdict": "PASS",
+      "magic_repro": "PASS (27 pass, 0 fail, 0 unreadable of 27)",
+      "result_path": "/home/runner/work/_temp/kpf/legs/host/result.json",
+      "result": {
+        "schema": "kin.release-preflight.leg.v1",
+        "leg": "host",
+        "citable": false,
+        "runner_os": "Linux",
+        "runner_arch": "ARM64",
+        "archive": {
+          "path": "/home/runner/work/_temp/rc/kin-linux-aarch64/kin-linux-aarch64.tar.gz",
+          "sha256": "2d604354ae7219f625453f78151e111d5a829d42d66b28849357496355bf0f36"
+        },
+        "binaries": {
+          "kin": {
+            "version_line": "kin 0.8.1 (b47cbd195d5752cbf85c5c99c4ebb3d5c1bd4a2d release/v0.8.1-candidate 2026-09-27T07:01:56Z)"
+          },
+          "kin_daemon": {
+            "version_line": "kin-daemon 0.8.1 (b47cbd195d5752cbf85c5c99c4ebb3d5c1bd4a2d release/v0.8.1-candidate 2026-09-27T07:01:56Z)"
+          },
+          "stamp_sha": "b47cbd195d5752cbf85c5c99c4ebb3d5c1bd4a2d",
+          "version": "0.8.1"
+        },
+        "expected": {
+          "commit": "b47cbd195d5752cbf85c5c99c4ebb3d5c1bd4a2d",
+          "lock_sha256": "953b2e2d9232b90564f9b76f5e112d9124488c6964c574ebfcd663a422b206e0",
+          "legacy_vfs": false,
+          "allow_dirty": false
+        },
+        "steps": [
+          {
+            "step": "stage-archive",
+            "status": "PASS",
+            "exit": 0,
+            "seconds": 1,
+            "log": "/home/runner/work/_temp/kpf/legs/host/logs/01-stage-archive.log",
+            "failing": "",
+            "tail": []
+          },
+          {
+            "step": "install",
+            "status": "PASS",
+            "exit": 0,
+            "seconds": 1,
+            "log": "/home/runner/work/_temp/kpf/legs/host/logs/02-install.log",
+            "failing": "",
+            "tail": []
+          },
+          {
+            "step": "verify-binaries",
+            "status": "PASS",
+            "exit": 0,
+            "seconds": 0,
+            "log": "/home/runner/work/_temp/kpf/legs/host/logs/03-verify-binaries.log",
+            "failing": "",
+            "tail": []
+          },
+          {
+            "step": "first-run",
+            "status": "PASS",
+            "exit": 0,
+            "seconds": 20,
+            "log": "/home/runner/work/_temp/kpf/legs/host/logs/04-first-run.log",
+            "failing": "",
+            "tail": []
+          },
+          {
+            "step": "graph-query-mcp",
+            "status": "PASS",
+            "exit": 0,
+            "seconds": 6,
+            "log": "/home/runner/work/_temp/kpf/legs/host/logs/05-graph-query-mcp.log",
+            "failing": "",
+            "tail": []
+          },
+          {
+            "step": "embedding-retrieval",
+            "status": "PASS",
+            "exit": 0,
+            "seconds": 4,
+            "log": "/home/runner/work/_temp/kpf/legs/host/logs/06-embedding-retrieval.log",
+            "failing": "",
+            "tail": []
+          },
+          {
+            "step": "restore-captures",
+            "status": "PASS",
+            "exit": 0,
+            "seconds": 0,
+            "log": "/home/runner/work/_temp/kpf/legs/host/logs/07-restore-captures.log",
+            "failing": "",
+            "tail": []
+          },
+          {
+            "step": "validate",
+            "status": "PASS",
+            "exit": 0,
+            "seconds": 0,
+            "log": "/home/runner/work/_temp/kpf/legs/host/logs/08-validate.log",
+            "failing": "",
+            "tail": []
+          },
+          {
+            "step": "magic-repro",
+            "status": "PASS",
+            "exit": 0,
+            "seconds": 220,
+            "log": "/home/runner/work/_temp/kpf/legs/host/logs/09-magic-repro.log",
+            "failing": "",
+            "tail": []
+          }
+        ],
+        "glibc_floor": null,
+        "assertions": {
+          "ported_from": {
+            "file": ".github/workflows/install-proof.yml",
+            "sha256": "747950dd57c9c71b14ea5d293632dab147fad241fc7c612818203897af3a70b0"
+          },
+          "counts": {
+            "PASS": 41,
+            "FAIL": 0,
+            "UNREADABLE": 0
+          },
+          "assertions": [
+            {
+              "status": "PASS",
+              "name": "installed launcher path",
+              "message": "/home/runner/work/_temp/kpf/legs/host/home/.kin/bin/kin"
+            },
+            {
+              "status": "PASS",
+              "name": "kin-build-meta.json schema",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "cli build SHA is a full commit",
+              "message": "b47cbd195d5752cbf85c5c99c4ebb3d5c1bd4a2d"
+            },
+            {
+              "status": "PASS",
+              "name": "cli build SHA matches the expected commit",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "cli release binary is clean",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "cli release binary proves source_known",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "cli Cargo.lock provenance is well formed",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "cli Cargo.lock provenance matches the source",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "daemon build SHA is a full commit",
+              "message": "b47cbd195d5752cbf85c5c99c4ebb3d5c1bd4a2d"
+            },
+            {
+              "status": "PASS",
+              "name": "daemon build SHA matches the expected commit",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "daemon release binary is clean",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "daemon release binary proves source_known",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "daemon Cargo.lock provenance is well formed",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "daemon Cargo.lock provenance matches the source",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "CLI and daemon share Cargo.lock provenance",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin-status.json schema",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "bench metadata proves vector and embedding support",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin-status.json embedding coverage shape",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin-claude-fallback-health.json forced Claude fallback",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin-claude-fallback-doctor.json forced Claude fallback",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin-health.json aggregate health",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin-health.json required check statuses",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin-health.json semantic_query_readiness",
+              "message": "healthy"
+            },
+            {
+              "status": "PASS",
+              "name": "kin-health.json no hard failures",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin-doctor.json aggregate health",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin-doctor.json required check statuses",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin-doctor.json semantic_query_readiness",
+              "message": "healthy"
+            },
+            {
+              "status": "PASS",
+              "name": "kin-doctor.json no hard failures",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "lexical kin search returns the seeded hello entity",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin locate returns the seeded probe.py graph artifact",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "MCP client configs bind the installed launcher",
+              "message": "9 configs"
+            },
+            {
+              "status": "PASS",
+              "name": "Antigravity legacy repair preserved user policy",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "bounded clean-install embedding reached full coverage",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin-embedded-status.json schema",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin-embedded-status.json embedding coverage shape",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "Unix status observed embedding coverage after settle",
+              "message": "bounded settle (kin status --wait-quiesce 60)"
+            },
+            {
+              "status": "PASS",
+              "name": "Unix status proves complete observed embedding coverage",
+              "message": "indexed 6/6"
+            },
+            {
+              "status": "PASS",
+              "name": "kin-embedded-health.json healthy with semantic readiness",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin-embedded-doctor.json healthy with semantic readiness",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "semantic kin search returns the seeded hello entity",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "semantic kin locate proves complete coverage and returns probe.py",
+              "message": "semantic_coverage={\"supported\":true,\"indexed\":6,\"total\":6,\"pending\":0,\"complete\":true,\"embedding_state\":\"present\",\"read_at\":\"2026-09-27T08:24:27Z\",\"graph_bodies\":{\"source_paths\":1,\"with_body\":1,\"gap_paths\":0}}"
+            }
+          ]
+        },
+        "magic_repro": {
+          "version": "kin 0.8.1 (b47cbd195d5752cbf85c5c99c4ebb3d5c1bd4a2d release/v0.8.1-candidate 2026-09-27T07:01:56Z)",
+          "counts": {
+            "PASS": 27,
+            "FAIL": 0,
+            "UNREADABLE": 0
+          },
+          "total": 27,
+          "checks": [
+            {
+              "id": "0",
+              "ticket": "GPU-OPTOUT",
+              "status": "PASS",
+              "detail": "embeddings indexed=0/44"
+            },
+            {
+              "id": "1",
+              "ticket": "FIR-2354",
+              "status": "PASS",
+              "detail": "find_references(parse_note) crosses into storage.py"
+            },
+            {
+              "id": "2",
+              "ticket": "FIR-2353",
+              "status": "PASS",
+              "detail": "references returned (2), so the absence path is not exercised"
+            },
+            {
+              "id": "3",
+              "ticket": "FIR-2357",
+              "status": "PASS",
+              "detail": "all three calling files returned: ['pkg/linkgraph.py', 'pkg/parsing.py', 'pkg/storage.py']"
+            },
+            {
+              "id": "4",
+              "ticket": "FIR-2356",
+              "status": "PASS",
+              "detail": "coverage is not reported incomplete (graph status reports 16 of 30 relations cross-file)"
+            },
+            {
+              "id": "5",
+              "ticket": "FIR-2360",
+              "status": "PASS",
+              "detail": "the ambiguous receiver in Session.drain produced 1 edge(s)"
+            },
+            {
+              "id": "6",
+              "ticket": "FIR-2361",
+              "status": "PASS",
+              "detail": "truncation is localized per step"
+            },
+            {
+              "id": "7",
+              "ticket": "FIR-2362",
+              "status": "PASS",
+              "detail": "relations per entity 3.88"
+            },
+            {
+              "id": "8",
+              "ticket": "FIR-2359",
+              "status": "PASS",
+              "detail": "context pack carries no decimal byte arrays (8885 chars)"
+            },
+            {
+              "id": "9",
+              "ticket": "FIR-2358",
+              "status": "PASS",
+              "detail": "graph validate does not read as a completeness bill"
+            },
+            {
+              "id": "10",
+              "ticket": "FIR-2598",
+              "status": "PASS",
+              "detail": "every relation kind held or grew: {'UsesType': 14, 'Calls': 10, 'Contains': 7, 'References': 6, 'Overrides': 1, 'Extends': 1}"
+            },
+            {
+              "id": "11",
+              "ticket": "FIR-2598",
+              "status": "PASS",
+              "detail": "the commit did not move the comparison point off 2026-09-27T08:25:47.443334841Z"
+            },
+            {
+              "id": "12",
+              "ticket": "FIR-2605",
+              "status": "PASS",
+              "detail": "the row for legacy_shim is labeled [unverified: caller_arrival_unresolved], which names the arrival reading rather than anything a file that declares nothing could have caused"
+            },
+            {
+              "id": "13",
+              "ticket": "FIR-2504",
+              "status": "PASS",
+              "detail": "the provenance field moves both ways: repository while set, kin's own default once cleared"
+            },
+            {
+              "id": "14",
+              "ticket": "FIR-2135",
+              "status": "PASS",
+              "detail": "status is live again once the store settles"
+            },
+            {
+              "id": "15",
+              "ticket": "FIR-2604",
+              "status": "PASS",
+              "detail": "the three files read 2 distinct parse states and certification differs between them, so these fields are observations rather than constants"
+            },
+            {
+              "id": "16",
+              "ticket": "FIR-2524",
+              "status": "PASS",
+              "detail": "isolated empty-reference arm refuses on both surfaces under census hold"
+            },
+            {
+              "id": "17",
+              "ticket": "FIR-2641",
+              "status": "PASS",
+              "detail": "docs/notes.md has no language adapter and stays uncertified (parsed='absent' tier='opaque_artifact'), so certification separates files rather than blessing them"
+            },
+            {
+              "id": "18",
+              "ticket": "FIR-2644",
+              "status": "PASS",
+              "detail": "the caller set is unchanged at ['Session.request', 'SessionRedirectMixin.resolve_redirects'] and every override-resolved row kept its composition"
+            },
+            {
+              "id": "19",
+              "ticket": "FIR-2644",
+              "status": "PASS",
+              "detail": "all 3 reported reference line(s) still carry the call they name"
+            },
+            {
+              "id": "20",
+              "ticket": "FIR-2644",
+              "status": "PASS",
+              "detail": "the answer discloses the loss structurally: _kin.degraded.relation_census_loss true and degraded_signals ['relation_census_loss']"
+            },
+            {
+              "id": "21",
+              "ticket": "MD-OPAQUE",
+              "status": "PASS",
+              "detail": "pkg/empty.py holds 1 entities and claims no opaque cause, so the disclosure is computed rather than unconditional"
+            },
+            {
+              "id": "22",
+              "ticket": "FIR-2838",
+              "status": "PASS",
+              "detail": "graph status reports no relation census loss"
+            },
+            {
+              "id": "23",
+              "ticket": "FIR-2821",
+              "status": "PASS",
+              "detail": "the fully accounted fixture prints a confident verdict: Found 1 unreferenced entities:"
+            },
+            {
+              "id": "24",
+              "ticket": "J6-14/18/21",
+              "status": "PASS",
+              "detail": "the predates-recording caveat does not name a repository this build registered"
+            },
+            {
+              "id": "25",
+              "ticket": "FIR-2955",
+              "status": "PASS",
+              "detail": "both explicit retries completed without starting a daemon"
+            },
+            {
+              "id": "cleanup",
+              "ticket": "CLEANUP",
+              "status": "PASS",
+              "detail": "/home/runner/work/_temp/kpf/legs/host/repro/graphsection-r4484: kin daemon stop --json rc=0; {\n  \"all_stopped\": true,\n  \"repo\": \"graphsection-r4484\",\n  \"schema\": \"kin.daemon-stop.v1\",\n  \"scope\": \"current-repo\",\n  \"stopped\": []\n} "
+            }
+          ],
+          "verdict": "PASS"
+        },
+        "failing": [],
+        "unreadable": [],
+        "waived": [],
+        "verdict": "PASS"
+      }
+    },
+    {
+      "name": "host (linux-x86_64, archive)",
+      "kind": "host",
+      "target": "kin-linux-x86_64",
+      "archive": "/home/runner/work/_temp/rc/kin-linux-x86_64/kin-linux-x86_64.tar.gz",
+      "verdict": "PASS",
+      "magic_repro": "PASS (27 pass, 0 fail, 0 unreadable of 27)",
+      "result_path": "/home/runner/work/_temp/kpf/legs/host/result.json",
+      "result": {
+        "schema": "kin.release-preflight.leg.v1",
+        "leg": "host",
+        "citable": false,
+        "runner_os": "Linux",
+        "runner_arch": "X64",
+        "archive": {
+          "path": "/home/runner/work/_temp/rc/kin-linux-x86_64/kin-linux-x86_64.tar.gz",
+          "sha256": "9b5fe9fe6432331bb346e50f18896e400ec941c95cd73a0c54e4eaaaf0f497a8"
+        },
+        "binaries": {
+          "kin": {
+            "version_line": "kin 0.8.1 (b47cbd195d5752cbf85c5c99c4ebb3d5c1bd4a2d release/v0.8.1-candidate 2026-09-27T07:02:41Z)"
+          },
+          "kin_daemon": {
+            "version_line": "kin-daemon 0.8.1 (b47cbd195d5752cbf85c5c99c4ebb3d5c1bd4a2d release/v0.8.1-candidate 2026-09-27T07:02:41Z)"
+          },
+          "stamp_sha": "b47cbd195d5752cbf85c5c99c4ebb3d5c1bd4a2d",
+          "version": "0.8.1"
+        },
+        "expected": {
+          "commit": "b47cbd195d5752cbf85c5c99c4ebb3d5c1bd4a2d",
+          "lock_sha256": "953b2e2d9232b90564f9b76f5e112d9124488c6964c574ebfcd663a422b206e0",
+          "legacy_vfs": false,
+          "allow_dirty": false
+        },
+        "steps": [
+          {
+            "step": "stage-archive",
+            "status": "PASS",
+            "exit": 0,
+            "seconds": 2,
+            "log": "/home/runner/work/_temp/kpf/legs/host/logs/01-stage-archive.log",
+            "failing": "",
+            "tail": []
+          },
+          {
+            "step": "install",
+            "status": "PASS",
+            "exit": 0,
+            "seconds": 2,
+            "log": "/home/runner/work/_temp/kpf/legs/host/logs/02-install.log",
+            "failing": "",
+            "tail": []
+          },
+          {
+            "step": "verify-binaries",
+            "status": "PASS",
+            "exit": 0,
+            "seconds": 0,
+            "log": "/home/runner/work/_temp/kpf/legs/host/logs/03-verify-binaries.log",
+            "failing": "",
+            "tail": []
+          },
+          {
+            "step": "first-run",
+            "status": "PASS",
+            "exit": 0,
+            "seconds": 20,
+            "log": "/home/runner/work/_temp/kpf/legs/host/logs/04-first-run.log",
+            "failing": "",
+            "tail": []
+          },
+          {
+            "step": "graph-query-mcp",
+            "status": "PASS",
+            "exit": 0,
+            "seconds": 6,
+            "log": "/home/runner/work/_temp/kpf/legs/host/logs/05-graph-query-mcp.log",
+            "failing": "",
+            "tail": []
+          },
+          {
+            "step": "embedding-retrieval",
+            "status": "PASS",
+            "exit": 0,
+            "seconds": 3,
+            "log": "/home/runner/work/_temp/kpf/legs/host/logs/06-embedding-retrieval.log",
+            "failing": "",
+            "tail": []
+          },
+          {
+            "step": "restore-captures",
+            "status": "PASS",
+            "exit": 0,
+            "seconds": 0,
+            "log": "/home/runner/work/_temp/kpf/legs/host/logs/07-restore-captures.log",
+            "failing": "",
+            "tail": []
+          },
+          {
+            "step": "validate",
+            "status": "PASS",
+            "exit": 0,
+            "seconds": 0,
+            "log": "/home/runner/work/_temp/kpf/legs/host/logs/08-validate.log",
+            "failing": "",
+            "tail": []
+          },
+          {
+            "step": "magic-repro",
+            "status": "PASS",
+            "exit": 0,
+            "seconds": 227,
+            "log": "/home/runner/work/_temp/kpf/legs/host/logs/09-magic-repro.log",
+            "failing": "",
+            "tail": []
+          }
+        ],
+        "glibc_floor": null,
+        "assertions": {
+          "ported_from": {
+            "file": ".github/workflows/install-proof.yml",
+            "sha256": "747950dd57c9c71b14ea5d293632dab147fad241fc7c612818203897af3a70b0"
+          },
+          "counts": {
+            "PASS": 41,
+            "FAIL": 0,
+            "UNREADABLE": 0
+          },
+          "assertions": [
+            {
+              "status": "PASS",
+              "name": "installed launcher path",
+              "message": "/home/runner/work/_temp/kpf/legs/host/home/.kin/bin/kin"
+            },
+            {
+              "status": "PASS",
+              "name": "kin-build-meta.json schema",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "cli build SHA is a full commit",
+              "message": "b47cbd195d5752cbf85c5c99c4ebb3d5c1bd4a2d"
+            },
+            {
+              "status": "PASS",
+              "name": "cli build SHA matches the expected commit",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "cli release binary is clean",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "cli release binary proves source_known",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "cli Cargo.lock provenance is well formed",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "cli Cargo.lock provenance matches the source",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "daemon build SHA is a full commit",
+              "message": "b47cbd195d5752cbf85c5c99c4ebb3d5c1bd4a2d"
+            },
+            {
+              "status": "PASS",
+              "name": "daemon build SHA matches the expected commit",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "daemon release binary is clean",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "daemon release binary proves source_known",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "daemon Cargo.lock provenance is well formed",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "daemon Cargo.lock provenance matches the source",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "CLI and daemon share Cargo.lock provenance",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin-status.json schema",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "bench metadata proves vector and embedding support",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin-status.json embedding coverage shape",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin-claude-fallback-health.json forced Claude fallback",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin-claude-fallback-doctor.json forced Claude fallback",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin-health.json aggregate health",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin-health.json required check statuses",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin-health.json semantic_query_readiness",
+              "message": "healthy"
+            },
+            {
+              "status": "PASS",
+              "name": "kin-health.json no hard failures",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin-doctor.json aggregate health",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin-doctor.json required check statuses",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin-doctor.json semantic_query_readiness",
+              "message": "healthy"
+            },
+            {
+              "status": "PASS",
+              "name": "kin-doctor.json no hard failures",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "lexical kin search returns the seeded hello entity",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin locate returns the seeded probe.py graph artifact",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "MCP client configs bind the installed launcher",
+              "message": "9 configs"
+            },
+            {
+              "status": "PASS",
+              "name": "Antigravity legacy repair preserved user policy",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "bounded clean-install embedding reached full coverage",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin-embedded-status.json schema",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin-embedded-status.json embedding coverage shape",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "Unix status observed embedding coverage after settle",
+              "message": "bounded settle (kin status --wait-quiesce 60)"
+            },
+            {
+              "status": "PASS",
+              "name": "Unix status proves complete observed embedding coverage",
+              "message": "indexed 6/6"
+            },
+            {
+              "status": "PASS",
+              "name": "kin-embedded-health.json healthy with semantic readiness",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin-embedded-doctor.json healthy with semantic readiness",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "semantic kin search returns the seeded hello entity",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "semantic kin locate proves complete coverage and returns probe.py",
+              "message": "semantic_coverage={\"supported\":true,\"indexed\":6,\"total\":6,\"pending\":0,\"complete\":true,\"embedding_state\":\"present\",\"read_at\":\"2026-09-27T08:24:30Z\",\"graph_bodies\":{\"source_paths\":1,\"with_body\":1,\"gap_paths\":0}}"
+            }
+          ]
+        },
+        "magic_repro": {
+          "version": "kin 0.8.1 (b47cbd195d5752cbf85c5c99c4ebb3d5c1bd4a2d release/v0.8.1-candidate 2026-09-27T07:02:41Z)",
+          "counts": {
+            "PASS": 27,
+            "FAIL": 0,
+            "UNREADABLE": 0
+          },
+          "total": 27,
+          "checks": [
+            {
+              "id": "0",
+              "ticket": "GPU-OPTOUT",
+              "status": "PASS",
+              "detail": "embeddings indexed=0/44"
+            },
+            {
+              "id": "1",
+              "ticket": "FIR-2354",
+              "status": "PASS",
+              "detail": "find_references(parse_note) crosses into storage.py"
+            },
+            {
+              "id": "2",
+              "ticket": "FIR-2353",
+              "status": "PASS",
+              "detail": "references returned (2), so the absence path is not exercised"
+            },
+            {
+              "id": "3",
+              "ticket": "FIR-2357",
+              "status": "PASS",
+              "detail": "all three calling files returned: ['pkg/linkgraph.py', 'pkg/parsing.py', 'pkg/storage.py']"
+            },
+            {
+              "id": "4",
+              "ticket": "FIR-2356",
+              "status": "PASS",
+              "detail": "coverage is not reported incomplete (graph status reports 16 of 30 relations cross-file)"
+            },
+            {
+              "id": "5",
+              "ticket": "FIR-2360",
+              "status": "PASS",
+              "detail": "the ambiguous receiver in Session.drain produced 1 edge(s)"
+            },
+            {
+              "id": "6",
+              "ticket": "FIR-2361",
+              "status": "PASS",
+              "detail": "truncation is localized per step"
+            },
+            {
+              "id": "7",
+              "ticket": "FIR-2362",
+              "status": "PASS",
+              "detail": "relations per entity 3.88"
+            },
+            {
+              "id": "8",
+              "ticket": "FIR-2359",
+              "status": "PASS",
+              "detail": "context pack carries no decimal byte arrays (8885 chars)"
+            },
+            {
+              "id": "9",
+              "ticket": "FIR-2358",
+              "status": "PASS",
+              "detail": "graph validate does not read as a completeness bill"
+            },
+            {
+              "id": "10",
+              "ticket": "FIR-2598",
+              "status": "PASS",
+              "detail": "every relation kind held or grew: {'UsesType': 14, 'Calls': 10, 'Contains': 7, 'References': 6, 'Extends': 1, 'Overrides': 1}"
+            },
+            {
+              "id": "11",
+              "ticket": "FIR-2598",
+              "status": "PASS",
+              "detail": "the commit did not move the comparison point off 2026-09-27T08:25:52.713398622Z"
+            },
+            {
+              "id": "12",
+              "ticket": "FIR-2605",
+              "status": "PASS",
+              "detail": "the row for legacy_shim is labeled [unverified: caller_arrival_unresolved], which names the arrival reading rather than anything a file that declares nothing could have caused"
+            },
+            {
+              "id": "13",
+              "ticket": "FIR-2504",
+              "status": "PASS",
+              "detail": "the provenance field moves both ways: repository while set, kin's own default once cleared"
+            },
+            {
+              "id": "14",
+              "ticket": "FIR-2135",
+              "status": "PASS",
+              "detail": "status is live again once the store settles"
+            },
+            {
+              "id": "15",
+              "ticket": "FIR-2604",
+              "status": "PASS",
+              "detail": "the three files read 2 distinct parse states and certification differs between them, so these fields are observations rather than constants"
+            },
+            {
+              "id": "16",
+              "ticket": "FIR-2524",
+              "status": "PASS",
+              "detail": "isolated empty-reference arm refuses on both surfaces under census hold"
+            },
+            {
+              "id": "17",
+              "ticket": "FIR-2641",
+              "status": "PASS",
+              "detail": "docs/notes.md has no language adapter and stays uncertified (parsed='absent' tier='opaque_artifact'), so certification separates files rather than blessing them"
+            },
+            {
+              "id": "18",
+              "ticket": "FIR-2644",
+              "status": "PASS",
+              "detail": "the caller set is unchanged at ['Session.request', 'SessionRedirectMixin.resolve_redirects'] and every override-resolved row kept its composition"
+            },
+            {
+              "id": "19",
+              "ticket": "FIR-2644",
+              "status": "PASS",
+              "detail": "all 3 reported reference line(s) still carry the call they name"
+            },
+            {
+              "id": "20",
+              "ticket": "FIR-2644",
+              "status": "PASS",
+              "detail": "the answer discloses the loss structurally: _kin.degraded.relation_census_loss true and degraded_signals ['relation_census_loss']"
+            },
+            {
+              "id": "21",
+              "ticket": "MD-OPAQUE",
+              "status": "PASS",
+              "detail": "pkg/empty.py holds 1 entities and claims no opaque cause, so the disclosure is computed rather than unconditional"
+            },
+            {
+              "id": "22",
+              "ticket": "FIR-2838",
+              "status": "PASS",
+              "detail": "graph status reports no relation census loss"
+            },
+            {
+              "id": "23",
+              "ticket": "FIR-2821",
+              "status": "PASS",
+              "detail": "the fully accounted fixture prints a confident verdict: Found 1 unreferenced entities:"
+            },
+            {
+              "id": "24",
+              "ticket": "J6-14/18/21",
+              "status": "PASS",
+              "detail": "the predates-recording caveat does not name a repository this build registered"
+            },
+            {
+              "id": "25",
+              "ticket": "FIR-2955",
+              "status": "PASS",
+              "detail": "both explicit retries completed without starting a daemon"
+            },
+            {
+              "id": "cleanup",
+              "ticket": "CLEANUP",
+              "status": "PASS",
+              "detail": "/home/runner/work/_temp/kpf/legs/host/repro/graphsection-r4227: kin daemon stop --json rc=0; {\n  \"all_stopped\": true,\n  \"repo\": \"graphsection-r4227\",\n  \"schema\": \"kin.daemon-stop.v1\",\n  \"scope\": \"current-repo\",\n  \"stopped\": []\n} "
+            }
+          ],
+          "verdict": "PASS"
+        },
+        "failing": [],
+        "unreadable": [],
+        "waived": [],
+        "verdict": "PASS"
+      }
+    },
+    {
+      "name": "host (macos-aarch64, archive)",
+      "kind": "host",
+      "target": "kin-macos-aarch64",
+      "archive": "/Users/runner/work/_temp/rc/kin-macos-aarch64/kin-macos-aarch64.tar.gz",
+      "verdict": "PASS",
+      "magic_repro": "PASS (27 pass, 0 fail, 0 unreadable of 27)",
+      "result_path": "/Users/runner/work/_temp/kpf/legs/host/result.json",
+      "result": {
+        "schema": "kin.release-preflight.leg.v1",
+        "leg": "host",
+        "citable": false,
+        "runner_os": "macOS",
+        "runner_arch": "ARM64",
+        "archive": {
+          "path": "/Users/runner/work/_temp/rc/kin-macos-aarch64/kin-macos-aarch64.tar.gz",
+          "sha256": "9d92fa1fd4367ad1df6769e485713773d2e48fa224d7080477c296ae53392552"
+        },
+        "binaries": {
+          "kin": {
+            "version_line": "kin 0.8.1 (b47cbd195d5752cbf85c5c99c4ebb3d5c1bd4a2d release/v0.8.1-candidate 2026-09-27T07:02:54Z)"
+          },
+          "kin_daemon": {
+            "version_line": "kin-daemon 0.8.1 (b47cbd195d5752cbf85c5c99c4ebb3d5c1bd4a2d release/v0.8.1-candidate 2026-09-27T07:02:54Z)"
+          },
+          "stamp_sha": "b47cbd195d5752cbf85c5c99c4ebb3d5c1bd4a2d",
+          "version": "0.8.1"
+        },
+        "expected": {
+          "commit": "b47cbd195d5752cbf85c5c99c4ebb3d5c1bd4a2d",
+          "lock_sha256": "953b2e2d9232b90564f9b76f5e112d9124488c6964c574ebfcd663a422b206e0",
+          "legacy_vfs": false,
+          "allow_dirty": false
+        },
+        "steps": [
+          {
+            "step": "stage-archive",
+            "status": "PASS",
+            "exit": 0,
+            "seconds": 1,
+            "log": "/Users/runner/work/_temp/kpf/legs/host/logs/01-stage-archive.log",
+            "failing": "",
+            "tail": []
+          },
+          {
+            "step": "install",
+            "status": "PASS",
+            "exit": 0,
+            "seconds": 1,
+            "log": "/Users/runner/work/_temp/kpf/legs/host/logs/02-install.log",
+            "failing": "",
+            "tail": []
+          },
+          {
+            "step": "verify-binaries",
+            "status": "PASS",
+            "exit": 0,
+            "seconds": 1,
+            "log": "/Users/runner/work/_temp/kpf/legs/host/logs/03-verify-binaries.log",
+            "failing": "",
+            "tail": []
+          },
+          {
+            "step": "first-run",
+            "status": "PASS",
+            "exit": 0,
+            "seconds": 36,
+            "log": "/Users/runner/work/_temp/kpf/legs/host/logs/04-first-run.log",
+            "failing": "",
+            "tail": []
+          },
+          {
+            "step": "graph-query-mcp",
+            "status": "PASS",
+            "exit": 0,
+            "seconds": 7,
+            "log": "/Users/runner/work/_temp/kpf/legs/host/logs/05-graph-query-mcp.log",
+            "failing": "",
+            "tail": []
+          },
+          {
+            "step": "embedding-retrieval",
+            "status": "PASS",
+            "exit": 0,
+            "seconds": 6,
+            "log": "/Users/runner/work/_temp/kpf/legs/host/logs/06-embedding-retrieval.log",
+            "failing": "",
+            "tail": []
+          },
+          {
+            "step": "restore-captures",
+            "status": "PASS",
+            "exit": 0,
+            "seconds": 0,
+            "log": "/Users/runner/work/_temp/kpf/legs/host/logs/07-restore-captures.log",
+            "failing": "",
+            "tail": []
+          },
+          {
+            "step": "validate",
+            "status": "PASS",
+            "exit": 0,
+            "seconds": 0,
+            "log": "/Users/runner/work/_temp/kpf/legs/host/logs/08-validate.log",
+            "failing": "",
+            "tail": []
+          },
+          {
+            "step": "magic-repro",
+            "status": "PASS",
+            "exit": 0,
+            "seconds": 244,
+            "log": "/Users/runner/work/_temp/kpf/legs/host/logs/09-magic-repro.log",
+            "failing": "",
+            "tail": []
+          }
+        ],
+        "glibc_floor": null,
+        "assertions": {
+          "ported_from": {
+            "file": ".github/workflows/install-proof.yml",
+            "sha256": "747950dd57c9c71b14ea5d293632dab147fad241fc7c612818203897af3a70b0"
+          },
+          "counts": {
+            "PASS": 41,
+            "FAIL": 0,
+            "UNREADABLE": 0
+          },
+          "assertions": [
+            {
+              "status": "PASS",
+              "name": "installed launcher path",
+              "message": "/Users/runner/work/_temp/kpf/legs/host/home/.kin/bin/kin"
+            },
+            {
+              "status": "PASS",
+              "name": "kin-build-meta.json schema",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "cli build SHA is a full commit",
+              "message": "b47cbd195d5752cbf85c5c99c4ebb3d5c1bd4a2d"
+            },
+            {
+              "status": "PASS",
+              "name": "cli build SHA matches the expected commit",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "cli release binary is clean",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "cli release binary proves source_known",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "cli Cargo.lock provenance is well formed",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "cli Cargo.lock provenance matches the source",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "daemon build SHA is a full commit",
+              "message": "b47cbd195d5752cbf85c5c99c4ebb3d5c1bd4a2d"
+            },
+            {
+              "status": "PASS",
+              "name": "daemon build SHA matches the expected commit",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "daemon release binary is clean",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "daemon release binary proves source_known",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "daemon Cargo.lock provenance is well formed",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "daemon Cargo.lock provenance matches the source",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "CLI and daemon share Cargo.lock provenance",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin-status.json schema",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "bench metadata proves vector and embedding support",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin-status.json embedding coverage shape",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin-claude-fallback-health.json forced Claude fallback",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin-claude-fallback-doctor.json forced Claude fallback",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin-health.json aggregate health",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin-health.json required check statuses",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin-health.json semantic_query_readiness",
+              "message": "healthy"
+            },
+            {
+              "status": "PASS",
+              "name": "kin-health.json no hard failures",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin-doctor.json aggregate health",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin-doctor.json required check statuses",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin-doctor.json semantic_query_readiness",
+              "message": "healthy"
+            },
+            {
+              "status": "PASS",
+              "name": "kin-doctor.json no hard failures",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "lexical kin search returns the seeded hello entity",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin locate returns the seeded probe.py graph artifact",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "MCP client configs bind the installed launcher",
+              "message": "9 configs"
+            },
+            {
+              "status": "PASS",
+              "name": "Antigravity legacy repair preserved user policy",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "bounded clean-install embedding reached full coverage",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin-embedded-status.json schema",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin-embedded-status.json embedding coverage shape",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "Unix status observed embedding coverage after settle",
+              "message": "bounded settle (kin status --wait-quiesce 60)"
+            },
+            {
+              "status": "PASS",
+              "name": "Unix status proves complete observed embedding coverage",
+              "message": "indexed 6/6"
+            },
+            {
+              "status": "PASS",
+              "name": "kin-embedded-health.json healthy with semantic readiness",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "kin-embedded-doctor.json healthy with semantic readiness",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "semantic kin search returns the seeded hello entity",
+              "message": ""
+            },
+            {
+              "status": "PASS",
+              "name": "semantic kin locate proves complete coverage and returns probe.py",
+              "message": "semantic_coverage={\"supported\":true,\"indexed\":6,\"total\":6,\"pending\":0,\"complete\":true,\"embedding_state\":\"present\",\"read_at\":\"2026-09-27T08:25:03Z\",\"graph_bodies\":{\"source_paths\":1,\"with_body\":1,\"gap_paths\":0}}"
+            }
+          ]
+        },
+        "magic_repro": {
+          "version": "kin 0.8.1 (b47cbd195d5752cbf85c5c99c4ebb3d5c1bd4a2d release/v0.8.1-candidate 2026-09-27T07:02:54Z)",
+          "counts": {
+            "PASS": 27,
+            "FAIL": 0,
+            "UNREADABLE": 0
+          },
+          "total": 27,
+          "checks": [
+            {
+              "id": "0",
+              "ticket": "GPU-OPTOUT",
+              "status": "PASS",
+              "detail": "embeddings indexed=0/44"
+            },
+            {
+              "id": "1",
+              "ticket": "FIR-2354",
+              "status": "PASS",
+              "detail": "find_references(parse_note) crosses into storage.py"
+            },
+            {
+              "id": "2",
+              "ticket": "FIR-2353",
+              "status": "PASS",
+              "detail": "references returned (2), so the absence path is not exercised"
+            },
+            {
+              "id": "3",
+              "ticket": "FIR-2357",
+              "status": "PASS",
+              "detail": "all three calling files returned: ['pkg/linkgraph.py', 'pkg/parsing.py', 'pkg/storage.py']"
+            },
+            {
+              "id": "4",
+              "ticket": "FIR-2356",
+              "status": "PASS",
+              "detail": "coverage is not reported incomplete (graph status reports 16 of 30 relations cross-file)"
+            },
+            {
+              "id": "5",
+              "ticket": "FIR-2360",
+              "status": "PASS",
+              "detail": "the ambiguous receiver in Session.drain produced 1 edge(s)"
+            },
+            {
+              "id": "6",
+              "ticket": "FIR-2361",
+              "status": "PASS",
+              "detail": "truncation is localized per step"
+            },
+            {
+              "id": "7",
+              "ticket": "FIR-2362",
+              "status": "PASS",
+              "detail": "relations per entity 3.88"
+            },
+            {
+              "id": "8",
+              "ticket": "FIR-2359",
+              "status": "PASS",
+              "detail": "context pack carries no decimal byte arrays (9431 chars)"
+            },
+            {
+              "id": "9",
+              "ticket": "FIR-2358",
+              "status": "PASS",
+              "detail": "graph validate does not read as a completeness bill"
+            },
+            {
+              "id": "10",
+              "ticket": "FIR-2598",
+              "status": "PASS",
+              "detail": "every relation kind held or grew: {'UsesType': 14, 'Calls': 10, 'Contains': 7, 'References': 6, 'Extends': 1, 'Overrides': 1}"
+            },
+            {
+              "id": "11",
+              "ticket": "FIR-2598",
+              "status": "PASS",
+              "detail": "the commit did not move the comparison point off 2026-09-27T08:26:30.397474Z"
+            },
+            {
+              "id": "12",
+              "ticket": "FIR-2605",
+              "status": "PASS",
+              "detail": "the row for legacy_shim is labeled [unverified: caller_arrival_unresolved], which names the arrival reading rather than anything a file that declares nothing could have caused"
+            },
+            {
+              "id": "13",
+              "ticket": "FIR-2504",
+              "status": "PASS",
+              "detail": "the provenance field moves both ways: repository while set, kin's own default once cleared"
+            },
+            {
+              "id": "14",
+              "ticket": "FIR-2135",
+              "status": "PASS",
+              "detail": "status is live again once the store settles"
+            },
+            {
+              "id": "15",
+              "ticket": "FIR-2604",
+              "status": "PASS",
+              "detail": "the three files read 2 distinct parse states and certification differs between them, so these fields are observations rather than constants"
+            },
+            {
+              "id": "16",
+              "ticket": "FIR-2524",
+              "status": "PASS",
+              "detail": "isolated empty-reference arm refuses on both surfaces under census hold"
+            },
+            {
+              "id": "17",
+              "ticket": "FIR-2641",
+              "status": "PASS",
+              "detail": "docs/notes.md has no language adapter and stays uncertified (parsed='absent' tier='opaque_artifact'), so certification separates files rather than blessing them"
+            },
+            {
+              "id": "18",
+              "ticket": "FIR-2644",
+              "status": "PASS",
+              "detail": "the caller set is unchanged at ['Session.request', 'SessionRedirectMixin.resolve_redirects'] and every override-resolved row kept its composition"
+            },
+            {
+              "id": "19",
+              "ticket": "FIR-2644",
+              "status": "PASS",
+              "detail": "all 3 reported reference line(s) still carry the call they name"
+            },
+            {
+              "id": "20",
+              "ticket": "FIR-2644",
+              "status": "PASS",
+              "detail": "the answer discloses the loss structurally: _kin.degraded.relation_census_loss true and degraded_signals ['relation_census_loss']"
+            },
+            {
+              "id": "21",
+              "ticket": "MD-OPAQUE",
+              "status": "PASS",
+              "detail": "pkg/empty.py holds 1 entities and claims no opaque cause, so the disclosure is computed rather than unconditional"
+            },
+            {
+              "id": "22",
+              "ticket": "FIR-2838",
+              "status": "PASS",
+              "detail": "graph status reports no relation census loss"
+            },
+            {
+              "id": "23",
+              "ticket": "FIR-2821",
+              "status": "PASS",
+              "detail": "the fully accounted fixture prints a confident verdict: Found 1 unreferenced entities:"
+            },
+            {
+              "id": "24",
+              "ticket": "J6-14/18/21",
+              "status": "PASS",
+              "detail": "the predates-recording caveat does not name a repository this build registered"
+            },
+            {
+              "id": "25",
+              "ticket": "FIR-2955",
+              "status": "PASS",
+              "detail": "both explicit retries completed without starting a daemon"
+            },
+            {
+              "id": "cleanup",
+              "ticket": "CLEANUP",
+              "status": "PASS",
+              "detail": "/Users/runner/work/_temp/kpf/legs/host/repro/graphsection-r4116: kin daemon stop --json rc=0; {\n  \"all_stopped\": true,\n  \"repo\": \"graphsection-r4116\",\n  \"schema\": \"kin.daemon-stop.v1\",\n  \"scope\": \"current-repo\",\n  \"stopped\": []\n} "
+            }
+          ],
+          "verdict": "PASS"
+        },
+        "failing": [],
+        "unreadable": [],
+        "waived": [],
+        "verdict": "PASS"
+      }
+    }
+  ],
+  "merged_from": [
+    {
+      "run": "20260927T082353Z",
+      "host": "Linux 6.17.0-1022-azure aarch64",
+      "lane": "DEV-LOCAL",
+      "cpu_embed": true,
+      "targets": [
+        "kin-linux-aarch64"
+      ]
+    },
+    {
+      "run": "20260927T082356Z",
+      "host": "Linux 6.17.0-1022-azure x86_64",
+      "lane": "DEV-LOCAL",
+      "cpu_embed": true,
+      "targets": [
+        "kin-linux-x86_64"
+      ]
+    },
+    {
+      "run": "20260927T082410Z",
+      "host": "Darwin 25.6.0 arm64",
+      "lane": "DEV-LOCAL",
+      "cpu_embed": true,
+      "targets": [
+        "kin-macos-aarch64"
+      ]
+    }
+  ],
+  "run_root": null,
+  "log": null
+}
