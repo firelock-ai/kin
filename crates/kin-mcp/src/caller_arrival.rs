@@ -264,6 +264,11 @@ pub struct CallerArrival {
     /// A caller can reach the focal without importing its file, so these
     /// qualify a settled family: see [`crate::call_sites::owed_outside`].
     pub owed_outside: Option<Vec<crate::call_sites::OwedFile>>,
+    /// Of the family's owed callers, how many `call_sites` leaves out because
+    /// their whole body never spells the name a call to the focal uses. They
+    /// stay in `owed_callers`, and their files keep the parse-against-edge
+    /// count, which still holds every call they make to account.
+    pub owed_callers_cannot_name_focal: u64,
 }
 
 impl CallerArrival {
@@ -278,7 +283,21 @@ impl CallerArrival {
             owed_callers: Vec::new(),
             call_sites: None,
             owed_outside: Some(Vec::new()),
+            owed_callers_cannot_name_focal: 0,
         }
+    }
+
+    /// The `call_sites` block for the callers in the files that import the
+    /// focal's file, qualified by the owed callers outside them, or `None`
+    /// when the family could not be established. `find_references` and
+    /// `kin refs` both serve this one block.
+    pub fn call_sites_block(&self) -> Option<serde_json::Value> {
+        let tally = self.call_sites.as_ref()?;
+        let mut block = crate::call_sites::family_block(tally, self.owed_outside.as_deref());
+        if self.owed_callers_cannot_name_focal > 0 {
+            block["owed_callers_cannot_name_focal"] = json!(self.owed_callers_cannot_name_focal);
+        }
+        Some(block)
     }
 
     /// The block `find_references` publishes, and the one the negative envelope
@@ -328,6 +347,9 @@ impl CallerArrival {
             // named up to the cap when there are any.
             "owed_caller_count": self.owed_callers.len(),
         });
+        if self.owed_callers_cannot_name_focal > 0 {
+            block["owed_callers_cannot_name_focal"] = json!(self.owed_callers_cannot_name_focal);
+        }
         match &self.owed_outside {
             Some(files) if !files.is_empty() => {
                 block["owed_outside_scope"] = json!({
@@ -537,12 +559,23 @@ struct LedgerCount {
 /// describes pushed onto `owed`. A file with no entity holding text is left to
 /// the arithmetic, because a count of nothing from ledgers would certify a file
 /// whose calls no entity holds.
+///
+/// An owed or stale caller whose whole body never spells the name a call to
+/// the focal uses (`could_name` false) is left out of `tally` and counted in
+/// `cannot_name` instead: it cannot call the focal by name, so settling its
+/// sites cannot add a caller of the focal. The file's module entity is one of
+/// the callers read here, so an import that binds the focal under another
+/// name spells it there and keeps the file's owed callers counted. It is still
+/// owed, so it is still pushed onto `owed` and keeps the file on the
+/// arithmetic.
 fn ledger_count<F: kin_model::CallSiteFacts + ?Sized>(
     facts: &F,
     file: &FilePathId,
     entities: &[Entity],
+    could_name: &dyn Fn(&Entity) -> bool,
     tally: &mut kin_model::CallSiteTally,
     owed: &mut Vec<OwedCaller>,
+    cannot_name: &mut u64,
 ) -> Option<LedgerCount> {
     use kin_model::CallerSites;
     let mut count = LedgerCount::default();
@@ -550,7 +583,15 @@ fn ledger_count<F: kin_model::CallSiteFacts + ?Sized>(
     let mut owed_here = false;
     for entity in entities {
         let reading = kin_model::read_caller_sites(facts, entity);
-        tally.add(&reading);
+        let unsettled_caller = matches!(
+            reading,
+            CallerSites::OwedDerivation | CallerSites::OwedEnrichment | CallerSites::Stale(_)
+        );
+        if unsettled_caller && !could_name(entity) {
+            *cannot_name += 1;
+        } else {
+            tally.add(&reading);
+        }
         match &reading {
             CallerSites::NoSites => {}
             CallerSites::Current(ledger) => {
@@ -905,6 +946,7 @@ pub fn observe_caller_arrival<G: GraphStore>(store: &G, focal: &Entity) -> Calle
                 files_from_site_ledgers: 0,
                 owed_callers: Vec::new(),
                 call_sites: Some(kin_model::CallSiteTally::default()),
+                owed_callers_cannot_name_focal: 0,
                 owed_outside: crate::call_sites::owed_outside(
                     store,
                     focal.language,
@@ -942,6 +984,9 @@ pub fn observe_caller_arrival<G: GraphStore>(store: &G, focal: &Entity) -> Calle
     let facts = crate::call_sites::GraphSiteFacts::new(store);
     let mut tally = kin_model::CallSiteTally::default();
     let mut owed_callers: Vec<OwedCaller> = Vec::new();
+    let mut owed_callers_cannot_name_focal = 0u64;
+    let could_name =
+        |entity: &Entity| crate::call_sites::could_name_focal(entity, focal.name.as_str());
     let mut files_from_site_ledgers = 0usize;
     for file in &family_files {
         let Some((entities, parsed)) = file_entities(store, file) else {
@@ -950,7 +995,15 @@ pub fn observe_caller_arrival<G: GraphStore>(store: &G, focal: &Entity) -> Calle
             );
         };
         let owed_before = owed_callers.len();
-        if let Some(count) = ledger_count(&facts, file, &entities, &mut tally, &mut owed_callers) {
+        if let Some(count) = ledger_count(
+            &facts,
+            file,
+            &entities,
+            &could_name,
+            &mut tally,
+            &mut owed_callers,
+            &mut owed_callers_cannot_name_focal,
+        ) {
             family_measured += 1;
             files_from_site_ledgers += 1;
             let unsettled: u64 = count.unsettled.values().sum();
@@ -1032,6 +1085,7 @@ pub fn observe_caller_arrival<G: GraphStore>(store: &G, focal: &Entity) -> Calle
         files_from_site_ledgers,
         owed_callers,
         call_sites: Some(tally),
+        owed_callers_cannot_name_focal,
         owed_outside: crate::call_sites::owed_outside(
             store,
             focal.language,
@@ -2317,6 +2371,7 @@ mod tests {
             owed_callers: Vec::new(),
             call_sites: None,
             owed_outside: Some(Vec::new()),
+            owed_callers_cannot_name_focal: 0,
         };
         vec![
             ("one shortfall file", build(vec![one.clone()])),

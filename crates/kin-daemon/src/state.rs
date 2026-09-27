@@ -3153,7 +3153,8 @@ struct GraphAuthorityClock {
     /// absence treats one as a writer: the files it covers are on their way
     /// into the graph, and an answer read from the graph as it stands would
     /// report a name the agent just wrote as absent. A read that returns rows
-    /// does not wait on one, and no other reader of this clock consults it.
+    /// does not wait on one. A graph status sample does, because the
+    /// durability reading it publishes is a claim about the working copy.
     pending_admissions: AtomicUsize,
     epoch: AtomicU64,
     /// Woken each time a writer finishes, and each time a pending admission
@@ -3164,6 +3165,10 @@ struct GraphAuthorityClock {
     /// Zero means none.
     #[cfg(test)]
     drain_ceiling_override_ms: AtomicU64,
+    /// A test's stand-in for [`GRAPH_STATUS_DRAIN_CEILING`], in milliseconds.
+    /// Zero means none.
+    #[cfg(test)]
+    status_drain_ceiling_override_ms: AtomicU64,
 }
 
 /// How long one reference read waits, in total, for graph-authority writers to
@@ -3181,6 +3186,28 @@ struct GraphAuthorityClock {
 /// answer needs, and past it the caller, not this daemon, decides what the
 /// agent sees.
 pub(crate) const XREF_WRITER_DRAIN_CEILING: Duration = Duration::from_secs(30);
+
+/// How long one `kin_graph_status` call waits, in total, for graph authority
+/// to settle before it replays the last settled reading instead.
+///
+/// A status sample cannot be taken while a writer holds graph authority, and
+/// one that tries every few milliseconds and gives up after three tries reads
+/// a single admission pass as churn. A daemon that has just picked up a new
+/// module holds authority for a few hundred milliseconds while it admits it,
+/// and a status call landing there replayed the reading from before the
+/// module, beside a working copy reading that no longer named the file. The
+/// sample therefore waits for the writer, and for the reconcile loop's
+/// pending admission, the way a reference read does, and answers live once
+/// they finish.
+///
+/// Far shorter than the reference-read ceiling, because status is what a
+/// caller asks while it waits for something else to settle, and a store under
+/// minutes of continuous reconcile must still answer. Past this the call
+/// replays the settled reading, labelled with its age, as it always has.
+/// `kin setup` verifies a client with this call and allows it ten seconds
+/// beyond the daemon's startup grace, so the wait fits inside that with room
+/// left for the answer.
+pub(crate) const GRAPH_STATUS_DRAIN_CEILING: Duration = Duration::from_secs(5);
 
 /// How a wait for graph-authority writers to finish ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4840,6 +4867,34 @@ impl DaemonState {
             }
         }
         XREF_WRITER_DRAIN_CEILING
+    }
+
+    /// How long one `kin_graph_status` call waits for graph authority to
+    /// settle, in total.
+    pub(crate) fn graph_status_drain_ceiling(&self) -> Duration {
+        #[cfg(test)]
+        {
+            let ms = self
+                .graph_authority_clock
+                .status_drain_ceiling_override_ms
+                .load(Ordering::SeqCst);
+            if ms != 0 {
+                return Duration::from_millis(ms);
+            }
+        }
+        GRAPH_STATUS_DRAIN_CEILING
+    }
+
+    /// Shorten the status wait, so a test that holds a writer through a status
+    /// call reaches the replay without waiting the production ceiling.
+    #[cfg(test)]
+    pub(crate) fn set_graph_status_drain_ceiling_for_test(&self, ceiling: Duration) {
+        let ms = u64::try_from(ceiling.as_millis())
+            .unwrap_or(u64::MAX)
+            .max(1);
+        self.graph_authority_clock
+            .status_drain_ceiling_override_ms
+            .store(ms, Ordering::SeqCst);
     }
 
     /// Shorten the reference-read writer wait, so a test that holds a writer

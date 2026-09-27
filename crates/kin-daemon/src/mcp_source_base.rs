@@ -173,10 +173,30 @@ fn require_entity_source_bases(
         .ok_or("the selected workspace no longer exists")?;
     let current = kin_mcp::source_base::SourceBaseContext::from_workspace(workspace)?;
     for expected in expected {
-        if expected.context != current
-            || expected.context.repository_id != context.repository_id().as_str()
+        // The base names the repository, workspace, head and tree the caller
+        // read, and the checks below bind the entity's own artifact, bytes,
+        // span and body. A generation that advanced over the same head and
+        // tree changed none of the bytes the edit replaces: language-server
+        // enrichment publishes its relations, call-site ledgers and
+        // completion marks as workspace mutations of their own, so a strict
+        // generation match refused an agent's edit whenever enrichment
+        // happened to land between its read and its write, a daemon restart
+        // flushing a pending mark included. A generation the workspace has
+        // not reached is still refused: no read of this workspace names it.
+        let observed = &expected.context;
+        if observed.repository_id != current.repository_id
+            || observed.repository_id != context.repository_id().as_str()
+            || observed.workspace_id != current.workspace_id
+            || observed.workspace_head_hash != current.workspace_head_hash
+            || observed.workspace_tree_hash != current.workspace_tree_hash
+            || observed.workspace_generation > current.workspace_generation
         {
-            return Err(format!("repository, workspace, branch or workspace revision changed since entity {} was read", expected.entity_id));
+            return Err(format!(
+                "repository, workspace, branch or workspace tree changed since entity {} was \
+                 read (it names workspace generation {}, and the workspace is now at \
+                 generation {})",
+                expected.entity_id, observed.workspace_generation, current.workspace_generation
+            ));
         }
         let entity = base
             .graph

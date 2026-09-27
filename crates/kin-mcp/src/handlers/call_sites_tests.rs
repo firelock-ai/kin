@@ -611,6 +611,80 @@ async fn find_references_keeps_the_arithmetic_for_a_family_with_owed_callers() {
     assert!(value["_kin"].get("self_check").is_none(), "{value}");
 }
 
+/// Give `entity` the parse-time preview of `body`, which the parser keeps
+/// whole for a body this short.
+fn previewed(store: &Store, entity: &Entity, body: &str) {
+    let mut entity = entity.clone();
+    entity.metadata.extra.insert(
+        kin_parser::extract::EMBEDDING_BODY_PREVIEW_KEY.to_string(),
+        json!(body.split_whitespace().collect::<Vec<_>>().join(" ")),
+    );
+    store.graph.upsert_entity(&entity).unwrap();
+}
+
+/// An owed caller in the family whose whole body never spells the name a call
+/// to the focal uses cannot call it by that name, so settling its sites cannot
+/// add a caller: `call_sites` leaves it out and says how many it left out.
+/// It is still owed, so `caller_arrival` still names it and its file keeps the
+/// parse-against-edge count.
+#[tokio::test]
+async fn find_references_leaves_out_owed_family_callers_that_never_spell_the_focal() {
+    let store = store();
+    previewed(&store, &store.caller, CALLER_BODY);
+    previewed(&store, &store.caller_module, MODULE_BODY);
+    let value = finalized(
+        handle_find_references(&args_for(&store.target), &store.graph, None)
+            .await
+            .unwrap(),
+        "find_references",
+    );
+    let arrival = &value[crate::caller_arrival::CALLER_ARRIVAL_KEY];
+    assert_eq!(arrival["owed_caller_count"], 2, "{arrival}");
+    assert_eq!(arrival["owed_callers_cannot_name_focal"], 2, "{arrival}");
+    let block = &value[crate::call_sites::CALL_SITES_KEY];
+    assert_eq!(block["settled"], true, "{block}");
+    assert_eq!(block["callers"], 0, "{block}");
+    assert_eq!(block["owed_callers_cannot_name_focal"], 2, "{block}");
+    assert!(
+        crate::call_sites::text_lines(block)
+            .iter()
+            .any(|line| line.contains("2 more owed caller(s) there never spell")),
+        "{block}"
+    );
+    assert_eq!(
+        value["_kin"]["verdict"]["inputs"]["call_sites"], "certified",
+        "{value}"
+    );
+}
+
+/// An import that binds the focal under another name spells it in the file's
+/// module, so the module stays counted as owed and the answer stays unsettled
+/// until the sweep proves its sites.
+#[tokio::test]
+async fn an_owed_module_that_imports_the_focal_under_another_name_still_counts() {
+    let store = store();
+    previewed(&store, &store.caller, CALLER_BODY);
+    previewed(
+        &store,
+        &store.caller_module,
+        "from storage import find_note as lookup\n",
+    );
+    let value = finalized(
+        handle_find_references(&args_for(&store.target), &store.graph, None)
+            .await
+            .unwrap(),
+        "find_references",
+    );
+    let block = &value[crate::call_sites::CALL_SITES_KEY];
+    assert_eq!(block["callers_owed_enrichment"], 1, "{block}");
+    assert_eq!(block["owed_callers_cannot_name_focal"], 1, "{block}");
+    assert_eq!(clause_codes(block), ["call_sites_owed"], "{block}");
+    assert_eq!(
+        value["_kin"]["verdict"]["inputs"]["call_sites"], "inconclusive",
+        "{value}"
+    );
+}
+
 #[test]
 fn a_site_row_names_its_target_by_an_id_the_entity_tools_accept() {
     let store = store();

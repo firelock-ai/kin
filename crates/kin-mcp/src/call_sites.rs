@@ -454,11 +454,12 @@ pub fn owed_files<G: GraphStore + ?Sized>(store: &G, entities: &[Entity]) -> Vec
 /// owed `views.py`, which reaches it through `current_app`.
 ///
 /// Such a caller reaches the focal by name, so only an owed caller whose body
-/// could spell `focal_name` is counted. One whose span holds no bytes holds no
-/// call, and one whose parse-time preview is its whole body and never spells
-/// the name cannot call the focal by it. Every other owed caller counts,
-/// including one whose preview was cut short or absent, because a name missing
-/// from part of a body proves nothing about the rest.
+/// could spell the focal's name is counted (see [`could_name_focal`]). One
+/// whose span holds no bytes holds no call, and one whose parse-time preview
+/// is its whole body and never spells the name cannot call the focal by it.
+/// Every other owed caller counts, including one whose preview was cut short
+/// or absent, because a name missing from part of a body proves nothing about
+/// the rest.
 pub fn owed_outside<G: GraphStore + ?Sized>(
     store: &G,
     language: LanguageId,
@@ -475,7 +476,7 @@ pub fn owed_outside<G: GraphStore + ?Sized>(
         .filter(|entity| {
             entity.span.as_ref().is_some_and(|span| {
                 !inside.contains(&span.file.0) && span.start_byte < span.end_byte
-            }) && could_name(entity, focal_name)
+            }) && could_name_focal(entity, focal_name)
         })
         .collect();
     Some(owed_files(store, &outside))
@@ -485,9 +486,23 @@ pub fn owed_outside<G: GraphStore + ?Sized>(
 /// with gaps, so its preview no longer proves what the body leaves out.
 const WHOLE_BODY_PREVIEW_CHARS: usize = 8000;
 
-/// Whether `entity`'s body could spell `name`, read off its parse-time
-/// preview: false only when that preview is the whole body and lacks it.
-fn could_name(entity: &Entity, name: &str) -> bool {
+/// The names a call site may spell to reach `focal_name`: each segment of it.
+///
+/// The graph names a member by its owner, `Session.send` or `Store::open`,
+/// and a call spells the member, `self.send(...)`, or only the owner, as a
+/// constructor call `HTTPAdapter()` reaches `HTTPAdapter.__init__`. So a body
+/// is searched for every segment, never for the qualified name, which no call
+/// spells: searching for it ruled out every owed caller of a method.
+pub fn focal_call_names(focal_name: &str) -> impl Iterator<Item = &str> {
+    focal_name
+        .split(['.', ':'])
+        .filter(|segment| !segment.is_empty())
+}
+
+/// Whether `entity`'s body could spell a name a call to `focal_name` uses,
+/// read off its parse-time preview: false only when that preview is the whole
+/// body and spells none of them.
+pub fn could_name_focal(entity: &Entity, focal_name: &str) -> bool {
     let Some(preview) = entity
         .metadata
         .extra
@@ -496,7 +511,9 @@ fn could_name(entity: &Entity, name: &str) -> bool {
     else {
         return true;
     };
-    preview.chars().count() > WHOLE_BODY_PREVIEW_CHARS || preview.contains(name)
+    preview.chars().count() > WHOLE_BODY_PREVIEW_CHARS
+        || focal_call_names(focal_name).any(|name| preview.contains(name))
+        || focal_call_names(focal_name).next().is_none()
 }
 
 /// The clause a family block carries while callers outside its scope are
@@ -648,6 +665,15 @@ pub fn text_lines(block: &Value) -> Vec<String> {
         header.push_str(&format!(" ({reading})"));
     }
     lines.push(header);
+    if let Some(cannot_name) = block["owed_callers_cannot_name_focal"]
+        .as_u64()
+        .filter(|count| *count > 0)
+    {
+        lines.push(format!(
+            "  {cannot_name} more owed caller(s) there never spell the focal's name, so they \
+             cannot call it by name and are not counted"
+        ));
+    }
     if let Some(shares) = block["shares"].as_object() {
         let parts: Vec<String> = shares
             .iter()
@@ -1324,11 +1350,13 @@ mod owed_outside_tests {
             Some(format!("def cut_short(): {}", "x".repeat(9000))),
         );
         body("no_preview", None);
+        // The graph names the focal by its owner, and a call spells only
+        // the member, so the qualified name is what the reading is handed.
         let owed = super::owed_outside(
             &graph,
             kin_model::LanguageId::Python,
             &std::collections::HashSet::new(),
-            "ensure_sync",
+            "App.ensure_sync",
         )
         .expect("the index reads");
         let files: Vec<&str> = owed.iter().map(|file| file.file.as_str()).collect();
@@ -1337,6 +1365,41 @@ mod owed_outside_tests {
             ["pkg/cut_short.py", "pkg/names_it.py", "pkg/no_preview.py"],
             "{owed:?}"
         );
+    }
+
+    /// A call spells a member without its owner, or the owner alone for a
+    /// constructor, so a body is searched for every segment of the focal's
+    /// name, whichever separator the language uses.
+    #[test]
+    fn a_focal_is_named_by_every_segment_a_call_may_spell() {
+        fn names(name: &str) -> Vec<&str> {
+            super::focal_call_names(name).collect()
+        }
+        assert_eq!(names("App.ensure_sync"), ["App", "ensure_sync"]);
+        assert_eq!(names("Store::open"), ["Store", "open"]);
+        assert_eq!(names("parse_note"), ["parse_note"]);
+        assert_eq!(names("Trailing."), ["Trailing"]);
+
+        let entity = |preview: &str| {
+            let mut entity = super::fixture::spanned_entity(
+                "caller",
+                "pkg/caller.py",
+                kin_model::LanguageId::Python,
+                0,
+                preview,
+            );
+            entity.metadata.extra.insert(
+                kin_parser::extract::EMBEDDING_BODY_PREVIEW_KEY.to_string(),
+                json!(preview),
+            );
+            entity
+        };
+        let constructs = entity("def make(): return HTTPAdapter()");
+        assert!(super::could_name_focal(&constructs, "HTTPAdapter.__init__"));
+        let sends = entity("def go(self): return self.send(req)");
+        assert!(super::could_name_focal(&sends, "Session.send"));
+        let unrelated = entity("def go(): return print(1)");
+        assert!(!super::could_name_focal(&unrelated, "Session.send"));
     }
 
     /// Impact's zero consumer counts are not whole while a caller outside a

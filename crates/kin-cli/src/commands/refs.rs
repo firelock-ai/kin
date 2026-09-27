@@ -330,10 +330,7 @@ pub fn build_refs_response_with_spine(
     // Qualified by the owed callers outside those files, since a caller can
     // reach the focal without importing its file.
     let arrival = kin_mcp::caller_arrival::observe_caller_arrival(graph, target);
-    let call_sites = arrival
-        .call_sites
-        .as_ref()
-        .map(|tally| kin_mcp::call_sites::family_block(tally, arrival.owed_outside.as_deref()));
+    let call_sites = arrival.call_sites_block();
     let call_site_lines = |lines: &mut Vec<String>| {
         if let Some(block) = call_sites.as_ref() {
             lines.extend(kin_mcp::call_sites::text_lines(block));
@@ -377,6 +374,7 @@ pub fn build_refs_response_with_spine(
             target,
             &relation_kinds,
             resolved_by_name,
+            &arrival,
             envelope,
             spine,
         );
@@ -385,6 +383,7 @@ pub fn build_refs_response_with_spine(
             target,
             &relation_kinds,
             resolved_by_name,
+            &arrival,
             envelope,
             spine,
         ));
@@ -897,12 +896,20 @@ fn refs_absence_verdict(
     target: &Entity,
     relation_kinds: &[RelationKind],
     addressed_by_name: Option<&str>,
+    arrival: &kin_mcp::caller_arrival::CallerArrival,
     envelope: &kin_mcp::Envelope,
     spine: RefsSpine<'_>,
 ) -> Option<serde_json::Value> {
     kin_mcp::negative::negative_for(
         "find_references",
-        &refs_absence_payload(graph, target, relation_kinds, addressed_by_name, spine),
+        &refs_absence_payload(
+            graph,
+            target,
+            relation_kinds,
+            addressed_by_name,
+            arrival,
+            spine,
+        ),
         envelope,
         &[],
     )
@@ -923,10 +930,18 @@ fn refs_absence_qualifier(
     target: &Entity,
     relation_kinds: &[RelationKind],
     addressed_by_name: Option<&str>,
+    arrival: &kin_mcp::caller_arrival::CallerArrival,
     envelope: &kin_mcp::Envelope,
     spine: RefsSpine<'_>,
 ) -> Vec<String> {
-    let payload = refs_absence_payload(graph, target, relation_kinds, addressed_by_name, spine);
+    let payload = refs_absence_payload(
+        graph,
+        target,
+        relation_kinds,
+        addressed_by_name,
+        arrival,
+        spine,
+    );
     let federated = payload["references"].as_array().map_or(0, Vec::len);
     if federated > 0 {
         return vec![format!(
@@ -963,6 +978,7 @@ fn refs_absence_payload(
     target: &Entity,
     relation_kinds: &[RelationKind],
     addressed_by_name: Option<&str>,
+    arrival: &kin_mcp::caller_arrival::CallerArrival,
     spine: RefsSpine<'_>,
 ) -> serde_json::Value {
     let coverage = kin_mcp::edge_coverage::observe_cross_file_reference_coverage_for_languages(
@@ -1000,6 +1016,15 @@ fn refs_absence_payload(
         kin_mcp::handlers::entities::focal_resolution_for(graph, target, addressed_by_name)
     {
         payload["focal_resolution"] = resolution;
+    }
+    // The two readings `find_references` publishes about the callers that
+    // could reach the focal, so the gate reads the same inputs on both
+    // surfaces. Without them this command certified an absence the MCP answer
+    // refused while it printed, a few lines below, that the call sites in
+    // scope were not settled.
+    payload[kin_mcp::caller_arrival::CALLER_ARRIVAL_KEY] = arrival.to_json();
+    if let Some(block) = arrival.call_sites_block() {
+        payload[kin_mcp::call_sites::CALL_SITES_KEY] = block;
     }
     payload
 }
@@ -2291,6 +2316,7 @@ mod tests {
                 &target,
                 &kinds,
                 Some("orphan"),
+                &kin_mcp::caller_arrival::observe_caller_arrival(&graph, &target),
                 super::RefsSpine::absent(),
             ),
             &degraded,
@@ -2956,6 +2982,144 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
         (graph, layout, dir)
+    }
+
+    /// `kin refs` reads the same caller readings `find_references` publishes.
+    ///
+    /// A Python focal whose importer holds a caller no call-site ledger
+    /// describes yet: the MCP gate reads the family's `call_sites` block as
+    /// owed and refuses the absence, and the CLI printed that block's
+    /// "not settled" line while certifying the absence anyway, because its gate
+    /// payload carried neither reading.
+    #[test]
+    fn an_owed_caller_in_the_family_qualifies_the_refs_absence_on_both_surfaces() {
+        use kin_model::{
+            Entity, EntityId, EntityKind, EntityMetadata, EntityRole, EntityStore, FilePathId,
+            FingerprintAlgorithm, GraphNodeId, Hash256, LanguageId, Relation, RelationId,
+            RelationOrigin, SemanticFingerprint, SourceSpan, Visibility,
+        };
+        fn entity(
+            name: &str,
+            kind: EntityKind,
+            file: &str,
+            span: Option<(usize, usize)>,
+        ) -> Entity {
+            let mut metadata = EntityMetadata::default();
+            // The caller's file parses one call, so its callers are owed a
+            // ledger rather than read as a file without calls.
+            metadata.extra.insert(
+                kin_parser::FILE_PARSED_CALL_SITES_KEY.to_string(),
+                serde_json::json!(1),
+            );
+            Entity {
+                id: EntityId::new(),
+                kind,
+                name: name.to_string(),
+                language: LanguageId::Python,
+                fingerprint: SemanticFingerprint {
+                    algorithm: FingerprintAlgorithm::V1TreeSitter,
+                    ast_hash: Hash256::from_bytes([0; 32]),
+                    signature_hash: Hash256::from_bytes([0; 32]),
+                    behavior_hash: Hash256::from_bytes([0; 32]),
+                    equivalence_hash: Hash256::from_bytes([0; 32]),
+                    stability_score: 1.0,
+                },
+                file_origin: Some(FilePathId::new(file)),
+                span: span.map(|(start, end)| SourceSpan {
+                    file: FilePathId::new(file),
+                    start_byte: start,
+                    end_byte: end,
+                    start_line: 0,
+                    start_col: 0,
+                    end_line: 1,
+                    end_col: 0,
+                }),
+                signature: name.to_string(),
+                visibility: Visibility::Public,
+                role: EntityRole::Source,
+                doc_summary: None,
+                metadata,
+                lineage_parent: None,
+                created_in: None,
+                superseded_by: None,
+            }
+        }
+        let graph = kin_db::InMemoryGraph::new();
+        let focal = entity("unused_probe", EntityKind::Function, "callee.py", None);
+        let caller_module = entity("caller", EntityKind::Module, "caller.py", Some((0, 60)));
+        let caller = entity(
+            "caller_probe",
+            EntityKind::Function,
+            "caller.py",
+            Some((20, 60)),
+        );
+        for node in [&focal, &caller_module, &caller] {
+            EntityStore::upsert_entity(&graph, node).unwrap();
+        }
+        EntityStore::upsert_relation(
+            &graph,
+            &Relation {
+                id: RelationId::new(),
+                kind: RelationKind::Imports,
+                src: GraphNodeId::Entity(caller_module.id),
+                dst: GraphNodeId::Entity(focal.id),
+                confidence: 1.0,
+                origin: RelationOrigin::Parsed,
+                created_in: None,
+                import_source: None,
+                evidence: Vec::new(),
+            },
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
+        let envelope = refs_test_envelope();
+
+        let response = build_refs_response(
+            &layout,
+            &graph,
+            &RefsRequest {
+                entity: "unused_probe".to_string(),
+                kind: "calls".to_string(),
+            },
+            &envelope,
+        )
+        .expect("refs response");
+        let arrival = kin_mcp::caller_arrival::observe_caller_arrival(&graph, &focal);
+        let block = arrival.call_sites_block().expect("the family is tallied");
+        assert_eq!(block["settled"], false, "{block}");
+        assert_eq!(block["callers_owed_enrichment"], 2, "{block}");
+        let payload = super::refs_absence_payload(
+            &graph,
+            &focal,
+            &[RelationKind::Calls],
+            Some("unused_probe"),
+            &arrival,
+            super::RefsSpine::absent(),
+        );
+        assert_eq!(
+            payload[kin_mcp::call_sites::CALL_SITES_KEY],
+            block,
+            "the gate reads the block the answer prints"
+        );
+        assert_eq!(
+            payload[kin_mcp::caller_arrival::CALLER_ARRIVAL_KEY],
+            arrival.to_json()
+        );
+        let verdict = response
+            .negative
+            .as_ref()
+            .expect("an empty refs answer carries a verdict");
+        assert_eq!(
+            verdict["safe_to_conclude_absent"],
+            serde_json::json!(false),
+            "{verdict}"
+        );
+        let rendered = response.lines.join("\n");
+        assert!(
+            rendered.contains("Kin cannot rule out references it did not see"),
+            "{rendered}"
+        );
     }
 
     /// A substrate in good health, so a test asserting refs CONTENT is not also

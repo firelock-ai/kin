@@ -3145,6 +3145,94 @@ mod tests {
         );
     }
 
+    /// A replayed status sample over a level graph and a level working copy.
+    ///
+    /// This is the payload a daemon served while admitting a module it had just
+    /// picked up: the working copy reading no longer counted the file as
+    /// unadmitted, and the replayed counters predated its entities. The
+    /// durability block read `recorded`, zero live-only entities and no
+    /// `behind`, over a working copy holding an uncommitted module. The
+    /// counters stay as observed and the state must not certify them.
+    #[test]
+    fn a_replayed_graph_status_does_not_publish_a_durability_all_clear() {
+        let level_report = serde_json::json!({
+            "schema": "kin.graph-status.v1",
+            "view": "daemon_selected_graph",
+            "scope": "head",
+            "authority": "repo-daemon",
+            "sampling": "point_in_time_selected_graph",
+            "authority_epoch": 0,
+            "entity_count": 6,
+            "durable_entity_count": 6,
+            "relation_count": 13,
+            "durable_relation_count": 13,
+            "embedding_source": "selected_graph",
+            "embeddings_indexed": 0,
+            "embeddings_pending": 12,
+            "embeddings_total": 12,
+            "completion_attested": false
+        });
+        let mut replayed_report = level_report.clone();
+        replayed_report["sampling"] = serde_json::json!("last_settled_selected_graph");
+        replayed_report["stale"] = serde_json::json!({
+            "reason": "selected_graph_changing",
+            "settled_age_ms": 2023,
+            "live_attempts": 3,
+            "note": "the live sample was abandoned while graph authority moved"
+        });
+        let stale_result = ToolCallResult::text(replayed_report.to_string());
+        let level_working_copy = serde_json::json!({
+            "reconcile": {
+                "untracked_path_count": 0,
+                "untracked_observed_age_seconds": 0,
+                "last_admission_success_at": "2026-09-27T00:35:27Z",
+                "last_admission_success_age_seconds": 0
+            }
+        });
+        let enveloped = finalize_daemon_graph_status(
+            stale_result,
+            Envelope::daemon().with_working_copy_health(&level_working_copy),
+            &[],
+            2,
+        );
+        let report = daemon_delegate::parse_graph_status_report(&enveloped)
+            .expect("the stdio contract validates")
+            .expect("the status call succeeds");
+        let envelope = report
+            .response_envelope
+            .expect("stdio status carries an envelope");
+        assert!(
+            envelope.behind.is_none(),
+            "the working copy reading is level"
+        );
+        let durability = envelope
+            .durability
+            .expect("graph status reports durability");
+        assert_eq!(durability.state, "unknown", "{durability:?}");
+        assert_eq!(durability.live_only_entities, None, "{durability:?}");
+        assert_eq!(durability.live_only_relations, None, "{durability:?}");
+        assert_eq!(durability.live_entities, Some(6), "{durability:?}");
+        assert_eq!(durability.durable_entities, Some(6), "{durability:?}");
+
+        // The control: the same counters sampled live keep the all-clear, so
+        // this does not qualify every status answer.
+        let live = finalize_daemon_graph_status(
+            ToolCallResult::text(level_report.to_string()),
+            Envelope::daemon().with_working_copy_health(&level_working_copy),
+            &[],
+            2,
+        );
+        let live = daemon_delegate::parse_graph_status_report(&live)
+            .expect("the stdio contract validates")
+            .expect("the status call succeeds")
+            .response_envelope
+            .expect("stdio status carries an envelope")
+            .durability
+            .expect("graph status reports durability");
+        assert_eq!(live.state, "recorded", "{live:?}");
+        assert_eq!(live.live_only_entities, Some(0), "{live:?}");
+    }
+
     #[test]
     fn graph_status_stdio_schema_rejects_a_mixed_head_envelope() {
         let enveloped =
