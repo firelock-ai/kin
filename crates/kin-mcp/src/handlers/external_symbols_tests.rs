@@ -794,7 +794,7 @@ async fn external_answers_survive_the_envelope_and_verdict() {
         session_authority_mode: crate::server::SessionAuthorityMode::OfflineFallback,
         ..Default::default()
     };
-    let sessions = SessionRegistry::new();
+    let sessions = SessionRegistry::empty_for_test();
     let address = f.address();
     let call = |tool: &'static str, arguments: serde_json::Value| {
         let message = serde_json::json!({
@@ -1209,7 +1209,7 @@ async fn no_id_tool_reports_a_held_external_symbol_missing() {
         session_authority_mode: crate::server::SessionAuthorityMode::OfflineFallback,
         ..Default::default()
     };
-    let sessions = SessionRegistry::new();
+    let sessions = SessionRegistry::empty_for_test();
     let address = f.address();
     let caller = f.caller.id.to_string();
     let calls: Vec<(&str, serde_json::Value)> = vec![
