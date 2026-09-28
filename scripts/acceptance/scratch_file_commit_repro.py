@@ -112,6 +112,64 @@ class Result(object):
         self.detail = detail
 
 
+# BEGIN failure evidence excerpt
+# Every suite carries this block byte for byte, because a suite is also copied
+# out and run as a single file. test_failure_excerpt.py keeps the copies equal.
+EVIDENCE_LIMIT = 4000
+EVIDENCE_LINE_LIMIT = 600
+EVIDENCE_PANICS = ("panicked at", "has overflowed its stack")
+EVIDENCE_ESCAPES = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+EVIDENCE_ERROR = re.compile(r"^(?:[\w./-]+:\s*)?(?:error|fatal)\b", re.IGNORECASE)
+EVIDENCE_LOG_ERROR = re.compile(r"\sERROR\s")
+
+
+def failure_excerpt(text, limit=EVIDENCE_LIMIT):
+    """Bounded evidence from a command's output that still says why it failed.
+
+    Output that fits is returned whole. Longer output keeps its opening and its
+    end, and between them every line that carries a Rust panic, with the
+    message line under it, and the last error line, wherever they fall. A
+    warning printed around the error cannot push it out, and a long log cannot
+    cut the panic out. `limit` only ever raises the bound, never lowers it.
+    """
+    text = (text or "").strip()
+    limit = max(int(limit), EVIDENCE_LIMIT)
+    if len(text) <= limit:
+        return text
+    head_end = limit // 4
+    tail_start = len(text) - limit // 2
+    lines = text.split("\n")
+    starts, offset = [], 0
+    panics, errors = [], []
+    for index, line in enumerate(lines):
+        starts.append(offset)
+        offset += len(line) + 1
+        plain = EVIDENCE_ESCAPES.sub("", line).strip()
+        if any(marker in plain for marker in EVIDENCE_PANICS):
+            panics.extend((index, index + 1))
+        if EVIDENCE_ERROR.match(plain) or EVIDENCE_LOG_ERROR.search(plain):
+            errors.append(index)
+    # The first panic and its message, then the last error line, then any
+    # later panics, for as long as the middle's share of the bound lasts.
+    order = panics[:2] + errors[-1:] + panics[2:]
+    budget, kept = limit // 4, set()
+    for index in order:
+        if index >= len(lines) or index in kept:
+            continue
+        start, end = starts[index], starts[index] + len(lines[index])
+        if end <= head_end or start >= tail_start:
+            continue
+        cost = min(len(lines[index]), EVIDENCE_LINE_LIMIT) + 1
+        if cost > budget:
+            continue
+        kept.add(index)
+        budget -= cost
+    middle = [lines[index][:EVIDENCE_LINE_LIMIT] for index in sorted(kept)]
+    parts = [text[:head_end], "[...]"] + middle + (["[...]"] if middle else [])
+    return "\n".join(parts + [text[tail_start:]])
+# END failure evidence excerpt
+
+
 def run(cmd, cwd=None, env=None, timeout=900):
     process = subprocess.Popen(
         cmd, cwd=cwd, env=env,
@@ -169,7 +227,7 @@ def grade_commit_admitted_the_scratch_delete(rc, text):
     if rc != 0:
         return Result("commit", UNREADABLE,
                       "kin commit failed for another reason (rc=%s): %s"
-                      % (rc, text.strip()[-200:]))
+                      % (rc, failure_excerpt(text)))
     return Result("commit", PASS,
                   "a scratch file deleted beside %d new files committed" % len(ADDITIONS))
 
@@ -283,7 +341,7 @@ class Suite(object):
     def git(self, repo, args, timeout=300):
         rc, out, err = run(["git"] + args, cwd=repo, env=self.env, timeout=timeout)
         if rc != 0:
-            raise RuntimeError("git %s failed: %s" % (" ".join(args), (err or out)[-300:]))
+            raise RuntimeError("git %s failed: %s" % (" ".join(args), failure_excerpt(err or out)))
         return out
 
     def repo(self):
@@ -308,7 +366,7 @@ class Suite(object):
         self.git(path, ["commit", "-q", "-m", "seed"])
         rc, out, err = self.kin_run(path, ["init", "."])
         if rc != 0:
-            raise RuntimeError("kin init failed: %s" % ((err or out)[-400:]))
+            raise RuntimeError("kin init failed: %s" % failure_excerpt(err or out))
         # Fixture assertion. If the scratch file was never tracked, deleting it
         # produces no unmatched removal and every arm below passes vacuously.
         #
@@ -321,10 +379,10 @@ class Suite(object):
         arc, aout, aerr = self.kin_run(path, ["admit"])
         if arc != 0:
             raise RuntimeError("kin admit failed after init, so the fixture read below "
-                               "could not be measured: %s" % ((aerr or aout)[-400:]))
+                               "could not be measured: %s" % failure_excerpt(aerr or aout))
         rc, out, err = self.kin_run(path, ["status"])
         if rc != 0:
-            raise RuntimeError("kin status failed after init: %s" % ((err or out)[-400:]))
+            raise RuntimeError("kin status failed after init: %s" % failure_excerpt(err or out))
         self._repo = path
         return path
 

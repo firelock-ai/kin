@@ -163,6 +163,64 @@ REFUSAL_FABRICATED_AFTER = (
 )
 
 
+# BEGIN failure evidence excerpt
+# Every suite carries this block byte for byte, because a suite is also copied
+# out and run as a single file. test_failure_excerpt.py keeps the copies equal.
+EVIDENCE_LIMIT = 4000
+EVIDENCE_LINE_LIMIT = 600
+EVIDENCE_PANICS = ("panicked at", "has overflowed its stack")
+EVIDENCE_ESCAPES = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+EVIDENCE_ERROR = re.compile(r"^(?:[\w./-]+:\s*)?(?:error|fatal)\b", re.IGNORECASE)
+EVIDENCE_LOG_ERROR = re.compile(r"\sERROR\s")
+
+
+def failure_excerpt(text, limit=EVIDENCE_LIMIT):
+    """Bounded evidence from a command's output that still says why it failed.
+
+    Output that fits is returned whole. Longer output keeps its opening and its
+    end, and between them every line that carries a Rust panic, with the
+    message line under it, and the last error line, wherever they fall. A
+    warning printed around the error cannot push it out, and a long log cannot
+    cut the panic out. `limit` only ever raises the bound, never lowers it.
+    """
+    text = (text or "").strip()
+    limit = max(int(limit), EVIDENCE_LIMIT)
+    if len(text) <= limit:
+        return text
+    head_end = limit // 4
+    tail_start = len(text) - limit // 2
+    lines = text.split("\n")
+    starts, offset = [], 0
+    panics, errors = [], []
+    for index, line in enumerate(lines):
+        starts.append(offset)
+        offset += len(line) + 1
+        plain = EVIDENCE_ESCAPES.sub("", line).strip()
+        if any(marker in plain for marker in EVIDENCE_PANICS):
+            panics.extend((index, index + 1))
+        if EVIDENCE_ERROR.match(plain) or EVIDENCE_LOG_ERROR.search(plain):
+            errors.append(index)
+    # The first panic and its message, then the last error line, then any
+    # later panics, for as long as the middle's share of the bound lasts.
+    order = panics[:2] + errors[-1:] + panics[2:]
+    budget, kept = limit // 4, set()
+    for index in order:
+        if index >= len(lines) or index in kept:
+            continue
+        start, end = starts[index], starts[index] + len(lines[index])
+        if end <= head_end or start >= tail_start:
+            continue
+        cost = min(len(lines[index]), EVIDENCE_LINE_LIMIT) + 1
+        if cost > budget:
+            continue
+        kept.add(index)
+        budget -= cost
+    middle = [lines[index][:EVIDENCE_LINE_LIMIT] for index in sorted(kept)]
+    parts = [text[:head_end], "[...]"] + middle + (["[...]"] if middle else [])
+    return "\n".join(parts + [text[tail_start:]])
+# END failure evidence excerpt
+
+
 def run(cmd, cwd=None, env=None, timeout=600):
     process = subprocess.Popen(
         cmd, cwd=cwd, env=env,
@@ -201,7 +259,7 @@ def grade_printed_id_is_accepted(printed_id, answer_text, control_id, control_te
     if not diff_carries_content(answer_text):
         return FAIL, (
             "kin history printed change id %s and kin diff will not take it back: %s"
-            % (printed_id, " ".join((answer_text or "").split())[:220])
+            % (printed_id, " ".join(failure_excerpt(answer_text).split()))
         )
     if diff_carries_content(control_text):
         return FAIL, (
@@ -212,7 +270,7 @@ def grade_printed_id_is_accepted(printed_id, answer_text, control_id, control_te
         return FAIL, (
             "kin diff refused fabricated id %s without naming it, so an operator "
             "diffing two endpoints cannot tell which one was bad: %s"
-            % (control_id, " ".join((control_text or "").split())[:220])
+            % (control_id, " ".join(failure_excerpt(control_text).split()))
         )
     return PASS, (
         "kin diff resolves the id kin history printed (%s) and still refuses a "
@@ -230,7 +288,7 @@ def grade_relative_ref_resolves(near_text, far_selector, far_text):
     if not diff_carries_content(near_text):
         return FAIL, (
             "kin diff HEAD~1 HEAD reports no content while kin blame --ref HEAD~1 "
-            "answers: %s" % " ".join((near_text or "").split())[:220]
+            "answers: %s" % " ".join(failure_excerpt(near_text).split())
         )
     if diff_carries_content(far_text):
         return FAIL, (
@@ -305,7 +363,7 @@ def grade_refusal_names_the_selector(selector, text):
         return PASS, "the refusal names the endpoint that failed: %s" % selector
     return FAIL, (
         "kin diff refused %s without naming it, so which of the two endpoints was bad "
-        "is not in the message: %s" % (selector, " ".join(body.split())[:220])
+        "is not in the message: %s" % (selector, " ".join(failure_excerpt(body).split()))
     )
 
 
@@ -338,7 +396,7 @@ def grade_short_prefix(prefix, text, matches):
             return PASS, "the unique %d-character prefix %r resolves" % (len(prefix), prefix)
         return FAIL, (
             "prefix %r names exactly one change and kin diff will not resolve it: %s"
-            % (prefix, " ".join((text or "").split())[:220])
+            % (prefix, " ".join(failure_excerpt(text).split()))
         )
     if diff_carries_content(text):
         return FAIL, (
@@ -348,7 +406,8 @@ def grade_short_prefix(prefix, text, matches):
     if prefix not in (text or ""):
         return FAIL, (
             "kin diff refused ambiguous prefix %r without naming it, so an operator cannot "
-            "tell which endpoint to lengthen: %s" % (prefix, " ".join((text or "").split())[:220])
+            "tell which endpoint to lengthen: %s"
+            % (prefix, " ".join(failure_excerpt(text).split()))
         )
     return PASS, "ambiguous prefix %r (%d changes) is refused and named" % (prefix, matches)
 
@@ -549,7 +608,7 @@ class Suite(object):
         # the store comes first and the files are written into it.
         rc, out, err = run([self.kin, "init"], cwd=path, env=self.env, timeout=600)
         if rc != 0:
-            raise RuntimeError("kin init failed: %s" % ((err or out)[-400:]))
+            raise RuntimeError("kin init failed: %s" % failure_excerpt(err or out))
         for body, message in ((MODULE_ONE, "Add ledger line parsing"),
                               (MODULE_TWO, "Add a biggest() helper"),
                               (MODULE_THREE, "Key biggest() on the amount column")):
@@ -559,7 +618,7 @@ class Suite(object):
             rc, out, err = self.kin_run(["commit", "-m", message])
             if rc != 0:
                 raise RuntimeError("seeding commit %r failed: %s"
-                                   % (message, (err or out)[-400:]))
+                                   % (message, failure_excerpt(err or out)))
         return path
 
     def printed_id(self):

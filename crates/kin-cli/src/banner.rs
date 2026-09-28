@@ -10,13 +10,24 @@
 //! them, and the smaller mark in [`crate::mark`] already covers
 //! `kin --version`, the `kin init` result and the `kin doctor` header.
 //!
-//! The logo is the Kin mark beside the KIN wordmark, with the brand line under
-//! the wordmark: eight rows and at most [`WIDTH`] columns. The mark follows
-//! `docs/assets/kin-icon.svg`, two filled bands, an arm and a leg, split by a
-//! hairline. Each terminal row carries two pixel rows through the half-block
-//! glyphs, which makes the pixels square, and the mark is sixteen of them
-//! tall. The split survives as a one-pixel channel and no cell holds both
-//! pieces, so the arm and the leg stay two shapes even without colour.
+//! The logo is the brand lockup: the Kin mark beside the KIN wordmark, with
+//! the brand line under the wordmark, nine rows and at most [`WIDTH`]
+//! columns. The mark follows `docs/assets/kin-icon.svg`, two filled bands, an
+//! arm and a leg, split by a hairline. Each terminal row carries two pixel
+//! rows through the half-block glyphs, which makes the pixels square, and the
+//! mark is eighteen of them tall. The split survives as a one-pixel channel
+//! and no cell holds both pieces, so the arm and the leg stay two shapes even
+//! without colour. The wordmark's cap height is two thirds of the mark and its
+//! strokes are two pixels, the brand's proportions.
+//!
+//! A terminal narrower than [`FULL_MIN_COLUMNS`] gets the compact lockup
+//! instead: the small mark from [`crate::mark`] beside a letter-spaced
+//! `K  I  N`, with the brand line under it. A terminal too narrow even for
+//! that gets no logo.
+//!
+//! Words keep the terminal's own foreground, so they read on a light theme and
+//! a dark one alike. The wordmark is never painted, the compact `K  I  N` is
+//! bold and the brand line is faint. Only the mark carries colour.
 //!
 //! It goes to stdout, only on a terminal, and at most once per process.
 //! Nothing is printed when the caller's output is for a program (`--json`, a
@@ -39,76 +50,119 @@ use crate::mark::{Glyphs, Paint};
 /// The logo in pixels, two to a terminal row.
 ///
 /// `A` is the mark's arm, `L` its leg, `W` the wordmark and `.` background.
-/// The mark fills the first twelve columns. The wordmark starts at
-/// [`WORDMARK_COLUMN`] and three pixels down, which centres it against the
-/// mark as the brand lockup does. The one-pixel gap between the arm's last
-/// rows and the leg's first is the split.
-const PIXELS: [&str; 16] = [
-    "...AAAAAAA.............................",
-    "..AAAAAAAA.............................",
-    ".AAAAAAAA..............................",
-    "AAAAAAAA..........W....W...W....W.....W",
-    "AAAAAAA...........W...W....W....WW....W",
-    "AAAAAA............W..W.....W....W.W...W",
-    "AAAAA.............W.W......W....W.W...W",
-    "AAAA..............WW.......W....W..W..W",
-    "AAA...............W.W......W....W...W.W",
-    "AA..LL............W..W.....W....W...W.W",
-    "...LLLL...........W...W....W....W....WW",
-    "..LLLLLL..........W....W...W....W.....W",
-    ".LLLLLLLL..............................",
-    "..LLLLLLLL.............................",
-    "...LLLLLLLL............................",
-    "....LLLLLLLL...........................",
+/// The mark fills the first thirteen columns. The wordmark starts at
+/// [`WORDMARK_COLUMN`], two pixels down, and is twelve pixels tall, two thirds
+/// of the mark as in the brand lockup. It sits on whole terminal rows, so every
+/// stem is solid blocks with square ends. The one-pixel gap between the arm's
+/// last rows and the leg's first is the split.
+///
+/// The arm is a 45 degree band with a flat top and a flat left side, and the
+/// leg a parallel band with a flat foot. The K's arm and leg are 45 degrees and
+/// meet its stem at the middle, and the N's diagonal moves one column every
+/// two pixel rows, like the brand N.
+const PIXELS: [&str; 18] = [
+    "....AAAAAAA........................................",
+    "...AAAAAAAA........................................",
+    "..AAAAAAAA...........WW.....WWW....WW....WWWW....WW",
+    ".AAAAAAAA............WW....WWW.....WW....WWWW....WW",
+    "AAAAAAAA.............WW...WWW......WW....WW.WW...WW",
+    "AAAAAAA..............WW..WWW.......WW....WW.WW...WW",
+    "AAAAAA...............WW.WWW........WW....WW..WW..WW",
+    "AAAAA................WWWWW.........WW....WW..WW..WW",
+    "AAAA.................WWWWW.........WW....WW...WW.WW",
+    "AAA..................WW.WWW........WW....WW...WW.WW",
+    "....LLL..............WW..WWW.......WW....WW....WWWW",
+    "...LLLLL.............WW...WWW......WW....WW....WWWW",
+    "..LLLLLLL............WW....WWW.....WW....WW.....WWW",
+    "..LLLLLLLL...........WW.....WWW....WW....WW.....WWW",
+    "..LLLLLLLLL........................................",
+    "...LLLLLLLLL.......................................",
+    "....LLLLLLLLL......................................",
+    ".....LLLLLLLL......................................",
 ];
 
 /// The logo in ASCII, one string per terminal row.
 ///
 /// Left of [`WORDMARK_COLUMN`], `/` is the arm and `\` the leg. From that
-/// column on, every glyph is the wordmark.
+/// column on, every glyph is the wordmark, whose K and N diagonals repeat the
+/// mark's hatching.
 const ASCII_ROWS: [&str; ROWS] = [
-    r"   ///////",
-    r"  ////////        |  /   |   |\    |",
-    r" ///////          | /    |   | \   |",
-    r" /////            |<     |   |  \  |",
-    r" ///              | \    |   |   \ |",
-    r"    \\\\          |  \   |   |    \|",
-    r"   \\\\\\\",
-    r"     \\\\\\\\",
+    r"   ////////",
+    r" /////////           ##   //       ##    ##\\    ##",
+    r"////////             ##  //        ##    ## \\   ##",
+    r"//////               ## //         ##    ##  \\  ##",
+    r"////                 ## \\         ##    ##   \\ ##",
+    r"   \\\\\             ##  \\        ##    ##    \\##",
+    r"  \\\\\\\\           ##   \\       ##    ##     \##",
+    r"  \\\\\\\\\\",
+    r"    \\\\\\\\\",
 ];
 
 /// Terminal rows the logo takes.
 const ROWS: usize = PIXELS.len() / 2;
 
-/// The column the wordmark, and the brand line under it, start at.
-const WORDMARK_COLUMN: usize = 18;
+/// The column the wordmark starts at, which is the K's stem, and the column
+/// the brand line under it starts at.
+const WORDMARK_COLUMN: usize = 21;
 
-/// Blank columns in front of the logo.
+/// Blank columns in front of the logo, the indent every first-run line has.
 const MARGIN: usize = 2;
 
 /// The brand line, verbatim from the brand canon.
 const BRAND_LINE: &str = "A new foundation for code.";
 
-/// The row the brand line sits on: the last, level with the foot of the leg.
+/// The row the brand line sits on: the last, under the wordmark.
 const BRAND_LINE_ROW: usize = ROWS - 1;
 
-/// The widest line the logo prints, margin included.
-///
-/// A terminal narrower than this gets no logo rather than a wrapped one.
-pub const WIDTH: usize = MARGIN + WORDMARK_COLUMN + BRAND_LINE.len();
+/// The compact lockup's wordmark: the three letters, set bold and spaced.
+const SET_WORDMARK: &str = "K  I  N";
 
-// The logo is sized for a narrow terminal, and a change that widens it past
-// that budget fails the build rather than a reader's terminal.
-const _: () = assert!(WIDTH <= 48, "the logo is wider than 48 columns");
+const fn max(a: usize, b: usize) -> usize {
+    if a > b {
+        a
+    } else {
+        b
+    }
+}
+
+/// The widest line the full lockup prints, margin included: a wordmark row,
+/// or the brand line if it were ever the longer.
+///
+/// A terminal narrower than this gets no full lockup rather than a wrapped
+/// one.
+pub const WIDTH: usize = max(
+    MARGIN + PIXELS[0].len(),
+    MARGIN + WORDMARK_COLUMN + BRAND_LINE.len(),
+);
+
+// The lockup's width is a budget, and a change that widens it past that budget
+// fails the build rather than a reader's terminal.
+const _: () = assert!(WIDTH <= 53, "the logo is wider than 53 columns");
+
+/// Below this width the compact lockup prints instead of the full one.
+///
+/// The width the first run treats as narrow. The full lockup fits in fewer
+/// columns, but beside rows that dropped their timing column to fit, it would
+/// be the widest thing on the screen.
+const FULL_MIN_COLUMNS: usize = 60;
+
+const _: () = assert!(
+    WIDTH <= FULL_MIN_COLUMNS,
+    "the full lockup is chosen on terminals too narrow to hold it"
+);
+
+/// The widest line the compact lockup prints: the brand line beside the
+/// small mark, margin included. Below this width no logo prints.
+const COMPACT_WIDTH: usize = MARGIN + crate::mark::TEXT_COLUMN + BRAND_LINE.len();
 
 /// The brand gradients' end points, in this grid's pixels.
 ///
 /// `kin-icon.svg` runs the arm's gradient from (391, 52) to (105, 338) and the
 /// leg's from (177, 309) to (436, 460). The mark's top-left corner there is
-/// (105, 52) and it is 408.1 units tall, so at sixteen pixels one pixel is
-/// 25.5 units.
-const ARM_GRADIENT: [(f32, f32); 2] = [(11.21, 0.0), (0.0, 11.21)];
-const LEG_GRADIENT: [(f32, f32); 2] = [(2.82, 10.08), (12.98, 16.0)];
+/// (105, 52) and it is 408.1 units tall, so at eighteen pixels one pixel is
+/// 22.67 units.
+const ARM_GRADIENT: [(f32, f32); 2] = [(12.61, 0.0), (0.0, 12.61)];
+const LEG_GRADIENT: [(f32, f32); 2] = [(3.18, 11.34), (14.60, 18.0)];
 
 /// One 256-colour index per piece: the cube's purple nearest the arm's first
 /// stop, and its blue nearest the leg's last.
@@ -119,13 +173,10 @@ const LEG_GRADIENT: [(f32, f32); 2] = [(2.82, 10.08), (12.98, 16.0)];
 const INDEXED_ARM: u8 = 135;
 const INDEXED_LEG: u8 = 69;
 
-/// The brand line in the kit's secondary text colour, `#9BA1AC`.
-const BRAND_LINE_TRUECOLOR: &str = "\u{1b}[38;2;155;161;172m";
-/// The 256-colour grey nearest that colour.
-const BRAND_LINE_INDEXED: &str = "\u{1b}[38;5;247m";
-/// Faint, for sixteen colours: ANSI bright black is the background colour in
-/// some palettes, and faint keeps the line readable in every one of them.
-const BRAND_LINE_BASIC: &str = "\u{1b}[2m";
+/// Bold and faint, in the terminal's own foreground. Words are never given a
+/// fixed colour, because none reads on both a dark and a light background.
+const BOLD: &str = "\u{1b}[1m";
+const FAINT: &str = "\u{1b}[2m";
 
 const RESET: &str = "\u{1b}[0m";
 
@@ -143,6 +194,28 @@ static PRINTED: AtomicBool = AtomicBool::new(false);
 /// The logo brings a blank line above and below it, so a caller that opens
 /// with a blank line of its own can drop that line when this returns `true`.
 pub fn print_once(human_mode: bool) -> bool {
+    print_with(human_mode, None)
+}
+
+/// [`print_once`], for a caller that needs `rows_after` more rows on screen
+/// together with the logo, such as `kin setup`'s first question.
+///
+/// A terminal too short for the full lockup and those rows gets the compact
+/// lockup, so what follows is never pushed off the top by the art above it.
+pub fn print_once_leaving(human_mode: bool, rows_after: usize) -> bool {
+    print_with(human_mode, Some(rows_after))
+}
+
+/// Whether the full lockup, its two blank lines and `rows_after` more rows fit
+/// a terminal `rows` tall.
+fn full_lockup_fits(rows: Option<usize>, rows_after: Option<usize>) -> bool {
+    match (rows, rows_after) {
+        (Some(rows), Some(after)) => ROWS + 2 + after <= rows,
+        _ => true,
+    }
+}
+
+fn print_with(human_mode: bool, rows_after: Option<usize>) -> bool {
     if !human_mode || PRINTED.load(Ordering::SeqCst) {
         return false;
     }
@@ -155,9 +228,15 @@ pub fn print_once(human_mode: bool) -> bool {
         utf8_console: console_output_is_utf8(),
         var: &read,
     };
-    let Some(style) = plan(&surroundings, human_mode) else {
+    let Some(mut style) = plan(&surroundings, human_mode) else {
         return false;
     };
+    let rows = console::Term::stdout()
+        .size_checked()
+        .map(|(rows, _)| usize::from(rows));
+    if style.lockup == Lockup::Full && !full_lockup_fits(rows, rows_after) {
+        style.lockup = Lockup::Compact;
+    }
     if !claim(&PRINTED) {
         return false;
     }
@@ -182,9 +261,19 @@ fn claim(flag: &AtomicBool) -> bool {
     !flag.swap(true, Ordering::SeqCst)
 }
 
+/// Which lockup the terminal's width allows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Lockup {
+    /// The mark beside the drawn wordmark, the brand lockup.
+    Full,
+    /// The small mark beside set type, for a narrow terminal.
+    Compact,
+}
+
 /// How the logo is drawn once it is decided that it is drawn.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Style {
+    lockup: Lockup,
     glyphs: Glyphs,
     paint: Paint,
 }
@@ -219,7 +308,7 @@ fn plan(surroundings: &Surroundings<'_>, human_mode: bool) -> Option<Style> {
     if !human_mode || !surroundings.stdout_is_terminal {
         return None;
     }
-    // A CI log is read after the fact, where eight rows of art are noise.
+    // A CI log is read after the fact, where nine rows of art are noise.
     // `CI=false` is how some runners say they are not one, so a falsy value
     // does not count.
     if surroundings
@@ -234,9 +323,12 @@ fn plan(surroundings: &Surroundings<'_>, human_mode: bool) -> Option<Style> {
     {
         return None;
     }
-    if surroundings.columns.is_some_and(|columns| columns < WIDTH) {
-        return None;
-    }
+    // An unknown width is given the benefit of the doubt.
+    let lockup = match surroundings.columns {
+        Some(columns) if columns < COMPACT_WIDTH => return None,
+        Some(columns) if columns < FULL_MIN_COLUMNS => Lockup::Compact,
+        _ => Lockup::Full,
+    };
     let term = surroundings.raw("TERM");
     let windows_terminal = surroundings.set("WT_SESSION").is_some();
     let colour = crate::output_style::wanted(
@@ -261,7 +353,11 @@ fn plan(surroundings: &Surroundings<'_>, human_mode: bool) -> Option<Style> {
         windows_terminal,
         surroundings.utf8_console,
     );
-    Some(Style { glyphs, paint })
+    Some(Style {
+        lockup,
+        glyphs,
+        paint,
+    })
 }
 
 /// Whether this terminal reliably reads the half blocks.
@@ -398,9 +494,18 @@ fn ascii_row(row: usize) -> Vec<Cell> {
 
 /// The logo's lines, without the blank lines around it.
 fn render(style: Style) -> Vec<String> {
+    match style.lockup {
+        Lockup::Full => render_full(style.glyphs, style.paint),
+        Lockup::Compact => render_compact(style.glyphs, style.paint),
+    }
+}
+
+/// The brand lockup: the mark beside the drawn wordmark, and the brand line
+/// under the wordmark on the mark's last row, starting at the K's stem.
+fn render_full(glyphs: Glyphs, paint: Paint) -> Vec<String> {
     (0..ROWS)
         .map(|row| {
-            let cells = match style.glyphs {
+            let cells = match glyphs {
                 Glyphs::Unicode => unicode_row(row),
                 Glyphs::Ascii => ascii_row(row),
             };
@@ -409,17 +514,37 @@ fn render(style: Style) -> Vec<String> {
                 .rposition(|cell| cell.glyph != ' ')
                 .map_or(0, |last| last + 1);
             let mut line = " ".repeat(MARGIN);
-            line.push_str(&paint_cells(&cells[..drawn], style.paint));
+            line.push_str(&paint_cells(&cells[..drawn], paint));
             if row == BRAND_LINE_ROW {
                 line.push_str(&" ".repeat(WORDMARK_COLUMN.saturating_sub(drawn)));
-                match brand_line_escape(style.paint) {
-                    Some(escape) => line.push_str(&format!("{escape}{BRAND_LINE}{RESET}")),
-                    None => line.push_str(BRAND_LINE),
-                }
+                line.push_str(&words(paint, FAINT, BRAND_LINE));
             }
             line
         })
         .collect()
+}
+
+/// The compact lockup: the small mark beside `K  I  N` in bold, with the brand
+/// line under it in faint.
+fn render_compact(glyphs: Glyphs, paint: Paint) -> Vec<String> {
+    let wordmark = words(paint, BOLD, SET_WORDMARK);
+    let brand_line = words(paint, FAINT, BRAND_LINE);
+    crate::mark::beside(
+        crate::mark::MarkStyle::new(glyphs, paint),
+        &["", &wordmark, &brand_line, ""],
+    )
+    .into_iter()
+    .map(|line| format!("{}{line}", " ".repeat(MARGIN)))
+    .collect()
+}
+
+/// `text` in bold or faint when this terminal takes escapes, and plain when it
+/// does not.
+fn words(paint: Paint, weight: &str, text: &str) -> String {
+    match paint {
+        Paint::None => text.to_string(),
+        _ => format!("{weight}{text}{RESET}"),
+    }
 }
 
 /// A row's glyphs with their colour escapes.
@@ -473,15 +598,6 @@ fn ink_escape(paint: Paint, piece: Piece, x: f32, y: f32) -> Option<String> {
     }
 }
 
-fn brand_line_escape(paint: Paint) -> Option<&'static str> {
-    match paint {
-        Paint::Truecolor => Some(BRAND_LINE_TRUECOLOR),
-        Paint::Indexed => Some(BRAND_LINE_INDEXED),
-        Paint::Basic => Some(BRAND_LINE_BASIC),
-        Paint::None => None,
-    }
-}
-
 /// How far along a linear gradient a point sits, from 0 at its start to 1 at
 /// its end, as SVG measures it: by projection onto the gradient's vector.
 fn along(gradient: [(f32, f32); 2], x: f32, y: f32) -> f32 {
@@ -510,40 +626,39 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    const ALL_STYLES: [Style; 8] = [
+    /// Every way the logo can be drawn: each lockup, each glyph set, each
+    /// colour depth.
+    fn all_styles() -> Vec<Style> {
+        let mut styles = Vec::new();
+        for lockup in [Lockup::Full, Lockup::Compact] {
+            for glyphs in [Glyphs::Unicode, Glyphs::Ascii] {
+                for paint in [Paint::Truecolor, Paint::Indexed, Paint::Basic, Paint::None] {
+                    styles.push(Style {
+                        lockup,
+                        glyphs,
+                        paint,
+                    });
+                }
+            }
+        }
+        styles
+    }
+
+    fn full(glyphs: Glyphs, paint: Paint) -> Style {
         Style {
-            glyphs: Glyphs::Unicode,
-            paint: Paint::Truecolor,
-        },
+            lockup: Lockup::Full,
+            glyphs,
+            paint,
+        }
+    }
+
+    fn compact(glyphs: Glyphs, paint: Paint) -> Style {
         Style {
-            glyphs: Glyphs::Unicode,
-            paint: Paint::Indexed,
-        },
-        Style {
-            glyphs: Glyphs::Unicode,
-            paint: Paint::Basic,
-        },
-        Style {
-            glyphs: Glyphs::Unicode,
-            paint: Paint::None,
-        },
-        Style {
-            glyphs: Glyphs::Ascii,
-            paint: Paint::Truecolor,
-        },
-        Style {
-            glyphs: Glyphs::Ascii,
-            paint: Paint::Indexed,
-        },
-        Style {
-            glyphs: Glyphs::Ascii,
-            paint: Paint::Basic,
-        },
-        Style {
-            glyphs: Glyphs::Ascii,
-            paint: Paint::None,
-        },
-    ];
+            lockup: Lockup::Compact,
+            glyphs,
+            paint,
+        }
+    }
 
     /// An ordinary truecolor UTF-8 terminal on a Unix machine, with the
     /// variables a test names set on top. A name written `-NAME` unsets it.
@@ -596,42 +711,38 @@ mod tests {
     /// shape shows up here as the drawing a reviewer will see.
     #[test]
     fn the_unicode_logo_is_the_mark_beside_the_wordmark() {
-        let drawn = render(Style {
-            glyphs: Glyphs::Unicode,
-            paint: Paint::None,
-        });
+        let drawn = render(full(Glyphs::Unicode, Paint::None));
         assert_eq!(
             drawn,
             vec![
-                "    ▄███████",
-                "  ▄███████▀         ▄    ▄   ▄    ▄     ▄",
-                "  ██████▀           █  ▄▀    █    █▀▄   █",
-                "  ████▀             █▄▀      █    █ ▀▄  █",
-                "  ██▀ ▄▄            █ ▀▄     █    █   █ █",
-                "    ▄████▄          █   ▀▄   █    █    ▀█",
-                "   ▀███████▄",
-                "     ▀███████▄      A new foundation for code.",
+                "     ▄███████",
+                "   ▄███████▀           ██    ▄██▀    ██    ████    ██",
+                "  ███████▀             ██  ▄██▀      ██    ██ ██   ██",
+                "  █████▀               ██▄██▀        ██    ██  ██  ██",
+                "  ███▀                 ██▀██▄        ██    ██   ██ ██",
+                "     ▄███▄             ██  ▀██▄      ██    ██    ████",
+                "    ███████▄           ██    ▀██▄    ██    ██     ███",
+                "    ▀████████▄",
+                "      ▀████████        A new foundation for code.",
             ]
         );
     }
 
     #[test]
     fn the_ascii_logo_hatches_the_arm_and_the_leg() {
-        let drawn = render(Style {
-            glyphs: Glyphs::Ascii,
-            paint: Paint::None,
-        });
+        let drawn = render(full(Glyphs::Ascii, Paint::None));
         assert_eq!(
             drawn,
             vec![
-                r"     ///////",
-                r"    ////////        |  /   |   |\    |",
-                r"   ///////          | /    |   | \   |",
-                r"   /////            |<     |   |  \  |",
-                r"   ///              | \    |   |   \ |",
-                r"      \\\\          |  \   |   |    \|",
-                r"     \\\\\\\",
-                r"       \\\\\\\\     A new foundation for code.",
+                r"     ////////",
+                r"   /////////           ##   //       ##    ##\\    ##",
+                r"  ////////             ##  //        ##    ## \\   ##",
+                r"  //////               ## //         ##    ##  \\  ##",
+                r"  ////                 ## \\         ##    ##   \\ ##",
+                r"     \\\\\             ##  \\        ##    ##    \\##",
+                r"    \\\\\\\\           ##   \\       ##    ##     \##",
+                r"    \\\\\\\\\\",
+                r"      \\\\\\\\\        A new foundation for code.",
             ]
         );
         for line in &drawn {
@@ -639,34 +750,167 @@ mod tests {
         }
     }
 
-    /// Every rendering fits the width budget and the eight-row budget.
+    /// The compact lockup is the small mark beside set type.
+    #[test]
+    fn the_compact_logo_is_the_small_mark_beside_set_type() {
+        assert_eq!(
+            render(compact(Glyphs::Unicode, Paint::None)),
+            vec![
+                "    ▄▀",
+                "  ▄▀     K  I  N",
+                "   ▀▄    A new foundation for code.",
+                "     ▀▄",
+            ]
+        );
+        assert_eq!(
+            render(compact(Glyphs::Ascii, Paint::None)),
+            vec![
+                "    /",
+                r"  /      K  I  N",
+                r"   \     A new foundation for code.",
+                r"     \",
+            ]
+        );
+    }
+
+    /// The ASCII logo keeps the Unicode one's shape: every row inks the same
+    /// columns, so a reader on either sees one lockup.
+    #[test]
+    fn the_ascii_logo_inks_the_same_columns_as_the_unicode_one() {
+        let unicode = render(full(Glyphs::Unicode, Paint::None));
+        let ascii = render(full(Glyphs::Ascii, Paint::None));
+        for (row, (blocks, hatched)) in unicode.iter().zip(&ascii).enumerate() {
+            let inked = |line: &str| -> Vec<usize> {
+                line.chars()
+                    .enumerate()
+                    .filter(|(_, glyph)| *glyph != ' ')
+                    .map(|(column, _)| column)
+                    .collect()
+            };
+            // Only the mark and the wordmark's stems are compared; the K and
+            // N diagonals are hatched one stroke wide rather than drawn.
+            let stems = |columns: Vec<usize>| -> Vec<usize> {
+                columns
+                    .into_iter()
+                    .filter(|column| {
+                        *column < MARGIN + WORDMARK_COLUMN
+                            || [23, 24, 37, 38, 43, 44, 51, 52].contains(column)
+                    })
+                    .collect()
+            };
+            assert_eq!(
+                stems(inked(blocks)),
+                stems(inked(hatched)),
+                "row {row}: {blocks:?} against {hatched:?}"
+            );
+        }
+    }
+
+    /// The brand line starts at the K's stem, on the mark's last row.
+    #[test]
+    fn the_brand_line_starts_under_the_k() {
+        for glyphs in [Glyphs::Unicode, Glyphs::Ascii] {
+            let drawn = render(full(glyphs, Paint::None));
+            let stem = drawn[1]
+                .chars()
+                .skip(MARGIN + WORDMARK_COLUMN - 1)
+                .take(3)
+                .collect::<String>();
+            assert!(
+                stem.starts_with(' ') && !stem[1..].starts_with(' '),
+                "{glyphs:?}: the K's stem is not at column {}: {:?}",
+                MARGIN + WORDMARK_COLUMN,
+                drawn[1]
+            );
+            let last = drawn.last().expect("the logo has rows");
+            let at = last
+                .find(BRAND_LINE)
+                .map(|byte| last[..byte].chars().count());
+            assert_eq!(at, Some(MARGIN + WORDMARK_COLUMN), "{glyphs:?}: {last:?}");
+            assert_eq!(drawn.len(), ROWS, "{glyphs:?}");
+        }
+    }
+
+    /// Words keep the terminal's foreground: the brand line is faint, the
+    /// compact wordmark bold, and neither is given a colour.
+    #[test]
+    fn words_are_bold_or_faint_and_never_coloured() {
+        for paint in [Paint::Truecolor, Paint::Indexed, Paint::Basic] {
+            let full_lines = render(full(Glyphs::Unicode, paint));
+            let last = full_lines.last().unwrap();
+            assert!(
+                last.ends_with(&format!("{FAINT}{BRAND_LINE}{RESET}")),
+                "{paint:?}: {last:?}"
+            );
+            for line in &full_lines[1..7] {
+                // The mark's run closes before the wordmark starts, and nothing
+                // opens after it.
+                let closed = line.rfind(RESET).expect("the mark is painted") + RESET.len();
+                let after = &line[closed..];
+                let plain = console::strip_ansi_codes(line);
+                let wordmark: String = plain.chars().skip(MARGIN + WORDMARK_COLUMN).collect();
+                assert!(
+                    !after.contains('\u{1b}') && after.ends_with(&wordmark),
+                    "{paint:?}: the wordmark is painted: {line:?}"
+                );
+            }
+            let compact_lines = render(compact(Glyphs::Unicode, paint));
+            assert!(
+                compact_lines[1].ends_with(&format!("{BOLD}{SET_WORDMARK}{RESET}")),
+                "{paint:?}: {:?}",
+                compact_lines[1]
+            );
+            assert!(
+                compact_lines[2].ends_with(&format!("{FAINT}{BRAND_LINE}{RESET}")),
+                "{paint:?}: {:?}",
+                compact_lines[2]
+            );
+        }
+    }
+
+    /// Every rendering fits its width budget and the nine-row budget.
     #[test]
     fn every_line_fits_the_width_budget() {
-        for style in ALL_STYLES {
+        for style in all_styles() {
+            let budget = match style.lockup {
+                Lockup::Full => WIDTH,
+                Lockup::Compact => COMPACT_WIDTH,
+            };
             let drawn = render(style);
-            assert!(drawn.len() <= 8, "{style:?} draws {} rows", drawn.len());
+            assert!(drawn.len() <= ROWS, "{style:?} draws {} rows", drawn.len());
             for line in &drawn {
                 let width = console::measure_text_width(line);
                 assert!(
-                    width <= WIDTH,
-                    "{style:?} draws {line:?} {width} columns wide, past {WIDTH}"
+                    width <= budget,
+                    "{style:?} draws {line:?} {width} columns wide, past {budget}"
                 );
             }
         }
-        let widest = render(ALL_STYLES[0])
-            .iter()
-            .map(|line| console::measure_text_width(line))
-            .max();
-        assert_eq!(widest, Some(WIDTH), "WIDTH no longer names the widest line");
+        let widest = |style: Style| {
+            render(style)
+                .iter()
+                .map(|line| console::measure_text_width(line))
+                .max()
+        };
+        assert_eq!(
+            widest(full(Glyphs::Unicode, Paint::Truecolor)),
+            Some(WIDTH),
+            "WIDTH no longer names the widest line"
+        );
+        assert_eq!(
+            widest(compact(Glyphs::Unicode, Paint::Truecolor)),
+            Some(COMPACT_WIDTH),
+            "COMPACT_WIDTH no longer names the widest compact line"
+        );
     }
 
     /// Colour is escapes and nothing else.
     #[test]
     fn stripping_the_escapes_yields_the_plain_logo() {
-        for style in ALL_STYLES {
+        for style in all_styles() {
             let plain = render(Style {
-                glyphs: style.glyphs,
                 paint: Paint::None,
+                ..style
             });
             let stripped: Vec<String> = render(style)
                 .iter()
@@ -679,11 +923,11 @@ mod tests {
     /// No colour means no escape bytes at all, whatever the glyphs.
     #[test]
     fn no_colour_writes_no_escapes() {
-        for glyphs in [Glyphs::Unicode, Glyphs::Ascii] {
-            for line in render(Style {
-                glyphs,
-                paint: Paint::None,
-            }) {
+        for style in all_styles() {
+            if style.paint != Paint::None {
+                continue;
+            }
+            for line in render(style) {
                 assert!(!line.contains('\u{1b}'), "{line:?} carries an escape");
             }
         }
@@ -693,7 +937,7 @@ mod tests {
     /// line pads past its last glyph.
     #[test]
     fn every_painted_run_is_reset() {
-        for style in ALL_STYLES {
+        for style in all_styles() {
             for line in render(style) {
                 if let Some(last) = line.rfind('\u{1b}') {
                     assert!(
@@ -709,10 +953,10 @@ mod tests {
     /// Truecolor paints the brand's stops at the ends of each gradient.
     #[test]
     fn truecolor_reaches_the_brand_stops() {
-        let arm_start = ink_escape(Paint::Truecolor, Piece::Arm, 11.21, 0.0);
-        let arm_end = ink_escape(Paint::Truecolor, Piece::Arm, 0.0, 11.21);
-        let leg_start = ink_escape(Paint::Truecolor, Piece::Leg, 2.82, 10.08);
-        let leg_end = ink_escape(Paint::Truecolor, Piece::Leg, 12.98, 16.0);
+        let arm_start = ink_escape(Paint::Truecolor, Piece::Arm, 12.61, 0.0);
+        let arm_end = ink_escape(Paint::Truecolor, Piece::Arm, 0.0, 12.61);
+        let leg_start = ink_escape(Paint::Truecolor, Piece::Leg, 3.18, 11.34);
+        let leg_end = ink_escape(Paint::Truecolor, Piece::Leg, 14.60, 18.0);
         assert_eq!(arm_start.as_deref(), Some("\u{1b}[38;2;174;90;255m"));
         assert_eq!(arm_end.as_deref(), Some("\u{1b}[38;2;108;72;250m"));
         assert_eq!(leg_start.as_deref(), Some("\u{1b}[38;2;91;85;253m"));
@@ -728,7 +972,7 @@ mod tests {
     fn every_colour_depth_tells_the_arm_from_the_leg() {
         for paint in [Paint::Truecolor, Paint::Indexed, Paint::Basic] {
             let arm = ink_escape(paint, Piece::Arm, 3.0, 3.0);
-            let leg = ink_escape(paint, Piece::Leg, 6.0, 13.0);
+            let leg = ink_escape(paint, Piece::Leg, 7.0, 15.0);
             assert!(
                 arm.is_some() && leg.is_some(),
                 "{paint:?} left a piece bare"
@@ -799,13 +1043,7 @@ mod tests {
     /// An ordinary terminal gets the full logo.
     #[test]
     fn a_truecolor_utf8_terminal_gets_the_gradient_blocks() {
-        assert_eq!(
-            decide(&[]),
-            Some(Style {
-                glyphs: Glyphs::Unicode,
-                paint: Paint::Truecolor,
-            })
-        );
+        assert_eq!(decide(&[]), Some(full(Glyphs::Unicode, Paint::Truecolor)));
     }
 
     /// A pipe or a file is being read by something, and gets nothing.
@@ -862,19 +1100,13 @@ mod tests {
         for value in ["1", ""] {
             assert_eq!(
                 decide(&[("NO_COLOR", value)]),
-                Some(Style {
-                    glyphs: Glyphs::Unicode,
-                    paint: Paint::None,
-                }),
+                Some(full(Glyphs::Unicode, Paint::None)),
                 "NO_COLOR={value:?}"
             );
         }
         assert_eq!(
             decide(&[("TERM", "dumb"), ("-COLORTERM", "")]),
-            Some(Style {
-                glyphs: Glyphs::Unicode,
-                paint: Paint::None,
-            })
+            Some(full(Glyphs::Unicode, Paint::None))
         );
     }
 
@@ -896,13 +1128,26 @@ mod tests {
         );
     }
 
-    /// A terminal too narrow for the logo gets none; an unknown width is
+    /// A wide terminal gets the full lockup, a narrow one the compact
+    /// lockup, and one too narrow for that gets none. An unknown width is
     /// given the benefit of the doubt.
     #[test]
-    fn a_narrow_terminal_gets_nothing() {
-        assert_eq!(decide_with(true, Some(WIDTH - 1), false, false, &[]), None);
-        assert!(decide_with(true, Some(WIDTH), false, false, &[]).is_some());
-        assert!(decide_with(true, None, false, false, &[]).is_some());
+    fn the_width_picks_the_lockup() {
+        let lockup = |columns: Option<usize>| {
+            decide_with(true, columns, false, false, &[]).map(|style| style.lockup)
+        };
+        assert_eq!(lockup(Some(100)), Some(Lockup::Full));
+        assert_eq!(lockup(Some(FULL_MIN_COLUMNS)), Some(Lockup::Full));
+        assert_eq!(lockup(Some(FULL_MIN_COLUMNS - 1)), Some(Lockup::Compact));
+        assert_eq!(lockup(Some(50)), Some(Lockup::Compact));
+        assert_eq!(lockup(Some(COMPACT_WIDTH)), Some(Lockup::Compact));
+        assert_eq!(lockup(Some(COMPACT_WIDTH - 1)), None);
+        assert_eq!(lockup(None), Some(Lockup::Full));
+        // The literals, so a constant that drifts is caught rather than
+        // followed: the compact lockup is 35 columns and the full one is
+        // chosen from 60.
+        assert_eq!(COMPACT_WIDTH, 35);
+        assert_eq!(FULL_MIN_COLUMNS, 60);
     }
 
     #[test]
@@ -955,6 +1200,23 @@ mod tests {
         );
     }
 
+    /// A terminal too short for the full lockup and the rows its caller needs
+    /// under it gets the compact one: 80x24 cannot hold nine rows of art and
+    /// setup's first question together.
+    #[test]
+    fn a_short_terminal_leaves_room_for_what_follows() {
+        assert!(full_lockup_fits(Some(40), Some(20)));
+        assert!(!full_lockup_fits(Some(24), Some(16)));
+        assert!(
+            full_lockup_fits(None, Some(16)),
+            "an unknown height keeps the full lockup"
+        );
+        assert!(
+            full_lockup_fits(Some(24), None),
+            "a caller that needs nothing keeps it"
+        );
+    }
+
     /// The first moment takes the slot and every later one finds it taken.
     #[test]
     fn the_logo_prints_once_per_process() {
@@ -967,8 +1229,8 @@ mod tests {
     /// The frame is one blank line above and one below.
     #[test]
     fn the_logo_is_framed_by_blank_lines() {
-        let block = framed(&render(ALL_STYLES[3]));
-        assert!(block.starts_with("\n    ▄"), "{block:?}");
+        let block = framed(&render(full(Glyphs::Unicode, Paint::None)));
+        assert!(block.starts_with("\n     ▄"), "{block:?}");
         assert!(block.ends_with("code.\n\n"), "{block:?}");
         assert_eq!(block.lines().count(), ROWS + 2);
     }

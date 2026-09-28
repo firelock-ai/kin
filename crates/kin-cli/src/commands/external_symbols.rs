@@ -30,6 +30,35 @@ pub const SITE_OFFSET_NOTE: &str = "note: a site is +N, N lines below the first 
      entity that makes the call, the offset a numbered body shows. A symbol outside this \
      repository has no location in the graph, so none is printed for it.";
 
+/// Why `kin work create`, `link` and `implement` refuse a scope naming a
+/// symbol outside the repository, the clause after the command's name.
+pub const WORK_SCOPE_WHY: &str = "links work to repository scopes and has nothing of it here \
+     to link work to; link one of its callers instead";
+
+/// Why `kin work list --scope` refuses one: no work can be linked to it, so the
+/// filter could only answer empty, which reads as an absence it is not.
+pub const WORK_LIST_WHY: &str = "filters work by the repository scopes it is linked to, and no \
+     work can be linked to it; filter by one of its callers instead";
+
+/// Why `kin note list` refuses one: `kin note add` refuses it, so no note is
+/// anchored there to list.
+pub const NOTE_LIST_WHY: &str = "lists notes anchored to repository entities, and none can be \
+     anchored to it; list the notes on one of its callers instead";
+
+/// Why `kin review note` and `kin review discuss` refuse one as their scope.
+pub const REVIEW_SCOPE_WHY: &str = "anchors review notes and discussions to repository \
+     entities and has nothing of it here to anchor one to; anchor it on one of its callers \
+     instead";
+
+/// Why `kin intent register` refuses one: an intent locks repository scopes.
+pub const INTENT_WHY: &str = "declares intent on repository scopes and has nothing of it here \
+     to lock; declare the intent on one of its callers instead";
+
+/// Why `kin traffic show` refuses one: no intent can be declared on it, so a
+/// report on it could only be empty, which reads as a clear path it is not.
+pub const TRAFFIC_WHY: &str = "reports the intents declared on repository scopes, and none can \
+     be declared on it; check one of its callers instead";
+
 /// The longest text quoted at one site.
 const CALLEE_TEXT_MAX_CHARS: usize = 60;
 
@@ -75,6 +104,55 @@ pub fn node_label(node: &ExternalSymbolNode) -> String {
     symbol_label(&mcp::external_symbol_json(&node.id, Some(&node.reference)))
 }
 
+/// The spelling [`mcp::external_symbols_named`] matched a name by, in words.
+fn matched_label(matched: &str) -> &'static str {
+    match matched {
+        mcp::MATCHED_SCIP_SYMBOL => "whole SCIP symbol",
+        mcp::MATCHED_SCIP_DESCRIPTORS => "SCIP descriptor chain",
+        _ => "name",
+    }
+}
+
+/// The line an answer reached by a name leads with: the symbol outside the
+/// repository the name named, and the spelling that matched it, which
+/// `find_references` reports under `focal_resolution`.
+pub fn named_line(name: &str, node: &ExternalSymbolNode, matched: &str) -> String {
+    format!(
+        "{} names no entity in this repository; it names {}, matched by its {}.",
+        name.trim(),
+        node_label(node),
+        matched_label(matched)
+    )
+}
+
+/// A name several symbols outside the repository carry and no entity does:
+/// every candidate by its address, and no answer about any of them, as
+/// `find_references` lists the same candidates.
+pub fn name_candidate_lines(
+    command: &str,
+    name: &str,
+    candidates: &[ExternalSymbolNode],
+) -> Vec<String> {
+    let listed = kin_mcp::handlers::entities::NAME_CANDIDATES_LISTED_MAX;
+    let mut lines = vec![format!(
+        "{} names {} symbols declared outside this repository, one per package or version \
+         the resolver loaded, so {command} answered about none of them. Run it again with \
+         one candidate's address:",
+        name.trim(),
+        candidates.len()
+    )];
+    lines.extend(
+        candidates
+            .iter()
+            .take(listed)
+            .map(|node| format!("  {}  {}", node.address(), node_label(node))),
+    );
+    if candidates.len() > listed {
+        lines.push(format!("  ... and {} more", candidates.len() - listed));
+    }
+    lines
+}
+
 /// What proved one edge: `proven_external by lsp:tsserver 5.6.3
 /// (lsp_definition)`, read off the `site_state` and `proof` of a row.
 pub fn proof_label(row: &serde_json::Value) -> String {
@@ -117,7 +195,12 @@ pub fn sites_label(sites: &serde_json::Value) -> String {
         .map(|site| {
             let offset = match site["line_in_entity"].as_u64() {
                 Some(line) => format!("+{line}"),
-                None => "+? (outside the caller)".to_string(),
+                // A site with no offset says why: the caller records no span
+                // to count from, or the site lies outside it.
+                None => match site["callee_unavailable"].as_str() {
+                    Some("caller_has_no_span") => "+? (caller has no span)".to_string(),
+                    _ => "+? (outside the caller)".to_string(),
+                },
             };
             match site["callee"].as_str().map(callee_text) {
                 Some(text) if !text.is_empty() => format!("{offset} `{text}`"),
@@ -130,7 +213,7 @@ pub fn sites_label(sites: &serde_json::Value) -> String {
 
 /// The first line of the text at a site, trimmed and bounded, so one quote
 /// cannot run a row across the screen.
-fn callee_text(text: &str) -> String {
+pub(crate) fn callee_text(text: &str) -> String {
     let line = text.lines().next().unwrap_or("").trim();
     if line.chars().count() <= CALLEE_TEXT_MAX_CHARS {
         return line.to_string();
@@ -171,18 +254,65 @@ pub fn leaf_line(row: &serde_json::Value) -> String {
 /// `why` finishes the first sentence after "so": "`kin context` has no body
 /// or neighborhood of its own here to build a pack around".
 pub fn refusal_lines(node: &ExternalSymbolNode, why: &str) -> Vec<String> {
-    let address = node.address();
+    address_refusal_lines(&node.address(), &node_label(node), why)
+}
+
+/// [`refusal_lines`] from the symbol's address and its [`symbol_label`], for a
+/// refusal a daemon route answered with rather than a symbol read here.
+fn address_refusal_lines(address: &str, label: &str, why: &str) -> Vec<String> {
     vec![
-        format!(
-            "{address} names {}, declared outside this repository, so {why}.",
-            node_label(node)
-        ),
+        format!("{address} names {label}, declared outside this repository, so {why}."),
         format!(
             "hint: `kin refs {address}` lists the entities in this repository that call it, \
              with each call's sites and proof, and `kin context <caller>` lists a caller's \
              calls into it."
         ),
     ]
+}
+
+/// What a command that takes a work, review, annotation or intent scope says
+/// when the scope names a symbol outside the repository: by its address, as
+/// an `entity:` scope or by its bare id. `None` for every other scope, which
+/// the command parses as it always did.
+///
+/// The check is the one the MCP tools ask, so a scope either surface refuses,
+/// the other refuses too.
+pub fn scope_argument_refusal<G: GraphStore>(
+    graph: &G,
+    scope: &str,
+    why: &str,
+) -> Result<Option<Vec<String>>> {
+    use kin_mcp::handlers::common::{external_scope_target, UnanchoredTarget};
+    let target = external_scope_target(graph, scope)
+        .map_err(|error| anyhow::anyhow!("read external symbol '{}': {error}", scope.trim()))?;
+    Ok(match target {
+        Some(UnanchoredTarget::External(node)) => Some(refusal_lines(&node, why)),
+        Some(UnanchoredTarget::UnknownExternalAddress(text)) => Some(unknown_address_lines(&text)),
+        Some(UnanchoredTarget::NotInGraph(_)) | None => None,
+    })
+}
+
+/// The lines a command prints for a daemon route that refused a scope naming
+/// a symbol outside the repository, read from the route's error body: the
+/// refusal the MCP tool gives, carrying `external_symbol_not_served` and the
+/// symbol's record, or the absence of an address naming nothing held. `None`
+/// for any other body, which the command reports as it always did.
+pub fn relayed_refusal_lines(body: &str, why: &str) -> Option<Vec<String>> {
+    let body = body.trim();
+    if let Some(address) = body.strip_prefix(&format!("{}: ", mcp::EXTERNAL_SYMBOL_NOT_FOUND)) {
+        return Some(unknown_address_lines(address));
+    }
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let error = &value["error"];
+    if error["code"].as_str() != Some(mcp::EXTERNAL_SYMBOL_NOT_SERVED) {
+        return None;
+    }
+    let address = error["id"].as_str()?;
+    Some(address_refusal_lines(
+        address,
+        &symbol_label(&error["symbol"]),
+        why,
+    ))
 }
 
 /// An argument a command that answers about repository entities cannot take.
@@ -529,6 +659,42 @@ mod tests {
             call_line(&rows[0]).contains("sites +2, +5,"),
             "{}",
             call_line(&rows[0])
+        );
+    }
+
+    /// A daemon intent or traffic route refuses a scope naming a symbol
+    /// outside the repository with the MCP tool's JSON. `kin intent register`
+    /// and `kin traffic show` print it in the words every scope argument is
+    /// refused with, and leave any other body to their usual report.
+    #[test]
+    fn a_relayed_scope_refusal_prints_as_the_commands_own() {
+        let store = fixture::external_store(false);
+        let address = store.address();
+        let refusal = kin_mcp::handlers::external_symbols::external_scope_refusal(
+            &store.graph,
+            &serde_json::json!([address]),
+            "kin_register_intent",
+            "scopes",
+        )
+        .unwrap()
+        .expect("a refusal");
+        let why = format!("`kin intent register` {}", INTENT_WHY);
+        let lines = relayed_refusal_lines(&refusal, &why).expect("rendered");
+        assert_eq!(
+            lines,
+            refusal_lines(
+                &lookup(&store.graph, &address).unwrap().expect("the symbol"),
+                &why
+            )
+        );
+        let unknown = "external_reference:00000000-0000-8000-8000-000000000000";
+        assert_eq!(
+            relayed_refusal_lines(&format!("External symbol not found: {unknown}"), &why),
+            Some(unknown_address_lines(unknown))
+        );
+        assert_eq!(
+            relayed_refusal_lines("unrecognized scope \"x\"", &why),
+            None
         );
     }
 

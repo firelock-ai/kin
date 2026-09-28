@@ -412,6 +412,21 @@ function unixSystemToolPath(name) {
   );
 }
 
+// The environment the extractor runs in. GNU tar does not decompress .tar.gz
+// itself: it starts `gzip` as a child and finds it through PATH. The extractor
+// is named absolutely so a planted binary cannot run in its place, and its
+// decompressor deserves the same: on a Unix host the trusted system directories
+// lead PATH, so an empty or unusual PATH neither breaks extraction nor lets a
+// `gzip` elsewhere on PATH stand in. Other PATH entries are kept after them.
+// A Windows host's System32 bsdtar decompresses internally and is left as is.
+export function extractorEnvironment(env, host = process.platform) {
+  if (host === 'win32') return env;
+  const existing = String(env.PATH ?? '')
+    .split(':')
+    .filter((entry) => entry && !UNIX_TOOL_DIRECTORIES.includes(entry));
+  return { ...env, PATH: [...UNIX_TOOL_DIRECTORIES, ...existing].join(':') };
+}
+
 // The archive layout comes from the TARGET, the extractor from the HOST, and
 // conflating the two is what broke the native Windows leg once already: a
 // Windows host has no /usr/bin, and the cross-target tests unpack a darwin
@@ -463,6 +478,14 @@ export function archiveExtraction(platform, env, file, host = process.platform) 
  * Returns no lines when the directory is already on PATH, because a healthy
  * global install does not need advice about a wall it did not hit.
  */
+/**
+ * Whether the command this launcher forwards to is `kin setup`: the first
+ * argument that is not an option.
+ */
+export function setupFollows(argv) {
+  return argv.find((arg) => !arg.startsWith('-')) === 'setup';
+}
+
 export function persistentPathAdvice(binDir, env = process.env, delimiter = path.delimiter) {
   const wanted = path.resolve(binDir);
   const onPath = String(env.PATH ?? '')
@@ -493,11 +516,17 @@ export async function provision(version, opts = {}) {
     fetchImpl = fetch,
     log = (line) => process.stderr.write(`${line}\n`),
     onProgress,
+    setupFollows = false,
   } = opts;
 
   const file = artifactName(platform, arch);
   const url = releaseDownloadUrl(version, file);
-  log(`kin: provisioning managed kin ${version} (${file})...`);
+  // When `kin setup` runs next, the download line is the only one printed
+  // here. Setup reports where Kin landed and asks about PATH itself, so the
+  // notes below would only repeat it, and the last of them told a person to
+  // run the command they were already running.
+  const note = setupFollows ? () => {} : log;
+  note(`kin: provisioning managed kin ${version} (${file})...`);
 
   // Interactive first runs show live bytes/percent; redirected/non-TTY npm
   // invocations stay line-oriented. An injected callback keeps streaming fully
@@ -538,7 +567,7 @@ export async function provision(version, opts = {}) {
     const extracted = spawnSync(extraction.executable, extraction.args, {
       cwd: tmp,
       encoding: 'utf8',
-      env: toolEnv,
+      env: extractorEnvironment(toolEnv),
     });
     if (extracted.status !== 0) {
       throw new Error(
@@ -582,13 +611,13 @@ export async function provision(version, opts = {}) {
     }
 
     if (notifierSrc && installNotifierBundleSource(notifierSrc, env)) {
-      log('kin: notification identity installed (KinNotifier.app)');
+      note('kin: notification identity installed (KinNotifier.app)');
     }
 
     writeLauncherStamp(version, env);
-    log(`kin: managed kin ${version} installed at ${binDir}`);
+    note(`kin: managed kin ${version} installed at ${binDir}`);
     for (const line of persistentPathAdvice(binDir, mergeEnvironment(process.env, env))) {
-      log(line);
+      note(line);
     }
     return path.join(binDir, binaryName('kin', platform));
   } finally {
@@ -682,6 +711,7 @@ export async function ensureProvisioned(opts = {}) {
     fetchImpl = fetch,
     log = (line) => process.stderr.write(`${line}\n`),
     spawnImpl = spawnSync,
+    setupFollows = false,
   } = opts;
 
   const target = targetKinVersion();
@@ -694,7 +724,8 @@ export async function ensureProvisioned(opts = {}) {
     return existing;
   }
 
-  const doProvision = () => provision(target, { env, platform, arch, fetchImpl, log });
+  const doProvision = () =>
+    provision(target, { env, platform, arch, fetchImpl, log, setupFollows });
 
   if (isTruthyEnv(env.KIN_LAUNCHER_ADOPT)) {
     return doProvision();

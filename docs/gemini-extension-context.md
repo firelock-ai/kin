@@ -16,7 +16,11 @@ gap to report or repair at conversion, never a reason to read or search whole fi
   import neighborhood. `get_entity_source` returns just the body.
 - **You need callers.** `find_references` returns everything that imports, calls, or
   references a symbol. `graph_neighborhood` walks the dependency structure, with
-  `direction` of `out`, `in`, or `both`.
+  `direction` of `out`, `in`, or `both`. Follow `next_cursor` with the same query
+  and filters to receive all reference pages. A partial page cannot prove absence;
+  reconstruct fragmented semantic records before using them. A stale cursor needs a
+  fresh query, and completing pages does not clear the answer's semantic caveats.
+
 - **You need the path a value travels.** `trace_data_flow` returns the ordered call and
   data-flow chain from a focal entity.
 - **You are changing shared code.** `impact_analysis` walks the relation graph to the

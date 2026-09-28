@@ -64,10 +64,12 @@ import functools
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 PASS = "PASS"
 FAIL = "FAIL"
@@ -116,6 +118,64 @@ def resolve_key(conn, key):
 ADMITTED_FUNCTION_NAME = "dangling_links"
 ADMITTED_FUNCTION_BODY = ('def dangling_links(conn):\n'
                           '    return conn.execute("SELECT 1 FROM notes WHERE " + %s)' % SYMBOL)
+
+
+# BEGIN failure evidence excerpt
+# Every suite carries this block byte for byte, because a suite is also copied
+# out and run as a single file. test_failure_excerpt.py keeps the copies equal.
+EVIDENCE_LIMIT = 4000
+EVIDENCE_LINE_LIMIT = 600
+EVIDENCE_PANICS = ("panicked at", "has overflowed its stack")
+EVIDENCE_ESCAPES = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+EVIDENCE_ERROR = re.compile(r"^(?:[\w./-]+:\s*)?(?:error|fatal)\b", re.IGNORECASE)
+EVIDENCE_LOG_ERROR = re.compile(r"\sERROR\s")
+
+
+def failure_excerpt(text, limit=EVIDENCE_LIMIT):
+    """Bounded evidence from a command's output that still says why it failed.
+
+    Output that fits is returned whole. Longer output keeps its opening and its
+    end, and between them every line that carries a Rust panic, with the
+    message line under it, and the last error line, wherever they fall. A
+    warning printed around the error cannot push it out, and a long log cannot
+    cut the panic out. `limit` only ever raises the bound, never lowers it.
+    """
+    text = (text or "").strip()
+    limit = max(int(limit), EVIDENCE_LIMIT)
+    if len(text) <= limit:
+        return text
+    head_end = limit // 4
+    tail_start = len(text) - limit // 2
+    lines = text.split("\n")
+    starts, offset = [], 0
+    panics, errors = [], []
+    for index, line in enumerate(lines):
+        starts.append(offset)
+        offset += len(line) + 1
+        plain = EVIDENCE_ESCAPES.sub("", line).strip()
+        if any(marker in plain for marker in EVIDENCE_PANICS):
+            panics.extend((index, index + 1))
+        if EVIDENCE_ERROR.match(plain) or EVIDENCE_LOG_ERROR.search(plain):
+            errors.append(index)
+    # The first panic and its message, then the last error line, then any
+    # later panics, for as long as the middle's share of the bound lasts.
+    order = panics[:2] + errors[-1:] + panics[2:]
+    budget, kept = limit // 4, set()
+    for index in order:
+        if index >= len(lines) or index in kept:
+            continue
+        start, end = starts[index], starts[index] + len(lines[index])
+        if end <= head_end or start >= tail_start:
+            continue
+        cost = min(len(lines[index]), EVIDENCE_LINE_LIMIT) + 1
+        if cost > budget:
+            continue
+        kept.add(index)
+        budget -= cost
+    middle = [lines[index][:EVIDENCE_LINE_LIMIT] for index in sorted(kept)]
+    parts = [text[:head_end], "[...]"] + middle + (["[...]"] if middle else [])
+    return "\n".join(parts + [text[tail_start:]])
+# END failure evidence excerpt
 
 
 def run(cmd, cwd=None, env=None, timeout=600, stdin=None):
@@ -448,30 +508,59 @@ def grade_admitted_reference(payload, focal_source, caller_source, expected_path
             or negative.get("safe_to_conclude_absent") is not False
             or negative.get("kind") != "qualified_answer"
             or negative.get("interpretation") != "qualified_answer"
-            or negative.get("trust") != "authoritative"
-            or verdict.get("state") != "certified"
             or verdict.get("absence_claim") != "not_applicable"
             or verdict.get("safe_to_conclude_absent") is not False):
         return FAIL, "positive reference rows, counts and absence verdict do not agree"
+    # The rows are either certified as the whole set, or the answer says it
+    # cannot rule out further callers and names exactly which call sites it
+    # could not settle. Either is a truthful positive; nothing else is.
+    if negative.get("trust") == "authoritative" and verdict.get("state") == "certified":
+        trust_detail = "certified"
+    else:
+        qualified, trust_detail = call_domain_qualification(payload, negative, verdict)
+        if not qualified:
+            return FAIL, ("positive reference rows, counts and absence verdict do not agree: %s"
+                          % trust_detail)
     focal = payload.get("focal_entity") or {}
     caller = references[0]
     anchor = (payload.get("cross_repo") or {}).get("authority_anchor") or {}
-    expected_use_line = next(index for index, line in enumerate(LINKGRAPH_SRC.splitlines(), 1)
-                             if SYMBOL in line and line.lstrip().startswith("return "))
+    # A row addresses the use inside its caller, never by a file line: the offset
+    # from the first line of `dangling_links`, counted from 0, and the text Kin
+    # cuts there from that body. The caller's source proof below binds its body
+    # and span start to the fixture bytes, so the offset is read off the pinned
+    # body, and the quoted text has to name the constant and come from that line.
+    body_lines = ADMITTED_FUNCTION_BODY.splitlines()
+    expected_offset = next(index for index, line in enumerate(body_lines) if SYMBOL in line)
+    use_text = body_lines[expected_offset]
+    sites = caller.get("sites") if isinstance(caller, dict) else None
+    site = sites[0] if isinstance(sites, list) and len(sites) == 1 else None
+    projection = caller.get("projection") if isinstance(caller, dict) else None
+    # The focal is addressed the way its caller is: by id, with its file only as
+    # the labelled projection. A focal still carrying `file_path` is the retired
+    # shape.
+    focal_projection = focal.get("projection")
     if (not isinstance(caller, dict) or focal.get("name") != SYMBOL
-            or focal.get("kind") != "constant" or focal.get("file_path") != expected_path
+            or focal.get("kind") != "constant"
+            or not isinstance(focal_projection, dict)
+            or focal_projection.get("path") != expected_path
+            or "file_path" in focal
             or not focal.get("id") or anchor.get("entity_id") != focal["id"]
             or not anchor.get("repo_id")
             or caller.get("name") != ADMITTED_FUNCTION_NAME
-            or caller.get("kind") != "Function" or caller.get("file_path") != expected_path
+            or caller.get("kind") != "Function"
+            or not isinstance(projection, dict) or projection.get("path") != expected_path
+            or any(key in caller for key in ("file_path", "start_line", "reference_lines"))
             or not caller.get("entity_id") or caller.get("resolution") != "type_resolved"
             or caller.get("relation_kinds") != ["references"]
-            or caller.get("reference_lines") != [expected_use_line]
-            or any(type(line) is not int for line in caller["reference_lines"])
-            or type(caller.get("reference_line_count")) is not int
-            or caller["reference_line_count"] != 1
-            or caller.get("reference_lines_absent_reason") is not None
-            or caller.get("reference_lines_partial_reason") is not None
+            or not isinstance(site, dict)
+            or type(site.get("line_in_entity")) is not int
+            or site["line_in_entity"] != expected_offset
+            or not isinstance(site.get("callee"), str) or SYMBOL not in site["callee"]
+            or site["callee"] not in use_text or "callee_unavailable" in site
+            or type(caller.get("site_count")) is not int
+            or caller["site_count"] != 1
+            or caller.get("sites_absent_reason") is not None
+            or caller.get("sites_partial_reason") is not None
             or payload.get("candidates") != []
             or type(payload.get("unconfirmed_candidates")) is not int
             or payload["unconfirmed_candidates"] != 0):
@@ -519,7 +608,103 @@ def grade_admitted_reference(payload, focal_source, caller_source, expected_path
         artifacts.append(base["artifact_id"])
     if contexts[0] != contexts[1] or artifacts[0] != artifacts[1]:
         return FAIL, "the focal and caller proofs describe different admitted artifacts or trees"
-    return PASS, "exact graph-owned focal and caller prove the real use on line %d; no absence claimed" % expected_use_line
+    return PASS, ("exact graph-owned focal and caller prove the real use at +%d inside %s; "
+                  "no absence claimed; rows %s" % (expected_offset, ADMITTED_FUNCTION_NAME,
+                                                   trust_detail))
+
+
+# The limiting codes a call-site reading names. An answer limited by these alone
+# has proven the rows it returned and says which calls it could not rule out, so
+# it bounds the rows without asserting or denying any absence.
+CALL_DOMAIN_CODES = frozenset((
+    "call_sites_owed", "call_sites_unresolved", "call_sites_server_failed",
+    "call_sites_not_in_build", "call_sites_unproven_no_resolver", "binding_unproven",
+    "proof_context_stale", "proof_context_unverified",
+))
+# The verdict inputs a call-site reading feeds: its own, and the absence gate,
+# which composes the same clauses under the same codes. Every other input must
+# certify or not apply.
+CALL_DOMAIN_INPUTS = ("call_sites", "absence_gate")
+
+
+def call_domain_qualification(payload, negative, verdict):
+    """Whether an inconclusive positive is bounded only by the call domain.
+
+    Returns (True, what it names) when the only thing between the rows and a
+    certified answer is a call-site reading that names every limiting factor as
+    a clause and every call site it kept as a row, and (False, why) otherwise.
+    A vaguer inconclusive answer, or one limited by anything else, fails.
+    """
+    if verdict.get("state") != "inconclusive" or negative.get("trust") != "inconclusive":
+        return False, "trust %r and verdict %r are neither certified nor call-domain inconclusive" % (
+            negative.get("trust"), verdict.get("state"))
+    inputs = verdict.get("inputs")
+    if not isinstance(inputs, dict) or inputs.get("call_sites") != "inconclusive":
+        return False, "the verdict does not attribute its inconclusive state to the call sites"
+    others = sorted(name for name, reading in inputs.items()
+                    if name not in CALL_DOMAIN_INPUTS
+                    and reading not in ("certified", "not_applicable"))
+    if others:
+        return False, "verdict inputs outside the call domain do not certify: %s" % ", ".join(others)
+    codes = [code.strip() for code in str(verdict.get("limiting_factor") or "").split(";")
+             if code.strip()]
+    if not codes or any(code not in CALL_DOMAIN_CODES for code in codes):
+        return False, "limiting factor %r is not only the call domain" % verdict.get("limiting_factor")
+    block = payload.get("call_sites")
+    if not isinstance(block, dict) or block.get("settled") is not False:
+        return False, "no unsettled call_sites block backs the inconclusive verdict"
+    clauses = block.get("clauses")
+    if (not isinstance(clauses, list) or not clauses
+            or any(not isinstance(clause, str) or ": " not in clause for clause in clauses)):
+        return False, "the call_sites block states no clause for what it cannot rule out"
+    if sorted({clause.split(":", 1)[0] for clause in clauses}) != sorted(set(codes)):
+        return False, "limiting factors %s and call-site clauses do not name the same gaps" % codes
+    advice = str(negative.get("advice") or "")
+    if any(code not in advice for code in codes):
+        return False, "the negative advice does not name every limiting factor"
+    candidates = block.get("candidates")
+    count = block.get("candidate_count")
+    withheld = block.get("candidates_withheld", 0)
+    if (not isinstance(candidates, list) or type(count) is not int or type(withheld) is not int
+            or count < 0 or withheld < 0 or count != len(candidates) + withheld):
+        return False, "the call_sites block does not account for every candidate site it kept"
+    for row in candidates:
+        if (not isinstance(row, dict) or not row.get("caller") or not row.get("caller_name")
+                or type(row.get("line_in_entity")) is not int or row["line_in_entity"] < 0
+                or not row.get("state") or not row.get("reason")
+                or not isinstance(row.get("projection"), dict)
+                or any(key in row for key in ("file_path", "start_line"))):
+            return False, "a candidate call site is not addressed by its caller and line in it"
+    return True, "bounded by the call domain (%s), naming %d candidate site(s)" % (
+        ", ".join(codes), count)
+
+
+def grade_cli_agrees(payload, rc, out):
+    """`kin refs --json` reads the same store the same way the MCP answer did."""
+    if rc != 0:
+        return FAIL, "kin refs exited %s: %s" % (rc, failure_excerpt(out))
+    try:
+        cli = json.loads(out)
+    except ValueError:
+        return UNREADABLE, "kin refs --json printed no JSON: %s" % failure_excerpt(out)
+    if not isinstance(cli, dict) or cli.get("error"):
+        return FAIL, "kin refs resolved no focal: %r" % (cli.get("error") if isinstance(cli, dict) else cli)
+    if not any(ADMITTED_FUNCTION_NAME in str(line) for line in cli.get("lines") or []):
+        return FAIL, "kin refs does not list %s as a reference" % ADMITTED_FUNCTION_NAME
+    mcp_block = payload.get("call_sites") if isinstance(payload, dict) else None
+    cli_block = cli.get("call_sites")
+    keys = ("callers", "sites", "by_state", "clauses", "settled", "candidate_count",
+            "call_names", "focal_escape")
+    if isinstance(mcp_block, dict) != isinstance(cli_block, dict):
+        return FAIL, "only one surface carries a call_sites block"
+    if isinstance(mcp_block, dict):
+        differ = [key for key in keys if mcp_block.get(key) != cli_block.get(key)]
+        if differ:
+            return FAIL, "kin refs and find_references read the call sites differently: %s" % ", ".join(differ)
+    negative = cli.get("negative")
+    if isinstance(negative, dict) and negative.get("safe_to_conclude_absent") is not False:
+        return FAIL, "kin refs claims an absence the MCP answer does not"
+    return PASS, "kin refs agrees"
 
 
 def grade_absence_stays_authoritative_over_a_committed_tree(payload):
@@ -619,10 +804,10 @@ class Suite(object):
         self._repo = path
         rc, out, err = self.kin_run(["init", "."])
         if rc != 0:
-            raise RuntimeError("kin init failed: %s" % (err or out)[-400:])
+            raise RuntimeError("kin init failed: %s" % failure_excerpt(err or out))
         rc, out, err = self.kin_run(["commit", "-m", "seed the modules the graph knows"])
         if rc != 0:
-            raise RuntimeError("kin commit failed: %s" % (err or out)[-400:])
+            raise RuntimeError("kin commit failed: %s" % failure_excerpt(err or out))
         self.strand_the_module()
         return path
 
@@ -640,7 +825,32 @@ class Suite(object):
         # this suite is grading.
         rc, out, err = self.kin_run(["graph", "status"], timeout=600)
         if rc != 0:
-            raise RuntimeError("the daemon did not come back: %s" % (err or out)[-400:])
+            raise RuntimeError("the daemon did not come back: %s" % failure_excerpt(err or out))
+        self.await_reference_readiness()
+
+    def await_reference_readiness(self, timeout=120):
+        """Wait on the language-server readiness observation a restarted daemon owes.
+
+        A daemon that has just started establishes readiness with its own server
+        handshake, and until that observation completes its answers read
+        `reference_enrichment: unknown`, which the verdict rightly refuses to
+        certify. That window is about timing, not about the working copy this
+        suite grades, so the fixture waits on the observation itself, read from
+        the coverage a control answer carries. The control asks about a name the
+        seeded commit admitted, so no graded question is asked early. A completed
+        finding of any kind ends the wait, and so does an answer that carries no
+        coverage. When the bound passes, the checks grade whatever the daemon
+        reports then.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            reply = self.mcp([("find_references", {"query": "parse_key", "answer_only": False})])
+            coverage = (reply.get(2) or {}).get("edge_coverage")
+            if not isinstance(coverage, dict) or coverage.get("reference_enrichment") != "unknown":
+                return
+            if time.monotonic() >= deadline:
+                return
+            time.sleep(0.5)
 
     def ground_truth(self):
         """What a one-line grep says, which is the whole point of the finding."""
@@ -813,6 +1023,12 @@ def check_absence(suite):
                                ("get_entity_source", {"entity_id": caller["entity_id"]})])
         status, detail = grade_admitted_reference(payload, proof.get(2), proof.get(3),
                                                   suite.unadmitted_path, suite.repo())
+        if status == PASS:
+            rc, out, err = suite.kin_run(["refs", SYMBOL, "--json"])
+            cli_status, cli_detail = grade_cli_agrees(payload, rc, out or err)
+            if cli_status != PASS:
+                status = cli_status
+            detail = "%s; %s" % (detail, cli_detail)
     else:
         status, detail = grade_absence_names_the_gap_it_is_withheld_for(payload)
     return Result("absence", status, "%s %s" % (TICKET, detail))
@@ -822,7 +1038,7 @@ def check_committed(suite):
     rc, out, err = suite.kin_run(["commit", "-m", "land the stranded module"])
     if rc != 0:
         return Result("committed", UNREADABLE,
-                      "%s the control's commit failed: %s" % (TICKET, (err or out)[-200:]))
+                      "%s the control's commit failed: %s" % (TICKET, failure_excerpt(err or out)))
     payloads = suite.mcp([
         ("kin_graph_status", {}),
         ("find_references", {"query": ABSENT_SYMBOL, "answer_only": False}),

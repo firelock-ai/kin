@@ -385,13 +385,15 @@ pub const BODY_ELIDED_KEY: &str = "body_elided";
 /// wrong conclusion. A sibling `affected_tests_withheld: 15` was right there in
 /// the second one and did not save it either.
 ///
-/// So a cut list keeps at least one entry and publishes this record beside it,
-/// and an empty array afterward means one thing only.
+/// Answer collections therefore retain an entry. The separately tallied optional
+/// `call_sites.candidates` example sample may be empty: its positive candidate
+/// count, exact withheld count, and unsettled reading remain authoritative.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Elision {
     /// Entries the budget withheld from this list.
     pub elided: usize,
-    /// Entries the response still carries. Never zero when the walk found any.
+    /// Entries the response still carries. Answer collections retain one; an
+    /// optional example sample with an independent census may reach zero.
     pub kept: usize,
     /// Entries the walk actually found, which is `kept + elided`.
     pub total: usize,
@@ -1051,17 +1053,25 @@ fn shape_for(tool: &str) -> Option<ResponseShape> {
         // purpose -- but a type-resolved interface edge is still evidence, and
         // it outranks a match made on a name alone.
         //
-        // `candidates` sheds first. Each is a same-name match whose destination
-        // nothing at the reference site proves, which is the weakest thing this
-        // response carries; the payload's own comment says never to add them to
-        // `total_upstream`.
+        // `candidates` holds same-name matches whose destination nothing at the
+        // reference site proves; the payload's own comment says never to add
+        // them to `total_upstream`.
         //
-        // Both lists keep the floor of one entry every cut collection keeps, and
-        // both already publish their true totals in a `call_resolution`
-        // degradation and in `counts`, so a reader of a cut list is not left
-        // inferring the count from the rows.
+        // `call_sites.candidates` is a sample of unsettled sites, not the
+        // answer. It sheds first while its full tally, clauses and candidate
+        // count remain intact. Its existing withheld count includes the
+        // handler's sampling limit; response cuts add to that count.
+        //
+        // All lists keep at least one entry, so a size cut never resembles an
+        // empty result. The totals and uncertainty do not depend on how many
+        // sample rows the response carries.
         "find_references" => ResponseShape {
-            collections: &["references", "interface_dispatch.candidates", "candidates"],
+            collections: &[
+                "references",
+                "interface_dispatch.candidates",
+                "candidates",
+                "call_sites.candidates",
+            ],
             body_keys: &["body", "snippet"],
             explain_keys: &[],
             top_explain_keys: &[],
@@ -1591,6 +1601,103 @@ pub fn enforce(
     tool: &str,
     budget: &ResponseBudget,
 ) -> Option<BudgetAccounting> {
+    enforce_with_preview(payload, tool, budget, None)
+}
+
+/// The final envelope fits the representation after its bounded qualification,
+/// not the smaller pre-downgrade object. Raw daemon budgeting still leaves
+/// verdict construction to the finalizer.
+pub(crate) fn enforce_final(
+    payload: &mut Value,
+    tool: &str,
+    budget: &ResponseBudget,
+) -> Option<BudgetAccounting> {
+    enforce_with_preview(
+        payload,
+        tool,
+        budget,
+        Some(crate::envelope::qualify_bounded_response),
+    )
+}
+
+type QualificationPreview = fn(&mut Value, &str, &ResponseBudget);
+
+fn enforce_with_preview(
+    payload: &mut Value,
+    tool: &str,
+    budget: &ResponseBudget,
+    preview: Option<QualificationPreview>,
+) -> Option<BudgetAccounting> {
+    if answer_only_before_projection(payload, tool, budget) {
+        return enforce_on_the_projection(payload, tool, budget, preview);
+    }
+    enforce_whole(payload, tool, budget, preview)
+}
+
+/// Whether `payload` is a whole `find_references` answer an `answer_only`
+/// reply will be narrowed from, not yet narrowed or enveloped: the daemon's
+/// route bounds it in that state, before the stdio arm computes the verdict
+/// from the whole of it and narrows it.
+fn answer_only_before_projection(payload: &Value, tool: &str, budget: &ResponseBudget) -> bool {
+    budget.answer_only
+        && tool == "find_references"
+        && payload.get(crate::envelope::ENVELOPE_KEY).is_none()
+        && payload.get("references").is_some_and(Value::is_array)
+        && payload.get("focal_entity").is_some()
+}
+
+/// The keys a cut of an `answer_only` reply's rows writes, which the whole
+/// answer carries on so the verdict reads the rows that ship and the next arm
+/// reads the cut that was made.
+const ANSWER_ONLY_CUT_KEYS: [&str; 5] = [
+    "references",
+    "truncated",
+    "references_withheld",
+    ELISIONS_KEY,
+    "degradations",
+];
+
+/// Bound a whole `find_references` answer by the `answer_only` reply that
+/// ships from it.
+///
+/// Measured on a swept Flask graph: the whole answer for `AppContext.pop` was
+/// 25,863 characters, so a 12,000-character budget cut its three proven rows
+/// to one, and the narrowing that followed shipped 6,675 characters. The rows
+/// went to pay for blocks the caller never received. The answer is bounded as
+/// the reply it becomes: the ladder runs on the narrowed copy, and only the
+/// rows and the cut's own disclosure are carried back, so the whole answer
+/// keeps every block its verdict is computed from.
+fn enforce_on_the_projection(
+    payload: &mut Value,
+    tool: &str,
+    budget: &ResponseBudget,
+    preview: Option<QualificationPreview>,
+) -> Option<BudgetAccounting> {
+    let mut projected = payload.clone();
+    crate::handlers::entities::project_answer_only(&mut projected);
+    let accounting = enforce_whole(&mut projected, tool, budget, preview)?;
+    let (Some(whole), Some(narrow)) = (payload.as_object_mut(), projected.as_object()) else {
+        return Some(accounting);
+    };
+    for key in ANSWER_ONLY_CUT_KEYS {
+        match narrow.get(key) {
+            Some(value) => {
+                whole.insert(key.to_string(), value.clone());
+            }
+            None => {
+                whole.remove(key);
+            }
+        }
+    }
+    Some(accounting)
+}
+
+fn enforce_whole(
+    payload: &mut Value,
+    tool: &str,
+    budget: &ResponseBudget,
+    preview: Option<QualificationPreview>,
+) -> Option<BudgetAccounting> {
     let shape = shape_for(tool)?;
     // Named and materialized BEFORE anything is measured. Adding an omitted
     // empty primary changes the size the accounting reports, and the accounting
@@ -1642,6 +1749,7 @@ pub fn enforce(
             primary,
             &mut accounting,
             extra_reserve,
+            preview,
         );
         let after = measure(payload);
         if after <= budget.max_chars || original.is_none() || extra_reserve == budget.max_chars {
@@ -1803,6 +1911,7 @@ fn run_ladder(
     primary: Option<&'static str>,
     accounting: &mut BudgetAccounting,
     extra_reserve: usize,
+    preview: Option<QualificationPreview>,
 ) {
     let started_at = measure(payload);
     let mut cuts: Vec<String> = Vec::new();
@@ -1937,7 +2046,8 @@ fn run_ladder(
     // first. This is the only stage that removes an answer, so it reports the
     // count withheld and the parameter that recovers them.
     //
-    // Every collection keeps at least one entry, not just the primary one. A
+    // Every answer collection keeps an entry, not just the primary one. The
+    // independently tallied call-site example sample alone may reach zero. A
     // bound is not a refusal: a caller handed an empty array cannot tell it from
     // "nothing matched", which is the one reading a size cut must never produce,
     // and the reading does not get safer further down the response. The floor
@@ -1983,13 +2093,45 @@ fn run_ladder(
     let mut primary_withheld = 0usize;
     let mut cursor_rebased = false;
     for key in shape.collections.iter().rev() {
+        // The reserve estimates disclosure size. Once every lower-priority
+        // reference sample is at its floor, measure the actual disclosure
+        // before charging that estimate to the answer. Large qualifications
+        // can leave both proven rows fitting the real ceiling but not the
+        // ceiling minus the reserve.
+        if tool == "find_references"
+            && Some(*key) == primary
+            && (withheld_any || prior_bound(payload).is_some())
+        {
+            let mut complete_answer = payload.clone();
+            let mut disclosure_remediations = remediations.clone();
+            disclosure_remediations
+                .push(format!("narrow the request with `{}`", shape.narrow_param));
+            disclose(
+                &mut complete_answer,
+                budget,
+                started_at,
+                &cuts,
+                &disclosure_remediations,
+                Some(answer_floor),
+            );
+            // The envelope's downgrade and its lossless qualification pointer
+            // are part of the reply too. Measuring before them would promise
+            // room that the next finalizer pass immediately spends again.
+            if let Some(qualify) = preview {
+                qualify(&mut complete_answer, tool, budget);
+            }
+            if measure(&complete_answer) <= budget.max_chars {
+                *payload = complete_answer;
+                return;
+            }
+        }
         let found = collection_rows(payload, key);
         // Every collection is cut, including a final page's primary one.
         // `max_chars` is the caller's context budget rather than a preference,
         // so nothing licenses exceeding it, and a page with no cursor is not an
         // exception: it is the case where the caller cannot page to the rest and
         // therefore most needs to be told what was withheld and how to reach it.
-        // The floor of one entry per list is what keeps this from producing the
+        // The answer floor of one entry per list keeps this from producing the
         // empty array FIR-2600 exists to prevent, and the remediation below says
         // `max_chars` rather than `next_cursor` when there is no cursor to
         // follow. Retaining rows here instead shipped a response over the
@@ -2004,10 +2146,11 @@ fn run_ladder(
         // So keep cutting the same list while it still has rows to give and the
         // record keeps the payload over target: the answer is cut only when
         // nothing before it is left to cut.
+        let min_keep = collection_floor(payload, key);
         let mut withheld = 0usize;
         let mut cut_shape = CutShape::Suffix;
         loop {
-            let (more, shape_now) = trim_collection(payload, key, target, 1);
+            let (more, shape_now) = trim_collection(payload, key, target, min_keep);
             if more == 0 {
                 break;
             }
@@ -2050,7 +2193,7 @@ fn run_ladder(
             break;
         }
     }
-    // The floor of one entry per list is absolute, and a response that cannot
+    // The floor of one entry per answer list holds, and a response that cannot
     // reach its ceiling with it says so rather than giving it up.
     //
     // A rung that released the floor when releasing it was what fit was written
@@ -2378,8 +2521,8 @@ fn disclose_residual(payload: &mut Value, budget: &ResponseBudget) {
         "component": "response_budget",
         "reason": OVER_BUDGET_REASON,
         "detail": format!(
-            "the response did not reach its {max_chars}-character budget: every list the budget \
-             cuts keeps at least one entry, and what survived does not fit. Read the size it \
+            "the response did not reach its {max_chars}-character budget: every answer list \
+             keeps at least one entry, and what survived does not fit. Read the size it \
              ships at from `_kin.response.chars_after_budget`, or from the bytes received"
         ),
         "remediation": format!(
@@ -2711,6 +2854,28 @@ impl CutShape {
     }
 }
 
+/// Examples may give their last row to the proven answer only when the
+/// independent census explicitly accounts for every candidate and still says
+/// unsettled. Missing or inconsistent accounting retains the normal floor.
+fn collection_floor(payload: &Value, key: &str) -> usize {
+    if key == "call_sites.candidates" {
+        let block = &payload["call_sites"];
+        let count = block["candidate_count"].as_u64();
+        let withheld = block["candidates_withheld"].as_u64();
+        let kept = block["candidates"].as_array().map(|rows| rows.len() as u64);
+        if block["settled"] == false
+            && count.is_some_and(|count| count > 0)
+            && withheld
+                .zip(kept)
+                .and_then(|(withheld, kept)| withheld.checked_add(kept))
+                == count
+        {
+            return 0;
+        }
+    }
+    1
+}
+
 /// Withhold entries from one collection until the payload fits, returning how
 /// many were withheld.
 ///
@@ -2906,6 +3071,44 @@ fn restate_trace_step_counts(
         }
     }
     restate_trace_spine(payload, walk_clips);
+    record_trace_unproven_steps(payload);
+}
+
+/// Count the retained paths that contain a guessed hop, including descendants
+/// whose own edge resolved. Used by the offline walker and after envelope cuts.
+pub(crate) fn record_trace_unproven_steps(payload: &mut Value) {
+    let Some(chain) = payload.get("chain").and_then(Value::as_array) else {
+        return;
+    };
+    let total = chain.len();
+    let unproven = chain
+        .iter()
+        .filter(|step| step["resolution"] == "name_only")
+        .count();
+    let reported_before = payload.get("unproven_steps").is_some();
+    if unproven == 0 && !reported_before {
+        return;
+    }
+    payload["unproven_steps"] = json!(unproven);
+    let disclosure = json!({
+        "component": "call_resolution",
+        "reason": "name_only_steps",
+        "detail": format!("{unproven} of {total} steps were reached through an edge matched by name alone, so the flow each claims may not exist"),
+        "remediation": "read each step's `resolution` field, and treat a `name_only` hop as a candidate rather than a call",
+    });
+    if let Some(entries) = payload
+        .get_mut("degradations")
+        .and_then(Value::as_array_mut)
+    {
+        entries.retain(|entry| {
+            entry["component"] != "call_resolution" || entry["reason"] != "name_only_steps"
+        });
+        if unproven > 0 {
+            entries.push(disclosure);
+        }
+    } else if unproven > 0 {
+        payload["degradations"] = json!([disclosure]);
+    }
 }
 
 /// Present, and `true`, when a trace reply's `spine_dropped_crossing_file` counts
@@ -3126,11 +3329,10 @@ fn restate_trace_spine(payload: &mut Value, walk_clips: &[Value]) {
     // No spine left, so nothing may still name the disclosure or the clause
     // that described one.
     const SPINE_SIGNAL: &str = "fanout_cap:spine_clipped";
-    if let Some(signals) = payload
-        .pointer_mut("/negative/degraded_signals")
-        .and_then(Value::as_array_mut)
-    {
-        signals.retain(|signal| signal.as_str() != Some(SPINE_SIGNAL));
+    for pointer in ["/negative/degraded_signals", "/negative/bounding_signals"] {
+        if let Some(signals) = payload.pointer_mut(pointer).and_then(Value::as_array_mut) {
+            signals.retain(|signal| signal.as_str() != Some(SPINE_SIGNAL));
+        }
     }
     let advice = payload
         .pointer("/negative/advice")
@@ -3295,6 +3497,7 @@ fn disclose(
         // is a claim a reader can check rather than take on trust.
         entry["chars_before_withholding"] = Value::from(floor);
     }
+    consolidate_sample_disclosure(payload, &mut entry, cuts, &ceiling);
     match payload
         .get_mut("degradations")
         .and_then(Value::as_array_mut)
@@ -3304,9 +3507,95 @@ fn disclose(
     }
 }
 
+/// The raw daemon and final envelope can shorten the same optional sample.
+/// Its cumulative elision already accounts for both cuts. Publish that one
+/// account rather than letting repeated copies of the sample notice displace
+/// the proven answer. Other cuts and qualifications are never consolidated.
+fn consolidate_sample_disclosure(
+    payload: &mut Value,
+    entry: &mut Value,
+    cuts: &[String],
+    ceiling: &str,
+) {
+    fn is_sample_cut(text: &str) -> bool {
+        let Some(counts) = text.strip_suffix(
+            " entries withheld from `call_sites.candidates`, from the end of the list",
+        ) else {
+            return false;
+        };
+        let Some((withheld, total)) = counts.split_once(" of ") else {
+            return false;
+        };
+        matches!((withheld.parse::<usize>(), total.parse::<usize>()),
+            (Ok(withheld), Ok(total)) if withheld > 0 && withheld <= total)
+    }
+    if cuts.len() != 1 || !is_sample_cut(&cuts[0]) {
+        return;
+    }
+    let Some(elision) = payload
+        .get(ELISIONS_KEY)
+        .and_then(|elisions| elisions.get("call_sites.candidates"))
+        .and_then(|value| serde_json::from_value::<Elision>(value.clone()).ok())
+        .filter(|elision| elision.reason == ELISION_REASON_BUDGET)
+    else {
+        return;
+    };
+    let Some(existing) = payload
+        .get_mut("degradations")
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    existing.retain(|prior| {
+        let same_sample = prior["component"] == "response_budget"
+            && prior["reason"] == BOUNDED_REASON
+            && prior["detail"].as_str().is_some_and(|detail| {
+                detail
+                    .split_once(", so ")
+                    .is_some_and(|(_, cut)| is_sample_cut(cut))
+            });
+        if same_sample {
+            for key in ["chars_before_budget", "chars_before_withholding"] {
+                if let Some(prior_size) = prior[key].as_u64() {
+                    entry[key] = json!(prior_size.max(entry[key].as_u64().unwrap_or(0)));
+                }
+            }
+        }
+        !same_sample
+    });
+    entry["detail"] = json!(format!(
+        "the response exceeded its {ceiling}, so {} of {} entries withheld from \
+         `call_sites.candidates`, from the end of the list",
+        elision.elided, elision.total,
+    ));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trace_unproven_count_tracks_the_retained_chain() {
+        let mut payload = json!({"chain": [
+            {"resolution": "type_resolved"},
+            {"resolution": "name_only"},
+            {"resolution": "name_only"}
+        ]});
+        record_trace_unproven_steps(&mut payload);
+        assert_eq!(payload["unproven_steps"], 2);
+        payload["chain"].as_array_mut().unwrap().truncate(2);
+        record_trace_unproven_steps(&mut payload);
+        assert_eq!(payload["unproven_steps"], 1);
+        assert_eq!(payload["degradations"].as_array().unwrap().len(), 1);
+        assert!(payload["degradations"][0]["detail"]
+            .as_str()
+            .unwrap()
+            .starts_with("1 of 2"));
+        payload["chain"].as_array_mut().unwrap().truncate(1);
+        record_trace_unproven_steps(&mut payload);
+        assert_eq!(payload["unproven_steps"], 0);
+        assert!(payload["degradations"].as_array().unwrap().is_empty());
+    }
 
     fn focal_history_page(count: usize, body_chars: usize) -> Value {
         let rows = (0..count).map(|index| {
@@ -5796,6 +6085,10 @@ mod tests {
                 "response_budget:steps_omitted", "fanout_cap:spine_clipped",
                 "edge_coverage:calls_absent",
             ],
+            "bounding_signals": [
+                "response_budget:steps_omitted", "fanout_cap:spine_clipped",
+                "edge_coverage:calls_absent",
+            ],
         });
         payload["_kin"] = json!({
             "verdict": {"limiting_factor": "response_bounded; trace_spine_clipped; substrate_partial"},
@@ -5889,6 +6182,10 @@ mod tests {
                 "response_budget:steps_omitted",
                 "edge_coverage:calls_absent"
             ])
+        );
+        assert_eq!(
+            payload["negative"]["bounding_signals"],
+            payload["negative"]["degraded_signals"]
         );
         assert_eq!(
             payload["_kin"]["verdict"]["limiting_factor"],
@@ -6847,6 +7144,253 @@ mod tests {
         payload
     }
 
+    /// A store-wide call-site reading can carry a 50-row sample while the
+    /// reference answer has only two rows. The full candidate count already
+    /// includes rows the handler withheld before response budgeting.
+    fn references_with_call_site_sample(refs: usize) -> Value {
+        let mut payload = references_payload(refs, 0, 0);
+        payload["call_sites"] = json!({
+            "scope": "the store's callers that could call the focal",
+            "settled": false,
+            "sites": 2760,
+            "by_state": { "binding": 183, "unresolved": 430, "proven_target": 2147 },
+            "candidate_count": 613,
+            "candidates_withheld": 563,
+            "candidates_by_reason": { "callee spells the name": 613 },
+            "clauses": [
+                "binding_unproven: 183 sites call through a value binding",
+                "call_sites_unresolved: 430 sites have no proven target"
+            ],
+            "candidates": (0..50).map(|index| json!({
+                "callee": "send",
+                "caller": format!("{index:08x}-0000-4000-8000-000000000000"),
+                "caller_name": format!("response_handler_{index}"),
+                "line_in_entity": index + 1,
+                "projection": { "path": format!("tests/test_transport_{index}.py") },
+                "reason": "callee spells the name",
+                "state": "unresolved",
+                "state_reason": "no_answer"
+            })).collect::<Vec<_>>()
+        });
+        payload["negative"] = json!({
+            "result_count": refs,
+            "safe_to_conclude_absent": false,
+            "trust_reason": "binding_unproven; call_sites_unresolved",
+            "bounding_signals": ["binding_unproven", "call_sites_unresolved"]
+        });
+        payload["_kin"] = json!({ "verdict": {
+            "state": "inconclusive",
+            "safe_to_conclude_absent": false,
+            "limiting_factor": "binding_unproven; call_sites_unresolved"
+        }});
+        payload
+    }
+
+    #[test]
+    fn call_site_samples_are_cut_before_reference_answers_without_losing_uncertainty() {
+        for refs in [0, 2] {
+            let mut payload = references_with_call_site_sample(refs);
+            let original = payload.clone();
+            let budget = ResponseBudget {
+                max_chars: 12_000,
+                ..ResponseBudget::default()
+            };
+            assert!(serde_json::to_vec(&payload).unwrap().len() > budget.max_chars);
+            let accounting = enforce(&mut payload, "find_references", &budget).unwrap();
+            let kept = collection_rows(&payload, "call_sites.candidates");
+            assert!((1..50).contains(&kept));
+            assert!(measure(&payload) <= budget.max_chars);
+            assert_eq!(payload["references"], original["references"]);
+            assert!(payload.get("references_withheld").is_none());
+            assert_eq!(accounting.primary_collection.as_deref(), Some("references"));
+            assert_eq!(accounting.primary_rows, Some(refs));
+            assert!(accounting.bounded);
+            assert_eq!(payload["negative"], original["negative"]);
+            assert_eq!(payload["_kin"]["verdict"], original["_kin"]["verdict"]);
+
+            // Only the sample and its withheld count change. In particular,
+            // the complete census, candidate total and limiting clauses stay.
+            let mut standing = payload["call_sites"].clone();
+            standing["candidates"] = original["call_sites"]["candidates"].clone();
+            standing["candidates_withheld"] = original["call_sites"]["candidates_withheld"].clone();
+            assert_eq!(standing, original["call_sites"]);
+            assert_eq!(
+                payload["call_sites"]["candidates_withheld"],
+                json!(613 - kept)
+            );
+            assert_eq!(
+                payload["elisions"]["call_sites.candidates"]["elided"],
+                json!(50 - kept)
+            );
+            assert_eq!(
+                payload["elisions"]["call_sites.candidates"]["kept"],
+                json!(kept)
+            );
+            assert_eq!(
+                payload["elisions"]["call_sites.candidates"]["reason"],
+                json!(ELISION_REASON_BUDGET)
+            );
+            assert!(payload.get("call_sites.candidates_withheld").is_none());
+        }
+    }
+
+    #[test]
+    fn call_site_sample_cuts_accumulate_across_response_budget_passes() {
+        let mut payload = references_with_call_site_sample(2);
+        let mut budget = ResponseBudget {
+            max_chars: 12_000,
+            ..ResponseBudget::default()
+        };
+        enforce(&mut payload, "find_references", &budget).unwrap();
+        let first_kept = collection_rows(&payload, "call_sites.candidates");
+        budget.max_chars = 6_000;
+        enforce(&mut payload, "find_references", &budget).unwrap();
+        let kept = collection_rows(&payload, "call_sites.candidates");
+        assert!(kept >= 1 && kept < first_kept);
+        assert!(measure(&payload) <= budget.max_chars);
+        assert_eq!(collection_rows(&payload, "references"), 2);
+        assert_eq!(payload["call_sites"]["candidate_count"], json!(613));
+        assert_eq!(
+            payload["call_sites"]["candidates_withheld"],
+            json!(613 - kept)
+        );
+        assert_eq!(
+            payload["elisions"]["call_sites.candidates"]["total"],
+            json!(50)
+        );
+        assert_eq!(
+            payload["elisions"]["call_sites.candidates"]["elided"],
+            json!(50 - kept)
+        );
+        assert_eq!(payload["negative"]["safe_to_conclude_absent"], json!(false));
+    }
+
+    #[test]
+    fn an_accounted_optional_call_site_sample_empties_before_reference_answers_are_cut() {
+        let mut payload = references_with_call_site_sample(40);
+        let budget = ResponseBudget {
+            max_chars: RESPONSE_MIN_MAX_CHARS,
+            ..ResponseBudget::default()
+        };
+        enforce(&mut payload, "find_references", &budget).unwrap();
+        assert!((1..40).contains(&collection_rows(&payload, "references")));
+        assert_eq!(collection_rows(&payload, "call_sites.candidates"), 0);
+        assert_eq!(payload["call_sites"]["candidate_count"], json!(613));
+        assert_eq!(payload["call_sites"]["candidates_withheld"], json!(613));
+        assert_eq!(payload["call_sites"]["settled"], false);
+        assert_eq!(payload["elisions"]["call_sites.candidates"]["kept"], 0);
+        assert_eq!(payload["elisions"]["call_sites.candidates"]["elided"], 50);
+        assert_eq!(payload["negative"]["safe_to_conclude_absent"], json!(false));
+    }
+
+    #[test]
+    fn optional_sample_zero_floor_requires_the_independent_unsettled_census() {
+        let valid = references_with_call_site_sample(40);
+        for invalid in ["missing_count", "missing_withheld", "mismatch", "settled"] {
+            let mut payload = valid.clone();
+            match invalid {
+                "missing_count" => {
+                    payload["call_sites"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("candidate_count");
+                }
+                "missing_withheld" => {
+                    payload["call_sites"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("candidates_withheld");
+                }
+                "mismatch" => payload["call_sites"]["candidate_count"] = json!(614),
+                "settled" => payload["call_sites"]["settled"] = json!(true),
+                _ => unreachable!(),
+            }
+            enforce(
+                &mut payload,
+                "find_references",
+                &ResponseBudget {
+                    max_chars: RESPONSE_MIN_MAX_CHARS,
+                    ..ResponseBudget::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                collection_rows(&payload, "call_sites.candidates"),
+                1,
+                "{invalid}"
+            );
+            assert!(collection_rows(&payload, "references") > 0);
+        }
+        assert_eq!(collection_floor(&valid, "references"), 1);
+        assert_eq!(collection_floor(&valid, "candidates"), 1);
+        assert_eq!(collection_floor(&valid, "interface_dispatch.candidates"), 1);
+    }
+
+    /// A populated answer with real store-wide qualification blocks. Its two
+    /// proven rows plus one candidate and the actual cut disclosure fit 12k;
+    /// reserving a fixed 1.5k for that disclosure used to drop one proven row.
+    #[test]
+    fn reference_qualifications_do_not_spend_an_estimated_reserve_on_answer_rows() {
+        let mut payload: Value = serde_json::from_str(include_str!(
+            "budget_test_data/reference_qualifications.json"
+        ))
+        .unwrap();
+        let candidate = payload["call_sites"]["candidates"][0].clone();
+        payload["call_sites"]["candidates"] = json!((0..50)
+            .map(|index| {
+                let mut row = candidate.clone();
+                row["caller"] = json!(format!("{index:08x}-0000-4000-8000-000000000000"));
+                row
+            })
+            .collect::<Vec<_>>());
+        payload["call_sites"]["candidates_withheld"] = json!(563);
+        let original = payload.clone();
+        let budget = ResponseBudget {
+            max_chars: 12_000,
+            ..ResponseBudget::default()
+        };
+        assert!(measure(&payload) > budget.max_chars);
+        let accounting = enforce(&mut payload, "find_references", &budget).unwrap();
+        assert!(measure(&payload) <= budget.max_chars);
+        assert_eq!(payload["references"], original["references"]);
+        assert_eq!(accounting.primary_rows, Some(2));
+        assert!(payload.get("references_withheld").is_none());
+        assert!(payload["elisions"].get("references").is_none());
+        let kept = collection_rows(&payload, "call_sites.candidates");
+        assert!(kept < 50);
+        assert_eq!(payload["call_sites"]["candidate_count"], json!(613));
+        assert_eq!(
+            payload["call_sites"]["candidates_withheld"],
+            json!(613 - kept)
+        );
+        assert_eq!(
+            payload["call_sites"]["clauses"],
+            original["call_sites"]["clauses"]
+        );
+        for field in [
+            "source_derivation",
+            "caller_arrival",
+            "cross_repo",
+            "edge_coverage",
+        ] {
+            assert_eq!(payload[field], original[field]);
+        }
+        assert_eq!(payload["_kin"]["verdict"], original["_kin"]["verdict"]);
+        assert_eq!(
+            payload["negative"]["trust_reason"],
+            original["negative"]["trust_reason"]
+        );
+        assert_eq!(payload["negative"]["safe_to_conclude_absent"], json!(false));
+        assert_eq!(
+            payload["negative"]["bounding_signals"],
+            original["negative"]["bounding_signals"]
+        );
+        assert!(payload["negative"]["advice"]
+            .as_str()
+            .unwrap()
+            .contains("negative.trust_reason"));
+    }
+
     /// The defect this test exists for, measured on the published 0.7.20: the
     /// answer was the only array the bounder could name, so it was the only
     /// array the bounder could cut. One reply spent 57,323 characters on
@@ -6891,6 +7435,57 @@ mod tests {
         assert!(
             payload.get("references_withheld").is_none(),
             "the answer reported a loss it did not take: {payload}"
+        );
+    }
+
+    /// An `answer_only` reply is bounded as the reply that ships. The whole
+    /// answer carries blocks the narrowing drops (here a large caller-arrival
+    /// reading the ladder has no rung for), and it used to cut the proven rows
+    /// to pay for them: on a swept Flask graph, 3 of `AppContext.pop`'s 3
+    /// proven rows became 1 in a 6,675-character reply under a 12,000 budget.
+    #[test]
+    fn an_answer_only_reply_that_fits_withholds_no_rows() {
+        const BUDGET: usize = 12_000;
+        let mut payload = references_payload(3, 0, 0);
+        payload["caller_arrival"] = json!({
+            "unaccounted_files": (0..400)
+                .map(|index| json!({ "file": format!("src/pkg{index}/module.py"), "unaccounted_call_sites": index }))
+                .collect::<Vec<_>>(),
+        });
+        assert!(
+            measure(&payload) > BUDGET,
+            "the whole answer must overflow or the test proves nothing"
+        );
+        let budget = ResponseBudget {
+            max_chars: BUDGET,
+            answer_only: true,
+            ..ResponseBudget::default()
+        };
+        enforce(&mut payload, "find_references", &budget).expect("find_references is budgeted");
+        assert_eq!(
+            payload["references"].as_array().map(Vec::len),
+            Some(3),
+            "rows were cut for bytes the answer_only reply never ships: {}",
+            payload["degradations"]
+        );
+        assert!(payload.get("references_withheld").is_none(), "{payload}");
+        assert!(
+            payload.get("caller_arrival").is_some(),
+            "the whole answer keeps the blocks its verdict is computed from"
+        );
+
+        // A reply that is still too large once narrowed is cut, and says so.
+        let mut payload = references_payload(400, 0, 0);
+        enforce(&mut payload, "find_references", &budget).expect("find_references is budgeted");
+        let kept = payload["references"].as_array().map_or(0, Vec::len);
+        assert!(
+            kept < 400,
+            "a narrowed reply over its budget is still bounded"
+        );
+        assert_eq!(
+            payload["references_withheld"],
+            json!(400 - kept),
+            "{payload}"
         );
     }
 

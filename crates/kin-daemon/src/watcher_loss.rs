@@ -10,7 +10,7 @@
 //! signal names a file and no per-path recovery can be derived from it. An
 //! unknown region of the working copy changed and nothing will ever report it.
 //!
-//! Ambient admission cannot recover that. The watch loop admits what it is told
+//! An ordinary watch tick cannot recover that. The loop admits what it is told
 //! about, and it was told nothing, so every later tick succeeds, stamps a fresh
 //! last-admission marker, and leaves the graph exactly as far behind as the loss
 //! left it. That is the failure this record exists to end: a store that lost a
@@ -29,13 +29,13 @@
 //! ran is still standing when it finishes. A boolean would be cleared by the
 //! same pass that never observed the newer loss.
 //!
-//! Only an explicit full admission clears it. The ambient watch tick shares the
+//! Only a completed full admission clears it. The ambient watch tick shares the
 //! admission seam with `kin admit` and records the same success on the same
 //! probes, so the clearing call deliberately does NOT live beside
 //! [`crate::background_work::record_durable_admission`], which both of them
-//! reach. It lives in [`crate::repository_admit`], which is only the explicit
-//! path. This is the founder's contract: fail loud, and let a person or an agent
-//! decide to admit.
+//! reach. It lives in [`crate::repository_admit`], used by an explicit request
+//! and the loop's automatic recovery. Recovery failures remain disclosed and
+//! retry with backoff; a new signal during recovery requires another pass.
 //!
 //! Reads are three-way for the same reason [`kin_core::last_admission`] reads
 //! are, with the direction reversed: an unreadable record is treated as recovery
@@ -143,9 +143,9 @@ impl WatcherLossRead {
                 Some(format!(
                     "the filesystem watcher lost events (loss generation {}, recovered through \
                      {}, most recently {}{reason}); an unknown set of paths under {} changed with \
-                     no notification, so ambient admission cannot recover them and this graph may \
-                     be behind its working copy. Run `kin admit` to admit the complete exact tree; \
-                     ordinary watch ticks do not clear this",
+                     no notification, so this graph may be behind its working copy. The daemon \
+                     owes a complete exact-tree recovery and retries it automatically; run \
+                     `kin admit` to request one now. Ordinary watch ticks do not clear this",
                     recorded.generation,
                     recorded.recovered_through,
                     recorded.at.to_rfc3339(),
@@ -221,13 +221,11 @@ pub fn read(layout: &kin_core::KinLayout) -> WatcherLossRead {
 /// store keeps owing an admission. That is the safe direction: the only outcome
 /// this must never produce is a record that reads as recovered.
 ///
-/// A write failure is logged and swallowed, in the one place where that is the
-/// wrong direction and there is no better one: failing the tick would stop the
-/// loop admitting, and the in-memory disclosure recorded beside this call still
-/// degrades every health surface for the life of this daemon.
-pub fn record_loss(layout: &kin_core::KinLayout, signals: u64, reason: Option<&str>) {
+/// Returns whether the signal was persisted. A loop must retain an unpersisted
+/// signal for its next attempt and must not clear an older record meanwhile.
+pub fn record_loss(layout: &kin_core::KinLayout, signals: u64, reason: Option<&str>) -> bool {
     if signals == 0 {
-        return;
+        return true;
     }
     let _gate = WRITE_GATE.lock().unwrap_or_else(PoisonError::into_inner);
     let recorded = match read(layout) {
@@ -247,7 +245,9 @@ pub fn record_loss(layout: &kin_core::KinLayout, signals: u64, reason: Option<&s
             "could not persist the watcher-loss record; this daemon still reports the loss on \
              every health surface, but a restart before the next successful write would lose it"
         );
+        return false;
     }
+    true
 }
 
 /// Read what stands against the store, for a full admission that is about to
@@ -264,7 +264,7 @@ pub fn capture(layout: &kin_core::KinLayout) -> RecoveryCapture {
 
 /// Clear the loss a COMPLETED full admission covered, and nothing else.
 ///
-/// Called only from the explicit admission path, and only after that pass
+/// Called only from the complete admission path, and only after that pass
 /// succeeded. Every refusal below is a rule the contract needs:
 ///
 /// - `Clean` writes nothing, so a loss that arrived during a pass that began on

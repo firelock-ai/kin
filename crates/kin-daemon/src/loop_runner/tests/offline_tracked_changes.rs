@@ -157,7 +157,11 @@ async fn a_tracked_edit_and_deletion_made_while_no_daemon_watched_are_owed_then_
         cancel_rx.clone(),
         Some(WatchArmed::with_canonical_ready(watch_tx, canonical_tx)),
     ));
-    crate::daemon::await_watch_armed(watch_rx, Duration::from_secs(10)).await;
+    assert_eq!(
+        crate::daemon::await_watch_armed(watch_rx, WATCH_ARMING_BOUND).await,
+        crate::daemon::WatchArming::Armed,
+        "the real watch must be armed before observing canonical startup"
+    );
     crate::daemon::await_canonical_ready(canonical_rx, cancel_rx)
         .await
         .expect("canonical readiness is what releases the endpoint");
@@ -370,7 +374,11 @@ async fn a_daemon_starting_over_an_untouched_working_copy_owes_nothing() {
         cancel_rx.clone(),
         Some(WatchArmed::with_canonical_ready(watch_tx, canonical_tx)),
     ));
-    crate::daemon::await_watch_armed(watch_rx, Duration::from_secs(10)).await;
+    assert_eq!(
+        crate::daemon::await_watch_armed(watch_rx, WATCH_ARMING_BOUND).await,
+        crate::daemon::WatchArming::Armed,
+        "the real watch must be armed before observing canonical startup"
+    );
     crate::daemon::await_canonical_ready(canonical_rx, cancel_rx)
         .await
         .expect("canonical readiness");
@@ -428,7 +436,11 @@ async fn an_unreadable_marker_is_reported_unchecked_and_holds_until_a_complete_a
         cancel_rx.clone(),
         Some(WatchArmed::with_canonical_ready(watch_tx, canonical_tx)),
     ));
-    crate::daemon::await_watch_armed(watch_rx, Duration::from_secs(10)).await;
+    assert_eq!(
+        crate::daemon::await_watch_armed(watch_rx, WATCH_ARMING_BOUND).await,
+        crate::daemon::WatchArming::Armed,
+        "the real watch must be armed before observing canonical startup"
+    );
     crate::daemon::await_canonical_ready(canonical_rx, cancel_rx)
         .await
         .expect("canonical readiness");

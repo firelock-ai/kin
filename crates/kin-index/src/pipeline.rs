@@ -22,7 +22,9 @@ use tree_sitter::Tree;
 use crate::artifacts;
 use crate::classifier::{FileClassification, FileClassifier};
 use crate::error::{IndexError, Result};
-use crate::fingerprint::{behavior_equivalence_hash, language_supports_equivalence};
+use crate::fingerprint::{
+    behavior_equivalence_hash_in_file, language_supports_equivalence, FileEquivalenceContext,
+};
 use crate::linker::UnresolvedRelation;
 
 /// Result of indexing a single file.
@@ -531,6 +533,12 @@ impl IndexPipeline {
             parsed_call_sites,
         );
         attach_equivalence_class(&mut entities, &tree, source, language);
+        kin_parser::binding_callability::attach_binding_callability(
+            &tree,
+            source,
+            language,
+            &mut entities,
+        );
         if language == LanguageId::Go {
             kin_parser::attach_go_package_metadata(&tree, source, &mut entities);
             kin_parser::attach_go_command_effect_contract_metadata(&tree, source, &mut entities);
@@ -702,6 +710,12 @@ impl IndexPipeline {
             parsed_call_sites,
         );
         attach_equivalence_class(&mut entities, &tree, &source, language);
+        kin_parser::binding_callability::attach_binding_callability(
+            &tree,
+            &source,
+            language,
+            &mut entities,
+        );
         if language == LanguageId::Go {
             kin_parser::attach_go_package_metadata(&tree, &source, &mut entities);
             kin_parser::attach_go_command_effect_contract_metadata(&tree, &source, &mut entities);
@@ -1038,13 +1052,15 @@ fn attach_equivalence_class(
         return;
     }
     let root = tree.root_node();
+    let file = FileEquivalenceContext::for_file(&root, source, language);
     for ent in entities.iter_mut() {
         let Some(span) = ent.span.as_ref() else {
             continue;
         };
         let end = span.end_byte.saturating_sub(1).max(span.start_byte);
         if let Some(node) = root.descendant_for_byte_range(span.start_byte, end) {
-            ent.fingerprint.equivalence_hash = behavior_equivalence_hash(&node, source, language);
+            ent.fingerprint.equivalence_hash =
+                behavior_equivalence_hash_in_file(&node, source, language, &file);
         }
     }
 }
@@ -1289,6 +1305,7 @@ fn resolve_relations(
     let mut relation_indices = HashMap::new();
     let mut unresolved = Vec::new();
     let source_index = crate::RelationSourceIndex::new(entities);
+    let same_file = crate::linker::file_name_slots(entities);
     let call_extraction_complete = !extracted
         .iter()
         .any(kin_parser::is_call_extraction_incomplete_marker);
@@ -1298,9 +1315,9 @@ fn resolve_relations(
             continue;
         }
         let src = source_index.resolve(rel);
-        let dst = entities
-            .iter()
-            .find(|e| e.name == rel.dst_name)
+        let dst = same_file
+            .get(rel.dst_name.as_str())
+            .copied()
             .filter(|_| !crate::linker::requires_rust_import_authority(rel, &file_id.0))
             .filter(|_| {
                 // Receiver-shaped fields and unproven local method calls must
@@ -1387,6 +1404,59 @@ fn resolve_relations(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_ingestion_persists_scalar_binding_and_complete_python_write_census() {
+        let pipeline = IndexPipeline::new();
+        let file = FilePathId::new("app.py");
+        for (source, writes) in [
+            (
+                "VALUE = 'value'\ndef render(): return 'prefix' + VALUE\n",
+                1,
+            ),
+            ("VALUE = 'value'\nVALUE = lambda: 7\n", 2),
+        ] {
+            let digest = kin_blobs::digest(source.as_bytes());
+            let indexed = pipeline
+                .index_file_content_with_tests(&file, source.as_bytes(), digest)
+                .unwrap()
+                .indexed_file;
+            let census_entity = indexed
+                .entities
+                .iter()
+                .find(|entity| {
+                    entity
+                        .metadata
+                        .extra
+                        .contains_key("python_binding_census_v1")
+                })
+                .unwrap();
+            assert_eq!(
+                census_entity.metadata.extra["blob_hash"],
+                digest.to_string()
+            );
+            assert_eq!(
+                census_entity.metadata.extra["python_binding_census_v1"]["writes"]["VALUE"],
+                writes
+            );
+            assert_eq!(
+                indexed
+                    .entities
+                    .iter()
+                    .filter(|entity| entity
+                        .metadata
+                        .extra
+                        .contains_key("python_binding_census_v1"))
+                    .count(),
+                1
+            );
+            assert!(indexed.entities.iter().any(|entity| entity
+                .metadata
+                .extra
+                .get("scalar_binding_v1")
+                .is_some_and(|binding| binding["name"] == "VALUE")));
+        }
+    }
 
     #[test]
     fn index_pipeline_creates() {
@@ -2418,5 +2488,81 @@ mod tests {
             before,
             "a refused retention changes nothing"
         );
+    }
+
+    /// A function whose `@overload` stubs sit above it, calling itself by
+    /// name, binds that call to the implementation: the definition Python
+    /// keeps under the name, and the one both linkers bind. Binding the first
+    /// stub instead gave every live re-derivation of the file an edge a fresh
+    /// import never made.
+    #[test]
+    fn a_self_call_under_overload_stubs_binds_the_implementation() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob_store = BlobStore::new(dir.path().join("blobs")).unwrap();
+        let pipeline = IndexPipeline::new();
+        let source: &[u8] = br#"import typing as t
+
+
+@t.overload
+def stream(value: t.Iterator[str]) -> t.Iterator[str]: ...
+
+
+@t.overload
+def stream(value: t.Callable[..., t.Iterator[str]]) -> t.Callable[..., t.Iterator[str]]: ...
+
+
+def stream(value):
+    def wrapper(*args):
+        return stream(value(*args))
+
+    return wrapper
+
+
+def caller(value):
+    return stream(value)
+"#;
+        let blob_hash = blob_store.write(source).unwrap();
+        let indexed = pipeline
+            .index_file_content_with_tests(&FilePathId::new("pkg/stream.py"), source, blob_hash)
+            .unwrap()
+            .indexed_file;
+        let mut group: Vec<&Entity> = indexed
+            .entities
+            .iter()
+            .filter(|entity| {
+                entity.name == "stream" && entity.kind == kin_model::EntityKind::Function
+            })
+            .collect();
+        group.sort_by_key(|entity| entity.span.as_ref().map(|span| span.start_line));
+        assert_eq!(group.len(), 3, "two stubs and the implementation");
+        // The file's module carries the same name, `stream`, and must not take
+        // the call either.
+        let module = indexed
+            .entities
+            .iter()
+            .find(|entity| entity.name == "stream" && entity.kind == kin_model::EntityKind::Module)
+            .expect("the file's module is named for its stem")
+            .id;
+        let implementation = group[2].id;
+        let caller = indexed
+            .entities
+            .iter()
+            .find(|entity| entity.name == "caller")
+            .unwrap()
+            .id;
+        let calls_to_group = |src: kin_model::EntityId| -> Vec<kin_model::EntityId> {
+            indexed
+                .relations
+                .iter()
+                .filter(|relation| {
+                    relation.kind == kin_model::RelationKind::Calls
+                        && relation.src.as_entity() == Some(src)
+                })
+                .filter_map(|relation| relation.dst.as_entity())
+                .filter(|dst| *dst == module || group.iter().any(|entity| entity.id == *dst))
+                .collect()
+        };
+        assert_eq!(calls_to_group(implementation), vec![implementation]);
+        assert_eq!(calls_to_group(caller), vec![implementation]);
     }
 }

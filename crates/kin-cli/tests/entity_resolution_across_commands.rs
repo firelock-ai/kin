@@ -2,7 +2,8 @@
 // Copyright 2026 Firelock, LLC
 
 //! One name, five definitions: every read command has to answer about the same
-//! one, say that it chose and how, and point at the line the function is on.
+//! one, say that it chose and how, and point at the function itself: by its id,
+//! or by the line the function is on, and never by the imports above it.
 //!
 //! The fixture is the shape a recorded demo hit on this repository:
 //! `human_bytes` is defined in five files, and in `src/cache.rs` it sits under
@@ -200,8 +201,31 @@ async fn impact_result(
     .await
 }
 
-/// The file an answer's first line points at, read off `@ <path>[:line]`.
+/// The one `human_bytes` twin defined in `file`.
+fn twin_in(graph: &InMemoryGraph, file: &str) -> Entity {
+    human_bytes_twins(graph)
+        .into_iter()
+        .find(|entity| entity.file_origin.as_ref().map(|f| f.0.as_str()) == Some(file))
+        .unwrap_or_else(|| panic!("no twin in {file}"))
+}
+
+/// How `kin refs` addresses an entity in its header: by id, with the file only
+/// as the projection it is.
+fn refs_address(entity: &Entity, file: &str) -> String {
+    format!("[{}] (projection: {file})", entity.id)
+}
+
+/// The file an answer's first line points at: the path after `projection:` in
+/// a `kin refs` header, which names its entity by id, or the path read off
+/// `@ <path>[:line]` in a `kin impact` header.
 fn header_file(first_line: &str) -> String {
+    if let Some((_, projected)) = first_line.split_once("(projection: ") {
+        return projected
+            .split(')')
+            .next()
+            .unwrap_or_else(|| panic!("an unclosed projection in {first_line:?}"))
+            .to_string();
+    }
     let location = first_line
         .rsplit(" @ ")
         .next()
@@ -236,10 +260,24 @@ async fn a_function_under_imports_is_pointed_at_on_its_own_line() {
         "impact must never point at the import block: {header}"
     );
 
+    // `kin refs` names the function by id and prints no file line of its
+    // own, so it points at the entity whose line `kin impact` printed above,
+    // and that entity's own line is the function's, not the import block's.
+    let twin = twin_in(&graph, "src/cache.rs");
+    assert_eq!(
+        kin_mcp::handlers::common::entity_presentation_start_line(&twin),
+        Some(fn_line),
+        "the addressed entity's own line is the function's"
+    );
     let refs = refs_response(&graph, "human_bytes@src/cache.rs");
     assert!(
-        refs.lines[0].ends_with(&format!("@ src/cache.rs:{fn_line}")),
-        "refs must point at the same line: {:?}",
+        refs.lines[0].ends_with(&refs_address(&twin, "src/cache.rs")),
+        "refs must address the same function by its id: {:?}",
+        refs.lines[0]
+    );
+    assert!(
+        !refs.lines[0].contains("src/cache.rs:"),
+        "refs points at no file line at all, the import block's or any other: {:?}",
         refs.lines[0]
     );
 }
@@ -311,8 +349,12 @@ async fn a_span_from_an_older_version_of_the_file_is_marked_stale() {
     );
 
     let refs = refs_response(&stale, "human_bytes@src/cache.rs");
+    let twin = twin_in(&stale, "src/cache.rs");
     assert!(
-        refs.lines[0].ends_with("@ src/cache.rs (span stale)"),
+        refs.lines[0].ends_with(&format!(
+            "{} (span stale)",
+            refs_address(&twin, "src/cache.rs")
+        )),
         "refs reads the same pointer: {:?}",
         refs.lines[0]
     );
@@ -384,9 +426,15 @@ async fn one_pin_reaches_one_entity_in_every_spelling_and_command() {
         .await
         .expect("impact");
     let refs = refs_response(&graph, "human_bytes@src/init_attempt.rs");
-    for first in [&by_flag.lines[0], &by_suffix.lines[0], &refs.lines[0]] {
+    for first in [&by_flag.lines[0], &by_suffix.lines[0]] {
         assert!(first.contains(&expected), "{first}");
     }
+    // `kin refs` names the entity by id rather than by a file line.
+    let address = refs_address(
+        &twin_in(&graph, "src/init_attempt.rs"),
+        "src/init_attempt.rs",
+    );
+    assert!(refs.lines[0].contains(&address), "{}", refs.lines[0]);
     for answer in [&by_flag.lines, &by_suffix.lines, &refs.lines] {
         assert!(
             !answer.join("\n").contains("names 5 entities"),
@@ -434,7 +482,9 @@ async fn refs_file_and_entity_kind_pin_which_twin_the_answer_is_about() {
         let refs = refs_response(&graph, &pinned);
         assert!(refs.error.is_none(), "{:?}", refs.lines);
         let header = &refs.lines[0];
-        assert!(header.contains(&expected), "pinned to {file}: {header}");
+        // `kin refs` names the entity by id, and `kin impact` by its line.
+        let address = refs_address(&twin_in(&graph, file), file);
+        assert!(header.contains(&address), "pinned to {file}: {header}");
 
         // The header says a pin chose, names it in the flags this command takes,
         // and names the definition it landed on. Without it the answer is silent
@@ -450,7 +500,7 @@ async fn refs_file_and_entity_kind_pin_which_twin_the_answer_is_about() {
             "the note must name the pin as this command takes it: {note}"
         );
         assert!(
-            note.contains(&expected) && note.contains("5 entities the name reaches"),
+            note.contains(&address) && note.contains("5 entities the name reaches"),
             "the note must name the definition and what the name alone reaches: {note}"
         );
         assert!(
@@ -555,8 +605,13 @@ fn each_twin_answers_only_the_caller_in_its_own_file() {
         let refs = refs_response(&graph, &format!("human_bytes@{file}"));
         assert!(refs.error.is_none(), "{:?}", refs.lines);
         let answer = refs.lines.join("\n");
+        let own_rows: Vec<&String> = refs
+            .lines
+            .iter()
+            .filter(|line| line.starts_with(&format!("  {own_caller} [")))
+            .collect();
         assert!(
-            answer.contains(&format!("  {own_caller} @ {file}")),
+            own_rows.len() == 1 && own_rows[0].contains(&format!("(projection: {file})")),
             "the twin in {file} is called by {own_caller} beside it: {answer}"
         );
         for (other_file, other_caller) in own_callers {
@@ -564,7 +619,7 @@ fn each_twin_answers_only_the_caller_in_its_own_file() {
                 continue;
             }
             assert!(
-                !answer.contains(&format!("  {other_caller} @ ")),
+                !answer.contains(&format!("  {other_caller} [")),
                 "{other_caller} calls the twin in {other_file}, not the one in {file}: {answer}"
             );
         }

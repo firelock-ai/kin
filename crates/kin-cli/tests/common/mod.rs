@@ -1847,6 +1847,14 @@ fn is_allowed_runtime_override(key: &OsStr) -> bool {
         // needs to set that budget, and it waits for its daemon to end before
         // Drop runs.
         "KIN_DAEMON_SHUTDOWN_GRACE_SECS",
+        // Fault injection a test sets on the one daemon it spawns to hold that
+        // start before it opens any state, or before it publishes its endpoint.
+        // Dropped here, the daemon starts unheld and a test about a stop that
+        // lands while it is starting races the start instead: on Linux the
+        // stop's image check outlasted the whole re-qualification, which then
+        // committed. Per-command levers, not repository or session authority.
+        "KIN_DAEMON_TEST_STARTUP_GATE",
+        "KIN_DAEMON_TEST_STARTUP_HOLD_SECS",
     ];
     !is_internal_runtime_capability(key)
         && (ALLOWED.iter().any(|allowed| env_os_name_eq(key, allowed))
@@ -1939,6 +1947,22 @@ fn runtime_authority_names_are_case_insensitive_on_windows() {
         !is_allowed_runtime_override(OsStr::new("kin_test_runtime_owner_token")),
         "mixed-case owner token became an allowed runtime override"
     );
+}
+
+/// The startup fault levers reach the daemon a test spawns with them. The
+/// isolation scrub once dropped the gate silently, so every test that held a
+/// starting daemon at it was racing an unheld start.
+#[test]
+fn runtime_bound_commands_carry_the_startup_fault_levers() {
+    for lever in [
+        "KIN_DAEMON_TEST_STARTUP_GATE",
+        "KIN_DAEMON_TEST_STARTUP_HOLD_SECS",
+    ] {
+        assert!(
+            is_allowed_test_override(true, OsStr::new(lever)),
+            "{lever} is scrubbed from the daemon a test spawns with it"
+        );
+    }
 }
 
 fn env_os_names_equal(left: &OsStr, right: &OsStr) -> bool {

@@ -21,6 +21,7 @@ pub mod proof;
 pub mod proof_context;
 pub mod protocol;
 pub mod registry;
+pub mod relation_identity;
 mod server_process;
 mod source_positions;
 mod typescript_call_hierarchy;

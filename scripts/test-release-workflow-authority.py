@@ -15626,8 +15626,21 @@ def main() -> None:
         "tr -d '\\r' < \"$f\" >> checksums-sha256.txt",
         "grep -q $'\\r' checksums-sha256.txt",
         "aggregate checksum file still contains carriage returns",
+        # A published sidecar with a CR cannot be verified by sha256sum -c, so
+        # the publisher refuses it rather than cleaning up the aggregate alone.
+        "if LC_ALL=C grep -q $'\\r' \"$f\"; then",
+        "contains a carriage return, so sha256sum -c cannot verify it",
     ):
         require(aggregate_step, policy, "cross-platform checksum aggregate")
+    inventory_start = aggregate_end
+    inventory_end = publish_job.index("\n      - ", inventory_start + 1)
+    inventory_step = publish_job[inventory_start:inventory_end]
+    for policy in (
+        'sha256sum -c "$asset.sha256"',
+        "printf '%s  %s\\n' \"$(sha256sum \"$asset\" | cut -d' ' -f1)\" \"$asset\"",
+        '| cmp -s - "$asset.sha256"',
+    ):
+        require(inventory_step, policy, "LF checksum sidecar inventory")
     if 'cat "$f" >> checksums-sha256.txt' in aggregate_step:
         raise AssertionError(
             "release checksum aggregation must not preserve Windows CRLF bytes"

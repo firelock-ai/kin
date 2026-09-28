@@ -157,6 +157,27 @@ async fn find_references(graph: &InMemoryGraph, target: &Entity) -> serde_json::
     serde_json::from_str(text).expect("find_references body is json")
 }
 
+/// The 1-based file lines the collector keys a served row's sites by, matched
+/// by the caller's entity id.
+///
+/// The wire addresses each site inside its caller and never by a file line,
+/// and this fixture strips entity spans, so a served site cannot say where it
+/// is. The exact lines are pinned here instead, at the collector the row is
+/// served from.
+fn collected_lines(graph: &InMemoryGraph, target: &Entity, served: &serde_json::Value) -> Vec<u32> {
+    kin_mcp::handlers::common::collect_graph_reference_rows(
+        graph,
+        &target.id,
+        &kin_mcp::handlers::common::default_reference_kinds(),
+        None,
+    )
+    .expect("collect reference rows")
+    .into_iter()
+    .find(|row| row.entity_id.as_deref() == served["entity_id"].as_str())
+    .unwrap_or_else(|| panic!("the collector holds no row for the served one: {served:#?}"))
+    .reference_lines
+}
+
 /// The same call, addressed by name instead of by raw entity id — the way a
 /// person or an agent actually asks for it, and the design's own bar:
 /// "addressable by its owner-qualified name".
@@ -244,13 +265,42 @@ async fn find_references_on_the_field_returns_read_and_write_sites_with_lines() 
         let row = by_caller
             .get(caller)
             .unwrap_or_else(|| panic!("no reference row for `{caller}`: {refs:#?}"));
+        // The wire serves each site inside its caller, and a spanless caller
+        // cannot place one, so the exact line is pinned at the collector.
         assert_eq!(
-            (*row)["reference_lines"],
-            serde_json::json!(expected_lines),
+            &collected_lines(graph, &target, row),
+            expected_lines,
             "{caller}'s row must carry the line its access is written on: {row:#?}"
         );
         assert_eq!(
-            (*row)["reference_lines_absent_reason"],
+            (*row)["site_count"],
+            serde_json::json!(expected_lines.len()),
+            "{caller}'s row serves one site per access: {row:#?}"
+        );
+        let sites = (*row)["sites"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{caller}'s row has a `sites` array: {row:#?}"));
+        assert_eq!(sites.len(), expected_lines.len(), "{row:#?}");
+        for site in sites {
+            assert_eq!(site["line_in_entity"], serde_json::Value::Null, "{row:#?}");
+            assert_eq!(
+                site["callee_unavailable"], "caller_has_no_span",
+                "the fixture removes entity spans on purpose: {row:#?}"
+            );
+        }
+        for retired in ["file_path", "start_line", "reference_lines"] {
+            assert!(
+                (*row).get(retired).is_none(),
+                "{caller}'s row carries no `{retired}`: {row:#?}"
+            );
+        }
+        assert_eq!(
+            (*row)["projection"]["path"],
+            "access.go",
+            "{caller}'s row is labelled with the file it is projected into: {row:#?}"
+        );
+        assert_eq!(
+            (*row)["sites_absent_reason"],
             serde_json::Value::Null,
             "{caller}'s row has a site, so it must claim no absence: {row:#?}"
         );

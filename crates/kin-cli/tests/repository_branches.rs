@@ -333,8 +333,14 @@ fn add_exact_refs(layout: &kin_core::KinLayout) {
         sealed_observation: None,
         collaboration_delta: None,
     };
+    // As the daemon commits a ref write: through the local binding-history
+    // verifier, which carries the store's checked lineage across a ref-only
+    // transition, so the next daemon start has nothing to re-qualify.
     let receipt = manager
-        .commit_repository_transaction(transaction)
+        .commit_repository_transaction_with_binding_history(
+            transaction,
+            &kin_index::binding_history::LocalBindingHistoryVerifier,
+        )
         .expect("commit exact refs");
     assert_eq!(receipt.generation, 2);
 }
@@ -821,14 +827,18 @@ fn branch_switch_projects_complete_polyglot_and_non_code_tree_from_repository_ca
         b'u', b'r', b'e', b'-', 0xff,
     ])
     .unwrap();
+    // As the daemon commits a ref write, carrying the checked lineage across.
     manager
-        .commit_repository_transaction(exact_ref_create_transaction(
-            &repository_id,
-            &roots,
-            raw_branch.clone(),
-            feature_target.clone(),
-            "install byte-exact switch target",
-        ))
+        .commit_repository_transaction_with_binding_history(
+            exact_ref_create_transaction(
+                &repository_id,
+                &roots,
+                raw_branch.clone(),
+                feature_target.clone(),
+                "install byte-exact switch target",
+            ),
+            &kin_index::binding_history::LocalBindingHistoryVerifier,
+        )
         .expect("commit byte-exact branch");
     pin_native_identity(&layout);
     // Hiding Git inside the working copy introduces ordinary untracked files
@@ -1665,5 +1675,100 @@ fn assert_workspace_blob(
             .expect("load exact source-CAS body")
             .expect("source-CAS body present"),
         expected_body
+    );
+}
+
+/// Whether the store's workspace graph carries checked binding history, the
+/// generation authority stands at, and how many changes a daemon's start
+/// recorded to re-qualify it, read with no daemon serving the store.
+#[cfg(unix)]
+fn lineage_reading(layout: &kin_core::KinLayout) -> (bool, u64, usize) {
+    let (_, manager) = open_authority(layout);
+    let lease = manager.read_authority();
+    let workspace = lease.metadata().workspaces[0].workspace_id;
+    let checked = lease
+        .workspace_graph_snapshot(&workspace)
+        .expect("materialize the workspace graph")
+        .expect("the workspace has a committed graph")
+        .verified_binding_history
+        .is_some();
+    let requalifications = lease
+        .snapshot()
+        .changes
+        .values()
+        .filter(|change| {
+            change
+                .message
+                .contains("The Kin daemon recorded this change when it started on this store")
+        })
+        .count();
+    (checked, lease.roots().generation, requalifications)
+}
+
+/// Branch create, delete and switch each carry the store's checked binding
+/// history across, so a daemon started afterwards finds it checked and
+/// re-derives nothing: it commits no generation and records no change.
+///
+/// Falsify by committing a branch ref through an ordinary commit: the create
+/// ends the lineage, and the next start re-derives every head and commits a
+/// re-qualification.
+#[cfg(unix)]
+#[test]
+fn branch_create_delete_and_switch_leave_a_daemon_start_nothing_to_requalify() {
+    let root = tempdir().expect("temp root");
+    let repo = root.path().join("repo");
+    initialize_git_repo(&repo);
+    add_feature_branch(&repo);
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    let layout = initialize_kin_repo(&runtime, &repo);
+    let stop = |what: &str| {
+        let stopped = run_kin(&runtime, &repo, &["daemon", "stop"]);
+        assert!(
+            stopped.status.success(),
+            "stop after {what}: stderr={}",
+            String::from_utf8_lossy(&stopped.stderr)
+        );
+    };
+    stop("init");
+    let (checked, _, requalified) = lineage_reading(&layout);
+    assert!(checked, "a store this build created starts checked");
+    assert_eq!(requalified, 0);
+
+    for (what, args) in [
+        ("create", &["branch", "create", "kept"][..]),
+        ("create", &["branch", "create", "doomed"][..]),
+        ("delete", &["branch", "delete", "doomed"][..]),
+        ("switch", &["branch", "switch", "feature"][..]),
+        ("switch back", &["branch", "switch", "main"][..]),
+    ] {
+        let output = run_kin(&runtime, &repo, args);
+        assert!(
+            output.status.success(),
+            "branch {what} failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        stop(what);
+        let (checked, _, requalified) = lineage_reading(&layout);
+        assert!(checked, "branch {what} ended the checked lineage");
+        assert_eq!(
+            requalified, 0,
+            "a start re-qualified the store after {what}"
+        );
+    }
+
+    // A fresh start over the store every operation above left behind.
+    let (_, generation, _) = lineage_reading(&layout);
+    let listed = run_kin(&runtime, &repo, &["branch", "list", "--json"]);
+    assert!(
+        listed.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    stop("the fresh start");
+    assert_eq!(
+        lineage_reading(&layout),
+        (true, generation, 0),
+        "a daemon start over a checked store must commit nothing"
     );
 }

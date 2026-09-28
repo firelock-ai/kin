@@ -62,6 +62,30 @@ pub async fn handle_tool_call<G: GraphStore>(
     repository_authority: Option<&RequestRepositoryAuthority>,
     host: WorkingCopySurface<'_>,
 ) -> Result<ToolCallResult> {
+    handle_tool_call_at(
+        tool_name,
+        arguments,
+        store,
+        sessions,
+        session_authority_mode,
+        repository_authority,
+        host,
+        common::EntitySourceScope::WorkspaceHead,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn handle_tool_call_at<G: GraphStore>(
+    tool_name: &str,
+    arguments: &HashMap<String, serde_json::Value>,
+    store: &G,
+    sessions: &SessionRegistry,
+    session_authority_mode: SessionAuthorityMode,
+    repository_authority: Option<&RequestRepositoryAuthority>,
+    host: WorkingCopySurface<'_>,
+    source_scope: common::EntitySourceScope,
+) -> Result<ToolCallResult> {
     let mut result = dispatch_tool_call(
         tool_name,
         arguments,
@@ -70,6 +94,7 @@ pub async fn handle_tool_call<G: GraphStore>(
         session_authority_mode,
         repository_authority,
         host,
+        source_scope,
     )
     .await?;
     attach_outside_graph(&mut result, arguments, store);
@@ -125,6 +150,7 @@ fn attach_outside_graph<G: GraphStore>(
 }
 
 /// The tool dispatch itself, wrapped by [`handle_tool_call`].
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_tool_call<G: GraphStore>(
     tool_name: &str,
     arguments: &HashMap<String, serde_json::Value>,
@@ -133,6 +159,7 @@ async fn dispatch_tool_call<G: GraphStore>(
     session_authority_mode: SessionAuthorityMode,
     repository_authority: Option<&RequestRepositoryAuthority>,
     _host: WorkingCopySurface<'_>,
+    source_scope: common::EntitySourceScope,
 ) -> Result<ToolCallResult> {
     if let Some(message) = crate::tools::retired_file_operation(tool_name) {
         return Err(crate::error::McpError::InvalidParams(message.into()));
@@ -164,7 +191,7 @@ async fn dispatch_tool_call<G: GraphStore>(
         "trace_computation" => {
             entities::handle_trace_computation(arguments, store, sessions, repository_authority)
         }
-        "trace_data_flow" => entities::handle_trace_data_flow(arguments, store),
+        "trace_data_flow" => entities::handle_trace_data_flow_unpaged(arguments, store),
         path::TOOL_NAME => path::handle_trace_path(arguments, store),
         "find_references" => {
             entities::handle_find_references(arguments, store, repository_authority).await
@@ -185,8 +212,23 @@ async fn dispatch_tool_call<G: GraphStore>(
         }
         // Review
         "semantic_diff" => review::handle_semantic_diff(arguments, store),
-        "impact_analysis" => review::handle_impact_analysis(arguments, store, sessions).await,
-        "semantic_review" => review::handle_semantic_review(arguments, store, sessions),
+        "impact_analysis" => {
+            review::handle_impact_analysis_with_source(
+                arguments,
+                store,
+                sessions,
+                repository_authority,
+                source_scope,
+            )
+            .await
+        }
+        "semantic_review" => review::handle_semantic_review_with_source(
+            arguments,
+            store,
+            sessions,
+            repository_authority,
+            source_scope,
+        ),
         "shadow_gate_report" => {
             review::handle_shadow_gate_report(arguments, store, repository_authority)
         }
@@ -203,13 +245,14 @@ async fn dispatch_tool_call<G: GraphStore>(
             sessions::handle_session_end(arguments, sessions, session_authority_mode).await
         }
         "kin_register_intent" => {
-            sessions::handle_register_intent(arguments, sessions, session_authority_mode).await
+            sessions::handle_register_intent(arguments, store, sessions, session_authority_mode)
+                .await
         }
         "kin_release_intent" => {
             sessions::handle_release_intent(arguments, sessions, session_authority_mode).await
         }
         "kin_check_traffic" => {
-            sessions::handle_check_traffic(arguments, sessions, session_authority_mode).await
+            sessions::handle_check_traffic(arguments, store, sessions, session_authority_mode).await
         }
         "kin_transaction_begin" => {
             sessions::handle_transaction_begin(arguments, sessions, session_authority_mode).await
@@ -1954,6 +1997,7 @@ mod tests {
 
         let result = sessions::handle_register_intent(
             &args,
+            &kin_db::InMemoryGraph::new(),
             &sessions,
             SessionAuthorityMode::OfflineFallback,
         )
@@ -2011,10 +2055,14 @@ mod tests {
             "scopes".into(),
             serde_json::json!([{ "Entity": entity_id }]),
         );
-        let result =
-            sessions::handle_check_traffic(&args, &sessions, SessionAuthorityMode::OfflineFallback)
-                .await
-                .unwrap();
+        let result = sessions::handle_check_traffic(
+            &args,
+            &kin_db::InMemoryGraph::new(),
+            &sessions,
+            SessionAuthorityMode::OfflineFallback,
+        )
+        .await
+        .unwrap();
         let text = match &result.content[0] {
             crate::types::ContentBlock::Text { text } => text.clone(),
         };
@@ -2042,6 +2090,7 @@ mod tests {
 
         let result = sessions::handle_register_intent(
             &args,
+            &kin_db::InMemoryGraph::new(),
             &sessions,
             SessionAuthorityMode::OfflineFallback,
         )
@@ -2585,6 +2634,379 @@ mod tests {
         }
     }
 
+    #[test]
+    fn analysis_escape_source_scopes_current_and_committed_cas_without_workspace_reads() {
+        use crate::call_sites::fixture::{ledger, proof_context};
+        use kin_model::{
+            ContextValidation, ContextValidationState, ResolutionRecord, ResolutionRecordDelta,
+        };
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        for value_escape in [false, true] {
+            let content = format!(
+                "export function target() {{ return 1; }}\nexport function consumer(callback: () => void) {{ callback(); }}\n{}",
+                if value_escape { "export function factory() { return target; }\n" } else { "" },
+            );
+            let fixture = make_source_backed_entity(&content);
+            let file = FilePathId::new("validate.ts");
+            let registry = kin_parser::AdapterRegistry::new();
+            let adapter = registry.get_by_language(LanguageId::TypeScript).unwrap();
+            let parsed = adapter
+                .extract(
+                    &adapter.parse(content.as_bytes()).unwrap(),
+                    content.as_bytes(),
+                    &file,
+                )
+                .unwrap();
+            let entities: Vec<_> = parsed
+                .entities
+                .into_iter()
+                .map(|entity| {
+                    entity.into_entity_with_source(
+                        LanguageId::TypeScript,
+                        &file,
+                        Some(content.as_bytes()),
+                    )
+                })
+                .collect();
+            let target = entities
+                .iter()
+                .find(|entity| entity.name == "target")
+                .unwrap();
+            let consumer = entities
+                .iter()
+                .find(|entity| entity.name == "consumer")
+                .unwrap();
+            let context = proof_context(LanguageId::TypeScript, "selected-source-test");
+            let proof = context.as_proof_context().unwrap().clone();
+            let mut records = vec![
+                context.clone(),
+                ResolutionRecord::ContextValidation(ContextValidation {
+                    language: LanguageId::TypeScript,
+                    state: ContextValidationState::Validated { context: proof },
+                }),
+            ];
+            for entity in &entities {
+                let span = entity.span.as_ref().unwrap();
+                let body = &content[span.start_byte..span.end_byte];
+                let mut record = ledger(entity, body, context.id(), vec![]);
+                if let ResolutionRecord::CallSites(ledger) = &mut record {
+                    ledger.body_hash = fixture.hash;
+                    if entity.id == consumer.id {
+                        ledger.census = 1;
+                        ledger.sites = vec![kin_model::CallSite {
+                            offset: body.rfind("callback").unwrap() as u32,
+                            length: "callback".len() as u32,
+                            state: kin_model::CallSiteState::Binding { may_call: None },
+                        }];
+                    }
+                }
+                records.push(record);
+            }
+            let mut change = build_exact_test_change(
+                entities.clone(),
+                vec![(
+                    fixture.artifact_id,
+                    kin_model::RepoPath::from_utf8("validate.ts").unwrap(),
+                    fixture.hash,
+                )],
+            );
+            change.resolution_record_deltas = records
+                .into_iter()
+                .map(|new| ResolutionRecordDelta::Added { new })
+                .collect();
+            change.id = kin_model::compute_semantic_change_id(&change).unwrap();
+            let graph = InMemoryGraph::new();
+            graph
+                .apply_transaction_delta(&kin_model::TransactionDelta {
+                    entity_deltas: change.entity_deltas.clone(),
+                    tree_deltas: change.tree_deltas.clone(),
+                    resolution_record_deltas: change.resolution_record_deltas.clone(),
+                    ..Default::default()
+                })
+                .unwrap();
+            graph.create_change(&change).unwrap();
+            initialize_test_repository(fixture._dir.path(), &change);
+            assert!(!fixture._dir.path().join("validate.ts").exists());
+            let authority = test_repository_authority(fixture._dir.path());
+            let source = review::AnalysisEscapeEvidence::new(
+                &graph,
+                Some(&authority),
+                EntitySourceScope::WorkspaceHead,
+            );
+            let evidence = |targets: &[Entity], at| source.observe(targets, at);
+            let observation = kin_review::enrichment::observe_selected_impact_with_source(
+                &graph,
+                std::slice::from_ref(target),
+                false,
+                Some(&evidence),
+            )
+            .unwrap();
+            assert_eq!(observation.bounds_answer(), value_escape);
+            assert_eq!(observation.selected_change, None);
+
+            // Removing live proof cannot rewrite the selected committed record.
+            let validation_id =
+                kin_model::ResolutionRecordId::context_validation(LanguageId::TypeScript);
+            let old = graph
+                .lookup_resolution_record(&validation_id)
+                .unwrap()
+                .unwrap();
+            graph
+                .apply_transaction_delta(&kin_model::TransactionDelta {
+                    resolution_record_deltas: vec![ResolutionRecordDelta::Removed { old }],
+                    ..Default::default()
+                })
+                .unwrap();
+            let historical = source.observe(std::slice::from_ref(target), Some(change.id));
+            assert_eq!(historical.selected_change, Some(change.id));
+            assert_eq!(historical.readings.len(), 1);
+            assert_eq!(historical.readings[0].may_escape(), value_escape);
+            let unavailable =
+                review::AnalysisEscapeEvidence::new(&graph, None, EntitySourceScope::At(change.id))
+                    .observe(std::slice::from_ref(target), None);
+            assert_eq!(unavailable.selected_change, Some(change.id));
+            assert!(unavailable.readings[0].may_escape());
+        }
+    }
+
+    #[tokio::test]
+    async fn historical_references_keep_committed_value_escape_after_head_removes_it() {
+        use crate::call_sites::fixture::{ledger, proof_context};
+        use crate::handlers::external_symbols::SiteText;
+        use kin_model::{
+            ContextValidation, ContextValidationState, ResolutionRecord, ResolutionRecordDelta,
+        };
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let before = "export function target() { return 1; }\nexport function consumer(callback: () => void) { callback(); }\nexport function factory() { return target; }\n";
+        let after = before.replace("return target", "return 123456");
+        assert_eq!(before.len(), after.len());
+        let fixture = make_source_backed_entity(before);
+        let file = FilePathId::new("validate.ts");
+        let parse = |content: &str| -> Vec<Entity> {
+            let registry = kin_parser::AdapterRegistry::new();
+            let adapter = registry.get_by_language(LanguageId::TypeScript).unwrap();
+            adapter
+                .extract(
+                    &adapter.parse(content.as_bytes()).unwrap(),
+                    content.as_bytes(),
+                    &file,
+                )
+                .unwrap()
+                .entities
+                .into_iter()
+                .map(|entity| {
+                    let mut entity = entity.into_entity_with_source(
+                        LanguageId::TypeScript,
+                        &file,
+                        Some(content.as_bytes()),
+                    );
+                    // Exercise exact selected CAS bytes rather than a preview.
+                    entity
+                        .metadata
+                        .extra
+                        .remove(kin_parser::extract::EMBEDDING_BODY_PREVIEW_KEY);
+                    entity
+                })
+                .collect()
+        };
+        let old_entities = parse(before);
+        let new_entities = parse(&after);
+        let target = old_entities
+            .iter()
+            .find(|entity| entity.name == "target")
+            .unwrap();
+        let consumer = old_entities
+            .iter()
+            .find(|entity| entity.name == "consumer")
+            .unwrap();
+        let factory = old_entities
+            .iter()
+            .find(|entity| entity.name == "factory")
+            .unwrap();
+        let context = proof_context(LanguageId::TypeScript, "historical-reference-test");
+        let records =
+            |entities: &[Entity], content: &str, hash: Hash256| -> Vec<ResolutionRecord> {
+                entities
+                    .iter()
+                    .map(|entity| {
+                        let span = entity.span.as_ref().unwrap();
+                        let body = &content[span.start_byte..span.end_byte];
+                        let mut record = ledger(entity, body, context.id(), vec![]);
+                        let ResolutionRecord::CallSites(sites) = &mut record else {
+                            unreachable!()
+                        };
+                        sites.body_hash = hash;
+                        if entity.name == "consumer" {
+                            sites.census = 1;
+                            sites.sites = vec![kin_model::CallSite {
+                                offset: body.rfind("callback").unwrap() as u32,
+                                length: "callback".len() as u32,
+                                state: kin_model::CallSiteState::Binding { may_call: None },
+                            }];
+                        }
+                        record
+                    })
+                    .collect()
+            };
+        let old_records = records(&old_entities, before, fixture.hash);
+        let path = kin_model::RepoPath::from_utf8("validate.ts").unwrap();
+        let mut old_change = build_exact_test_change(
+            old_entities.clone(),
+            vec![(fixture.artifact_id, path.clone(), fixture.hash)],
+        );
+        old_change.resolution_record_deltas = [
+            context.clone(),
+            ResolutionRecord::ContextValidation(ContextValidation {
+                language: LanguageId::TypeScript,
+                state: ContextValidationState::Validated {
+                    context: context.as_proof_context().unwrap().clone(),
+                },
+            }),
+        ]
+        .into_iter()
+        .chain(old_records.iter().cloned())
+        .map(|new| ResolutionRecordDelta::Added { new })
+        .collect();
+        old_change.id = kin_model::compute_semantic_change_id(&old_change).unwrap();
+        let selected = InMemoryGraph::new();
+        let current = InMemoryGraph::new();
+        for graph in [&selected, &current] {
+            graph
+                .apply_transaction_delta(&kin_model::TransactionDelta {
+                    entity_deltas: old_change.entity_deltas.clone(),
+                    tree_deltas: old_change.tree_deltas.clone(),
+                    resolution_record_deltas: old_change.resolution_record_deltas.clone(),
+                    ..Default::default()
+                })
+                .unwrap();
+            graph.create_change(&old_change).unwrap();
+        }
+        initialize_test_repository(fixture._dir.path(), &old_change);
+        let blobs = kin_blobs::BlobStore::new(fixture._dir.path().join(".kin/objects")).unwrap();
+        let new_hash = model_blob_hash(&blobs, after.as_bytes());
+        let new_records = records(&new_entities, &after, new_hash);
+        let mut new_change = exact_test_change(
+            vec![old_change.id],
+            "remove the escaped value at head",
+            new_entities
+                .iter()
+                .filter_map(|new| {
+                    let old = old_entities.iter().find(|old| old.id == new.id).unwrap();
+                    (old != new).then(|| kin_model::EntityDelta::Modified {
+                        old: old.clone(),
+                        new: new.clone(),
+                    })
+                })
+                .collect(),
+            vec![kin_model::TreeDelta::Updated {
+                artifact_id: fixture.artifact_id,
+                old: kin_model::LocatedEntry::new(
+                    path.clone(),
+                    kin_model::TreeEntry::blob(fixture.hash, false),
+                ),
+                new: kin_model::LocatedEntry::new(
+                    path,
+                    kin_model::TreeEntry::blob(new_hash, false),
+                ),
+            }],
+        );
+        assert!(
+            new_change.entity_deltas.iter().any(|delta| {
+                matches!(delta, kin_model::EntityDelta::Modified { old, new }
+                if old.id == factory.id && old.fingerprint != new.fingerprint)
+            }),
+            "the factory has an actual parsed semantic change"
+        );
+        new_change.resolution_record_deltas = new_records
+            .into_iter()
+            .map(|new| ResolutionRecordDelta::Modified {
+                old: old_records
+                    .iter()
+                    .find(|old| old.id() == new.id())
+                    .unwrap()
+                    .clone(),
+                new,
+            })
+            .collect();
+        new_change.id = kin_model::compute_semantic_change_id(&new_change).unwrap();
+        current
+            .apply_transaction_delta(&kin_model::TransactionDelta {
+                entity_deltas: new_change.entity_deltas.clone(),
+                tree_deltas: new_change.tree_deltas.clone(),
+                resolution_record_deltas: new_change.resolution_record_deltas.clone(),
+                ..Default::default()
+            })
+            .unwrap();
+        current.create_change(&new_change).unwrap();
+        advance_test_repository(fixture._dir.path(), &new_change);
+        let authority = test_repository_authority(fixture._dir.path());
+        assert!(!fixture._dir.path().join("validate.ts").exists());
+        let args = HashMap::from([("entity_id".into(), serde_json::json!(target.id.to_string()))]);
+        let historical = tool_result_json(
+            entities::handle_find_references_with_authority_at(
+                &args,
+                &selected,
+                entities::FindReferencesAuthority {
+                    repo_id: "selected-source-test",
+                    graph_root: "committed",
+                    spine: kin_spine::DaemonSpine::Absent,
+                },
+                Some(&authority),
+                EntitySourceScope::At(old_change.id),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(
+            historical["call_sites"]["focal_escape"]["escape"], "escapes",
+            "{historical}"
+        );
+        assert_eq!(historical["call_sites"]["settled"], false);
+        assert_eq!(historical["call_sites"]["candidate_count"], 1);
+        assert_eq!(
+            historical["call_sites"]["candidates"][0]["caller"],
+            consumer.id.to_string()
+        );
+        let head = tool_result_json(
+            entities::handle_find_references_with_authority_at(
+                &args,
+                &current,
+                entities::FindReferencesAuthority {
+                    repo_id: "selected-source-test",
+                    graph_root: "head",
+                    spine: kin_spine::DaemonSpine::Absent,
+                },
+                Some(&authority),
+                EntitySourceScope::WorkspaceHead,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(
+            head["call_sites"]["focal_escape"]["escape"], "contained",
+            "{head}"
+        );
+        assert_eq!(head["call_sites"]["candidate_count"], 0);
+        // Exact semantic quotes use the same historical scope as the census.
+        let held = HeldSourceAuthority::new(&selected, Some(&authority));
+        let text = external_symbols::CalleeText::with_read_limit_at(
+            &held,
+            1,
+            EntitySourceScope::At(old_change.id),
+        );
+        let span = factory.span.as_ref().unwrap();
+        assert_eq!(
+            text.quote(factory, span).unwrap(),
+            before[span.start_byte..span.end_byte]
+        );
+    }
+
     impl GraphBackedSource {
         fn install(&self, store: &InMemoryGraph) -> SemanticChangeId {
             use kin_model::graph::{ChangeStore, EntityStore};
@@ -2937,8 +3359,20 @@ mod tests {
                 ),
             ],
         );
+        let validation =
+            kin_model::ResolutionRecord::ContextValidation(kin_model::ContextValidation {
+                language: entity.language,
+                state: kin_model::ContextValidationState::Validated {
+                    context: context.as_proof_context().unwrap().clone(),
+                },
+            });
         store.resolution_records.insert(context_id, context);
+        store.resolution_records.insert(validation.id(), validation);
         store.resolution_records.insert(ledger.id(), ledger);
+        assert!(matches!(
+            kin_model::read_caller_sites(&crate::call_sites::GraphSiteFacts::new(&store), entity),
+            kin_model::CallerSites::Current(_)
+        ));
 
         let expected = serde_json::json!([
             {
@@ -3108,7 +3542,7 @@ mod tests {
     /// `find_references` must answer "where is this used" with graph facts, not
     /// with a base position an agent has to count forward from.
     #[test]
-    fn find_references_rows_carry_graph_owned_snippets_and_one_based_site_lines() {
+    fn find_references_rows_carry_graph_owned_snippets_and_sites_inside_the_caller() {
         let _lock = ENV_MUTEX
             .get_or_init(|| Mutex::new(()))
             .lock()
@@ -3163,12 +3597,12 @@ mod tests {
             evidence: vec![kin_model::relation::RelationEvidence {
                 source_span: Some(kin_model::entity::SourceSpan {
                     file: caller_file,
-                    start_byte: 63,
-                    end_byte: 105,
+                    start_byte: 71,
+                    end_byte: 109,
                     start_line: call_site_row,
-                    start_col: 2,
+                    start_col: 9,
                     end_line: call_site_row,
-                    end_col: 44,
+                    end_col: 47,
                 }),
                 parser_rule: Some("call_expression".into()),
                 token: Some("validate_probe_range_1d8f8275".into()),
@@ -3209,14 +3643,23 @@ mod tests {
         );
 
         assert_eq!(
-            row.start_line,
-            Some(1),
-            "the caller's definition starts on line 1"
-        );
-        assert_eq!(
             row.reference_lines,
             vec![call_site_row + 1],
-            "the call site is served as a graph fact at its own 1-based line"
+            "the call site is keyed by its own line, a graph fact"
+        );
+        // Served inside the caller: two lines below its first, with the text at
+        // the site cut from its own body, never as a file line.
+        let sites: Vec<serde_json::Value> = common::served_reference_sites(row)
+            .into_iter()
+            .map(common::ReferenceSite::to_json)
+            .collect();
+        assert_eq!(
+            sites,
+            vec![serde_json::json!({
+                "line_in_entity": call_site_row,
+                "callee": "validate_probe_range_1d8f8275",
+            })],
+            "{row:?}"
         );
     }
 
@@ -4883,8 +5326,20 @@ mod tests {
             context_id,
             vec![("validate_range", kin_model::CallSiteState::ProvenOutside); 30],
         );
+        let validation =
+            kin_model::ResolutionRecord::ContextValidation(kin_model::ContextValidation {
+                language: entity.language,
+                state: kin_model::ContextValidationState::Validated {
+                    context: context.as_proof_context().unwrap().clone(),
+                },
+            });
         store.resolution_records.insert(context_id, context);
+        store.resolution_records.insert(validation.id(), validation);
         store.resolution_records.insert(ledger.id(), ledger);
+        assert!(matches!(
+            kin_model::read_caller_sites(&crate::call_sites::GraphSiteFacts::new(&store), entity),
+            kin_model::CallerSites::Current(_)
+        ));
         let authority = test_repository_authority(source._dir.path());
         let sessions = crate::session::SessionRegistry::empty_for_test();
         // The budget leaves room for the focal's body beside the fixed blocks
@@ -7329,6 +7784,7 @@ mod tests {
             state: "active".into(),
             staged_operations: Vec::new(),
             commit_payload_hash: None,
+            created_at: None,
             last_activity_at: kin_model::timestamp::Timestamp::now(),
         }]);
         let stage = sessions::handle_transaction_stage(
@@ -10588,6 +11044,135 @@ mod tests {
                 .iter()
                 .any(|row| row.file_path.as_deref() == Some("src/deleted_caller.ts")),
             "a caller the current workspace does not contain is skipped here too: {members:?}"
+        );
+    }
+
+    /// A reference row addresses each site inside its caller: the line counted
+    /// from 0 at the caller's first line, and the text at the site cut from
+    /// the caller's own body through the request's authority, with a call's
+    /// argument list left out. A site outside the caller's span keeps no line
+    /// and says why it has no text. The membership form reads no body and
+    /// addresses nothing.
+    #[test]
+    fn a_reference_row_addresses_each_site_inside_its_caller() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        reset_trace_source_registry();
+        let dir = tempdir().unwrap();
+        let kin_dir = dir.path().join(".kin");
+        fs::create_dir_all(&kin_dir).unwrap();
+        let _guard = EnvVarGuard::set("KIN_SOURCE_ROOT", dir.path());
+        let blob_store = kin_blobs::BlobStore::new(kin_dir.join("objects")).unwrap();
+
+        let mut store = EmptyStore::default();
+        let target_content = "export function target(x: number) { return x; }\n";
+        let target_hash = blob_store.write(target_content.as_bytes()).unwrap();
+        let target_file = FilePathId::new("src/target.ts");
+        store.file_hashes.insert(target_file.clone(), target_hash);
+        let mut target = whole_file_entity(&target_file, target_content, Some(target_hash));
+        target.name = "target".into();
+        store.insert_test_entity(target.clone());
+
+        let caller_content = "// helpers\n\
+                              export function caller() {\n  \
+                              const a = target(1);\n  \
+                              return a + other.target(\n    \
+                              2,\n  \
+                              );\n\
+                              }\n";
+        let caller_hash = blob_store.write(caller_content.as_bytes()).unwrap();
+        let caller_file = FilePathId::new("src/caller.ts");
+        store.file_hashes.insert(caller_file.clone(), caller_hash);
+        let mut caller = whole_file_entity(&caller_file, caller_content, Some(caller_hash));
+        caller.name = "caller".into();
+        // The caller starts on the file's second line, so an entity-relative
+        // line and a file line differ by one.
+        let body_start = caller_content.find("export").unwrap();
+        let span = caller.span.as_mut().unwrap();
+        span.start_byte = body_start;
+        span.start_line = 1;
+        span.end_line = 6;
+        store.insert_test_entity(caller.clone());
+
+        let site = |text: &str, line: u32, end_line: u32| {
+            let start = caller_content.find(text).unwrap();
+            kin_model::RelationEvidence {
+                source_span: Some(kin_model::entity::SourceSpan {
+                    file: caller_file.clone(),
+                    start_byte: start,
+                    end_byte: start + text.len(),
+                    start_line: line,
+                    start_col: 0,
+                    end_line,
+                    end_col: 0,
+                }),
+                ..Default::default()
+            }
+        };
+        let relation = Relation {
+            id: RelationId::new(),
+            kind: RelationKind::Calls,
+            src: kin_model::GraphNodeId::Entity(caller.id),
+            dst: kin_model::GraphNodeId::Entity(target.id),
+            confidence: 1.0,
+            origin: kin_model::relation::RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+            evidence: vec![
+                site("other.target(\n    2,\n  )", 3, 5),
+                site("target(1)", 2, 2),
+                site("// helpers", 0, 0),
+            ],
+        };
+        for entity in [caller.id, target.id] {
+            store
+                .relations_by_entity
+                .entry(entity)
+                .or_default()
+                .push(relation.clone());
+        }
+        install_empty_store_exact_tree(&mut store, dir.path());
+
+        let authority = test_repository_authority(dir.path());
+        let rows = collect_graph_reference_rows(
+            &store,
+            &target.id,
+            &[RelationKind::Calls],
+            Some(&authority),
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let sites: Vec<serde_json::Value> = common::served_reference_sites(&rows[0])
+            .into_iter()
+            .map(common::ReferenceSite::to_json)
+            .collect();
+        assert_eq!(
+            sites,
+            vec![
+                serde_json::json!({
+                    "line_in_entity": null,
+                    "callee": null,
+                    "callee_unavailable": "site_outside_caller",
+                }),
+                serde_json::json!({ "line_in_entity": 1, "callee": "target" }),
+                serde_json::json!({ "line_in_entity": 2, "callee": "other.target" }),
+            ],
+            "each site inside its caller, never a file line"
+        );
+
+        let members = collect_graph_reference_members(
+            &store,
+            &target.id,
+            &[RelationKind::Calls],
+            Some(&authority),
+        )
+        .unwrap();
+        assert_eq!(members.len(), 1);
+        assert!(
+            members[0].site_addresses.is_empty(),
+            "the membership form reads no body, so it addresses no site: {members:?}"
         );
     }
 

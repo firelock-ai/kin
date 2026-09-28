@@ -50,6 +50,53 @@ use kin_model::{
     ArtifactKind, Entity, EntityKind, OpaqueArtifact, ShallowTrackedFile, StructuredArtifact,
 };
 
+/// Per-call embedding work observer. Completed computation is distinct from
+/// indexed or durable vectors. Implementations must not infer progress from a
+/// dispatch, timer, CPU usage, or a cache lookup.
+pub trait EmbeddingWork: Send + Sync {
+    fn cancelled(&self) -> bool {
+        false
+    }
+
+    fn completed_chunk(&self, _vectors: usize) {}
+
+    fn checkpoint(&self) -> Result<(), KinDbError> {
+        if self.cancelled() {
+            Err(KinDbError::EmbeddingCancelled)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Enter the indivisible index publication only after cancellation is
+    /// checked. Supervisors may override this to hold their publication guard.
+    fn publish(
+        &self,
+        publication: Box<dyn FnOnce() -> Result<usize, KinDbError> + '_>,
+    ) -> Result<usize, KinDbError> {
+        self.checkpoint()?;
+        publication()
+    }
+}
+
+impl EmbeddingWork for () {}
+
+#[cfg(feature = "embeddings")]
+fn observe_completed_chunk<T>(
+    work: &dyn EmbeddingWork,
+    expected_vectors: usize,
+    compute: impl FnOnce() -> Result<Vec<T>, KinDbError>,
+    finite: impl Fn(&T) -> bool,
+) -> Result<Vec<T>, KinDbError> {
+    work.checkpoint()?;
+    let chunk = compute()?;
+    if expected_vectors > 0 && chunk.len() == expected_vectors && chunk.iter().all(finite) {
+        work.completed_chunk(chunk.len());
+    }
+    work.checkpoint()?;
+    Ok(chunk)
+}
+
 // ---------------------------------------------------------------------------
 // Embed stage timing
 // ---------------------------------------------------------------------------
@@ -591,6 +638,59 @@ const DEFAULT_OPENAI_EMBED_MODEL_ID: &str = "text-embedding-3-small";
 /// Default model revision.
 #[cfg(feature = "embeddings")]
 const DEFAULT_REVISION: &str = "main";
+
+/// Decides whether this process may download embedding model files that the
+/// Hugging Face cache does not already hold.
+///
+/// `kin-db` cannot see the choices an operator recorded, so the binary that
+/// embeds installs one at startup. `kin` and `kin-daemon` install a gate that
+/// reads the model-download decision `kin setup` recorded. A machine that
+/// declined the download then never fetches the model, whichever trigger
+/// reaches the embedder: the daemon's background pass, a query, `kin init`'s
+/// first embed pass or `kin embed`. A model already in the cache loads without
+/// asking, because loading it downloads nothing. With no gate installed, a
+/// fetch is allowed, as it always was.
+///
+/// The error is the sentence a caller reports.
+pub type ModelFetchGate = fn(model_id: &str) -> std::result::Result<(), String>;
+
+static MODEL_FETCH_GATE: std::sync::OnceLock<ModelFetchGate> = std::sync::OnceLock::new();
+
+/// Install this process's [`ModelFetchGate`].
+///
+/// The first gate installed stays for the life of the process, and a later
+/// call returns `false`.
+pub fn install_model_fetch_gate(gate: ModelFetchGate) -> bool {
+    MODEL_FETCH_GATE.set(gate).is_ok()
+}
+
+/// The files [`CodeEmbedder::with_model`] loads from a Hugging Face model
+/// repository, in the order it loads them.
+#[cfg(feature = "embeddings")]
+const HUB_MODEL_FILES: [&str; 3] = ["config.json", "tokenizer.json", "model.safetensors"];
+
+/// Resolve a hub model's files, from the cache when it holds all of them, and
+/// otherwise only after `gate` allows a download.
+///
+/// `cached` reads the local cache and nothing else. `fetch` is the only path
+/// here that can reach the network. It runs only when a file is missing from
+/// the cache and the gate, if one is installed, allows it. A refused fetch
+/// returns the gate's sentence without calling `fetch` at all.
+#[cfg(feature = "embeddings")]
+fn resolve_hub_model_files(
+    model_id: &str,
+    cached: impl Fn(&str) -> Option<PathBuf>,
+    gate: Option<ModelFetchGate>,
+    fetch: impl FnOnce() -> Result<[PathBuf; 3], KinDbError>,
+) -> Result<[PathBuf; 3], KinDbError> {
+    if let [Some(config), Some(tokenizer), Some(weights)] = HUB_MODEL_FILES.map(&cached) {
+        return Ok([config, tokenizer, weights]);
+    }
+    if let Some(gate) = gate {
+        gate(model_id).map_err(KinDbError::IndexError)?;
+    }
+    fetch()
+}
 
 /// Serializes `--lib` unit tests that build a real [`CodeEmbedder`] against
 /// the shared on-disk HuggingFace Hub cache
@@ -1168,20 +1268,31 @@ impl CodeEmbedder {
         } else {
             let repo =
                 Repo::with_revision(model_id.to_string(), RepoType::Model, revision.to_string());
-            let api = Api::new().map_err(|e| {
-                KinDbError::IndexError(format!("failed to initialise HuggingFace API: {e}"))
-            })?;
-            let api = api.repo(repo);
+            // The same cache `Api::new()` reads before it downloads anything,
+            // so a model it would load without a fetch loads here too.
+            let cache = hf_hub::Cache::default().repo(repo.clone());
+            let [config_path, tokenizer_path, weights_path] = resolve_hub_model_files(
+                model_id,
+                |file| cache.get(file),
+                MODEL_FETCH_GATE.get().copied(),
+                || {
+                    let api = Api::new().map_err(|e| {
+                        KinDbError::IndexError(format!("failed to initialise HuggingFace API: {e}"))
+                    })?;
+                    let api = api.repo(repo);
 
-            let config_path = api.get("config.json").map_err(|e| {
-                KinDbError::IndexError(format!("failed to download model config: {e}"))
-            })?;
-            let tokenizer_path = api.get("tokenizer.json").map_err(|e| {
-                KinDbError::IndexError(format!("failed to download tokenizer: {e}"))
-            })?;
-            let weights_path = api.get("model.safetensors").map_err(|e| {
-                KinDbError::IndexError(format!("failed to download model weights: {e}"))
-            })?;
+                    let config_path = api.get("config.json").map_err(|e| {
+                        KinDbError::IndexError(format!("failed to download model config: {e}"))
+                    })?;
+                    let tokenizer_path = api.get("tokenizer.json").map_err(|e| {
+                        KinDbError::IndexError(format!("failed to download tokenizer: {e}"))
+                    })?;
+                    let weights_path = api.get("model.safetensors").map_err(|e| {
+                        KinDbError::IndexError(format!("failed to download model weights: {e}"))
+                    })?;
+                    Ok([config_path, tokenizer_path, weights_path])
+                },
+            )?;
             (config_path, tokenizer_path, weights_path)
         };
 
@@ -1357,7 +1468,7 @@ impl CodeEmbedder {
         let _span =
             tracing::info_span!("kindb.embedder.embed_text", text_len = text.len()).entered();
         let mut batch =
-            self.embed_batch_for_role(&[text.to_string()], EmbeddingInputRole::Query)?;
+            self.embed_batch_for_role(&[text.to_string()], EmbeddingInputRole::Query, &())?;
         batch
             .vectors
             .pop()
@@ -1389,7 +1500,17 @@ impl CodeEmbedder {
         &self,
         texts: &[String],
     ) -> Result<ProducedEmbeddingBatch, KinDbError> {
-        self.embed_batch_for_role(texts, EmbeddingInputRole::Document)
+        self.embed_batch_for_role(texts, EmbeddingInputRole::Document, &())
+    }
+
+    /// Embed with per-call completed-computation and cancellation observation.
+    #[cfg(feature = "embeddings")]
+    pub fn embed_batch_with_producers_observed(
+        &self,
+        texts: &[String],
+        work: &dyn EmbeddingWork,
+    ) -> Result<ProducedEmbeddingBatch, KinDbError> {
+        self.embed_batch_for_role(texts, EmbeddingInputRole::Document, work)
     }
 
     /// Batch-embed multiple raw queries as query roles.
@@ -1417,7 +1538,7 @@ impl CodeEmbedder {
             queries = queries.len()
         )
         .entered();
-        self.embed_batch_for_role(queries, EmbeddingInputRole::Query)
+        self.embed_batch_for_role(queries, EmbeddingInputRole::Query, &())
     }
 
     #[cfg(feature = "embeddings")]
@@ -1425,7 +1546,9 @@ impl CodeEmbedder {
         &self,
         texts: &[String],
         role: EmbeddingInputRole,
+        work: &dyn EmbeddingWork,
     ) -> Result<ProducedEmbeddingBatch, KinDbError> {
+        work.checkpoint()?;
         if texts.is_empty() {
             return Ok(ProducedEmbeddingBatch::empty());
         }
@@ -1473,10 +1596,11 @@ impl CodeEmbedder {
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            work.checkpoint()?;
             return Ok(produced_batch_from_attributed(attributed));
         }
 
-        let missing_results = self.embed_uncached_batch(&missing_texts)?;
+        let missing_results = self.embed_uncached_batch(&missing_texts, work)?;
         if missing_results.len() != missing_texts.len() {
             return Err(KinDbError::IndexError(format!(
                 "embedding endpoint returned {} vectors for {} inputs",
@@ -1506,6 +1630,7 @@ impl CodeEmbedder {
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
+        work.checkpoint()?;
         Ok(produced_batch_from_attributed(attributed))
     }
 
@@ -1524,29 +1649,44 @@ impl CodeEmbedder {
     }
 
     #[cfg(feature = "embeddings")]
-    fn embed_uncached_batch(&self, texts: &[&str]) -> Result<Vec<AttributedEmbedding>, KinDbError> {
+    fn embed_uncached_batch(
+        &self,
+        texts: &[&str],
+        work: &dyn EmbeddingWork,
+    ) -> Result<Vec<AttributedEmbedding>, KinDbError> {
         match &self.backend {
             CodeEmbedderBackend::Bert(embedder) => {
-                embedder.embed_uncached_batch(texts, self.dimensions)
+                embedder.embed_uncached_batch(texts, self.dimensions, work)
             }
-            CodeEmbedderBackend::OpenAiCompat(embedder) => Ok(embedder
-                .embed_batch(texts)?
-                .into_iter()
-                .map(AttributedEmbedding::remote)
-                .collect()),
+            CodeEmbedderBackend::OpenAiCompat(embedder) => Ok(observe_completed_chunk(
+                work,
+                texts.len(),
+                || embedder.embed_batch(texts),
+                |vector| vector.iter().all(|value| value.is_finite()),
+            )?
+            .into_iter()
+            .map(AttributedEmbedding::remote)
+            .collect()),
             #[cfg(test)]
             CodeEmbedderBackend::TestLocalRuntime(runtime) => {
                 let token_ids = vec![vec![1u32]; texts.len()];
                 let attention_masks = vec![vec![1u32]; texts.len()];
                 let indices: Vec<usize> = (0..texts.len()).collect();
-                let placed = process_chunk_with_runtime(
-                    runtime,
-                    runtime.route,
-                    &token_ids,
-                    &attention_masks,
-                    &indices,
-                    1,
-                    self.dimensions,
+                let placed = observe_completed_chunk(
+                    work,
+                    texts.len(),
+                    || {
+                        process_chunk_with_runtime(
+                            runtime,
+                            runtime.route,
+                            &token_ids,
+                            &attention_masks,
+                            &indices,
+                            1,
+                            self.dimensions,
+                        )
+                    },
+                    |(_, vector, _)| vector.iter().all(|value| value.is_finite()),
                 )?;
                 scatter_attributed(placed, texts.len())
             }
@@ -1628,6 +1768,7 @@ impl BertEmbedder {
         &self,
         texts: &[&str],
         dimensions: usize,
+        work: &dyn EmbeddingWork,
     ) -> Result<Vec<AttributedEmbedding>, KinDbError> {
         let encodings = {
             let _span =
@@ -1659,10 +1800,11 @@ impl BertEmbedder {
 
         let mode = hybrid_mode(self.model.backend());
         if mode != HybridMode::Off {
-            return self.embed_hybrid(batch, dimensions, budget, texts.len(), mode);
+            return self.embed_hybrid(batch, dimensions, budget, texts.len(), mode, work);
         }
 
-        let placed = self.process_encoded_subset(batch.as_slice(), dimensions, budget, None)?;
+        let placed =
+            self.process_encoded_subset(batch.as_slice(), dimensions, budget, None, work)?;
         scatter_attributed(placed, texts.len())
     }
 
@@ -1673,6 +1815,7 @@ impl BertEmbedder {
         budget: BatchBudget,
         total: usize,
         mode: HybridMode,
+        work: &dyn EmbeddingWork,
     ) -> Result<Vec<AttributedEmbedding>, KinDbError> {
         let placed = match mode {
             HybridMode::Off => unreachable!("embed_hybrid is only called for enabled modes"),
@@ -1681,7 +1824,7 @@ impl BertEmbedder {
                     // A sequence longer than the truncation cap is present: keep
                     // the over-cap entities on the CPU twin and the rest on the GPU.
                     let (short, long) = batch.as_slice().split_at(cpu_from);
-                    self.dispatch_concurrent(short, long, dimensions, budget, false)?
+                    self.dispatch_concurrent(short, long, dimensions, budget, false, work)?
                 }
                 SeqFloorRoute::Degenerate => {
                     // Every entity sits at or under the truncation cap, so the
@@ -1693,7 +1836,13 @@ impl BertEmbedder {
                     // decision when it does not — instead of silently collapsing to
                     // a single GPU arm that looks like a balanced hybrid.
                     hybrid_metrics::record_seqfloor_degenerate_batch();
-                    self.dispatch_adaptive_balanced(batch.as_slice(), dimensions, budget, None)?
+                    self.dispatch_adaptive_balanced(
+                        batch.as_slice(),
+                        dimensions,
+                        budget,
+                        None,
+                        work,
+                    )?
                 }
             },
             HybridMode::Balanced { gpu_tput_ratio } => self.dispatch_adaptive_balanced(
@@ -1701,6 +1850,7 @@ impl BertEmbedder {
                 dimensions,
                 budget,
                 gpu_tput_ratio,
+                work,
             )?,
         };
 
@@ -1721,6 +1871,7 @@ impl BertEmbedder {
         dimensions: usize,
         budget: BatchBudget,
         gpu_tput_ratio: Option<f64>,
+        work: &dyn EmbeddingWork,
     ) -> Result<Vec<(usize, Vec<f32>, EmbeddingProducer)>, KinDbError> {
         let (plan, adaptive) = match gpu_tput_ratio {
             Some(fixed) => (
@@ -1749,7 +1900,7 @@ impl BertEmbedder {
                     cpu_twin_used = false,
                     "embed_hybrid_dispatch"
                 );
-                self.process_encoded_subset(batch, dimensions, budget, None)
+                self.process_encoded_subset(batch, dimensions, budget, None, work)
             }
             adaptive_split::SplitPlan::Balanced {
                 ratio,
@@ -1775,6 +1926,7 @@ impl BertEmbedder {
                     dimensions,
                     budget,
                     adaptive,
+                    work,
                 )
             }
         }
@@ -1786,6 +1938,7 @@ impl BertEmbedder {
         dimensions: usize,
         budget: BatchBudget,
         route_override: Option<EmbedDispatchRoute>,
+        work: &dyn EmbeddingWork,
     ) -> Result<Vec<(usize, Vec<f32>, EmbeddingProducer)>, KinDbError> {
         // Pack the length-sorted run into sub-batch ranges up front.
         let mut ranges: Vec<(usize, usize, usize)> = Vec::new();
@@ -1834,6 +1987,7 @@ impl BertEmbedder {
                         &batch.idx[s..e],
                         longest,
                         dimensions,
+                        work,
                     )
                 })
                 .collect::<Result<Vec<_>, KinDbError>>()?;
@@ -1855,6 +2009,7 @@ impl BertEmbedder {
                 &batch.idx[s..e],
                 longest,
                 dimensions,
+                work,
             )?);
         }
         Ok(placed)
@@ -1874,15 +2029,23 @@ impl BertEmbedder {
         indices: &[usize],
         longest: usize,
         dimensions: usize,
+        work: &dyn EmbeddingWork,
     ) -> Result<Vec<(usize, Vec<f32>, EmbeddingProducer)>, KinDbError> {
-        process_chunk_with_runtime(
-            &BertChunkRuntime(self),
-            route,
-            token_ids,
-            attention_masks,
-            indices,
-            longest,
-            dimensions,
+        observe_completed_chunk(
+            work,
+            token_ids.len(),
+            || {
+                process_chunk_with_runtime(
+                    &BertChunkRuntime(self),
+                    route,
+                    token_ids,
+                    attention_masks,
+                    indices,
+                    longest,
+                    dimensions,
+                )
+            },
+            |(_, vector, _)| vector.iter().all(|value| value.is_finite()),
         )
     }
 
@@ -1893,6 +2056,7 @@ impl BertEmbedder {
         dimensions: usize,
         budget: BatchBudget,
         record_adaptive: bool,
+        work: &dyn EmbeddingWork,
     ) -> Result<Vec<(usize, Vec<f32>, EmbeddingProducer)>, KinDbError> {
         let tokens =
             |side: EncodedSlice<'_>| -> u64 { side.ids.iter().map(|ids| ids.len() as u64).sum() };
@@ -1928,7 +2092,7 @@ impl BertEmbedder {
             let cpu_override = twin_available.then_some(EmbedDispatchRoute::CpuTwin {
                 reason: "hybrid_cpu_only",
             });
-            return self.process_encoded_subset(cpu_side, dimensions, budget, cpu_override);
+            return self.process_encoded_subset(cpu_side, dimensions, budget, cpu_override, work);
         }
         if cpu_side.is_empty() {
             // Whole batch is short enough to stay on the GPU — record the
@@ -1943,7 +2107,7 @@ impl BertEmbedder {
                 cpu_twin_used = false,
                 "embed_hybrid_dispatch"
             );
-            return self.process_encoded_subset(metal_side, dimensions, budget, None);
+            return self.process_encoded_subset(metal_side, dimensions, budget, None, work);
         }
 
         // Hybrid concurrency is only safe when the CPU arm runs on a CPU model
@@ -1974,6 +2138,7 @@ impl BertEmbedder {
                 Some(EmbedDispatchRoute::PrimaryBatched {
                     reason: REASON_HYBRID_SERIAL_PRIMARY,
                 }),
+                work,
             )?;
             merged.extend(self.process_encoded_subset(
                 cpu_side,
@@ -1982,6 +2147,7 @@ impl BertEmbedder {
                 Some(EmbedDispatchRoute::PrimaryBatched {
                     reason: REASON_HYBRID_SERIAL_PRIMARY,
                 }),
+                work,
             )?);
             return Ok(merged);
         }
@@ -2012,6 +2178,7 @@ impl BertEmbedder {
                     Some(EmbedDispatchRoute::PrimaryBatched {
                         reason: REASON_HYBRID_PRIMARY,
                     }),
+                    work,
                 );
                 (result, started.elapsed())
             },
@@ -2024,6 +2191,7 @@ impl BertEmbedder {
                     Some(EmbedDispatchRoute::CpuTwin {
                         reason: "hybrid_cpu",
                     }),
+                    work,
                 );
                 (result, started.elapsed())
             },
@@ -6435,6 +6603,115 @@ mod tests {
     }
 
     #[cfg(feature = "embeddings")]
+    #[derive(Default)]
+    struct ObservedEmbeddingWork {
+        completed: std::sync::atomic::AtomicUsize,
+        cancelled: std::sync::atomic::AtomicBool,
+        cancel_on_completion: bool,
+    }
+
+    #[cfg(feature = "embeddings")]
+    impl EmbeddingWork for ObservedEmbeddingWork {
+        fn cancelled(&self) -> bool {
+            self.cancelled.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn completed_chunk(&self, vectors: usize) {
+            self.completed
+                .fetch_add(vectors, std::sync::atomic::Ordering::SeqCst);
+            if self.cancel_on_completion {
+                self.cancelled
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn embedding_progress_requires_successful_nonempty_finite_complete_chunks() {
+        use std::sync::atomic::Ordering;
+        let work = ObservedEmbeddingWork::default();
+        for vectors in [vec![], vec![vec![f32::NAN]], vec![vec![1.0], vec![2.0]]] {
+            let _ = observe_completed_chunk(
+                &work,
+                1,
+                || Ok(vectors),
+                |v| v.iter().all(|x| x.is_finite()),
+            );
+        }
+        assert!(observe_completed_chunk::<Vec<f32>>(
+            &work,
+            1,
+            || Err(KinDbError::IndexError("failed forward".into())),
+            |_| true
+        )
+        .is_err());
+        assert_eq!(work.completed.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            observe_completed_chunk(
+                &work,
+                1,
+                || Ok(vec![vec![1.0f32]]),
+                |v| v.iter().all(|x| x.is_finite())
+            )
+            .unwrap(),
+            vec![vec![1.0]]
+        );
+        assert_eq!(work.completed.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn embedding_progress_cancels_before_later_chunks_and_keeps_cache_hits_uncredited() {
+        use std::sync::atomic::Ordering;
+        let work = ObservedEmbeddingWork {
+            cancel_on_completion: true,
+            ..Default::default()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let (embedder, _) = CodeEmbedder::test_cpu_route_with_unavailable_twin(
+            2,
+            dir.path().to_path_buf(),
+            GpuBackend::Cpu,
+            vec![1.0, 0.0],
+        );
+        assert!(matches!(
+            embedder.embed_batch_with_producers_observed(&["first".into()], &work),
+            Err(KinDbError::EmbeddingCancelled)
+        ));
+        assert_eq!(work.completed.load(Ordering::SeqCst), 1);
+        assert!(
+            embedder.test_cache_is_empty(),
+            "cancelled outer work must not populate the cache"
+        );
+        assert!(matches!(
+            embedder.embed_batch_with_producers_observed(&["later".into()], &work),
+            Err(KinDbError::EmbeddingCancelled)
+        ));
+        assert_eq!(work.completed.load(Ordering::SeqCst), 1);
+
+        let fresh = ObservedEmbeddingWork::default();
+        let first = embedder
+            .embed_batch_with_producers_observed(&["cached".into()], &fresh)
+            .unwrap();
+        assert_eq!(fresh.completed.load(Ordering::SeqCst), 1);
+        let cached = embedder
+            .embed_batch_with_producers_observed(&["cached".into()], &fresh)
+            .unwrap();
+        assert_eq!(first.vectors, cached.vectors);
+        assert_eq!(first.producers, cached.producers);
+        assert_eq!(
+            fresh.completed.load(Ordering::SeqCst),
+            1,
+            "cache lookup is not completed inference"
+        );
+        fresh.cancelled.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            embedder.embed_batch_with_producers_observed(&["cached".into()], &fresh),
+            Err(KinDbError::EmbeddingCancelled)
+        ));
+    }
+
+    #[cfg(feature = "embeddings")]
     #[test]
     fn metal_oom_fallback_records_the_cpu_model_that_returned_the_vectors() {
         let dir = tempfile::tempdir().unwrap();
@@ -7130,5 +7407,156 @@ mod tests {
         assert_eq!(served_from_disk, expected);
         assert_eq!(served_from_lru, expected);
         assert_eq!(served_from_lru, from_disk);
+    }
+}
+
+#[cfg(all(test, feature = "embeddings"))]
+mod model_fetch_gate_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    fn refuse(model_id: &str) -> std::result::Result<(), String> {
+        Err(format!("{model_id} was declined"))
+    }
+
+    fn allow(_: &str) -> std::result::Result<(), String> {
+        Ok(())
+    }
+
+    fn fetched_paths() -> Result<[PathBuf; 3], KinDbError> {
+        Ok([
+            "fetched/config.json",
+            "fetched/tokenizer.json",
+            "fetched/weights",
+        ]
+        .map(PathBuf::from))
+    }
+
+    /// Write a hub cache entry the way `hf-hub` lays one out: a ref naming a
+    /// commit, and the files under that commit's snapshot directory.
+    fn seed_hub_cache(root: &Path, repo: &Repo, files: &[&str]) {
+        let repo_dir = root.join(repo.folder_name());
+        let commit = "0123456789abcdef0123456789abcdef01234567";
+        std::fs::create_dir_all(repo_dir.join("refs")).unwrap();
+        std::fs::write(repo_dir.join("refs").join(repo.revision()), commit).unwrap();
+        let snapshot = repo_dir.join("snapshots").join(commit);
+        std::fs::create_dir_all(&snapshot).unwrap();
+        for file in files {
+            std::fs::write(snapshot.join(file), b"{}").unwrap();
+        }
+    }
+
+    /// The consent defect: `kin setup` recorded that this machine does not
+    /// download the model, and the first query downloaded it anyway. A refused
+    /// gate has to stop the download before anything reaches the network, so
+    /// the test asserts that the one closure able to reach it never ran.
+    #[test]
+    fn a_declined_model_is_never_fetched() {
+        let fetch_attempted = Cell::new(false);
+        let result = resolve_hub_model_files(
+            "nomic-ai/nomic-embed-text-v1.5",
+            |_| None,
+            Some(refuse),
+            || {
+                fetch_attempted.set(true);
+                fetched_paths()
+            },
+        );
+        assert!(
+            !fetch_attempted.get(),
+            "a declined model reached the download"
+        );
+        let error = result.expect_err("a declined, uncached model must not load");
+        assert!(
+            error
+                .to_string()
+                .contains("nomic-ai/nomic-embed-text-v1.5 was declined"),
+            "the refusal carries the gate's sentence: {error}"
+        );
+    }
+
+    /// Half a model in the cache is still a download, so the gate still
+    /// decides. This is the shape an interrupted earlier fetch leaves.
+    #[test]
+    fn a_partly_cached_declined_model_is_never_fetched() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = Repo::with_revision(
+            "nomic-ai/nomic-embed-text-v1.5".to_string(),
+            RepoType::Model,
+            "main".to_string(),
+        );
+        seed_hub_cache(root.path(), &repo, &["config.json", "tokenizer.json"]);
+        let cache = hf_hub::Cache::new(root.path().to_path_buf()).repo(repo);
+        assert!(
+            cache.get("config.json").is_some(),
+            "the seeded cache is read"
+        );
+
+        let fetch_attempted = Cell::new(false);
+        let result = resolve_hub_model_files(
+            "nomic-ai/nomic-embed-text-v1.5",
+            |file| cache.get(file),
+            Some(refuse),
+            || {
+                fetch_attempted.set(true);
+                fetched_paths()
+            },
+        );
+        assert!(!fetch_attempted.get(), "the missing weights were fetched");
+        assert!(result.is_err());
+    }
+
+    /// A model already in the cache loads whatever was recorded, because
+    /// loading it downloads nothing. The gate is not even asked.
+    #[test]
+    fn a_cached_model_loads_without_asking_the_gate() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = Repo::with_revision(
+            "nomic-ai/nomic-embed-text-v1.5".to_string(),
+            RepoType::Model,
+            "main".to_string(),
+        );
+        seed_hub_cache(root.path(), &repo, &HUB_MODEL_FILES);
+        let cache = hf_hub::Cache::new(root.path().to_path_buf()).repo(repo);
+
+        let fetch_attempted = Cell::new(false);
+        let paths = resolve_hub_model_files(
+            "nomic-ai/nomic-embed-text-v1.5",
+            |file| cache.get(file),
+            Some(refuse),
+            || {
+                fetch_attempted.set(true);
+                fetched_paths()
+            },
+        )
+        .expect("a cached model loads");
+        assert!(!fetch_attempted.get());
+        for (path, file) in paths.iter().zip(HUB_MODEL_FILES) {
+            assert!(path.ends_with(file), "{path:?} is the cached {file}");
+            assert!(
+                path.starts_with(root.path()),
+                "{path:?} came from the cache"
+            );
+        }
+    }
+
+    /// Consent, or no gate at all, keeps the download exactly as it was.
+    #[test]
+    fn an_allowed_or_ungated_fetch_still_downloads() {
+        for gate in [Some(allow as ModelFetchGate), None] {
+            let fetch_attempted = Cell::new(false);
+            let paths = resolve_hub_model_files(
+                "nomic-ai/nomic-embed-text-v1.5",
+                |_| None,
+                gate,
+                || {
+                    fetch_attempted.set(true);
+                    fetched_paths()
+                },
+            )
+            .expect("an allowed fetch runs");
+            assert!(fetch_attempted.get());
+            assert_eq!(paths, fetched_paths().unwrap());
+        }
     }
 }

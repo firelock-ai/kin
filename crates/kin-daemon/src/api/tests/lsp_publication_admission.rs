@@ -71,6 +71,127 @@ fn lsp_publication_same_semantics(left: &kin_db::GraphSnapshot, right: &kin_db::
 }
 
 #[tokio::test]
+async fn lsp_publication_retires_old_contexts_and_restores_exact_binding_witness() {
+    use crate::daemon::lsp_publication::{QueryInputs, Refused};
+    use kin_model::EntityStore as _;
+    let (repo, state) = lsp_publication_fixture().await;
+    let caller = waiting_entity(&state, "caller.py", "run");
+    assert!(matches!(
+        state.graph.binding_history_observation(),
+        kin_model::BindingHistoryObservation::Checked { .. }
+    ));
+    let context = |version: &str| kin_model::ProofContext {
+        language: kin_model::LanguageId::Python,
+        resolver: "lsp:pyright".to_owned(),
+        resolver_version: version.to_owned(),
+        configuration_hash: kin_model::Hash256::from_bytes([1; 32]),
+        environment_hash: kin_model::Hash256::from_bytes([2; 32]),
+        environment_summary: String::new(),
+    };
+    let mut previous_ledger = None;
+    let mut previous_validation = None;
+    let mut previous_context = None;
+    for version in ["1", "2"] {
+        let context = context(version);
+        let proof = kin_model::ResolutionRecord::ProofContext(context.clone());
+        let span = caller.span.as_ref().unwrap();
+        let ledger = kin_model::ResolutionRecord::CallSites(kin_model::CallSiteLedger {
+            caller: caller.id,
+            behavior_hash: caller.fingerprint.behavior_hash,
+            body_hash: kin_model::Hash256::from_bytes(kin_blobs::digest_bytes(
+                LSP_PUBLICATION_CALLER.as_bytes(),
+            )),
+            context: proof.id(),
+            census: 1,
+            sites: vec![kin_model::CallSite {
+                offset: (LSP_PUBLICATION_CALLER.find("callback()").unwrap() - span.start_byte)
+                    .try_into()
+                    .unwrap(),
+                length: "callback".len().try_into().unwrap(),
+                state: kin_model::CallSiteState::Unresolved {
+                    reason: kin_model::UnresolvedReason::NoAnswer,
+                },
+            }],
+        });
+        let validation =
+            kin_model::ResolutionRecord::ContextValidation(kin_model::ContextValidation {
+                language: kin_model::LanguageId::Python,
+                state: kin_model::ContextValidationState::Validated { context },
+            });
+        let replace = |old, new| match old {
+            None => kin_model::ResolutionRecordDelta::Added { new },
+            Some(old) => kin_model::ResolutionRecordDelta::Modified { old, new },
+        };
+        state
+            .graph
+            .apply_resolution_record_deltas(&[
+                kin_model::ResolutionRecordDelta::Added { new: proof.clone() },
+                replace(previous_ledger, ledger.clone()),
+                replace(previous_validation, validation.clone()),
+            ])
+            .unwrap();
+        assert_eq!(
+            state.graph.binding_history_observation(),
+            kin_model::BindingHistoryObservation::Unproven
+        );
+        let inputs = QueryInputs::capture(&state).await.unwrap();
+        state.save_snapshot().unwrap();
+        inputs
+            .current(&state)
+            .await
+            .expect("collecting unused nodes at a checkpoint must not invalidate the next file");
+        let live = state.graph.semantic_observation();
+        let durable = lsp_publication_durable(&state);
+        lsp_publication_same_semantics(&live, &durable);
+        assert_eq!(
+            live.resolution_records, durable.resolution_records,
+            "a retired proof context must leave the live graph as well as authority"
+        );
+        if let Some(old_context) = previous_context {
+            assert!(!live.resolution_records.contains_key(&old_context));
+        }
+        assert!(matches!(
+            state.graph.binding_history_observation(),
+            kin_model::BindingHistoryObservation::Checked { .. }
+        ));
+        if version == "2" {
+            assert_eq!(
+                inputs.document("second.py").as_deref(),
+                Some("def second():\n    return 2\n")
+            );
+            let mut pending = crate::daemon::PendingEnrichment::default();
+            inputs.absorb(&state, &mut pending, vec![]).await.unwrap();
+            inputs.flush(&state, &mut pending).await.unwrap();
+            assert!(inputs
+                .record_file_completed(&state, "second.py")
+                .await
+                .unwrap());
+            std::fs::write(
+                repo.path().join("second.py"),
+                "def second():\n    return 22\n",
+            )
+            .unwrap();
+            waiting_admit(&state, "external source edit after context collection").await;
+            assert_eq!(
+                inputs.current(&state).await,
+                Err(Refused::Stale),
+                "the checkpoint must not weaken the intervening source-writer fence"
+            );
+        }
+        previous_ledger = Some(ledger);
+        previous_validation = Some(validation);
+        previous_context = Some(proof.id());
+    }
+    let layout = state.layout.clone();
+    drop(state);
+    let cold = waiting_cold_start(layout).await;
+    assert!(matches!(
+        cold.graph.binding_history_observation(),
+        kin_model::BindingHistoryObservation::Checked { .. }
+    ));
+}
+
+#[tokio::test]
 async fn lsp_publication_fence_late_atomic_admit_answer_is_stale_without_warm_cold_split() {
     use crate::daemon::lsp_publication::{QueryInputs, Refused};
     use kin_model::EntityStore as _;
@@ -331,4 +452,287 @@ async fn lsp_publication_fence_fresh_empty_answer_can_mark_actual_source_complet
         .unwrap()
         .contains("caller.py"));
     inputs.current(&state).await.unwrap();
+}
+
+#[tokio::test]
+async fn lsp_publication_records_exact_withdrawals_and_keeps_checked_history() {
+    use crate::daemon::lsp_publication::QueryInputs;
+    use kin_index::binding_debt::{claims_local_binding_debt, decode_local_binding_debt};
+    use kin_model::EntityStore as _;
+    let (repo, state) = lsp_publication_fixture().await;
+    let body = "from target import work\n\ndef run():\n    return work()\n";
+    std::fs::write(repo.path().join("caller.py"), body).unwrap();
+    waiting_admit(&state, "admit a real parser binding").await;
+    waiting_commit(&state, "record parser binding baseline").await;
+    let caller = waiting_entity(&state, "caller.py", "run");
+    let target = waiting_entity(&state, "target.py", "work");
+    let replacement = waiting_entity(&state, "first.py", "first");
+    let parsed = state
+        .graph
+        .semantic_observation()
+        .relations
+        .values()
+        .find(|edge| {
+            edge.kind == RelationKind::Calls
+                && edge.src == GraphNodeId::Entity(caller.id)
+                && edge.dst == GraphNodeId::Entity(target.id)
+                && kin_index::binding_debt::parser_owns_binding(edge)
+        })
+        .expect("the admitted parser resolves the imported call")
+        .clone();
+    assert!(matches!(
+        state.graph.binding_history_observation(),
+        kin_model::BindingHistoryObservation::Checked { .. }
+    ));
+
+    // A previously accepted LSP reference is a separate obligation from the
+    // parser call, even though both cite this same occurrence.
+    let start = body.rfind("work()").unwrap();
+    let mut reference = lsp_publication_call(caller.id, target.id);
+    reference.kind = RelationKind::References;
+    reference.evidence[0].parser_rule = Some("lsp_references".into());
+    reference.evidence[0].source_span = Some(kin_model::SourceSpan {
+        file: kin_model::FilePathId::new("caller.py"),
+        start_byte: start,
+        end_byte: start + 4,
+        start_line: 3,
+        start_col: 11,
+        end_line: 3,
+        end_col: 15,
+    });
+    state.graph.upsert_relation(&reference).unwrap();
+    state.save_snapshot().unwrap();
+    assert!(matches!(
+        state.graph.binding_history_observation(),
+        kin_model::BindingHistoryObservation::Checked { .. }
+    ));
+
+    let mut answer = reference.clone();
+    answer.id =
+        kin_model::language_server_relation_id(RelationKind::Calls, caller.id, replacement.id);
+    answer.kind = RelationKind::Calls;
+    answer.dst = GraphNodeId::Entity(replacement.id);
+    answer.evidence[0].parser_rule = Some("lsp_call_hierarchy".into());
+    state.graph.remove_relation(&parsed.id).unwrap();
+    state.lsp_settled_guesses.lock().unwrap().insert(parsed.id);
+    state.graph.upsert_relation(&answer).unwrap();
+    let inputs = QueryInputs::capture(&state).await.unwrap();
+    state.save_snapshot().unwrap();
+    let first_debts: Vec<_> = state
+        .graph
+        .semantic_observation()
+        .relations
+        .into_values()
+        .filter(claims_local_binding_debt)
+        .collect();
+    assert_eq!(first_debts.len(), 1);
+    assert!(matches!(
+        state.graph.binding_history_observation(),
+        kin_model::BindingHistoryObservation::Checked { .. }
+    ));
+    let previously_recorded_counts = (
+        state.durable_entity_count().unwrap(),
+        state.durable_relation_count().unwrap(),
+    );
+    // A later withdrawal must merge with the first exact obligation and may
+    // replace that live debt only because the durable successor contains it.
+    state.graph.remove_relation(&reference.id).unwrap();
+    state
+        .lsp_settled_guesses
+        .lock()
+        .unwrap()
+        .insert(reference.id);
+    state.save_snapshot().unwrap();
+    inputs
+        .current(&state)
+        .await
+        .expect("own artifact bookkeeping does not stale the next LSP document");
+    let durable = lsp_publication_durable(&state);
+    let live = state.graph.semantic_observation();
+    lsp_publication_same_semantics(&live, &durable);
+    assert!(matches!(
+        state.graph.binding_history_observation(),
+        kin_model::BindingHistoryObservation::Checked { .. }
+    ));
+    assert!(!durable.relations.contains_key(&parsed.id));
+    assert!(!durable.relations.contains_key(&reference.id));
+    assert_eq!(durable.relations.get(&answer.id), Some(&answer));
+    assert_ne!(
+        previously_recorded_counts.1,
+        durable.relations.len() as u64,
+        "withdrawals and their merged debt must change the recorded relation count"
+    );
+    let recorded = durability_block(&state).await;
+    assert_eq!(recorded.state, "recorded", "{recorded:?}");
+    assert_eq!(
+        recorded.durable_entities,
+        Some(durable.entities.len() as u64)
+    );
+    assert_eq!(
+        recorded.durable_relations,
+        Some(durable.relations.len() as u64)
+    );
+    assert_eq!(recorded.live_only_entities, Some(0));
+    assert_eq!(recorded.live_only_relations, Some(0));
+
+    // Retry finalization with the prior observed counts, as after a checkpoint
+    // whose artifacts had not finished. A separate live write must prevent
+    // levelling those counters against even this valid held authority.
+    let authority_graph = kin_db::InMemoryGraph::from_snapshot(durable.clone()).unwrap();
+    let generation = state
+        .snapshot_generation
+        .load(std::sync::atomic::Ordering::SeqCst);
+    state.record_durable_entity_count(previously_recorded_counts.0);
+    state.record_durable_relation_count(previously_recorded_counts.1);
+    let mut independent = reference.clone();
+    independent.id = kin_model::RelationId::new();
+    state.graph.upsert_relation(&independent).unwrap();
+    state
+        .finalize_held_generation_for_test(generation, &authority_graph)
+        .unwrap();
+    assert_eq!(
+        state.durable_entity_count(),
+        Some(previously_recorded_counts.0)
+    );
+    assert_eq!(
+        state.durable_relation_count(),
+        Some(previously_recorded_counts.1)
+    );
+    assert_eq!(
+        state.graph.get_relation_by_id(&independent.id),
+        Some(independent.clone())
+    );
+    assert!(!durable.relations.contains_key(&independent.id));
+    assert!(matches!(
+        state.graph.binding_history_observation(),
+        kin_model::BindingHistoryObservation::Unproven
+    ));
+    // Removing only that independent write permits the same held authority to
+    // restore its exact witness and counts, without another publication.
+    state.graph.remove_relation(&independent.id).unwrap();
+    state
+        .finalize_held_generation_for_test(generation, &authority_graph)
+        .unwrap();
+    assert_eq!(
+        state.durable_entity_count(),
+        Some(durable.entities.len() as u64)
+    );
+    assert_eq!(
+        state.durable_relation_count(),
+        Some(durable.relations.len() as u64)
+    );
+    assert_eq!(
+        state
+            .snapshot_generation
+            .load(std::sync::atomic::Ordering::SeqCst),
+        generation
+    );
+    let recorded = durability_block(&state).await;
+    assert_eq!(recorded.state, "recorded", "{recorded:?}");
+    let debts: Vec<_> = durable
+        .relations
+        .values()
+        .filter(|edge| claims_local_binding_debt(edge))
+        .collect();
+    assert_eq!(
+        debts.len(),
+        1,
+        "one source owns the two exact prior obligations"
+    );
+    let debt_relation = debts[0].clone();
+    let kin_model::GraphNodeId::Artifact(artifact) = debt_relation.src else {
+        panic!("artifact debt")
+    };
+    let debt = decode_local_binding_debt(
+        &kin_model::FilePathId::new("caller.py"),
+        artifact,
+        &debt_relation,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(debt.obligations.len(), 2);
+    for old in [&parsed, &reference] {
+        assert!(debt
+            .obligations
+            .iter()
+            .any(|entry| &entry.retired_relation == old));
+    }
+
+    // A later positive answer did not discharge either contradictory prior
+    // target. Removing their debt must still fail the unchanged verifier.
+    use kin_db::storage::binding_history::BindingHistoryVerifier as _;
+    let mut erased = durable.clone();
+    erased.relations.remove(&debt_relation.id);
+    let context =
+        crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(&state)
+            .unwrap();
+    let authority = context.open().unwrap();
+    assert!(!kin_index::binding_history::LocalBindingHistoryVerifier
+        .verify_graph_transition(&durable, &erased, &|hash| authority.load_source_blob(hash))
+        .unwrap());
+    drop(authority);
+
+    // Simulate an admitted debt whose live mirror has not landed. The next
+    // publication has an empty new semantic delta and must recover it from
+    // authority, without a new operation or silently dropping the witness.
+    let generation = state
+        .snapshot_generation
+        .load(std::sync::atomic::Ordering::SeqCst);
+    state.graph.remove_relation(&debt_relation.id).unwrap();
+    state.save_snapshot().unwrap();
+    assert_eq!(
+        state
+            .snapshot_generation
+            .load(std::sync::atomic::Ordering::SeqCst),
+        generation
+    );
+    assert_eq!(
+        state.graph.get_relation_by_id(&debt_relation.id),
+        Some(debt_relation.clone())
+    );
+    assert!(matches!(
+        state.graph.binding_history_observation(),
+        kin_model::BindingHistoryObservation::Checked { .. }
+    ));
+    // A retry that captures a newer, divergent payload must not overwrite
+    // it with the older durable debt, even though the relation ID is equal.
+    let mut divergent = debt.clone();
+    divergent.obligations[0].retired_relation.confidence = 0.8;
+    let mut divergent_relation =
+        kin_index::binding_debt::build_local_binding_debt(artifact, divergent).unwrap();
+    divergent_relation.created_in = debt_relation.created_in;
+    assert_ne!(divergent_relation, debt_relation);
+    state.graph.upsert_relation(&divergent_relation).unwrap();
+    let refused = state.save_snapshot().unwrap_err().to_string();
+    assert!(
+        refused.contains("does not retain every current live obligation"),
+        "{refused}"
+    );
+    assert_eq!(
+        state.graph.get_relation_by_id(&debt_relation.id),
+        Some(divergent_relation)
+    );
+    assert_eq!(
+        lsp_publication_durable(&state)
+            .relations
+            .get(&debt_relation.id),
+        Some(&debt_relation)
+    );
+    assert_eq!(
+        state
+            .snapshot_generation
+            .load(std::sync::atomic::Ordering::SeqCst),
+        generation
+    );
+    let layout = state.layout.clone();
+    drop(state);
+    let cold = waiting_cold_start(layout).await;
+    assert_eq!(
+        cold.graph.get_relation_by_id(&debt_relation.id),
+        Some(debt_relation)
+    );
+    assert!(matches!(
+        cold.graph.binding_history_observation(),
+        kin_model::BindingHistoryObservation::Checked { .. }
+    ));
 }

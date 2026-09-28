@@ -221,6 +221,62 @@ async fn find_references(graph: &InMemoryGraph, target: &Entity) -> serde_json::
     serde_json::from_str(text).expect("find_references body is json")
 }
 
+/// The collector's row behind a served `find_references` row, matched by the
+/// caller's entity id.
+///
+/// The wire addresses each site inside its caller and never by a file line,
+/// and this fixture strips entity spans, so a served site cannot say where it
+/// is. The exact 1-based file lines are pinned here instead, at the collector
+/// the row is served from, where a row still keys its sites by them.
+fn collected_row(
+    graph: &InMemoryGraph,
+    target: &Entity,
+    served: &serde_json::Value,
+) -> kin_mcp::handlers::common::ReferenceRow {
+    kin_mcp::handlers::common::collect_graph_reference_rows(
+        graph,
+        &target.id,
+        &kin_mcp::handlers::common::default_reference_kinds(),
+        None,
+    )
+    .expect("collect reference rows")
+    .into_iter()
+    .find(|row| row.entity_id.as_deref() == served["entity_id"].as_str())
+    .unwrap_or_else(|| panic!("the collector holds no row for the served one: {served:#}"))
+}
+
+/// A served row whose caller the graph holds no span for: `count` sites, each
+/// addressed inside the caller and unable to give an offset or text, and no
+/// file address of any kind.
+fn assert_spanless_sites(row: &serde_json::Value, count: usize) {
+    assert_eq!(row["site_count"], serde_json::json!(count), "{row:#}");
+    let sites = row["sites"]
+        .as_array()
+        .unwrap_or_else(|| panic!("`sites` array: {row:#}"));
+    assert_eq!(sites.len(), count, "{row:#}");
+    for site in sites {
+        assert_eq!(site["line_in_entity"], serde_json::Value::Null, "{row:#}");
+        assert_eq!(site["callee"], serde_json::Value::Null, "{row:#}");
+        assert_eq!(
+            site["callee_unavailable"], "caller_has_no_span",
+            "the fixture removes entity spans on purpose: {row:#}"
+        );
+    }
+    for retired in [
+        "file_path",
+        "start_line",
+        "reference_lines",
+        "reference_line_count",
+        "reference_lines_absent_reason",
+        "reference_lines_partial_reason",
+    ] {
+        assert!(
+            row.get(retired).is_none(),
+            "a reference row carries no `{retired}`: {row:#}"
+        );
+    }
+}
+
 /// The edge language-server enrichment writes for this caller: one relation for
 /// the whole (caller, callee, kind) pair, carrying exactly one site whatever the
 /// file holds.
@@ -283,15 +339,14 @@ async fn a_module_level_caller_reached_only_by_enrichment_does_not_certify_its_s
         .unwrap_or_else(|| panic!("references array: {body:#}"));
     let row = rows
         .iter()
-        .find(|row| row["file_path"] == CALLER_PATH)
+        .find(|row| row["projection"]["path"] == CALLER_PATH)
         .unwrap_or_else(|| panic!("no row for {CALLER_PATH}: {body:#}"));
 
-    let reported: Vec<u32> = row["reference_lines"]
-        .as_array()
-        .unwrap_or_else(|| panic!("reference_lines array: {row:#}"))
-        .iter()
-        .map(|line| line.as_u64().expect("a site line is a number") as u32)
-        .collect();
+    // The wire serves each site inside its caller, and a spanless caller
+    // cannot place one, so the lines this row reports are read at the
+    // collector it is served from, and the wire must serve exactly that many.
+    let reported: Vec<u32> = collected_row(&graph, &target, row).reference_lines;
+    assert_spanless_sites(row, reported.len());
 
     // The invariant, stated once: every site, or no claim of completeness.
     if reported != sites {
@@ -307,18 +362,14 @@ async fn a_module_level_caller_reached_only_by_enrichment_does_not_certify_its_s
             "a site total that is only a floor is not emitted as a number: {body:#}"
         );
         assert_eq!(
-            row["reference_lines_partial_reason"], "language_server_edge",
+            row["sites_partial_reason"], "language_server_edge",
             "a row whose sites are a floor must name why: {row:#}"
         );
     }
 
-    // Non-vacuity: the fixture removes entity spans, so any line above came from
-    // relation evidence rather than from a definition line.
-    assert_eq!(
-        row["start_line"],
-        serde_json::Value::Null,
-        "the fixture removes entity spans on purpose: {row:#}"
-    );
+    // Non-vacuity: the fixture removes entity spans and the row carries no
+    // start_line or file line at all (checked above), so any line above came
+    // from relation evidence rather than from a definition line.
     assert!(
         !reported.is_empty(),
         "the enrichment edge carries one site, so the row must not be empty: {row:#}"
@@ -347,14 +398,16 @@ async fn a_function_level_caller_lists_every_site_and_certifies_them() {
         .find(|row| row["name"] == "run")
         .unwrap_or_else(|| panic!("no row for caller `run`: {body:#}"));
 
+    // The wire serves each site inside its caller, and a spanless caller
+    // cannot place one, so the exact lines are pinned at the collector.
     assert_eq!(
-        row["reference_lines"],
-        serde_json::json!(sites),
+        collected_row(&graph, &target, row).reference_lines,
+        sites,
         "the adapter records each call site, so every one must be reported: {row:#}"
     );
-    assert_eq!(row["reference_line_count"], 5);
+    assert_spanless_sites(row, 5);
     assert_eq!(
-        row["reference_lines_partial_reason"],
+        row["sites_partial_reason"],
         serde_json::Value::Null,
         "a parsed row holds every site the parse saw: {row:#}"
     );
@@ -431,13 +484,16 @@ async fn a_recovered_parse_floors_the_row_while_keeping_every_site_it_recorded()
          this fixture proves nothing"
     );
 
+    // The wire serves each site inside its caller, and a spanless caller
+    // cannot place one, so the exact lines are pinned at the collector.
     assert_eq!(
-        row["reference_lines"],
-        serde_json::json!(sites),
+        collected_row(&graph, &target, row).reference_lines,
+        sites,
         "every site the recovered parse did record must still be reported: {row:#}"
     );
+    assert_spanless_sites(row, sites.len());
     assert_eq!(
-        row["reference_lines_partial_reason"], "incomplete_call_evidence",
+        row["sites_partial_reason"], "incomplete_call_evidence",
         "the linker said the parse was short, so the answer must not certify: {row:#}"
     );
     assert_eq!(

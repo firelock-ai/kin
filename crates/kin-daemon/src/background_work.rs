@@ -8,13 +8,11 @@
 //! indexes — runs with nobody watching. A pass that wedges therefore spends that
 //! machine indefinitely and the sole evidence is a warm fan. This module is the
 //! product-side answer: every background pass reports persisted progress to a
-//! supervisor, and a pass that holds the CPU without advancing that count is
-//! stopped and said out loud.
-//!
-//! Liveness keys on the persisted-progress delta and never on CPU utilization. A
-//! busy-spin pegs a core while achieving nothing, so utilization cannot tell a
-//! working pass from a wedged one, and a counter that moves only when work is
-//! durably recorded can.
+//! supervisor. Workers also report completed, validated inference chunks or
+//! successful language-server responses,
+//! which can finish before the outer batch is ready to publish. Neither dispatch
+//! starts nor CPU utilization count as progress: a busy-spin can achieve neither
+//! a completed chunk nor durable work. Public unit counts remain durable only.
 //!
 //! Three properties are load-bearing and each exists because its absence makes
 //! the mechanism silently useless:
@@ -65,13 +63,13 @@ pub enum PassEnforcement {
     DiscloseOnly,
 }
 
-/// How long a pass may hold the CPU with no persisted progress before the daemon
-/// stops it.
+/// How long a pass may work without durable progress or a completed inference
+/// chunk before the daemon requests a cooperative stop.
 ///
 /// Generous on purpose. The cost of stopping a healthy pass is lost work a user
 /// asked for; the cost of waiting is ten more minutes of a fan. A pass that has
-/// been working continuously for this long and has recorded nothing durable in
-/// that whole stretch is not slow, it is stuck.
+/// been working continuously for this long without completing any work needs a
+/// bounded checkpoint, even when it still consumes CPU.
 pub const DEFAULT_STALL_THRESHOLD: Duration = Duration::from_secs(600);
 
 /// How much cumulative delay a retry ladder may spend before the work it is
@@ -125,11 +123,16 @@ pub struct BackgroundPass {
 
 #[derive(Debug)]
 struct PassInner {
+    /// Publication has no safe halt checkpoint. Its lifetime is disclosed, but
+    /// the supervisor must not mark it stopped or poison the next sweep.
+    publications: usize,
     /// Units of work this pass has durably recorded. Monotonic for the life of
     /// the process, so a delta over any window is meaningful.
     progress: u64,
     /// When `progress` last advanced; `None` until it first does.
     progress_at: Option<Instant>,
+    /// Last finite completed computation/query, which does not credit durable units.
+    computed_at: Option<Instant>,
     /// Start of the current uninterrupted working stretch; `None` while idle.
     working_since: Option<Instant>,
     /// Start of the current stretch with deferred work owed; `None` when the
@@ -142,8 +145,17 @@ struct PassInner {
     deferred_since: Option<Instant>,
     /// Why this pass stopped, once it has.
     halt: Option<String>,
+    halt_cause: Option<HaltCause>,
+    stall_restarts: u32,
+    stall_restart_progress: u64,
     /// Cumulative delay charged to the retry ladder since the last success.
     retry_spent: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HaltCause {
+    SupervisorStall,
+    Explicit,
 }
 
 impl BackgroundPass {
@@ -153,11 +165,16 @@ impl BackgroundPass {
             enforcement,
             halted: AtomicBool::new(false),
             inner: Mutex::new(PassInner {
+                publications: 0,
                 progress: 0,
                 progress_at: None,
+                computed_at: None,
                 working_since: None,
                 deferred_since: None,
                 halt: None,
+                halt_cause: None,
+                stall_restarts: 0,
+                stall_restart_progress: 0,
                 retry_spent: Duration::ZERO,
             }),
         }
@@ -194,11 +211,11 @@ impl BackgroundPass {
 
     /// Whether this pass is in a working stretch right now.
     ///
-    /// False once the pass is halted, because [`halt`](Self::halt) ends the
-    /// stretch, so a wedged pass the supervisor stopped cannot hold a daemon
-    /// open forever.
+    /// False once the pass is halted, unless it is still publishing completed
+    /// work. That indivisible write must finish before its worker can retire.
     pub fn is_working(&self) -> bool {
-        self.lock().working_since.is_some()
+        let inner = self.lock();
+        inner.working_since.is_some() || inner.publications > 0
     }
 
     /// Declare that this pass has nothing to do.
@@ -209,6 +226,14 @@ impl BackgroundPass {
     /// wedged loop still reaches would clear the very stretch being measured.
     pub fn idle(&self) {
         self.lock().working_since = None;
+    }
+
+    /// Keep an indivisible publication outside the cooperative stall rule.
+    /// The guard spans the actual write, including error returns. It neither
+    /// fabricates persisted progress nor clears an earlier halt request.
+    pub fn publishing(&self) -> PublicationGuard<'_> {
+        self.lock().publications += 1;
+        PublicationGuard(self)
     }
 
     /// Record whether deferred work is still owed to this pass, and since when.
@@ -254,6 +279,26 @@ impl BackgroundPass {
         inner.progress_at = Some(now);
     }
 
+    /// Record a nonempty, validated inference chunk completed before its outer
+    /// batch is published. This feeds liveness only, never durable counters or
+    /// retry budgets, and cannot revive a halted pass.
+    pub fn computed_chunk(&self, vectors: usize, now: Instant) {
+        self.completed_work(vectors as u64, now);
+    }
+
+    /// Record finite successful work before publication. Empty LSP results are
+    /// completed queries, not durable relations. Starts, polls and failed
+    /// requests must never call this; it cannot clear a halt or retry budget.
+    pub fn completed_work(&self, units: u64, now: Instant) {
+        if units == 0 {
+            return;
+        }
+        let mut inner = self.lock();
+        if inner.halt.is_none() && inner.working_since.is_some() {
+            inner.computed_at = Some(inner.computed_at.map_or(now, |old| old.max(now)));
+        }
+    }
+
     /// Whether this pass has been stopped and should wind itself down.
     ///
     /// Polled by the pass at its own checkpoint. Nothing else enforces the stop:
@@ -273,6 +318,9 @@ impl BackgroundPass {
     /// the account of why it was stopped.
     pub fn halt(&self, reason: impl Into<String>) {
         let mut inner = self.lock();
+        // An explicit stop also disarms automatic recovery of an earlier
+        // supervisor stall, while preserving the first reported reason.
+        inner.halt_cause = Some(HaltCause::Explicit);
         if inner.halt.is_some() {
             return;
         }
@@ -280,6 +328,45 @@ impl BackgroundPass {
         inner.working_since = None;
         drop(inner);
         self.halted.store(true, Ordering::Relaxed);
+    }
+
+    pub fn supervisor_stalled(&self) -> bool {
+        self.lock().halt_cause == Some(HaltCause::SupervisorStall)
+    }
+
+    /// Resume only an observed supervisor stall after the worker has retired
+    /// its servers and waited its cancellable backoff. Two restarts without
+    /// durable progress are enough to distinguish a failed server from a
+    /// persistent stall. Completed queries do not renew that allowance, and
+    /// even durable progress never forgives cumulative retry spending here.
+    pub fn resume_supervisor_stall(&self, delay: Duration, budget: Duration, now: Instant) -> bool {
+        let mut inner = self.lock();
+        if inner.halt_cause != Some(HaltCause::SupervisorStall) || inner.publications > 0 {
+            return false;
+        }
+        if inner.progress > inner.stall_restart_progress {
+            inner.stall_restarts = 0;
+            inner.stall_restart_progress = inner.progress;
+        }
+        inner.retry_spent = inner.retry_spent.saturating_add(delay);
+        if inner.stall_restarts >= 2 || (!budget.is_zero() && inner.retry_spent >= budget) {
+            let reason = format!(
+                "{}; automatic stall recovery exhausted after {} restarts and {}s of cumulative \
+                 retry backoff; unfinished work remains owed",
+                inner.halt.as_deref().unwrap_or("the pass stalled"),
+                inner.stall_restarts,
+                inner.retry_spent.as_secs(),
+            );
+            inner.halt = Some(reason);
+            inner.halt_cause = Some(HaltCause::Explicit);
+            return false;
+        }
+        inner.stall_restarts += 1;
+        inner.halt = None;
+        inner.halt_cause = None;
+        inner.working_since = Some(now);
+        self.halted.store(false, Ordering::Relaxed);
+        true
     }
 
     /// Charge `delay` against this pass's cumulative retry budget.
@@ -356,7 +443,9 @@ impl BackgroundPass {
         // is described by that, not by the queue it also owes. `waiting_deferred`
         // outranks `idle`, which is the whole correction: a pass waiting out a
         // ladder is not a pass with nothing to do.
-        let state = if inner.halt.is_some() {
+        let state = if inner.publications > 0 {
+            "publishing"
+        } else if inner.halt.is_some() {
             "stopped"
         } else if inner.working_since.is_some() {
             "working"
@@ -379,6 +468,21 @@ impl BackgroundPass {
                 .deferred_since
                 .map(|since| now.saturating_duration_since(since).as_secs()),
             stopped_reason: inner.halt.clone(),
+        }
+    }
+}
+
+#[must_use = "the guard must live until publication finishes"]
+pub struct PublicationGuard<'a>(&'a BackgroundPass);
+
+impl Drop for PublicationGuard<'_> {
+    fn drop(&mut self) {
+        let mut inner = self.0.lock();
+        inner.publications -= 1;
+        if inner.publications == 0 && inner.working_since.is_some() {
+            // A new cancellable working stretch begins now. Time inside a
+            // write cannot count as a stall at the next checkpoint either.
+            inner.working_since = Some(Instant::now());
         }
     }
 }
@@ -523,22 +627,20 @@ impl BackgroundWorkSupervisor {
         let passes: Vec<Arc<BackgroundPass>> = self.passes().values().map(Arc::clone).collect();
         let mut stopped = Vec::new();
         for pass in passes {
-            let (working_for, since_progress, progress, already_halted) = {
-                let inner = pass.lock();
-                (
-                    inner
-                        .working_since
-                        .map(|since| now.saturating_duration_since(since)),
-                    inner
-                        .progress_at
-                        .map(|at| now.saturating_duration_since(at)),
-                    inner.progress,
-                    inner.halt.is_some(),
-                )
-            };
-            if already_halted {
+            // Decide and publish under the same lock as progress and entry
+            // into publication. Otherwise a write could start after the
+            // sample and still be announced as stopped.
+            let mut inner = pass.lock();
+            if inner.halt.is_some() || inner.publications > 0 {
                 continue;
             }
+            let working_for = inner
+                .working_since
+                .map(|since| now.saturating_duration_since(since));
+            let since_progress = inner
+                .progress_at
+                .max(inner.computed_at)
+                .map(|at| now.saturating_duration_since(at));
             if !is_stalled(working_for, since_progress, self.stall_threshold) {
                 continue;
             }
@@ -550,14 +652,25 @@ impl BackgroundWorkSupervisor {
                 continue;
             }
             let working_for = working_for.unwrap_or_default();
+            let stalled_for = since_progress.unwrap_or(working_for).min(working_for);
+            let progress = inner.progress;
+            let recovery = if pass.name() == PASS_LSP {
+                "the daemon keeps serving; the worker may retry with fresh servers within its recovery budget"
+            } else {
+                "the daemon keeps serving and a restart retries it"
+            };
             let reason = format!(
-                "the {} pass held the CPU for {}s without recording any progress \
-                 (still at {progress} units) and was stopped; the daemon keeps serving and a \
-                 restart retries it",
+                "the {} pass spent {}s without recording any progress \
+                 (still at {progress} durable units, {}s working); a stop was requested at its next \
+                 checkpoint; {recovery}",
                 pass.name(),
+                stalled_for.as_secs(),
                 working_for.as_secs(),
             );
-            pass.halt(reason.clone());
+            inner.halt = Some(reason.clone());
+            inner.halt_cause = Some(HaltCause::SupervisorStall);
+            inner.working_since = None;
+            pass.halted.store(true, Ordering::Relaxed);
             stopped.push(reason);
         }
         stopped
@@ -740,11 +853,21 @@ pub fn record_durable_admission(layout: &kin_core::KinLayout, tracked_artifacts:
 /// older one in place, so the next comparison spans a longer window and reports
 /// more movement rather than less. Turning it into a sweep or commit failure
 /// would fail work that actually succeeded.
+///
+/// The census credits the name-only call guesses exact language-server proof
+/// retired since it last looked (see
+/// [`kin_core::relation_census::record_settled`]). They are read before the
+/// graph is measured, so a retirement that lands in between is left for the
+/// next census rather than credited to a graph that may still hold it. Once
+/// the census advances or holds, what it read is accounted for, by the new
+/// baseline or by the hold, and leaves the daemon's count.
 pub fn record_relation_census(
-    layout: &kin_core::KinLayout,
+    state: &crate::state::DaemonState,
     graph: &kin_db::InMemoryGraph,
     source: kin_core::relation_census::CensusSource,
 ) {
+    let layout = &state.layout;
+    let settled = state.census_settled_retirements();
     let (kinds, entities) = match kin_cli::commands::graph::measure_relation_census_with_entities(
         graph,
     ) {
@@ -768,13 +891,16 @@ pub fn record_relation_census(
     // baseline, which is what keeps a commit from resetting the comparison
     // point to the graph it just damaged and what stops the recovery sweeps
     // after it from burying the loss a second and third time.
-    match kin_core::relation_census::record(layout, &recorded) {
-        kin_core::relation_census::CensusRecordOutcome::Advanced => {}
+    match kin_core::relation_census::record_settled(layout, &recorded, &settled) {
+        kin_core::relation_census::CensusRecordOutcome::Advanced => {
+            state.release_census_settled_retirements(&settled);
+        }
         kin_core::relation_census::CensusRecordOutcome::Held {
             held_at,
             held_source,
             losses,
         } => {
+            state.release_census_settled_retirements(&settled);
             tracing::warn!(
                 held_at = %held_at.to_rfc3339(),
                 held_source = held_source.label(),
@@ -1617,6 +1743,207 @@ mod tests {
             .halt_reason()
             .expect("a stopped pass carries a reason")
             .contains("without recording any progress"));
+    }
+
+    #[test]
+    fn publication_is_disclosed_without_halting_or_poisoning_the_next_work() {
+        let supervisor = BackgroundWorkSupervisor::new(Duration::from_secs(60));
+        let pass = supervisor.pass(PASS_LSP);
+        let base = Instant::now();
+        pass.working(base);
+        pass.advanced(7, base);
+        {
+            let _publication = pass.publishing();
+            assert!(supervisor.sweep(at(base, 900)).is_empty());
+            assert!(!pass.halted());
+            assert_eq!(pass.report(at(base, 900)).state, "publishing");
+            assert!(pass.is_working(), "publication must keep its worker alive");
+            assert_eq!(pass.progress(), 7, "the guard must not invent progress");
+        }
+        let resumed = Instant::now();
+        assert!(supervisor.sweep(at(resumed, 59)).is_empty());
+        assert_eq!(pass.report(resumed).state, "working");
+        assert_eq!(supervisor.sweep(at(resumed, 61)).len(), 1);
+        assert!(pass.halted(), "a later real stall remains stoppable");
+    }
+
+    #[test]
+    fn publication_does_not_clear_a_preexisting_halt() {
+        let supervisor = BackgroundWorkSupervisor::new(Duration::from_secs(60));
+        let pass = supervisor.pass(PASS_LSP);
+        pass.working(Instant::now());
+        pass.halt("stop at the next checkpoint");
+        {
+            let _publication = pass.publishing();
+            assert_eq!(pass.report(Instant::now()).state, "publishing");
+            assert!(pass.halted());
+            assert!(pass.is_working());
+        }
+        assert_eq!(pass.report(Instant::now()).state, "stopped");
+        assert_eq!(
+            pass.halt_reason().as_deref(),
+            Some("stop at the next checkpoint")
+        );
+    }
+
+    #[test]
+    fn embedding_progress_keeps_completed_chunks_live_without_claiming_durability() {
+        let supervisor = BackgroundWorkSupervisor::new(Duration::from_secs(600));
+        let pass = supervisor.pass(PASS_EMBED);
+        let base = Instant::now();
+        pass.working(base);
+        pass.computed_chunk(85, at(base, 200));
+        pass.computed_chunk(66, at(base, 500));
+        assert!(supervisor.sweep(at(base, 624)).is_empty());
+        assert_eq!(pass.progress(), 0);
+        assert_eq!(pass.report(at(base, 624)).progress_age_seconds, None);
+        assert!(pass.is_working());
+        pass.computed_chunk(0, at(base, 1099));
+        assert_eq!(supervisor.sweep(at(base, 1101)).len(), 1);
+        pass.computed_chunk(56, at(base, 1102));
+        assert!(
+            pass.halted(),
+            "late completion cannot revoke the stop checkpoint"
+        );
+        assert_eq!(pass.progress(), 0);
+    }
+
+    #[test]
+    fn embedding_progress_does_not_forgive_failed_retries_or_dispatch_only_work() {
+        let supervisor = BackgroundWorkSupervisor::new(Duration::from_secs(600));
+        let pass = supervisor.pass(PASS_EMBED);
+        let base = Instant::now();
+        pass.working(base);
+        assert!(pass.charge_retry(Duration::from_secs(30), Duration::from_secs(100), "embed"));
+        pass.computed_chunk(10, at(base, 50));
+        assert!(!pass.charge_retry(Duration::from_secs(71), Duration::from_secs(100), "embed"));
+        assert_eq!(pass.progress(), 0);
+        assert!(pass.halted());
+
+        let other = BackgroundWorkSupervisor::new(Duration::from_secs(600));
+        let stalled = other.pass(PASS_EMBED);
+        stalled.working(base);
+        stalled.working(at(base, 599));
+        stalled.computed_chunk(0, at(base, 599));
+        assert_eq!(other.sweep(at(base, 600)).len(), 1);
+    }
+
+    #[test]
+    fn lsp_query_progress_is_live_without_relations_and_never_revives_a_halt() {
+        let supervisor = BackgroundWorkSupervisor::new(Duration::from_secs(60));
+        let pass = supervisor.pass(PASS_LSP);
+        let base = Instant::now();
+        pass.working(base);
+        pass.completed_work(1, at(base, 40));
+        pass.completed_work(7, at(base, 80));
+        assert!(supervisor.sweep(at(base, 110)).is_empty());
+        assert_eq!(pass.progress(), 0);
+        assert_eq!(pass.report(at(base, 110)).progress_age_seconds, None);
+        pass.completed_work(0, at(base, 139));
+        assert_eq!(supervisor.sweep(at(base, 141)).len(), 1);
+        pass.completed_work(2, at(base, 142));
+        assert!(pass.halted());
+        assert!(pass.supervisor_stalled());
+    }
+
+    #[test]
+    fn lsp_stall_restarts_are_bounded_without_durable_progress() {
+        let supervisor = BackgroundWorkSupervisor::new(Duration::from_secs(60));
+        let pass = supervisor.pass(PASS_LSP);
+        let base = Instant::now();
+        let delay = Duration::from_secs(30);
+        let budget = Duration::from_secs(1800);
+        pass.working(base);
+        for attempt in 0..3 {
+            let started = at(base, attempt * 100);
+            pass.completed_work(1, at(base, attempt * 100 + 1));
+            assert_eq!(supervisor.sweep(started + Duration::from_secs(62)).len(), 1);
+            let resumed =
+                pass.resume_supervisor_stall(delay, budget, at(base, (attempt + 1) * 100));
+            assert_eq!(resumed, attempt < 2);
+        }
+        assert!(pass.halted());
+        assert!(!pass.supervisor_stalled());
+        assert_eq!(pass.progress(), 0);
+        assert_eq!(pass.retry_spent(), Duration::from_secs(90));
+        assert!(pass
+            .halt_reason()
+            .unwrap()
+            .contains("unfinished work remains owed"));
+    }
+
+    #[test]
+    fn lsp_stall_recovery_preserves_manual_stops_publication_and_retry_spending() {
+        let supervisor = BackgroundWorkSupervisor::new(Duration::from_secs(60));
+        let pass = supervisor.pass(PASS_LSP);
+        let base = Instant::now();
+        pass.working(base);
+        supervisor.sweep(at(base, 61));
+        {
+            let _publication = pass.publishing();
+            assert!(!pass.resume_supervisor_stall(
+                Duration::from_secs(30),
+                Duration::from_secs(100),
+                at(base, 90)
+            ));
+            assert_eq!(pass.retry_spent(), Duration::ZERO);
+        }
+        assert!(pass.resume_supervisor_stall(
+            Duration::from_secs(30),
+            Duration::from_secs(100),
+            at(base, 90)
+        ));
+        pass.advanced(1, at(base, 91));
+        supervisor.sweep(at(base, 152));
+        assert!(pass.resume_supervisor_stall(
+            Duration::from_secs(30),
+            Duration::from_secs(100),
+            at(base, 180)
+        ));
+        assert_eq!(pass.retry_spent(), Duration::from_secs(60));
+        pass.advanced(1, at(base, 181));
+        supervisor.sweep(at(base, 242));
+        assert!(
+            !pass.resume_supervisor_stall(
+                Duration::from_secs(40),
+                Duration::from_secs(100),
+                at(base, 280)
+            ),
+            "durable progress renews the restart allowance, never the cumulative budget"
+        );
+        assert!(pass.halted());
+
+        let manual = BackgroundWorkSupervisor::new(Duration::from_secs(60));
+        let pass = manual.pass(PASS_LSP);
+        pass.working(base);
+        manual.sweep(at(base, 61));
+        let first = pass.halt_reason();
+        pass.halt("operator stop");
+        assert_eq!(pass.halt_reason(), first);
+        assert!(!pass.resume_supervisor_stall(
+            Duration::from_secs(30),
+            Duration::from_secs(100),
+            at(base, 90)
+        ));
+        assert!(!pass.supervisor_stalled());
+    }
+
+    #[test]
+    fn stall_reason_reports_time_since_progress_instead_of_the_whole_pass() {
+        let supervisor = BackgroundWorkSupervisor::new(Duration::from_secs(60));
+        let pass = supervisor.pass(PASS_LSP);
+        let base = Instant::now();
+        pass.working(base);
+        pass.advanced(7, at(base, 500));
+        let reasons = supervisor.sweep(at(base, 561));
+        assert_eq!(reasons.len(), 1);
+        assert!(
+            reasons[0].contains("61s without recording any progress"),
+            "{}",
+            reasons[0]
+        );
+        assert!(reasons[0].contains("561s working"), "{}", reasons[0]);
+        assert!(reasons[0].contains("stop was requested"), "{}", reasons[0]);
     }
 
     /// A pass with nowhere to read a halt must never be announced as stopped.

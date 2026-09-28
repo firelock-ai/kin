@@ -191,12 +191,30 @@ and `install.ps1` unless noted):
 
 ## 2. Guided setup (`kin setup`)
 
-`kin setup` is the guided wizard. The recommended `npx -y @kinlab/kin setup` command
+`kin setup` is the guided setup. The recommended `npx -y @kinlab/kin setup` command
 launches it on macOS, Linux, WSL2, and native Windows x64. After using the PowerShell
 installer, run `kin setup` yourself. WSL2 remains the recommended Windows route for
-the full experience; see the [native Windows limits](#windows). You can run the wizard
-again any time. It opens with **"What do you want Kin for?"** and asks
-for your **intent** rather than a bag of independent toggles:
+the full experience; see the [native Windows limits](#windows). You can run it again any
+time.
+
+On a terminal it asks up to four questions on one screen, and changes nothing until every
+answer is in. It asks only what this machine still needs, and a flag answers a question up
+front:
+
+| Question | What yes does |
+| --- | --- |
+| **AI clients** | Adds Kin's MCP server to each AI client it found. Codex CLI and Grok CLI keep one entry that names a repository, so `kin clone` and `kin init` connect them to the repository they open. |
+| **PATH** | Adds a line to your shell profile so a new terminal finds `kin`. On macOS with zsh that is `~/.zshenv` and `~/.zprofile`, because a login shell reorders `PATH` after `~/.zshenv`. |
+| **Language servers** | Installs a language server when a repository you clone or initialize needs one, for that repository's languages only. |
+| **Search model** | Downloads the search model, about 523 MB, the first time Kin builds a search index. Answering no means it never downloads until you run `kin embed`. |
+
+The arrow keys, or `j` and `k`, choose. Enter confirms, Esc goes back, and Ctrl-C cancels
+with nothing changed. Setup then checks that a new terminal runs the `kin` it installed, and
+ends with what it connected, anything that needs you, and one next command.
+
+`kin setup --verbose` runs the full wizard instead, and a pipe or CI prints its full record
+without asking. The wizard opens with **"What do you want Kin for?"** and asks for your
+**intent** rather than a bag of independent toggles:
 
 | Intent | What it configures |
 | --- | --- |
@@ -694,7 +712,7 @@ beside the `healthy` boolean:
 
 `healthy` is true only for `ready`. It used to be true whenever nothing was MISSING or
 MISCONFIGURED, which meant a fresh install printing "2 checks need attention" on its last
-line also reported `"healthy": true` to every machine reader (FIR-2919). Read `verdict`
+line also reported `"healthy": true` to every machine reader. Read `verdict`
 when you need to tell a warming install from a broken one; the boolean cannot carry that
 difference.
 

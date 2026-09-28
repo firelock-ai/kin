@@ -143,7 +143,10 @@ pub fn plan_local_binding_obligations(
     plan_withdrawn_local_binding_obligations(&selected, entity, artifact, held_at, exact)
 }
 
-pub(crate) fn plan_withdrawn_local_binding_obligations(
+/// Preserve exact prior bindings that a trusted transition classifier could
+/// neither retain nor discharge. Callers supply the actual withdrawn payloads
+/// from the held predecessor; existing debt is merged without losing history.
+pub fn plan_withdrawn_local_binding_obligations(
     incident: &[Relation],
     mut entity: impl FnMut(kin_model::EntityId) -> Result<Option<kin_model::Entity>>,
     mut artifact: impl FnMut(&FilePathId) -> Result<Option<(ArtifactId, kin_model::Hash256)>>,

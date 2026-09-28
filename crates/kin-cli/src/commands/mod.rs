@@ -192,6 +192,26 @@ pub(crate) fn require_commit_author_for(
     Ok(kin_model::AuthorId::new(identity.author))
 }
 
+pub(crate) const COMPACT_AUTHOR_CONSEQUENCE: &str =
+    "Author not set; admission and commits are blocked.";
+
+/// Only the generic unresolved case can use generic setup advice. A misplaced
+/// Kin setting shares its first sentence but carries a different repair.
+pub(crate) fn is_missing_author_identity(error: &kin_core::KinError) -> bool {
+    matches!(error, kin_core::KinError::Config(detail) if *detail == kin_core::unresolved_identity_message())
+}
+
+/// Keep the short form to one repair route, using the resolver's exact
+/// commands. Health and verbose output retain its alternative Kin setting.
+pub(crate) fn compact_author_commands() -> String {
+    kin_core::IDENTITY_REMEDIATION
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("git config "))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// The one wording every "you are not in a Kin repository" refusal is raised
 /// with, so a command whose condition is its own still states the same remedy.
 ///

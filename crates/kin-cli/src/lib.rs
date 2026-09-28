@@ -17,6 +17,7 @@ pub mod daemon_error;
 pub mod embed_model;
 pub mod entity_identity;
 pub mod entity_ref;
+pub mod first_run;
 pub mod mark;
 pub mod model_residency;
 pub mod open_files;
@@ -26,6 +27,8 @@ pub mod progress;
 pub mod provenance;
 pub mod resource_profile;
 pub mod retrieval_profile;
+pub mod screen;
+pub mod tui;
 
 #[cfg(all(test, unix))]
 #[test]

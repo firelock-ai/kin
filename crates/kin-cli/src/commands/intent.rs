@@ -114,6 +114,17 @@ pub async fn register(
     } else {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
+        // A scope naming a symbol outside the repository is refused by what
+        // it names, in the words every scope argument is refused with.
+        if let Some(lines) = crate::commands::external_symbols::relayed_refusal_lines(
+            &body,
+            &format!(
+                "`kin intent register` {}",
+                crate::commands::external_symbols::INTENT_WHY
+            ),
+        ) {
+            anyhow::bail!(lines.join("\n"));
+        }
         anyhow::bail!("daemon returned {}: {}", status, body)
     }
 }

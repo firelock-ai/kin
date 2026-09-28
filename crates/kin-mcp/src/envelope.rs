@@ -458,6 +458,16 @@ impl Degraded {
     /// work nobody recorded, is never cleared, so it keeps bounding every
     /// answer.
     pub fn bounds(&self, substrate: AbsenceSubstrate) -> bool {
+        self.scoped_to(substrate).any()
+    }
+
+    /// The active flags that bound this substrate, from the same policy as
+    /// [`Self::bounds`]. Disclosed flags outside it are not refusal reasons.
+    pub fn bounding_labels(&self, substrate: AbsenceSubstrate) -> Vec<&'static str> {
+        self.scoped_to(substrate).active_labels()
+    }
+
+    fn scoped_to(&self, substrate: AbsenceSubstrate) -> Self {
         use kin_core::memory_pressure::HeavyWork;
         let mut rest = self.clone();
         // A stopped embedding worker freezes the vector index, and a store with
@@ -477,7 +487,7 @@ impl Degraded {
         if embed_batch_out_of_scope || lsp_sweep_out_of_scope {
             rest.memory_pressure = None;
         }
-        rest.any()
+        rest
     }
 
     /// The names of the degraded signals that are affirmatively set, in a stable
@@ -520,6 +530,9 @@ impl Degraded {
         }
         if self.enrichment_shortfall == Some(true) {
             labels.push("enrichment_shortfall");
+        }
+        if self.no_repository == Some(true) {
+            labels.push("no_repository");
         }
         labels
     }
@@ -3409,6 +3422,14 @@ pub fn finalize_bounded(
     budget: &ResponseBudget,
 ) -> ToolCallResult {
     let mut payload = first_payload_value(&result);
+    // The daemon's trace pager already measured its complete page envelope.
+    // Appending a second reading would both exceed the caller's byte ceiling
+    // and qualify a frozen page against a different observation.
+    if matches!(tool_name, "trace_data_flow" | "find_references")
+        && payload.as_ref().is_some_and(crate::trace_pages::is_page)
+    {
+        return result;
+    }
     let context_limit = matches!(tool_name, "get_context_pack" | "trace_computation")
         .then(|| {
             payload
@@ -3748,10 +3769,14 @@ fn answer_only_envelope(envelope_value: &Value) -> Value {
     );
     envelope.insert("verdict".to_string(), Value::Object(verdict));
     // Freshness and persisted-state observations are not all verdict inputs.
-    // Keep them even when the reference diagnostics are omitted.
+    // Keep them even when the reference diagnostics are omitted. Repository
+    // and daemon identity must survive this pre-page projection too: the pager
+    // measures and freezes this envelope before the connection checks it.
     for key in [
         "envelope_version",
         "runtime",
+        "repository",
+        "answered_by",
         "graph_as_of",
         "graph_state",
         "freshness",
@@ -3958,7 +3983,7 @@ fn apply_response_budget(annotated: &mut Value, tool_name: &str, budget: &Respon
     // the rule that verdict inputs themselves are never trimmed.
     for _ in 0..16 {
         let before = annotated.clone();
-        if let Some(applied) = crate::budget::enforce(annotated, tool_name, budget) {
+        if let Some(applied) = crate::budget::enforce_final(annotated, tool_name, budget) {
             bounded |= applied.bounded;
             largest_before = largest_before.max(applied.chars_before);
             accounting = applied;
@@ -3967,19 +3992,10 @@ fn apply_response_budget(annotated: &mut Value, tool_name: &str, budget: &Respon
         accounting.chars_before = largest_before;
 
         if bounded {
-            if let Some(completeness) = annotated
-                .get_mut(ENVELOPE_KEY)
-                .and_then(Value::as_object_mut)
-                .and_then(|envelope| envelope.get_mut("completeness"))
-            {
-                Completeness::mark_response_bounded(completeness);
-            }
-            // The verdict and the absence object are downgraded with it. A
-            // budget that removed rows on purpose is the one cut that cannot
-            // leave a response certifying what it no longer carries.
-            crate::verdict::mark_response_bounded(annotated);
+            qualify_bounded_response(annotated, tool_name, budget);
+        } else {
+            disclose_self_contradictions(annotated, tool_name);
         }
-        disclose_self_contradictions(annotated, tool_name);
         settle_response_accounting(annotated, &mut accounting);
 
         if *annotated == before {
@@ -3987,10 +4003,8 @@ fn apply_response_budget(annotated: &mut Value, tool_name: &str, budget: &Respon
         }
     }
 
-    // The loop above rebuilds the verdict on any pass that marked the response
-    // bounded, so a pointer the ladder wrote inside the loop is overwritten by
-    // the long form on the next pass. It is applied here, after the loop has
-    // settled, where nothing rewrites those fields again.
+    // A final idempotent pointer pass also covers a response that needed only
+    // lossless compaction and never entered bounded qualification.
     if crate::budget::point_restated_limiting_factor(annotated, budget) > 0 {
         settle_response_accounting(annotated, &mut accounting);
     }
@@ -4000,6 +4014,22 @@ fn apply_response_budget(annotated: &mut Value, tool_name: &str, budget: &Respon
     // more because adding or removing the marker changes the measured bytes.
     crate::budget::reconcile_residual(annotated, budget);
     settle_response_accounting(annotated, &mut accounting);
+}
+
+/// Apply the same bounded qualification during fit previews and finalization.
+/// A repeated pass must not restore long-form restatements after the ladder
+/// has measured their lossless pointer representation.
+pub(crate) fn qualify_bounded_response(
+    annotated: &mut Value,
+    tool_name: &str,
+    budget: &ResponseBudget,
+) {
+    if let Some(completeness) = annotated.pointer_mut("/_kin/completeness") {
+        Completeness::mark_response_bounded(completeness);
+    }
+    crate::verdict::mark_response_bounded(annotated);
+    disclose_self_contradictions(annotated, tool_name);
+    crate::budget::point_restated_limiting_factor(annotated, budget);
 }
 
 /// Write `_kin.response` until its `chars_after_budget` field equals the exact
@@ -8332,6 +8362,49 @@ mod tests {
         );
     }
 
+    #[test]
+    fn bounding_labels_share_the_substrate_policy_with_negative_trust() {
+        let flags = Degraded {
+            embed_worker_failed: Some(true),
+            embed_persistence_unavailable: Some(true),
+            memory_pressure: Some(true),
+            memory_pressure_work: Some("lsp-sweep".into()),
+            ..Default::default()
+        };
+        for (substrate, expected) in [
+            (AbsenceSubstrate::Relations, vec!["memory_pressure"]),
+            (
+                AbsenceSubstrate::Vectors,
+                vec!["embed_worker_failed", "embed_persistence_unavailable"],
+            ),
+            (AbsenceSubstrate::EntityIndex, vec![]),
+            (AbsenceSubstrate::History, vec![]),
+        ] {
+            assert_eq!(flags.bounding_labels(substrate), expected, "{substrate:?}");
+            assert_eq!(
+                flags.bounds(substrate),
+                !expected.is_empty(),
+                "{substrate:?}"
+            );
+        }
+        let all = Degraded {
+            mass_deletion_blocked: Some(true),
+            ..flags
+        };
+        assert_eq!(
+            all.bounding_labels(AbsenceSubstrate::EntityIndex),
+            vec!["mass_deletion_blocked"]
+        );
+        let absent = Degraded {
+            no_repository: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(
+            absent.bounding_labels(AbsenceSubstrate::EntityIndex),
+            vec!["no_repository"]
+        );
+    }
+
     /// FIR-2829: replay-version agreement stays silent and every version gap
     /// becomes a degraded signal that reaches completeness and negative trust.
     #[test]
@@ -8860,6 +8933,181 @@ mod self_check_tests {
         assert_eq!(value["candidates"], payload["candidates"]);
         assert_eq!(value["_kin"]["verdict"]["state"], "inconclusive");
         assert_eq!(value["_kin"]["verdict"]["safe_to_conclude_absent"], false);
+    }
+
+    fn captured_reference_pipeline() -> Value {
+        serde_json::from_str(include_str!("budget_test_data/reference_pipeline.json")).unwrap()
+    }
+
+    #[test]
+    fn reference_pipeline_retains_proven_rows_across_daemon_and_repeated_finalizers() {
+        let fixture = captured_reference_pipeline();
+        let original = &fixture["raw"];
+        let envelope: Envelope = serde_json::from_value(fixture["envelope"].clone()).unwrap();
+        let budget = ResponseBudget::from_arguments(&std::collections::HashMap::from([
+            ("max_chars".into(), json!(12_000)),
+            ("answer_only".into(), json!(false)),
+        ]));
+        let baseline = finalize_bounded(
+            ToolCallResult::text(original.to_string()),
+            envelope.clone(),
+            "find_references",
+            &ResponseBudget {
+                max_chars: 60_000,
+                ..budget
+            },
+        );
+        let ContentBlock::Text { text } = &baseline.content[0];
+        let baseline: Value = serde_json::from_str(text).unwrap();
+        for input in ["raw", "already_bounded"] {
+            let mut raw = fixture[input].clone();
+            // The daemon bounds before and after route-level disclosures. Its
+            // text serialization then crosses into the stdio finalizer.
+            for _ in 0..2 {
+                crate::budget::enforce(
+                    &mut raw,
+                    "find_references",
+                    &budget.less_envelope_reserve(),
+                );
+                let wire = crate::budget::render(&raw).unwrap();
+                raw = serde_json::from_str(&wire).unwrap();
+            }
+            assert_eq!(raw["references"], original["references"]);
+            let mut result = ToolCallResult::text(crate::budget::render(&raw).unwrap());
+            for pass in 0..3 {
+                result = finalize_bounded(result, envelope.clone(), "find_references", &budget);
+                let ContentBlock::Text { text } = &result.content[0];
+                let value: Value = serde_json::from_str(text).unwrap();
+                assert!(
+                    text.len() <= 12_000,
+                    "{input}, pass {pass}: {} bytes",
+                    text.len()
+                );
+                assert_eq!(value["_kin"]["response"]["chars_after_budget"], text.len());
+                assert_eq!(value["_kin"]["response"]["primary_rows"], 2);
+                assert_eq!(
+                    value["references"], original["references"],
+                    "{input}, pass {pass}"
+                );
+                assert!(value.get("references_withheld").is_none());
+                for key in [
+                    "counts",
+                    "caller_arrival",
+                    "source_derivation",
+                    "cross_repo",
+                    "total_upstream",
+                ] {
+                    assert_eq!(value[key], original[key], "{input}, pass {pass}: {key}");
+                }
+                // Finalization can add verdict limits to the coverage block;
+                // all original facts and preexisting limits must still hold.
+                for (key, expected) in original["edge_coverage"].as_object().unwrap() {
+                    assert_eq!(value["edge_coverage"][key], *expected, "coverage {key}");
+                }
+                for limit in baseline["edge_coverage"]["limits"].as_array().unwrap() {
+                    assert!(value["edge_coverage"]["limits"]
+                        .as_array()
+                        .unwrap()
+                        .contains(limit));
+                }
+                let sample = value["call_sites"]["candidates"].as_array().unwrap().len();
+                assert_eq!(sample, 0, "the optional examples yield to both proven rows");
+                assert_eq!(value["call_sites"]["settled"], false);
+                assert_eq!(value["call_sites"]["candidate_count"], 613);
+                assert_eq!(value["call_sites"]["candidates_withheld"], 613 - sample);
+                assert_eq!(value["elisions"]["call_sites.candidates"]["total"], 50);
+                assert_eq!(
+                    value["elisions"]["call_sites.candidates"]["elided"],
+                    50 - sample
+                );
+                let mut standing = value["call_sites"].clone();
+                standing["candidates"] = original["call_sites"]["candidates"].clone();
+                standing["candidates_withheld"] =
+                    original["call_sites"]["candidates_withheld"].clone();
+                assert_eq!(standing, original["call_sites"]);
+                assert_eq!(value["negative"]["safe_to_conclude_absent"], false);
+                assert_eq!(value["_kin"]["verdict"]["safe_to_conclude_absent"], false);
+                let reason = value["negative"]["trust_reason"].as_str().unwrap();
+                for clause in baseline["negative"]["trust_reason"]
+                    .as_str()
+                    .unwrap()
+                    .split(crate::verdict::CLAUSE_SEPARATOR)
+                {
+                    assert!(
+                        reason
+                            .split(crate::verdict::CLAUSE_SEPARATOR)
+                            .any(|actual| actual == clause),
+                        "missing qualification: {clause}"
+                    );
+                }
+                let codes = value["_kin"]["verdict"]["limiting_factor"]
+                    .as_str()
+                    .unwrap();
+                for code in baseline["_kin"]["verdict"]["limiting_factor"]
+                    .as_str()
+                    .unwrap()
+                    .split(crate::verdict::CLAUSE_SEPARATOR)
+                {
+                    assert!(codes
+                        .split(crate::verdict::CLAUSE_SEPARATOR)
+                        .any(|actual| actual == code));
+                }
+                let degradations = value["degradations"].as_array().unwrap();
+                assert_eq!(
+                    degradations
+                        .iter()
+                        .filter(|row| row["reason"] == crate::budget::BOUNDED_REASON)
+                        .count(),
+                    1
+                );
+                assert!(!degradations
+                    .iter()
+                    .any(|row| row["reason"] == crate::budget::OVER_BUDGET_REASON));
+            }
+        }
+    }
+
+    #[test]
+    fn irreducible_reference_qualifications_remain_honest_under_a_smaller_budget() {
+        let fixture = captured_reference_pipeline();
+        let mut raw = fixture["raw"].clone();
+        let envelope: Envelope = serde_json::from_value(fixture["envelope"].clone()).unwrap();
+        let budget = ResponseBudget::from_arguments(&std::collections::HashMap::from([(
+            "max_chars".into(),
+            json!(2_000),
+        )]));
+        crate::budget::enforce(&mut raw, "find_references", &budget);
+        let result = finalize_bounded(
+            ToolCallResult::text(crate::budget::render(&raw).unwrap()),
+            envelope,
+            "find_references",
+            &budget,
+        );
+        let ContentBlock::Text { text } = &result.content[0];
+        let value: Value = serde_json::from_str(text).unwrap();
+        let rows = value["references"].as_array().unwrap().len();
+        assert!(rows > 0 && rows <= 2);
+        assert_eq!(value["_kin"]["response"]["primary_rows"], rows);
+        assert_eq!(value["_kin"]["response"]["chars_after_budget"], text.len());
+        assert_eq!(
+            value["references_withheld"].as_u64().unwrap_or(0),
+            (2 - rows) as u64
+        );
+        assert_eq!(value["call_sites"]["candidate_count"], 613);
+        assert_eq!(
+            value["call_sites"]["clauses"],
+            fixture["raw"]["call_sites"]["clauses"]
+        );
+        assert_eq!(value["negative"]["safe_to_conclude_absent"], false);
+        assert_eq!(value["_kin"]["verdict"]["safe_to_conclude_absent"], false);
+        assert!(
+            text.len() <= budget.max_chars
+                || value["degradations"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|row| row["reason"] == crate::budget::OVER_BUDGET_REASON)
+        );
     }
 
     #[test]

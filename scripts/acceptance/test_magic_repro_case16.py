@@ -43,8 +43,12 @@ required `Fast gate lint and policy` context, so the class is refused at the
 pull request rather than a release later.
 """
 import importlib.util
+import io
+import json
 from pathlib import Path
+import tempfile
 import unittest
+from unittest import mock
 
 
 def _load(name):
@@ -61,10 +65,14 @@ m = _load("magic_repro")
 # the v0.7.8 candidate archive (08490e9f3) against an isolated store on a macOS
 # host with no Python language server. Paraphrasing these would let the fixture
 # drift away from what the product actually prints, which is the whole failure
-# mode this file guards.
+# mode this file guards. The one exception is the header line, which is in the
+# form `kin refs` prints now that it names an entity by id and its file only as
+# the projection it is (the id is this fixture's, since a real one is minted
+# per store): the receipt's header carried `@ callee.py` in their place.
 ABSENCE_LINE = "No incoming Calls relations."
 CLEAN_STDOUT = (
-    "References to 'unused_absence_probe' -> unused_absence_probe (Function) @ callee.py\n"
+    "References to 'unused_absence_probe' -> unused_absence_probe (Function) "
+    "[5f0c1d9e-3a47-4b1e-9d62-7c8e2f4a6b10] (projection: callee.py)\n"
     + ABSENCE_LINE + "\n")
 HEDGED_STDOUT = CLEAN_STDOUT + (
     "Kin cannot rule out references it did not see: this answer carries "
@@ -195,6 +203,81 @@ class GapPredicate(unittest.TestCase):
             "[edge_coverage:cross_file_edges_unproduced], so it may not reflect current truth.\n")
         self.assertIsNone(m.host_lacks_reference_enrichment(
             payload(False, HOST_GAP), other))
+
+
+class IsolatedFixtureReadiness(unittest.TestCase):
+    def graph(self, **changes):
+        sites = {"settled": True, "callers": 5, "census": 1,
+                 "callers_owed": 0, "callers_stale": 0,
+                 "callers_unverified": 0, "callers_unproven_no_resolver": 0}
+        sites.update(changes)
+        return {"call_sites": sites}
+
+    def work(self, **changes):
+        work = {"pending_work": 0, "failed_work": 0, "merge_pending": False,
+                "worker_available": True, "running": False, "files_blocked": 0,
+                "languages_skipped": [], "files_owed": 0, "evidence_unrecorded_files": []}
+        work.update(changes)
+        return work
+
+    def test_independent_readiness_does_not_require_a_certifying_verdict(self):
+        graph = self.graph()
+        graph.update(payload(False, "a verdict regression must still fail the next assertion"))
+        self.assertTrue(m.absence_control_ready(graph, self.work()))
+        status, _ = m.certification_arm_reading(graph, cli(HEDGED_STDOUT))
+        self.assertEqual(status, m.FAIL)
+
+    def test_drained_worker_does_not_hide_owed_or_unverified_graph_callers(self):
+        for changes in ({"settled": False, "callers_owed": 2},
+                        {"callers_stale": 1}, {"callers_unverified": 1},
+                        {"callers_unproven_no_resolver": 1}, {"census": 0}, {"callers": 0}):
+            with self.subTest(changes=changes):
+                self.assertFalse(m.absence_control_ready(self.graph(**changes), self.work()))
+
+    def test_settled_graph_does_not_hide_pending_or_unrecorded_work(self):
+        for changes in ({"pending_work": 1}, {"running": True}, {"merge_pending": True},
+                        {"files_owed": 1}, {"evidence_unrecorded_files": ["caller.py"]}):
+            with self.subTest(changes=changes):
+                self.assertFalse(m.absence_control_ready(self.graph(), self.work(**changes)))
+
+    def test_failed_or_unavailable_enrichment_never_becomes_ready(self):
+        for changes in ({"failed_work": 1}, {"worker_available": False},
+                        {"files_blocked": 1}, {"languages_skipped": ["python"]}):
+            with self.subTest(changes=changes), self.assertRaises(RuntimeError):
+                m.absence_control_ready(self.graph(), self.work(**changes))
+
+    def test_missing_or_malformed_readings_fail_closed(self):
+        for graph in ({}, self.graph(settled="true"), self.graph(callers_owed=None),
+                      self.graph(census=-1)):
+            with self.subTest(graph=graph), self.assertRaises(RuntimeError):
+                m.absence_control_ready(graph, self.work())
+        with self.assertRaises(RuntimeError):
+            m.absence_control_ready(self.graph(), self.work(files_owed=None))
+
+    def test_wait_reads_only_independent_status_and_keeps_one_deadline(self):
+        with tempfile.TemporaryDirectory() as repo:
+            kin = Path(repo) / ".kin"
+            kin.mkdir()
+            (kin / "daemon.port").write_text("4219\n")
+            (kin / "daemon.token").write_text("fixture-token")
+            suite = m.Suite("unused", repo)
+            suite.kin_run = mock.Mock(return_value=(0, json.dumps(self.graph(settled=False)), ""))
+            suite.mcp = mock.Mock(side_effect=AssertionError("readiness must not query a verdict"))
+            elapsed = [0.0]
+            def sleep(seconds):
+                elapsed[0] += seconds
+            with mock.patch.object(m.time, "monotonic", side_effect=lambda: elapsed[0]), \
+                    mock.patch.object(m.time, "sleep", side_effect=sleep), \
+                    mock.patch.object(m.urllib.request, "urlopen",
+                                      side_effect=lambda *a, **k: io.StringIO(json.dumps(self.work()))):
+                with self.assertRaisesRegex(RuntimeError, "did not settle in 0.5s"):
+                    suite.await_absence_control_ready(repo, timeout=0.5)
+            self.assertEqual(elapsed[0], 0.5)
+            self.assertEqual(suite.kin_run.call_count, 2)
+            for call in suite.kin_run.call_args_list:
+                self.assertEqual(call.args[0], ["graph", "status", "--json"])
+                self.assertLessEqual(call.kwargs["timeout"], 0.5)
+            suite.mcp.assert_not_called()
 
 
 class TokensStillExistInTheProduct(unittest.TestCase):

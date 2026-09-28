@@ -837,6 +837,15 @@ fn execute_locked(
             return refuse_unpublished(state, binding, None);
         }
         if let Some(operations) = request.arguments.get("operations") {
+            if let Some(refusal) = kin_mcp::handlers::external_symbols::external_relation_refusal(
+                state.graph.as_ref(),
+                operations,
+                TOOL,
+            )
+            .map_err(|error| error.to_string())?
+            {
+                return refuse_unpublished(state, binding, Some(refusal));
+            }
             let parsed = kin_mcp::session::parse_staged_operations(operations)?;
             if let Err(reason) = kin_mcp::session::validate_semantic_operations(&parsed) {
                 return refuse_unpublished(state, binding, Some(reason));
@@ -867,6 +876,17 @@ fn execute_locked(
         return Err(refusal);
     }
     state.coordinator.heartbeat(&session_id).map_err(recovery)?;
+    if let Some(operations) = request.arguments.get("operations") {
+        if let Some(refusal) = kin_mcp::handlers::external_symbols::external_relation_refusal(
+            state.graph.as_ref(),
+            operations,
+            TOOL,
+        )
+        .map_err(|error| error.to_string())?
+        {
+            return Err(refusal);
+        }
+    }
     let operations = kin_mcp::handlers::sessions::checked_mutate_operations(&request.arguments)
         .map_err(|error| {
             error
@@ -933,6 +953,7 @@ fn execute_locked(
             state: "active".to_string(),
             staged_operations: Vec::new(),
             commit_payload_hash: None,
+            created_at: Some(Timestamp::now()),
             last_activity_at: Timestamp::now(),
         };
         let mut transactions = sessions.list_transactions();

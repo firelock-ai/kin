@@ -1982,11 +1982,75 @@ pub enum LspEnrichmentMessage {
     Sweep,
 }
 
+/// An unfinished reservation is tied to the source-marker generation it read.
+/// Ordinary enrichment writes do not advance this generation; source changes do.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum LspWorkItem {
+    File {
+        file: String,
+        source_generation: u64,
+    },
+    Sweep {
+        source_generation: u64,
+    },
+    // Only the low-level accounting tests admit work without a source identity.
+    #[cfg(test)]
+    Reservation {
+        id: u64,
+    },
+}
+
+impl LspWorkItem {
+    pub(crate) fn file(file: impl Into<String>, source_generation: u64) -> Self {
+        Self::File {
+            file: file.into(),
+            source_generation,
+        }
+    }
+
+    fn completed_by(&self, completed: &Self) -> bool {
+        match (self, completed) {
+            (
+                Self::File {
+                    file,
+                    source_generation,
+                },
+                Self::File {
+                    file: completed_file,
+                    source_generation: completed_generation,
+                },
+            ) => file == completed_file && source_generation <= completed_generation,
+            (
+                Self::Sweep { source_generation },
+                Self::Sweep {
+                    source_generation: completed_generation,
+                },
+            ) => source_generation <= completed_generation,
+            #[cfg(test)]
+            (Self::Reservation { id }, Self::Reservation { id: completed_id }) => {
+                id == completed_id
+            }
+            _ => false,
+        }
+    }
+}
+
+#[derive(Default)]
+struct LspWorkFailures {
+    serial: u64,
+    items: BTreeMap<LspWorkItem, u64>,
+}
+
 /// Completion accounting includes queue residence and server-start buffering.
 #[derive(Default)]
 pub struct LspWorkTracker {
     pub pending: AtomicU64,
+    // Cached count for existing internal consumers. The ledger is authoritative.
     pub failed: AtomicU64,
+    failures: Mutex<LspWorkFailures>,
+    #[cfg(test)]
+    reservations: AtomicU64,
     /// Language-server query errors the incremental path saw, since this
     /// daemon started.
     ///
@@ -2004,28 +2068,151 @@ pub struct LspWorkTracker {
 
 pub(crate) struct LspWorkGuard {
     tracker: Arc<LspWorkTracker>,
+    items: std::collections::BTreeSet<LspWorkItem>,
+    sweep: Option<LspWorkItem>,
+    failure_cutoff: u64,
     completed: bool,
     transferred: bool,
 }
 
 impl LspWorkTracker {
+    pub(crate) fn failed_items(&self) -> Vec<LspWorkItem> {
+        self.failures
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .items
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) fn reserve_for(self: &Arc<Self>, item: LspWorkItem) -> LspWorkGuard {
+        self.pending.fetch_add(1, Ordering::SeqCst);
+        self.resume_for(item)
+    }
+
+    pub(crate) fn resume_for(self: &Arc<Self>, item: LspWorkItem) -> LspWorkGuard {
+        let failure_cutoff = self
+            .failures
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .serial;
+        let sweep = matches!(item, LspWorkItem::Sweep { .. }).then(|| item.clone());
+        LspWorkGuard {
+            tracker: Arc::clone(self),
+            items: std::collections::BTreeSet::from([item]),
+            sweep,
+            failure_cutoff,
+            completed: false,
+            transferred: false,
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn reserve(self: &Arc<Self>) -> LspWorkGuard {
         self.pending.fetch_add(1, Ordering::SeqCst);
         self.resume()
     }
 
+    #[cfg(test)]
     pub(crate) fn resume(self: &Arc<Self>) -> LspWorkGuard {
-        LspWorkGuard {
-            tracker: Arc::clone(self),
-            completed: false,
-            transferred: false,
-        }
+        self.resume_for(LspWorkItem::Reservation {
+            id: self.reservations.fetch_add(1, Ordering::SeqCst),
+        })
     }
 }
 
 impl LspWorkGuard {
+    /// Finishing or handing off a reservation is not proof that earlier failures
+    /// were repaired. Only `resolve_files` / `resolve_completed` may clear them.
     pub(crate) fn complete(&mut self) {
         self.completed = true;
+    }
+
+    pub(crate) fn bind_file(&mut self, file: String, generation: u64) {
+        self.items = std::collections::BTreeSet::from([LspWorkItem::file(file, generation)]);
+        self.sweep = None;
+    }
+
+    /// Replace the pre-capture sweep identity with the actual captured files.
+    /// Keep its sweep key for failures that occurred before any input was known.
+    pub(crate) fn bind_files(&mut self, files: impl IntoIterator<Item = String>, generation: u64) {
+        self.items = files
+            .into_iter()
+            .map(|file| LspWorkItem::file(file, generation))
+            .collect();
+        self.sweep = Some(LspWorkItem::Sweep {
+            source_generation: generation,
+        });
+    }
+
+    fn resolve(&self, items: impl IntoIterator<Item = LspWorkItem>) {
+        let mut failures = self
+            .tracker
+            .failures
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        for item in items {
+            failures.items.retain(|failed_item, serial| {
+                // Current-source completion supersedes this file's older work,
+                // including an unrelated edit advancing the marker generation.
+                // An older retry cannot clear newer source, and a failure made
+                // while this retry ran remains independent even at the same key.
+                let resolved = *serial <= self.failure_cutoff && failed_item.completed_by(&item);
+                if resolved {
+                    debug!(?failed_item, completed_item = ?item,
+                        "completed LSP work resolved an earlier failed reservation");
+                }
+                !resolved
+            });
+        }
+        self.tracker
+            .failed
+            .store(failures.items.len() as u64, Ordering::SeqCst);
+    }
+
+    pub(crate) fn resolve_files(&mut self, files: &[String], generation: u64) {
+        let resolved: Vec<_> = files
+            .iter()
+            .map(|file| LspWorkItem::file(file.clone(), generation))
+            .filter(|item| self.items.remove(item))
+            .collect();
+        self.resolve(resolved);
+    }
+
+    /// A complete current sweep can also retire work for a source that was
+    /// removed. Missing entities alone never establish this: the predicate must
+    /// inspect the captured admitted tree, and the ordinary failure cutoff holds.
+    pub(crate) fn resolve_absent_files(
+        &self,
+        generation: u64,
+        path_is_absent: impl Fn(&str) -> bool,
+    ) {
+        let mut failures = self
+            .tracker
+            .failures
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        failures.items.retain(|item, serial| {
+            let removed = matches!(item, LspWorkItem::File { file, source_generation }
+                if *source_generation <= generation && *serial <= self.failure_cutoff
+                    && path_is_absent(file));
+            if removed {
+                debug!(failed_item = ?item, completed_generation = generation,
+                    "complete LSP sweep retired failed work for removed admitted source");
+            }
+            !removed
+        });
+        self.tracker
+            .failed
+            .store(failures.items.len() as u64, Ordering::SeqCst);
+    }
+
+    /// Only called after the existing source freshness and completion gates.
+    pub(crate) fn resolve_completed(&mut self) {
+        self.resolve(self.items.iter().cloned().chain(self.sweep.iter().cloned()));
+        self.items.clear();
+        self.complete();
     }
 
     /// Record language-server query errors this pass saw, without failing it.
@@ -2038,7 +2225,7 @@ impl LspWorkGuard {
             .fetch_add(failures as u64, Ordering::SeqCst);
     }
 
-    /// The queued or buffered message now owns the same reservation.
+    /// The queued or buffered message now owns the same pending reservation.
     pub(crate) fn transfer(mut self) {
         self.transferred = true;
     }
@@ -2050,7 +2237,27 @@ impl Drop for LspWorkGuard {
             return;
         }
         if !self.completed {
-            self.tracker.failed.fetch_add(1, Ordering::SeqCst);
+            let mut failures = self
+                .tracker
+                .failures
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            failures.serial = failures
+                .serial
+                .checked_add(1)
+                .expect("LSP failure serial exhausted");
+            let serial = failures.serial;
+            let items = if self.items.is_empty() {
+                self.sweep.iter().cloned().collect()
+            } else {
+                self.items.clone()
+            };
+            for item in items {
+                failures.items.insert(item, serial);
+            }
+            self.tracker
+                .failed
+                .store(failures.items.len() as u64, Ordering::SeqCst);
         }
         let result =
             self.tracker
@@ -2059,6 +2266,168 @@ impl Drop for LspWorkGuard {
                     pending.checked_sub(1)
                 });
         debug_assert!(result.is_ok(), "enrichment completion without admission");
+    }
+}
+
+#[cfg(test)]
+mod lsp_failed_work_tests {
+    use super::{LspWorkItem, LspWorkTracker};
+    use std::sync::{atomic::Ordering, Arc};
+
+    fn file(name: &str, generation: u64) -> LspWorkItem {
+        LspWorkItem::file(name, generation)
+    }
+
+    #[test]
+    fn lsp_failed_work_same_file_retry_drains_only_its_failure() {
+        let tracker = Arc::new(LspWorkTracker::default());
+        drop(tracker.reserve_for(file("failed.py", 4)));
+        drop(tracker.reserve_for(file("never_retried.py", 4)));
+        let mut retry = tracker.reserve_for(file("failed.py", 4));
+        retry.resolve_completed();
+        drop(retry);
+        assert_eq!(tracker.pending.load(Ordering::SeqCst), 0);
+        assert_eq!(tracker.failed.load(Ordering::SeqCst), 1);
+        assert_eq!(tracker.failed_items(), vec![file("never_retried.py", 4)]);
+        let mut remaining = tracker.reserve_for(file("never_retried.py", 4));
+        remaining.resolve_completed();
+        drop(remaining);
+        assert_eq!(tracker.failed.load(Ordering::SeqCst), 0);
+        assert!(tracker.failed_items().is_empty());
+    }
+
+    #[test]
+    fn lsp_failed_work_completion_cannot_erase_a_concurrent_failure() {
+        let tracker = Arc::new(LspWorkTracker::default());
+        let key = file("same.py", 4);
+        drop(tracker.reserve_for(key.clone()));
+        let mut older_retry = tracker.reserve_for(key.clone());
+        // The same source item failed again while this retry was in flight.
+        drop(tracker.reserve_for(key.clone()));
+        older_retry.resolve_completed();
+        drop(older_retry);
+        assert_eq!(tracker.failed_items(), vec![key.clone()]);
+        let mut later_retry = tracker.reserve_for(key);
+        later_retry.resolve_completed();
+        drop(later_retry);
+        assert_eq!(tracker.failed.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn lsp_failed_work_source_generations_resolve_only_forward() {
+        let tracker = Arc::new(LspWorkTracker::default());
+        drop(tracker.reserve_for(file("same.py", 4)));
+        let mut old_retry = tracker.reserve_for(file("same.py", 4));
+        drop(tracker.reserve_for(file("same.py", 5)));
+        old_retry.resolve_completed();
+        drop(old_retry);
+        assert_eq!(tracker.failed_items(), vec![file("same.py", 5)]);
+        // A later source admission replaces the obsolete question. Completing
+        // that current source may retire older failures for the same file.
+        drop(tracker.reserve_for(file("same.py", 4)));
+        let mut current = tracker.reserve_for(file("same.py", 5));
+        current.bind_file("same.py".into(), 5);
+        current.resolve_completed();
+        drop(current);
+        assert!(tracker.failed_items().is_empty());
+        assert_eq!(tracker.failed.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn lsp_failed_work_unrelated_source_edit_does_not_stick_a_repaired_file() {
+        let tracker = Arc::new(LspWorkTracker::default());
+        drop(tracker.reserve_for(file("a.py", 4)));
+        // Editing b.py advances the source marker for the graph, even though
+        // a.py's bytes are unchanged. Only a.py actually completes this retry.
+        drop(tracker.reserve_for(file("b.py", 5)));
+        let mut retry = tracker.reserve_for(file("a.py", 5));
+        retry.resolve_completed();
+        drop(retry);
+        assert_eq!(tracker.failed_items(), vec![file("b.py", 5)]);
+        assert_eq!(tracker.failed.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn lsp_failed_work_partial_sweep_resolves_only_marked_files() {
+        let tracker = Arc::new(LspWorkTracker::default());
+        for name in ["done.py", "owed.py"] {
+            drop(tracker.reserve_for(file(name, 7)));
+        }
+        let mut sweep = tracker.reserve_for(LspWorkItem::Sweep {
+            source_generation: 7,
+        });
+        sweep.bind_files(["done.py".into(), "owed.py".into()], 7);
+        sweep.resolve_files(&["done.py".into()], 7);
+        drop(sweep);
+        assert_eq!(tracker.failed_items(), vec![file("owed.py", 7)]);
+        assert_eq!(tracker.pending.load(Ordering::SeqCst), 0);
+        let mut retry = tracker.reserve_for(LspWorkItem::Sweep {
+            source_generation: 7,
+        });
+        retry.bind_files(["done.py".into(), "owed.py".into()], 7);
+        retry.resolve_completed();
+        drop(retry);
+        assert!(tracker.failed_items().is_empty());
+    }
+
+    #[test]
+    fn lsp_failed_work_transfers_and_supersession_are_not_repair() {
+        let tracker = Arc::new(LspWorkTracker::default());
+        let key = file("queued.py", 2);
+        drop(tracker.reserve_for(key.clone()));
+        tracker.reserve_for(key.clone()).transfer();
+        assert_eq!(tracker.pending.load(Ordering::SeqCst), 1);
+        assert_eq!(tracker.failed_items(), vec![key.clone()]);
+        let mut received = tracker.resume_for(key.clone());
+        received.complete(); // A fresh sweep accepted ownership, not evidence.
+        drop(received);
+        assert_eq!(tracker.pending.load(Ordering::SeqCst), 0);
+        assert_eq!(tracker.failed_items(), vec![key.clone()]);
+        tracker.reserve_for(key.clone()).transfer();
+        let mut received = tracker.resume_for(key);
+        received.resolve_completed();
+        drop(received);
+        assert!(tracker.failed_items().is_empty());
+    }
+
+    #[test]
+    fn lsp_failed_work_removed_source_does_not_erase_concurrent_or_newer_failures() {
+        let tracker = Arc::new(LspWorkTracker::default());
+        drop(tracker.reserve_for(file("removed.py", 3)));
+        drop(tracker.reserve_for(file("present.py", 3)));
+        drop(tracker.reserve_for(file("newer.py", 5)));
+        let mut sweep = tracker.reserve_for(LspWorkItem::Sweep {
+            source_generation: 4,
+        });
+        drop(tracker.reserve_for(file("concurrent.py", 4)));
+        sweep.resolve_absent_files(4, |path| path != "present.py");
+        sweep.resolve_completed();
+        drop(sweep);
+        assert_eq!(
+            tracker.failed_items(),
+            vec![
+                file("concurrent.py", 4),
+                file("newer.py", 5),
+                file("present.py", 3),
+            ]
+        );
+    }
+
+    #[test]
+    fn lsp_failed_work_pre_capture_sweep_failure_needs_a_complete_sweep() {
+        let tracker = Arc::new(LspWorkTracker::default());
+        let key = LspWorkItem::Sweep {
+            source_generation: 9,
+        };
+        drop(tracker.reserve_for(key.clone()));
+        let mut retry = tracker.reserve_for(key.clone());
+        retry.bind_files(["done.py".into()], 9);
+        retry.resolve_files(&["done.py".into()], 9);
+        // Resolving a file does not prove an unknown pre-capture scope complete.
+        assert_eq!(tracker.failed_items(), vec![key]);
+        retry.resolve_completed();
+        drop(retry);
+        assert!(tracker.failed_items().is_empty());
     }
 }
 
@@ -2897,6 +3266,15 @@ fn resolution_node_deltas<'a>(
             Some(_) => {}
         }
     }
+    // A language's context validation the live graph no longer holds was
+    // removed because it no longer holds, so authority must not keep it.
+    for (id, record) in &authority.resolution_records {
+        if record.as_context_validation().is_some() && !live.resolution_records.contains_key(id) {
+            record_deltas.push(kin_model::ResolutionRecordDelta::Removed {
+                old: record.clone(),
+            });
+        }
+    }
     // A context another record still names stays; only contexts no relation
     // and no record names are collected.
     for (id, record) in &authority.resolution_records {
@@ -2910,6 +3288,43 @@ fn resolution_node_deltas<'a>(
         }
     }
     (reference_deltas, record_deltas)
+}
+
+/// How many removals of a context validation the live graph has seen, and
+/// how many of them a publication has carried into authority.
+#[derive(Debug, Default)]
+pub(crate) struct ValidationRemovals {
+    removed: AtomicU64,
+    published: AtomicU64,
+}
+
+impl ValidationRemovals {
+    /// Count one removal from the live graph.
+    pub(crate) fn record(&self) {
+        self.removed.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// The removals a publication about to read the live graph can see.
+    pub(crate) fn observed(&self) -> u64 {
+        self.removed.load(Ordering::SeqCst)
+    }
+
+    /// Whether a removal a publication that observed `seen` must carry is
+    /// still owed to authority.
+    pub(crate) fn pending(&self, seen: u64) -> bool {
+        seen > self.published.load(Ordering::SeqCst)
+    }
+
+    /// A publication that observed `seen` carried every removal up to it,
+    /// and none after it.
+    pub(crate) fn acknowledge(&self, seen: u64) {
+        self.published.fetch_max(seen, Ordering::SeqCst);
+    }
+
+    /// Whether any removal is still owed to authority.
+    pub(crate) fn owed(&self) -> bool {
+        self.pending(self.observed())
+    }
 }
 
 /// The call-site ledgers the live graph holds that an enrichment publication
@@ -2929,12 +3344,18 @@ fn publishable_ledgers(
         .resolution_records
         .iter()
         .filter(|(id, record)| {
-            let Some(ledger) = record.as_call_sites() else {
-                return false;
-            };
             if authority.resolution_records.get(id) == Some(record) {
                 return false;
             }
+            // Which context a language's ledgers are current under names no
+            // node and no other record, so it is published whenever it moved,
+            // including a sweep that settled a context and changed no ledger.
+            if record.as_context_validation().is_some() {
+                return true;
+            }
+            let Some(ledger) = record.as_call_sites() else {
+                return false;
+            };
             let caller_holds = authority
                 .entities
                 .get(&ledger.caller)
@@ -2963,11 +3384,13 @@ fn publishable_ledgers(
 /// call edge: `None` leaves it alone, `Some(None)` retires it, and
 /// `Some(Some(narrowed))` replaces it with the sites the live graph kept.
 ///
-/// Three kinds of edge are settled: a linker `Calls` guess a language server
+/// Four kinds of edge are settled: a linker `Calls` guess a language server
 /// contradicted at its call site, a language-server `Calls` proof a file's
 /// sweep retracted because the file was proven again and no longer proves the
-/// edge at those sites, and a language-server `References` edge the file's
-/// definitions pass no longer produces. Only an id the live graph
+/// edge at those sites, a language-server `References` edge the file's
+/// definitions pass no longer produces, and a language-server edge of any
+/// kind held under the id an older build gave it, which the same edge under
+/// its current id replaced. Only an id the live graph
 /// recorded as settled reaches here, so an edge the live graph merely lacks
 /// for any other reason stays. The delta the publication commits and the
 /// marks it commits beside it both read this, so a mark digests exactly the
@@ -2979,8 +3402,7 @@ fn settled_guess_successor<'a>(
 ) -> Option<Option<&'a kin_model::Relation>> {
     let held = authority.relations.get(relation_id)?;
     let settles = held.kind == kin_model::RelationKind::Calls
-        || (held.kind == kin_model::RelationKind::References
-            && held.origin == kin_model::RelationOrigin::Lsp);
+        || held.origin == kin_model::RelationOrigin::Lsp;
     if !settles {
         return None;
     }
@@ -3015,7 +3437,7 @@ fn tree_holds_body(tree: &ResolvedTree, path: &str, body: &Hash256) -> bool {
 pub(crate) fn resumable_enrichment_files<'a>(
     marks: &[kin_model::EnrichmentMark],
     tree: &ResolvedTree,
-    entities: &std::collections::HashMap<kin_model::EntityId, kin_model::Entity>,
+    entities: &'a std::collections::HashMap<kin_model::EntityId, kin_model::Entity>,
     relations: impl IntoIterator<Item = &'a kin_model::Relation>,
     records: impl IntoIterator<Item = &'a kin_model::ResolutionRecord>,
     python_scope_current: bool,
@@ -3031,23 +3453,18 @@ pub(crate) fn resumable_enrichment_files<'a>(
     if current.is_empty() {
         return std::collections::BTreeMap::new();
     }
-    let entity_file = |id: &kin_model::EntityId| entity_file_in(entities, id);
-    let by_path = kin_model::enrichment_relations_by_owner_file(relations, entity_file);
-    let ledgers_by_path = kin_model::enrichment_ledgers_by_file(records, entity_file);
+    let proofs = kin_model::enrichment_proof_inputs_by_file(
+        current.iter().map(|mark| mark.path.as_str()),
+        entities.values(),
+        relations,
+        records,
+    );
+    let Ok(proofs) = proofs else {
+        return Default::default();
+    };
     current
         .into_iter()
-        .filter(|mark| {
-            kin_model::enrichment_relations_digest(
-                &mark.path,
-                by_path.get(&mark.path).into_iter().flatten().copied(),
-                entity_file,
-                ledgers_by_path
-                    .get(&mark.path)
-                    .into_iter()
-                    .flatten()
-                    .copied(),
-            ) == mark.relations
-        })
+        .filter(|mark| proofs.get(&mark.path) == Some(&mark.relations))
         .map(|mark| (mark.path.clone(), mark.body))
         .collect()
 }
@@ -3178,14 +3595,16 @@ struct GraphAuthorityClock {
 /// and an edit admission holds it for its whole pass, which on a loaded host
 /// has been measured at 37 s for a single publication. The read therefore
 /// waits for the writer instead of spending its attempts inside the window.
-/// The bound is the MCP bridge's: `kin mcp start` gives the daemon 60 s before
+/// The bound leaves room inside the MCP bridge's default: `kin mcp start`
+/// gives the daemon 60 s before
 /// it stops waiting on the answer and asks whether the daemon is alive, and a
-/// read that waited the full 30 s still has the other half of that budget for
-/// the read itself. The longest find_references measured while an enrichment
-/// sweep was writing took 7.3 s. A longer wait would spend the budget the
+/// read that waited the full 45 s still has 15 s for the read itself. This
+/// covers the measured 37 s publication; the previous 30 s ceiling could not.
+/// The longest find_references measured while an enrichment sweep was writing
+/// took 7.3 s. A longer wait would spend the budget the
 /// answer needs, and past it the caller, not this daemon, decides what the
 /// agent sees.
-pub(crate) const XREF_WRITER_DRAIN_CEILING: Duration = Duration::from_secs(30);
+pub(crate) const XREF_WRITER_DRAIN_CEILING: Duration = Duration::from_secs(45);
 
 /// How long one `kin_graph_status` call waits, in total, for graph authority
 /// to settle before it replays the last settled reading instead.
@@ -3934,6 +4353,11 @@ pub struct DaemonState {
     /// read index have not both been durably finalized yet. A save with no new
     /// graph mutations still retries this work.
     post_commit_finalization_pending: AtomicBool,
+    /// Committed enrichment bookkeeping has not yet been mirrored into the
+    /// live graph. Unlike read-index finalization, this needs a workspace
+    /// comparison even when there is no new enrichment delta. Startup loads
+    /// the committed graph directly, so this retry obligation is runtime-only.
+    enrichment_bookkeeping_pending: AtomicBool,
     #[cfg(test)]
     finalization_fail_once: AtomicBool,
     /// Deterministic crash seam after exact MCP repository authority commits
@@ -4255,6 +4679,9 @@ pub struct DaemonState {
     /// a sub-second window cannot round down into the sentinel and turn "expire
     /// quickly" into "never expire".
     idle_timeout_ms: AtomicU64,
+    /// Floors attached sessions hold over the window above for as long as
+    /// they renew them. See [`crate::idle_floor`].
+    idle_floor_leases: crate::idle_floor::IdleFloorLeases,
     /// Set once a caller has asked this daemon to exit as soon as nothing
     /// needs it. The idle monitor then treats the window as zero, so the exit
     /// still waits on every gate an idle exit waits on.
@@ -4381,9 +4808,11 @@ pub struct DaemonState {
     pub(crate) lsp_evidence_unrecorded: std::sync::Mutex<std::collections::BTreeSet<String>>,
     /// Call edges this daemon retired or narrowed in its live graph and that
     /// local repository authority has not been told about yet: name-only
-    /// guesses a language server contradicted at their call site, and
+    /// guesses a language server contradicted at their call site,
     /// language-server proofs a file's sweep retracted because the file was
-    /// proven again and its ledgers no longer hold them.
+    /// proven again and its ledgers no longer hold them, and language-server
+    /// edges held under the id an older build gave them, which the same edge
+    /// under its current id replaced.
     ///
     /// The next enrichment publication carries the live graph's version of
     /// each one (its absence, or its narrowed sites) in the same commit that
@@ -4392,11 +4821,37 @@ pub struct DaemonState {
     /// files that proved them, so the next sweep proves them again.
     pub(crate) lsp_settled_guesses:
         std::sync::Mutex<std::collections::BTreeSet<kin_model::RelationId>>,
+    /// Name-only guesses a language server contradicted at their call site
+    /// and this daemon retired from its live graph, counted per relation kind
+    /// under the label the relation census counts them by, since the census
+    /// last took them into account.
+    ///
+    /// The relation census reads each retirement as proof rather than loss.
+    /// Without it, the sweep after an upgrade retires the guesses the
+    /// re-derivation bound again, `Calls` falls over an unmoved entity count,
+    /// and the census holds below a baseline no later pass can reach. A census
+    /// takes what it credited out of this, and a hold carries it from there.
+    pub(crate) census_settled_retirements:
+        std::sync::Mutex<std::collections::BTreeMap<String, u64>>,
     /// The proof context each language's server answered under, as this
     /// daemon last started one. A ledger proven under any other context for
     /// its language is stale, and a sweep proves its file again rather than
     /// skipping it. Empty until a server starts: a daemon that has not run
     /// one does not know, and judges no ledger stale.
+    /// Languages whose proof-context validation this daemon could neither
+    /// record nor clear. While any is here, language-server enrichment is not
+    /// published, so no reader is handed ledgers under a validation that no
+    /// longer holds.
+    pub(crate) lsp_unrecorded_validations:
+        std::sync::Mutex<std::collections::HashSet<kin_model::LanguageId>>,
+    /// Removals of a language's context validation from the live graph, and
+    /// how many of them a publication has carried into authority, so the
+    /// next enrichment publication carries a removal even when nothing else
+    /// moved.
+    pub(crate) lsp_validation_removals: ValidationRemovals,
+    /// The daemon's own cancel channel, the one a cooperative stop request
+    /// sends on, for a path that has to stop this daemon serving.
+    pub(crate) stop_trigger: std::sync::OnceLock<tokio::sync::watch::Sender<bool>>,
     pub(crate) lsp_current_contexts: std::sync::Mutex<
         std::collections::HashMap<kin_model::LanguageId, kin_model::ResolutionRecordId>,
     >,
@@ -4803,6 +5258,43 @@ impl DaemonState {
         })
     }
 
+    /// Count a name-only guess of `kind` that exact language-server proof
+    /// retired from the live graph, for the next relation census to credit.
+    pub(crate) fn note_census_settled_retirement(&self, kind: kin_model::RelationKind) {
+        let mut settled = self
+            .census_settled_retirements
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let count = settled.entry(format!("{kind:?}")).or_insert(0);
+        *count = count.saturating_add(1);
+    }
+
+    /// The retirements the next relation census may credit.
+    pub(crate) fn census_settled_retirements(&self) -> std::collections::BTreeMap<String, u64> {
+        self.census_settled_retirements
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Forget `credited`, which a census has now accounted for, keeping any
+    /// retirement that landed after the census read them.
+    pub(crate) fn release_census_settled_retirements(
+        &self,
+        credited: &std::collections::BTreeMap<String, u64>,
+    ) {
+        let mut settled = self
+            .census_settled_retirements
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (kind, count) in credited {
+            if let Some(held) = settled.get_mut(kind) {
+                *held = held.saturating_sub(*count);
+            }
+        }
+        settled.retain(|_, count| *count > 0);
+    }
+
     /// Begin one entity/relation authority mutation batch.
     ///
     /// The first epoch edge is published before callers touch the graph; the
@@ -4898,7 +5390,7 @@ impl DaemonState {
     }
 
     /// Shorten the reference-read writer wait, so a test that holds a writer
-    /// through a read reaches the refusal without waiting the production 30 s.
+    /// through a read reaches the refusal without waiting the production ceiling.
     #[cfg(test)]
     pub(crate) fn set_xref_writer_drain_ceiling_for_test(&self, ceiling: Duration) {
         let ms = u64::try_from(ceiling.as_millis())
@@ -5138,6 +5630,7 @@ impl DaemonState {
         };
         let embeddings = self.graph.embedding_status();
         let observation = kin_mcp::handlers::entities::GraphStatusObservation {
+            details: None,
             authority_epoch,
             entity_count: self.graph.entity_count(),
             relation_count: self.graph.relation_count(),
@@ -6800,6 +7293,7 @@ impl DaemonState {
             graph_authority_storage_backend: false,
             snapshot_generation: AtomicU64::new(generation),
             post_commit_finalization_pending: AtomicBool::new(false),
+            enrichment_bookkeeping_pending: AtomicBool::new(false),
             #[cfg(test)]
             finalization_fail_once: AtomicBool::new(false),
             #[cfg(test)]
@@ -6888,6 +7382,7 @@ impl DaemonState {
             background_embed_paused: AtomicBool::new(false),
             last_activity_ms: AtomicU64::new(0),
             idle_timeout_ms: AtomicU64::new(0),
+            idle_floor_leases: crate::idle_floor::IdleFloorLeases::default(),
             retirement_requested: AtomicBool::new(false),
             active_requests: AtomicU64::new(0),
             lsp_enrichment_tx: None,
@@ -6910,7 +7405,11 @@ impl DaemonState {
             lsp_retry_owed_now: AtomicBool::new(false),
             lsp_evidence_unrecorded: std::sync::Mutex::new(Default::default()),
             lsp_settled_guesses: std::sync::Mutex::new(Default::default()),
+            census_settled_retirements: std::sync::Mutex::new(Default::default()),
             lsp_current_contexts: std::sync::Mutex::new(Default::default()),
+            lsp_unrecorded_validations: std::sync::Mutex::new(Default::default()),
+            lsp_validation_removals: ValidationRemovals::default(),
+            stop_trigger: std::sync::OnceLock::new(),
             legacy_owed_derivations: std::sync::Mutex::new(None),
             cached_repo_id,
             cached_workspace_id: Some(workspace_id),
@@ -7242,6 +7741,7 @@ impl DaemonState {
             graph_authority_storage_backend: true,
             snapshot_generation: AtomicU64::new(generation),
             post_commit_finalization_pending: AtomicBool::new(false),
+            enrichment_bookkeeping_pending: AtomicBool::new(false),
             #[cfg(test)]
             finalization_fail_once: AtomicBool::new(false),
             #[cfg(test)]
@@ -7330,6 +7830,7 @@ impl DaemonState {
             background_embed_paused: AtomicBool::new(false),
             last_activity_ms: AtomicU64::new(0),
             idle_timeout_ms: AtomicU64::new(0),
+            idle_floor_leases: crate::idle_floor::IdleFloorLeases::default(),
             retirement_requested: AtomicBool::new(false),
             active_requests: AtomicU64::new(0),
             lsp_enrichment_tx: None,
@@ -7352,7 +7853,11 @@ impl DaemonState {
             lsp_retry_owed_now: AtomicBool::new(false),
             lsp_evidence_unrecorded: std::sync::Mutex::new(Default::default()),
             lsp_settled_guesses: std::sync::Mutex::new(Default::default()),
+            census_settled_retirements: std::sync::Mutex::new(Default::default()),
             lsp_current_contexts: std::sync::Mutex::new(Default::default()),
+            lsp_unrecorded_validations: std::sync::Mutex::new(Default::default()),
+            lsp_validation_removals: ValidationRemovals::default(),
+            stop_trigger: std::sync::OnceLock::new(),
             legacy_owed_derivations: std::sync::Mutex::new(None),
             cached_repo_id: repo_id.to_string(),
             cached_workspace_id: None,
@@ -10075,7 +10580,7 @@ impl DaemonState {
                 .find(|entity| kin_model::is_derived_member(entity))
             {
                 return Err(format!(
-                    "{DERIVED_MEMBER_SPINE_GAP}: repo {repo_id} contains inferred member {}; the current spine format cannot preserve candidate authority. Local Kin queries and generator edits remain available. Federation requires versioned candidate-status support before this graph can be published.",
+                    "{DERIVED_MEMBER_SPINE_GAP}: repo {repo_id} contains inferred member {}. The current spine format cannot preserve candidate authority. Local Kin queries and generator edits remain available. Federation requires versioned candidate-status support before this graph can be published.",
                     entity.id
                 ));
             }
@@ -13776,7 +14281,7 @@ impl DaemonState {
     ) -> Result<()> {
         // A live graph ahead of this immutable authority deliberately remains
         // unproven. Only exact semantic equality rebinds its admitted witness.
-        self.graph.restore_binding_history_from(authority_graph);
+        let live_matches_authority = self.graph.restore_binding_history_from(authority_graph);
         let (staged_index, persisted_entity_count) =
             self.stage_read_index_from_graph(generation, authority_graph)?;
         let index_path = self.invalidate_canonical_read_index()?;
@@ -13789,9 +14294,25 @@ impl DaemonState {
         }
         self.persisted_entity_count
             .store(persisted_entity_count, Ordering::SeqCst);
+        if live_matches_authority {
+            // The exact witness restoration established this levelling. Read
+            // both counts from its held authority, never from a live graph
+            // that an independent writer may have advanced during finalization.
+            self.record_durable_entity_count(persisted_entity_count);
+            self.record_durable_relation_count(authority_graph.relation_count() as u64);
+        }
         self.post_commit_finalization_pending
             .store(false, Ordering::SeqCst);
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn finalize_held_generation_for_test(
+        &self,
+        generation: u64,
+        authority_graph: &kin_db::InMemoryGraph,
+    ) -> Result<()> {
+        self.finalize_generation_from_graph(generation, authority_graph)
     }
 
     /// Retire the read index a committed generation left stale, and leave its
@@ -13950,10 +14471,29 @@ impl DaemonState {
             )));
         }
 
+        // Taken before the live graph is read, so a removal that lands after
+        // this is not acknowledged by a publication that could not have seen it.
+        let removals_seen = self.lsp_validation_removals.observed();
         let live_snapshot = self.graph.to_snapshot();
         // The guesses a language server contradicted since the last
         // publication, read once so the ids this publication carries are the
         // ids it forgets.
+        let unrecorded = self
+            .lsp_unrecorded_validations
+            .lock()
+            .map(|held| held.clone())
+            .unwrap_or_default();
+        if !unrecorded.is_empty() {
+            let mut languages: Vec<String> = unrecorded.iter().map(ToString::to_string).collect();
+            languages.sort();
+            return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
+                format!(
+                "language-server enrichment is not published while the proof-context validation \
+                 of {} could not be recorded",
+                languages.join(", ")
+            ),
+            )));
+        }
         let settled = self
             .lsp_settled_guesses
             .lock()
@@ -13976,10 +14516,11 @@ impl DaemonState {
                 .relations
                 .values()
                 .any(|relation| relation.origin == kin_model::RelationOrigin::Lsp)
-            && !live_snapshot
-                .resolution_records
-                .values()
-                .any(|record| record.as_call_sites().is_some())
+            && !live_snapshot.resolution_records.values().any(|record| {
+                record.as_call_sites().is_some() || record.as_context_validation().is_some()
+            })
+            && !self.lsp_validation_removals.pending(removals_seen)
+            && !self.enrichment_bookkeeping_pending.load(Ordering::SeqCst)
         {
             return Ok(Some(expected_generation));
         }
@@ -14015,13 +14556,20 @@ impl DaemonState {
                 "language-server relations name a node this workspace authority does not hold and were not published"
             );
         }
+        let (semantic_delta, published_debts, retired_debts) =
+            Self::account_for_withdrawn_local_bindings(
+                &authority_snapshot,
+                &live_snapshot,
+                semantic_delta,
+                &|digest| authority.load_source_blob(digest),
+            )?;
+        let mirrored_debts = published_debts;
         let (marks, unmarkable) = Self::enrichment_marks_to_commit(
             &pending_marks,
             &workspace.tree,
             &live_snapshot,
             &authority_snapshot,
-            &settled,
-            &ledgers,
+            &semantic_delta,
         );
         if !unmarkable.is_empty() {
             // A file whose bytes moved on, or with a relation authority cannot
@@ -14049,9 +14597,61 @@ impl DaemonState {
                     )))
                 })?
         };
+        // Authority collects obsolete resolver nodes with this publication.
+        // Keep its exact successor membership for the live cleanup, including
+        // a retry where authority already collected a node on the prior save.
+        let mut successor_references: std::collections::HashSet<_> = authority_snapshot
+            .external_references
+            .keys()
+            .copied()
+            .collect();
+        for delta in semantic_delta.external_reference_deltas() {
+            if delta.new_state().is_some() {
+                successor_references.insert(delta.target_id());
+            } else {
+                successor_references.remove(&delta.target_id());
+            }
+        }
+        let mut successor_records: std::collections::HashSet<_> = authority_snapshot
+            .resolution_records
+            .keys()
+            .copied()
+            .collect();
+        for delta in semantic_delta.resolution_record_deltas() {
+            if delta.new_state().is_some() {
+                successor_records.insert(delta.target_id());
+            } else {
+                successor_records.remove(&delta.target_id());
+            }
+        }
+        let retired_references: Vec<_> = live_snapshot
+            .external_references
+            .values()
+            .filter(|reference| {
+                reference.resolution_namespace == kin_model::EXTERNAL_SYMBOL_NAMESPACE
+                    && !successor_references.contains(&reference.id)
+            })
+            .cloned()
+            .collect();
+        let retired_records: Vec<_> = live_snapshot
+            .resolution_records
+            .values()
+            .filter(|record| {
+                record.as_proof_context().is_some() && !successor_records.contains(&record.id())
+            })
+            .cloned()
+            .collect();
         if semantic_delta.is_empty() {
             // Authority already agrees with the live graph about every one.
             self.forget_settled_guesses(&settled);
+            self.lsp_validation_removals.acknowledge(removals_seen);
+            self.mirror_published_enrichment_bookkeeping_with_retirements(
+                &live_snapshot,
+                &mirrored_debts,
+                &retired_debts,
+                &retired_references,
+                &retired_records,
+            )?;
             return Ok(Some(expected_generation));
         }
         // Decided after the delta, so a flush with nothing new to publish still
@@ -14123,7 +14723,15 @@ impl DaemonState {
         // that commit installed, the next reader keeps it rather than
         // reopening the store to load it.
         crate::api::relabel_held_authority_after_own_commit(self);
+        self.mirror_published_enrichment_bookkeeping_with_retirements(
+            &live_snapshot,
+            &mirrored_debts,
+            &retired_debts,
+            &retired_references,
+            &retired_records,
+        )?;
         self.forget_settled_guesses(&settled);
+        self.lsp_validation_removals.acknowledge(removals_seen);
         if !marks.is_empty() {
             if let Ok(mut pending) = self.lsp_pending_marks.lock() {
                 for mark in &marks {
@@ -14144,6 +14752,148 @@ impl DaemonState {
             "published language-server enrichment into workspace authority"
         );
         Ok(Some(receipt.generation))
+    }
+
+    /// Mirror only bookkeeping already admitted by the completed publication.
+    /// The full semantic capture fences unrelated writes. A failed mirror
+    /// leaves its own retry pending; the next flush also reads already-durable
+    /// debt, even when its new semantic delta is empty. Artifact finalization
+    /// alone must not force this workspace comparison.
+    #[cfg(test)]
+    fn mirror_published_enrichment_bookkeeping(
+        &self,
+        observed: &kin_db::GraphSnapshot,
+        debts: &[kin_model::Relation],
+        references: &[kin_model::ExternalReference],
+        records: &[kin_model::ResolutionRecord],
+    ) -> Result<()> {
+        self.mirror_published_enrichment_bookkeeping_with_retirements(
+            observed,
+            debts,
+            &[],
+            references,
+            records,
+        )
+    }
+
+    fn mirror_published_enrichment_bookkeeping_with_retirements(
+        &self,
+        observed: &kin_db::GraphSnapshot,
+        debts: &[kin_model::Relation],
+        retired_debts: &[kin_model::Relation],
+        references: &[kin_model::ExternalReference],
+        records: &[kin_model::ResolutionRecord],
+    ) -> Result<()> {
+        if debts.is_empty()
+            && retired_debts.is_empty()
+            && references.is_empty()
+            && records.is_empty()
+        {
+            self.enrichment_bookkeeping_pending
+                .store(false, Ordering::SeqCst);
+            return Ok(());
+        }
+        self.enrichment_bookkeeping_pending
+            .store(true, Ordering::SeqCst);
+        // A removal/shrink was separately proven against the admitted
+        // successor. It still has to name this exact captured live payload.
+        for old in retired_debts {
+            if observed.relations.get(&old.id) != Some(old) {
+                return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
+                    "refusing published binding debt mirror: retired debt differs from capture"
+                        .into(),
+                )));
+            }
+        }
+        // A retry may capture live evidence newer than this durable debt.
+        // Exact capture alone cannot authorize erasing that prior evidence:
+        // the admitted debt must include every captured live obligation.
+        let mut changed_debts = Vec::new();
+        for published in debts {
+            let invalid = |reason: &str| {
+                DaemonError::Graph(kin_db::KinDbError::StorageError(format!(
+                    "refusing published binding debt mirror: {reason}"
+                )))
+            };
+            let kin_model::GraphNodeId::Artifact(artifact) = published.src else {
+                return Err(invalid("debt source is not an artifact"));
+            };
+            let entry = observed
+                .resolved_tree
+                .get(&artifact)
+                .ok_or_else(|| invalid("source artifact is absent"))?;
+            let file = kin_model::FilePathId::new(
+                entry
+                    .path
+                    .as_utf8()
+                    .ok_or_else(|| invalid("source path is not UTF-8"))?,
+            );
+            let kin_model::TreeEntry::Blob { hash, .. } = entry.entry else {
+                return Err(invalid("source is not an admitted body"));
+            };
+            let decode = |relation| {
+                kin_index::binding_debt::decode_local_binding_debt(&file, artifact, relation)
+                    .map_err(|error| invalid(&error))?
+                    .ok_or_else(|| invalid("reserved identity is not exact debt"))
+            };
+            let new = decode(published)?;
+            if new.observed_source_digest != hash {
+                return Err(invalid(
+                    "published debt source seal does not match the captured body",
+                ));
+            }
+            if let Some(live) = observed.relations.get(&published.id) {
+                if live == published {
+                    continue;
+                }
+                let old = decode(live)?;
+                if old.observed_source_digest != hash
+                    || (!retired_debts.contains(live)
+                        && old
+                            .obligations
+                            .iter()
+                            .any(|obligation| !new.obligations.contains(obligation)))
+                {
+                    return Err(invalid(
+                        "durable debt does not retain every current live obligation",
+                    ));
+                }
+            }
+            changed_debts.push(published.clone());
+        }
+        if changed_debts.is_empty()
+            && retired_debts.is_empty()
+            && references.is_empty()
+            && records.is_empty()
+        {
+            self.enrichment_bookkeeping_pending
+                .store(false, Ordering::SeqCst);
+            return Ok(());
+        }
+        // These artifact obligations change no captured source/entity or LSP
+        // resolver input. As with unused-node collection, DB truth advances,
+        // but a sweep's own publication must not stale its next source query.
+        if !self
+            .graph
+            .mirror_published_artifact_relations_and_resolution_cleanup_with_retirements(
+                observed,
+                &changed_debts,
+                retired_debts,
+                references,
+                records,
+            )
+            .map_err(DaemonError::from)?
+        {
+            return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
+                "enrichment committed but live bookkeeping capture changed; retry finalization"
+                    .into(),
+            )));
+        }
+        self.post_commit_finalization_pending
+            .store(true, Ordering::SeqCst);
+        self.enrichment_bookkeeping_pending
+            .store(false, Ordering::SeqCst);
+        Ok(())
     }
 
     /// Forget the settled guesses a publication carried. Ids settled while it
@@ -14175,8 +14925,7 @@ impl DaemonState {
         tree: &ResolvedTree,
         live: &kin_db::GraphSnapshot,
         authority: &kin_db::GraphSnapshot,
-        settled: &std::collections::BTreeSet<kin_model::RelationId>,
-        ledgers: &[kin_model::ResolutionRecord],
+        delta: &kin_model::WorkspaceSemanticDelta,
     ) -> (Vec<kin_model::EnrichmentMark>, Vec<String>) {
         if pending.is_empty() {
             return (Vec::new(), Vec::new());
@@ -14187,13 +14936,11 @@ impl DaemonState {
             entity_file_in(&authority.entities, id).or_else(|| entity_file_in(&live.entities, id))
         };
         let mut unpublishable = Vec::new();
-        for (id, relation) in &live.relations {
+        for relation in live.relations.values() {
             if relation.origin != kin_model::RelationOrigin::Lsp {
                 continue;
             }
-            if lsp_relation_is_publishable(live, authority, relation) {
-                desired.insert(id, relation);
-            } else {
+            if !lsp_relation_is_publishable(live, authority, relation) {
                 unpublishable.push(relation);
             }
         }
@@ -14201,32 +14948,48 @@ impl DaemonState {
         // not finished as far as authority is concerned.
         let unpublishable_paths =
             kin_model::enrichment_relations_by_owner_file(unpublishable, entity_file);
-        for relation_id in settled {
-            match settled_guess_successor(relation_id, live, authority) {
-                Some(None) => {
-                    desired.remove(relation_id);
+        // Hash the actual final publication, including any bookkeeping added
+        // after the initial language-server delta. Selection from live state
+        // above is only the existing unpublishable-work guard.
+        for change in delta.relation_deltas() {
+            match change.new_state() {
+                Some(relation) => {
+                    desired.insert(&relation.id, relation);
                 }
-                Some(Some(narrowed)) => {
-                    desired.insert(&narrowed.id, narrowed);
+                None => {
+                    desired.remove(&change.target_id());
                 }
-                None => {}
             }
         }
-        let by_path =
-            kin_model::enrichment_relations_by_owner_file(desired.values().copied(), entity_file);
-        // The ledgers authority holds once this publication commits: its own,
-        // with the ones this publication writes in their place.
-        let replaced: std::collections::BTreeSet<kin_model::ResolutionRecordId> = ledgers
-            .iter()
-            .map(kin_model::ResolutionRecord::id)
-            .collect();
-        let desired_records = authority
+        // Bind the exact successor records already selected for publication,
+        // including context validation and resolver-node collection. Do not
+        // hash unpublished live records beside a durable marker.
+        let mut desired_records: std::collections::BTreeMap<_, _> = authority
             .resolution_records
             .iter()
-            .filter(|(id, _)| !replaced.contains(id))
-            .map(|(_, record)| record)
-            .chain(ledgers.iter());
-        let ledgers_by_path = kin_model::enrichment_ledgers_by_file(desired_records, entity_file);
+            .map(|(id, record)| (*id, record))
+            .collect();
+        for delta in delta.resolution_record_deltas() {
+            match delta.new_state() {
+                Some(record) => {
+                    desired_records.insert(record.id(), record);
+                }
+                None => {
+                    desired_records.remove(&delta.target_id());
+                }
+            }
+        }
+        let ledgers_by_path =
+            kin_model::enrichment_ledgers_by_file(desired_records.values().copied(), entity_file);
+        let proofs = kin_model::enrichment_proof_inputs_by_file(
+            pending.keys().map(String::as_str),
+            authority.entities.values(),
+            desired.values().copied(),
+            desired_records.values().copied(),
+        );
+        let Ok(proofs) = proofs else {
+            return (Vec::new(), pending.keys().cloned().collect());
+        };
         // The pending files with a caller no ledger will describe: every
         // entity with source text in the file needs one before it is marked,
         // unless the parser read no call in its file at all.
@@ -14263,12 +15026,7 @@ impl DaemonState {
                 path: path.clone(),
                 body: *body,
                 version: crate::daemon::LSP_ENRICHMENT_MARKER_VERSION,
-                relations: kin_model::enrichment_relations_digest(
-                    path,
-                    by_path.get(path).into_iter().flatten().copied(),
-                    entity_file,
-                    ledgers_by_path.get(path).into_iter().flatten().copied(),
-                ),
+                relations: proofs[path],
             });
         }
         (marks, unmarkable)
@@ -14296,7 +15054,8 @@ impl DaemonState {
     ///
     /// The one retraction is `settled`: name-only call guesses a language
     /// server contradicted at their call site, which the live graph retired or
-    /// narrowed when it installed the proof. For each one authority still
+    /// narrowed when it installed the proof, and the other edges
+    /// [`settled_guess_successor`] names. For each one authority still
     /// holds, the live graph's version is what is published: its absence, or
     /// the sites it kept. Nothing outside `settled` is ever retracted, so a
     /// guess the live graph merely lacks for any other reason stays.
@@ -14362,6 +15121,174 @@ impl DaemonState {
         .with_resolution_records(record_deltas)
         .map_err(canonicalize)?;
         Ok((delta, unpublishable))
+    }
+
+    /// Preserve exact withdrawals which the same verifier used at commit
+    /// cannot retain or discharge. Selection comes from this publication's
+    /// delta, never from unrelated relations in the repository.
+    fn account_for_withdrawn_local_bindings(
+        authority: &kin_db::GraphSnapshot,
+        live: &kin_db::GraphSnapshot,
+        delta: kin_model::WorkspaceSemanticDelta,
+        load_body: &dyn Fn(Hash256) -> std::result::Result<Option<Vec<u8>>, kin_db::KinDbError>,
+    ) -> Result<(
+        kin_model::WorkspaceSemanticDelta,
+        Vec<kin_model::Relation>,
+        Vec<kin_model::Relation>,
+    )> {
+        let withdrawn: Vec<_> = delta
+            .relation_deltas()
+            .iter()
+            .filter_map(|change| change.old_state().cloned())
+            .collect();
+        if withdrawn.is_empty()
+            && !authority
+                .relations
+                .values()
+                .any(kin_index::binding_debt::claims_local_binding_debt)
+            && !live
+                .relations
+                .values()
+                .any(kin_index::binding_debt::claims_local_binding_debt)
+        {
+            // Ordinary additive/idle flushes without debt need no graph clone.
+            let debts = authority
+                .relations
+                .values()
+                .filter(|relation| kin_index::binding_debt::claims_local_binding_debt(relation))
+                .cloned()
+                .collect();
+            return Ok((delta, debts, Vec::new()));
+        }
+        let mut successor = authority.clone();
+        // The capability names the exact predecessor. This speculative graph
+        // must be checked normally, never inherit a witness across our edits.
+        successor.verified_binding_history = None;
+        for change in delta.relation_deltas() {
+            match change.new_state() {
+                Some(new) => {
+                    successor.relations.insert(new.id, new.clone());
+                }
+                None => {
+                    successor.relations.remove(&change.target_id());
+                }
+            }
+        }
+        for change in delta.external_reference_deltas() {
+            match change.new_state() {
+                Some(new) => {
+                    successor.external_references.insert(new.id, new.clone());
+                }
+                None => {
+                    successor.external_references.remove(&change.target_id());
+                }
+            }
+        }
+        for change in delta.resolution_record_deltas() {
+            match change.new_state() {
+                Some(new) => {
+                    successor.resolution_records.insert(new.id(), new.clone());
+                }
+                None => {
+                    successor.resolution_records.remove(&change.target_id());
+                }
+            }
+        }
+        let unaccounted = kin_index::binding_history::unaccounted_binding_withdrawals(
+            authority, &successor, &withdrawn, load_body,
+        )
+        .map_err(DaemonError::from)?;
+        let mut held_by_artifact: std::collections::HashMap<_, Vec<_>> = Default::default();
+        for relation in authority
+            .relations
+            .values()
+            .filter(|relation| kin_index::binding_debt::claims_local_binding_debt(relation))
+        {
+            if let kin_model::GraphNodeId::Artifact(artifact) = relation.src {
+                held_by_artifact
+                    .entry(artifact)
+                    .or_default()
+                    .push(relation.clone());
+            }
+        }
+        let debts = kin_reconcile::plan_withdrawn_local_binding_obligations(
+            &unaccounted,
+            |id| Ok(authority.entities.get(&id).cloned()),
+            |file| {
+                let path = kin_model::RepoPath::from_utf8(file.0.clone())
+                    .map_err(|error| kin_reconcile::ReconcileError::Graph(error.to_string()))?;
+                Ok(authority
+                    .resolved_tree
+                    .artifact_at_path(&path)
+                    .and_then(|entry| match entry.entry {
+                        kin_model::TreeEntry::Blob { hash, .. } => Some((entry.artifact_id, hash)),
+                        _ => None,
+                    }))
+            },
+            |artifact| Ok(held_by_artifact.get(&artifact).cloned().unwrap_or_default()),
+            |id| Ok(authority.relations.get(&id).cloned()),
+        )
+        .map_err(|error| DaemonError::Graph(kin_db::KinDbError::StorageError(error.to_string())))?;
+        for change in &debts {
+            if let Some(new) = change.new_state() {
+                successor.relations.insert(new.id, new.clone());
+            }
+        }
+        // New validated proof can settle existing debt even when this flush
+        // withdraws no edge. Use the same source-sealed history verifier, then
+        // compose debt changes against the exact publication predecessor.
+        let settled =
+            kin_index::binding_history::settled_binding_debt_deltas(&successor, load_body)
+                .map_err(DaemonError::from)?;
+        let mut relations = delta.relation_deltas().to_vec();
+        relations.extend(debts);
+        for change in settled {
+            let id = change.target_id();
+            match change.new_state() {
+                Some(new) => {
+                    successor.relations.insert(id, new.clone());
+                }
+                None => {
+                    successor.relations.remove(&id);
+                }
+            }
+            relations.retain(|prior| prior.target_id() != id);
+            match (authority.relations.get(&id), successor.relations.get(&id)) {
+                (Some(old), Some(new)) if old != new => {
+                    relations.push(kin_model::RelationDelta::Modified {
+                        old: old.clone(),
+                        new: new.clone(),
+                    })
+                }
+                (Some(old), None) => {
+                    relations.push(kin_model::RelationDelta::Removed { old: old.clone() })
+                }
+                (None, Some(new)) => {
+                    relations.push(kin_model::RelationDelta::Added { new: new.clone() })
+                }
+                _ => {}
+            }
+        }
+        let combined = kin_model::WorkspaceSemanticDelta::new_with_external_references(
+            delta.entity_deltas().to_vec(),
+            relations,
+            delta.external_reference_deltas().to_vec(),
+        )
+        .and_then(|combined| {
+            combined.with_resolution_records(delta.resolution_record_deltas().to_vec())
+        })
+        .and_then(|combined| combined.with_enrichment_marks(delta.enrichment_marks().clone()))
+        .map_err(|error| DaemonError::Graph(kin_db::KinDbError::StorageError(error.to_string())))?;
+        let debts = successor
+            .relations
+            .values()
+            .filter(|relation| kin_index::binding_debt::claims_local_binding_debt(relation))
+            .cloned()
+            .collect();
+        let retired =
+            kin_index::binding_history::settled_live_binding_debts(live, &successor, load_body)
+                .map_err(DaemonError::from)?;
+        Ok((combined, debts, retired))
     }
 
     fn load_committed_authority_graph(
@@ -14492,7 +15419,8 @@ impl DaemonState {
     ///
     /// Called from the paths that actually level the two: opening a graph out
     /// of a durable workspace snapshot, and installing a committed authority
-    /// graph onto the live one. It takes the count rather than reading it back
+    /// graph onto the live one, or finalizing an exact admitted graph match.
+    /// It takes the count rather than reading it back
     /// off the live graph so the number is the durable side's, not a live side
     /// an ambient admission may already have moved.
     pub fn record_durable_entity_count(&self, count: u64) {
@@ -14519,7 +15447,7 @@ impl DaemonState {
     /// Record that the live query graph now carries every relation durable
     /// authority carries, and how many that is.
     ///
-    /// Called from the same two levelling paths as
+    /// Called from the same levelling paths as
     /// [`Self::record_durable_entity_count`] and from nowhere else. A path that
     /// levels one counter and not the other publishes a difference no
     /// observation produced, which is the shape of wrong answer the block this
@@ -14600,6 +15528,7 @@ impl DaemonState {
         if self.mutation_epoch.load(Ordering::SeqCst) != observed_epoch
             || self.graph.has_unpersisted_changes()
             || self.post_commit_finalization_pending.load(Ordering::SeqCst)
+            || self.enrichment_bookkeeping_pending.load(Ordering::SeqCst)
         {
             self.dirty.store(true, Ordering::SeqCst);
             return;
@@ -14610,8 +15539,14 @@ impl DaemonState {
     }
 
     /// Check if the graph has unsaved mutations.
+    ///
+    /// A context validation removed from the live graph is unsaved until a
+    /// publication has carried the removal into authority, whatever a save that
+    /// ran concurrently with it cleared, so periodic persistence keeps trying.
     pub fn is_dirty(&self) -> bool {
         self.dirty.load(Ordering::SeqCst)
+            || self.lsp_validation_removals.owed()
+            || self.enrichment_bookkeeping_pending.load(Ordering::SeqCst)
     }
 
     /// Whether persisting the current in-memory graph on shutdown would overwrite
@@ -14829,6 +15764,15 @@ impl DaemonState {
     /// attached client, a request in flight, a pending publication, running
     /// enrichment or embedding, and an unflushed graph all keep the daemon up,
     /// and it exits on the first check after the last of them clears.
+    /// Stop this daemon serving now, through the same cancel channel a
+    /// cooperative stop request sends on. Answers whether a channel was there to
+    /// send on; a state no daemon loop runs (a test's) has none.
+    pub(crate) fn stop_serving(&self) -> bool {
+        self.stop_trigger
+            .get()
+            .is_some_and(|cancel| cancel.send(true).is_ok())
+    }
+
     pub fn request_retirement(&self) -> bool {
         !self.retirement_requested.swap(true, Ordering::SeqCst)
     }
@@ -14850,8 +15794,53 @@ impl DaemonState {
     }
 
     /// The live idle window, or `None` when this daemon never idles out.
+    ///
+    /// This daemon's own window, raised to the largest floor an attached
+    /// session currently holds. The idle monitor reads it every tick, so a
+    /// floor takes effect as soon as it is held and stops the moment it is
+    /// released or expires, which returns the daemon to its own policy.
     pub fn idle_timeout(&self) -> Option<Duration> {
+        crate::idle_floor::effective_idle_window(
+            self.own_idle_timeout(),
+            self.idle_floor_leases.floor(Instant::now()),
+        )
+    }
+
+    /// This daemon's own idle window, without any attached session's floor.
+    pub fn own_idle_timeout(&self) -> Option<Duration> {
         Self::window_from_millis(self.idle_timeout_ms.load(Ordering::SeqCst))
+    }
+
+    /// Hold or renew an attached session's idle floor.
+    ///
+    /// Unlike [`Self::raise_idle_timeout`], this changes nothing permanently:
+    /// the floor lasts while the session renews it and ends when the session
+    /// releases it or stops renewing it for one floor. Clamped to
+    /// [`MAX_ATTACHED_IDLE_TIMEOUT_SECS`].
+    pub fn hold_idle_floor(
+        &self,
+        lease: &str,
+        floor: Duration,
+        client: &str,
+    ) -> std::result::Result<crate::idle_floor::LeaseHeld, crate::idle_floor::LeaseRefusal> {
+        self.idle_floor_leases.hold(
+            lease,
+            floor,
+            Duration::from_secs(MAX_ATTACHED_IDLE_TIMEOUT_SECS),
+            client,
+            Instant::now(),
+        )
+    }
+
+    /// Release an attached session's idle floor. Returns the client that held
+    /// it, or `None` when no live lease had that id.
+    pub fn release_idle_floor(&self, lease: &str) -> Option<String> {
+        self.idle_floor_leases.release(lease, Instant::now())
+    }
+
+    /// How many attached sessions hold a live idle floor.
+    pub fn idle_floor_leases_live(&self) -> usize {
+        self.idle_floor_leases.live(Instant::now())
     }
 
     fn window_from_millis(millis: u64) -> Option<Duration> {
@@ -14917,7 +15906,10 @@ impl DaemonState {
             return;
         }
         if let Some(ref tx) = self.lsp_enrichment_tx {
-            let work = self.lsp_work.reserve();
+            let work = self.lsp_work.reserve_for(LspWorkItem::file(
+                request.file_id.0.clone(),
+                crate::daemon::current_marker_epoch(self),
+            ));
             match tx.try_send(LspEnrichmentMessage::Incremental(request)) {
                 Ok(()) => work.transfer(),
                 Err(error) => warn!(%error, "LSP incremental request could not be queued"),
@@ -14949,13 +15941,22 @@ impl DaemonState {
         {
             return false;
         }
-        let work = self.lsp_work.reserve();
+        let mut work = self.lsp_work.reserve_for(LspWorkItem::Sweep {
+            source_generation: crate::daemon::current_marker_epoch(self),
+        });
         match tx.try_send(LspEnrichmentMessage::Sweep) {
             Ok(()) => {
                 work.transfer();
                 true
             }
             Err(error) => {
+                // No work was accepted on a full queue. The caller retains
+                // its coalesced demand and retries when capacity opens, so
+                // this unsent reservation is not an abandoned attempt.
+                // A closed receiver still records a genuine failed handoff.
+                if matches!(&error, tokio::sync::mpsc::error::TrySendError::Full(_)) {
+                    work.complete();
+                }
                 warn!(%error, "LSP sweep could not be queued");
                 self.lsp_sweep_running.store(false, Ordering::SeqCst);
                 false
@@ -15030,6 +16031,63 @@ mod finalization_external_tests;
 
 #[cfg(test)]
 mod tests {
+    /// A removal of a context validation that lands after a publication read
+    /// the live graph is not acknowledged by that publication, so the next one
+    /// carries it even when nothing else moved.
+    #[test]
+    fn a_removal_after_a_publication_read_the_live_graph_stays_owed() {
+        let removals = super::ValidationRemovals::default();
+        assert!(!removals.owed());
+        removals.record();
+        // A publication observes the removals, then reads the live graph.
+        let seen = removals.observed();
+        // Another removal lands while it runs.
+        removals.record();
+        // It succeeds, carrying only what it could see.
+        removals.acknowledge(seen);
+        assert!(
+            removals.owed(),
+            "the later removal is still owed to authority"
+        );
+        assert!(
+            removals.pending(removals.observed()),
+            "so the next publication does not take the idle return"
+        );
+        removals.acknowledge(removals.observed());
+        assert!(!removals.owed());
+        // An older publication finishing late never moves the mark back.
+        removals.acknowledge(seen);
+        assert!(!removals.owed());
+    }
+
+    /// A save that ran while a validation was being removed clears the dirty
+    /// flag, and must not hide the removal it did not carry.
+    #[test]
+    fn marking_the_graph_clean_does_not_hide_an_owed_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = kin_core::init(dir.path()).unwrap().layout;
+        let state = DaemonState::open(layout).unwrap();
+        // The graph's own flag as a save that acknowledged everything leaves
+        // it. `mark_clean` re-arms it while the freshly opened graph still has
+        // unpersisted changes, which is not what this test is about.
+        state.dirty.store(false, Ordering::SeqCst);
+        assert!(!state.is_dirty());
+        state.lsp_validation_removals.record();
+        // A save that ran concurrently with the removal clears the flag.
+        state.dirty.store(false, Ordering::SeqCst);
+        assert!(
+            state.is_dirty(),
+            "the removal is owed to authority, so persistence keeps trying"
+        );
+        state
+            .lsp_validation_removals
+            .acknowledge(state.lsp_validation_removals.observed());
+        assert!(
+            !state.is_dirty(),
+            "carried, it no longer holds persistence open"
+        );
+    }
+
     mod hosted_fleet;
     use super::*;
     use kin_model::{
@@ -18578,6 +19636,7 @@ mod tests {
                 .err()
                 .unwrap();
             assert!(refusal.contains("spine_candidate_representation_gap"));
+            assert!(!refusal.contains("; "));
             assert!(refusal.contains("Local Kin queries and generator edits remain available"));
             // Reproduce an older publisher at the exact SAME graph root. This
             // proves a matching watermark cannot bypass the new capture gate.
@@ -22509,6 +23568,7 @@ mod tests {
                 state: "active".to_string(),
                 staged_operations: Vec::new(),
                 commit_payload_hash: None,
+                created_at: None,
                 last_activity_at: kin_model::timestamp::Timestamp::now(),
             },
         );
@@ -24117,26 +25177,51 @@ mod tests {
         assert!(records.contains(&(ledger.id(), true)), "{records:?}");
         assert!(records.contains(&(context.id(), true)), "{records:?}");
 
-        let (marks, unmarkable) = DaemonState::enrichment_marks_to_commit(
+        let (marks, unmarkable) =
+            DaemonState::enrichment_marks_to_commit(&pending, &tree, &live, &authority, &delta);
+        assert!(unmarkable.is_empty());
+        assert_eq!(
+            marks[0].relations,
+            kin_model::enrichment_proof_inputs_by_file(
+                ["src/sessions.rs"],
+                authority.entities.values(),
+                [&edge],
+                [&context, &ledger],
+            )
+            .unwrap()["src/sessions.rs"],
+            "the mark digests the file's ledgers with its proofs"
+        );
+
+        let mut final_edge = edge.clone();
+        final_edge.confidence = 0.5;
+        let final_delta = kin_model::WorkspaceSemanticDelta::new(
+            Vec::new(),
+            vec![kin_model::RelationDelta::Added {
+                new: final_edge.clone(),
+            }],
+        )
+        .unwrap()
+        .with_resolution_records(delta.resolution_record_deltas().to_vec())
+        .unwrap();
+        let (final_marks, unmarkable) = DaemonState::enrichment_marks_to_commit(
             &pending,
             &tree,
             &live,
             &authority,
-            &Default::default(),
-            &ledgers,
+            &final_delta,
         );
         assert!(unmarkable.is_empty());
+        assert_ne!(final_marks[0].relations, marks[0].relations);
         assert_eq!(
-            marks[0].relations,
-            kin_model::enrichment_relations_digest(
-                "src/sessions.rs",
-                [&edge],
-                |id: &kin_model::EntityId| (*id == caller.id)
-                    .then_some("src/sessions.rs")
-                    .or((*id == callee.id).then_some("src/adapters.rs")),
-                [ledger.id()],
-            ),
-            "the mark digests the file's ledgers with its proofs"
+            final_marks[0].relations,
+            kin_model::enrichment_proof_inputs_by_file(
+                ["src/sessions.rs"],
+                authority.entities.values(),
+                [&final_edge],
+                [&context, &ledger]
+            )
+            .unwrap()["src/sessions.rs"],
+            "completion must bind the final canonical publication, not an earlier live offer"
         );
 
         let (marks, unmarkable) = DaemonState::enrichment_marks_to_commit(
@@ -24145,7 +25230,6 @@ mod tests {
             &live,
             &authority,
             &Default::default(),
-            &[],
         );
         assert!(
             marks.is_empty(),
@@ -24349,6 +25433,379 @@ mod tests {
                 ..Default::default()
             })
             .unwrap();
+    }
+
+    #[test]
+    fn refined_binding_debt_publication_and_empty_retry_converge_live_and_snapshot() {
+        use kin_db::storage::binding_history::BindingHistoryVerifier;
+        use kin_index::binding_debt::{
+            build_local_binding_debt, decode_local_binding_debt, LocalBindingDebt,
+            LocalBindingObligation,
+        };
+        use kin_model::{
+            CallSite, CallSiteLedger, CallSiteState, ContextValidation, ContextValidationState,
+            ProofContext, RelationEvidence, RelationKind, RelationOrigin, ResolutionRecord,
+            ResolutionRecordId, SourceSpan,
+        };
+        for partial in [false, true] {
+            let mut authority = kin_db::GraphSnapshot::empty();
+            let mut bodies = std::collections::HashMap::new();
+            let mut entries = Vec::new();
+            let mut calls = Vec::new();
+            let body = "def run(options):\n    options.pop(1)\n    options.pop(2)\n";
+            for (path, content) in [
+                ("caller.py", body),
+                ("old.py", "class Old:\n    def pop(self):\n        pass\n"),
+                (
+                    "actual.py",
+                    "class Actual:\n    def pop(self):\n        pass\n",
+                ),
+            ] {
+                let digest = kin_blobs::digest(content.as_bytes());
+                let parsed = kin_index::IndexPipeline::new()
+                    .index_file_content_with_tests(
+                        &FilePathId::new(path),
+                        content.as_bytes(),
+                        digest,
+                    )
+                    .unwrap()
+                    .indexed_file;
+                if path == "caller.py" {
+                    calls = parsed
+                        .extracted_relations
+                        .into_iter()
+                        .filter(|raw| raw.kind == RelationKind::Calls && raw.src_name == "run")
+                        .collect::<Vec<_>>();
+                }
+                authority
+                    .entities
+                    .extend(parsed.entities.into_iter().map(|e| (e.id, e)));
+                let hash = Hash256::from_bytes(digest.0);
+                bodies.insert(hash, content.as_bytes().to_vec());
+                entries.push(kin_model::ResolvedArtifact::new(
+                    kin_model::ArtifactId::new(),
+                    RepoPath::from_utf8(path).unwrap(),
+                    TreeEntry::blob(hash, false),
+                ));
+            }
+            assert_eq!(calls.len(), 2);
+            authority.resolved_tree = ResolvedTree::from_artifacts(entries).unwrap();
+            let file = FilePathId::new("caller.py");
+            let caller = authority
+                .entities
+                .values()
+                .find(|e| e.name == "run")
+                .unwrap()
+                .clone();
+            let old_target = authority
+                .entities
+                .values()
+                .find(|e| e.name == "Old.pop")
+                .unwrap()
+                .clone();
+            let actual = authority
+                .entities
+                .values()
+                .find(|e| e.name == "Actual.pop")
+                .unwrap()
+                .id;
+            let source_artifact = authority
+                .resolved_tree
+                .artifact_at_path(&RepoPath::from_utf8("caller.py").unwrap())
+                .unwrap();
+            let TreeEntry::Blob { hash, .. } = source_artifact.entry else {
+                unreachable!()
+            };
+            let target_artifact = authority
+                .resolved_tree
+                .artifact_id_at_path(&RepoPath::from_utf8("old.py").unwrap())
+                .unwrap();
+            let obligations = calls
+                .iter()
+                .map(|raw| LocalBindingObligation {
+                    retired_relation: kin_model::Relation {
+                        evidence: vec![RelationEvidence {
+                            source_span: Some(raw.site.as_ref().unwrap().to_source_span(&file)),
+                            ..Default::default()
+                        }],
+                        ..language_server_relation(&caller, &old_target, RelationOrigin::Inferred)
+                    },
+                    source_name: caller.name.clone(),
+                    source_digest: hash,
+                    prior_source_file: None,
+                    target_artifact,
+                    target_file: FilePathId::new("old.py"),
+                    target_name: old_target.name.clone(),
+                })
+                .collect();
+            let debt = build_local_binding_debt(
+                source_artifact.artifact_id,
+                LocalBindingDebt {
+                    source_file: file.clone(),
+                    observed_source_digest: hash,
+                    obligations,
+                },
+            )
+            .unwrap();
+            authority.relations.insert(debt.id, debt.clone());
+            let context = ProofContext {
+                language: kin_model::LanguageId::Python,
+                resolver: "lsp:pyright".into(),
+                resolver_version: "1".into(),
+                configuration_hash: Hash256::from_bytes([1; 32]),
+                environment_hash: Hash256::from_bytes([2; 32]),
+                environment_summary: "fixture".into(),
+            };
+            let context_id = ResolutionRecordId::proof_context(&context);
+            let mut replacement = language_server_relation(
+                &caller,
+                &authority.entities[&actual],
+                RelationOrigin::Lsp,
+            );
+            let mut sites = Vec::new();
+            for (index, (at, _)) in body.match_indices("pop").enumerate() {
+                let prefix = &body[..at];
+                let line = prefix.bytes().filter(|b| *b == b'\n').count() as u32;
+                let col = prefix.rsplit('\n').next().unwrap().len() as u32;
+                let span = SourceSpan {
+                    file: file.clone(),
+                    start_byte: at,
+                    end_byte: at + 3,
+                    start_line: line,
+                    end_line: line,
+                    start_col: col,
+                    end_col: col + 3,
+                };
+                let (offset, length) =
+                    kin_model::site_key(caller.span.as_ref().unwrap().start_byte, at, at + 3)
+                        .unwrap();
+                let state = if partial && index == 0 {
+                    CallSiteState::Binding { may_call: None }
+                } else {
+                    CallSiteState::ProvenTarget { target: actual }
+                };
+                sites.push(CallSite {
+                    offset,
+                    length,
+                    state,
+                });
+                replacement.evidence.push(RelationEvidence {
+                    source_span: Some(span),
+                    token: Some(context_id.context_token()),
+                    parser_rule: Some("lsp_definition".into()),
+                    ..Default::default()
+                });
+            }
+            let records = vec![
+                ResolutionRecord::ProofContext(context.clone()),
+                ResolutionRecord::ContextValidation(ContextValidation {
+                    language: kin_model::LanguageId::Python,
+                    state: ContextValidationState::Validated { context },
+                }),
+                ResolutionRecord::CallSites(CallSiteLedger {
+                    caller: caller.id,
+                    behavior_hash: caller.fingerprint.behavior_hash,
+                    body_hash: hash,
+                    context: context_id,
+                    census: 2,
+                    sites,
+                }),
+            ];
+            let mut live = authority.clone();
+            live.relations.insert(replacement.id, replacement.clone());
+            live.resolution_records
+                .extend(records.iter().cloned().map(|r| (r.id(), r)));
+            let delta = kin_model::WorkspaceSemanticDelta::new(
+                Vec::new(),
+                vec![kin_model::RelationDelta::Added { new: replacement }],
+            )
+            .unwrap()
+            .with_resolution_records(
+                records
+                    .into_iter()
+                    .map(|new| kin_model::ResolutionRecordDelta::Added { new })
+                    .collect(),
+            )
+            .unwrap();
+            assert!(delta
+                .relation_deltas()
+                .iter()
+                .all(|change| change.old_state().is_none()));
+            let load = |digest| Ok(bodies.get(&digest).cloned());
+            let (delta, debts, retired) =
+                DaemonState::account_for_withdrawn_local_bindings(&authority, &live, delta, &load)
+                    .unwrap();
+            assert_eq!(retired, vec![debt.clone()]);
+            assert_eq!(debts.len(), usize::from(partial));
+            if partial {
+                let remaining =
+                    decode_local_binding_debt(&file, source_artifact.artifact_id, &debts[0])
+                        .unwrap()
+                        .unwrap();
+                assert_eq!(remaining.obligations.len(), 1);
+            }
+            let mut published = authority.clone();
+            for change in delta.relation_deltas() {
+                match change.new_state() {
+                    Some(new) => {
+                        published.relations.insert(new.id, new.clone());
+                    }
+                    None => {
+                        published.relations.remove(&change.target_id());
+                    }
+                }
+            }
+            for change in delta.resolution_record_deltas() {
+                if let Some(new) = change.new_state() {
+                    published.resolution_records.insert(new.id(), new.clone());
+                }
+            }
+            assert!(kin_index::binding_history::LocalBindingHistoryVerifier
+                .verify_graph_transition(&authority, &published, &load)
+                .unwrap());
+            let repo = tempfile::tempdir().unwrap();
+            let init = kin_core::init(repo.path()).unwrap();
+            let mut state = test_state(init.layout, repo.path());
+            state.graph = Arc::new(kin_db::InMemoryGraph::from_snapshot(live.clone()).unwrap());
+            let observed = state.graph.semantic_observation();
+            let mut changed = caller.clone();
+            changed
+                .metadata
+                .extra
+                .insert("concurrent_note".into(), serde_json::json!(true));
+            state.graph.upsert_entity(&changed).unwrap();
+            assert!(state
+                .mirror_published_enrichment_bookkeeping_with_retirements(
+                    &observed,
+                    &debts,
+                    &retired,
+                    &[],
+                    &[]
+                )
+                .is_err());
+            assert_eq!(state.graph.get_relation_by_id(&debt.id), Some(debt.clone()));
+            let retry_observed = state.graph.semantic_observation();
+            let (empty, debts, retired) = DaemonState::account_for_withdrawn_local_bindings(
+                &published,
+                &retry_observed,
+                kin_model::WorkspaceSemanticDelta::default(),
+                &load,
+            )
+            .unwrap();
+            assert!(
+                empty.is_empty(),
+                "the durable publication is already complete"
+            );
+            state.graph.clear_pending_delta();
+            state
+                .mirror_published_enrichment_bookkeeping_with_retirements(
+                    &retry_observed,
+                    &debts,
+                    &retired,
+                    &[],
+                    &[],
+                )
+                .unwrap();
+            assert!(!state.enrichment_bookkeeping_pending.load(Ordering::SeqCst));
+            assert_eq!(
+                state.graph.get_relation_by_id(&debt.id),
+                published.relations.get(&debt.id).cloned()
+            );
+            assert!(state.graph.pending_delta_snapshot(1).is_none());
+            let reconstructed = kin_db::InMemoryGraph::from_snapshot(published).unwrap();
+            assert_eq!(
+                state.graph.get_relation_by_id(&debt.id),
+                reconstructed.get_relation_by_id(&debt.id)
+            );
+        }
+    }
+
+    #[test]
+    fn published_binding_debt_mirror_requires_the_captured_source_seal() {
+        use kin_index::binding_debt::{
+            build_local_binding_debt, LocalBindingDebt, LocalBindingObligation,
+        };
+        for keep_identical_live_debt in [false, true] {
+            let repo = tempfile::tempdir().unwrap();
+            let init = kin_core::init(repo.path()).unwrap();
+            let state = test_state(init.layout, repo.path());
+            let caller = test_entity("caller", "caller.rs");
+            let target = test_entity("target", "target.rs");
+            publish_authority_entities(&state, &[caller.clone(), target.clone()]);
+            let tree = state.graph.resolved_tree();
+            let source = tree
+                .artifact_at_path(&RepoPath::from_utf8("caller.rs").unwrap())
+                .unwrap();
+            let target_artifact = tree
+                .artifact_id_at_path(&RepoPath::from_utf8("target.rs").unwrap())
+                .unwrap();
+            let digest = tree_body(&state, "caller.rs");
+            let debt = build_local_binding_debt(
+                source.artifact_id,
+                LocalBindingDebt {
+                    source_file: FilePathId::new("caller.rs"),
+                    observed_source_digest: digest,
+                    obligations: vec![LocalBindingObligation {
+                        retired_relation: lsp_relation_from(&caller, &target, "caller.rs"),
+                        source_name: caller.name.clone(),
+                        source_digest: digest,
+                        prior_source_file: None,
+                        target_artifact,
+                        target_file: FilePathId::new("target.rs"),
+                        target_name: target.name.clone(),
+                    }],
+                },
+            )
+            .unwrap();
+            state
+                .mirror_published_enrichment_bookkeeping(
+                    &state.graph.semantic_observation(),
+                    std::slice::from_ref(&debt),
+                    &[],
+                    &[],
+                )
+                .expect("the matching body accepts missing bookkeeping");
+            if !keep_identical_live_debt {
+                state.graph.remove_relation(&debt.id).unwrap();
+            }
+            // Capture AFTER a writer has admitted a different body. A later
+            // exact-capture fence alone cannot discover this stale debt seal.
+            let changed = Hash256::from_bytes([0xa5; 32]);
+            assert_ne!(digest, changed);
+            state
+                .graph
+                .apply_transaction_delta(&kin_model::TransactionDelta {
+                    tree_deltas: vec![TreeDelta::Updated {
+                        artifact_id: source.artifact_id,
+                        old: LocatedEntry::new(source.path.clone(), source.entry.clone()),
+                        new: LocatedEntry::new(
+                            source.path.clone(),
+                            TreeEntry::blob(changed, false),
+                        ),
+                    }],
+                    ..Default::default()
+                })
+                .unwrap();
+            let observed = state.graph.semantic_observation();
+            let refused = state
+                .mirror_published_enrichment_bookkeeping(
+                    &observed,
+                    std::slice::from_ref(&debt),
+                    &[],
+                    &[],
+                )
+                .unwrap_err()
+                .to_string();
+            assert!(
+                refused.contains("source seal does not match the captured body"),
+                "{refused}"
+            );
+            assert_eq!(
+                state.graph.get_relation_by_id(&debt.id),
+                keep_identical_live_debt.then_some(debt)
+            );
+            assert_eq!(state.graph.resolved_tree(), observed.resolved_tree);
+        }
     }
 
     /// The body the workspace tree holds at `path`.
@@ -24679,7 +26136,14 @@ mod tests {
         let repo_dir = tempfile::tempdir().unwrap();
         let init = kin_core::init(repo_dir.path()).unwrap();
         let layout = init.layout.clone();
-        let caller = test_entity("send", "src/sessions.rs");
+        let mut caller = test_entity("send", "src/sessions.rs");
+        // publish_authority_entities stages these exact fixture bytes. The
+        // prior relation must carry their seal before it can become debt.
+        let body = b"// src/sessions.rs\n";
+        caller.metadata.extra.insert(
+            "blob_hash".into(),
+            serde_json::json!(Hash256::from_bytes(kin_blobs::digest_bytes(body)).to_string()),
+        );
         let guessed = test_entity("adapter_send", "src/adapters.rs");
         let proven = test_entity("transport_send", "src/transport.rs");
         let mut guess =
@@ -24780,7 +26244,8 @@ mod tests {
             path: path.to_string(),
             body: Hash256::from_bytes([byte; 32]),
             version: crate::daemon::LSP_ENRICHMENT_MARKER_VERSION,
-            relations: kin_model::enrichment_relations_digest(path, [], |_| None, []),
+            relations: kin_model::enrichment_proof_inputs_by_file([path], [], [], []).unwrap()
+                [path],
         };
         let marks = [mark("app/run.py", 1), mark("src/lib.rs", 2)];
         let resumed = |scope_current| {
@@ -25322,6 +26787,87 @@ mod tests {
             DaemonState::flush_workspace_graph_builds(),
             before + 1,
             "a flush that publishes must build the workspace graph it diffs against"
+        );
+    }
+
+    #[test]
+    fn a_refused_bookkeeping_mirror_retries_without_a_new_enrichment_delta() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let state = test_state(init.layout, repo_dir.path());
+        let caller = test_entity("send", "src/sessions.rs");
+        publish_authority_entities(&state, std::slice::from_ref(&caller));
+        state.save_snapshot().unwrap();
+        let generation = state.snapshot_generation.load(Ordering::SeqCst);
+        let (_, first, _) = external_proof(&caller);
+        let kin_model::ResolutionRecord::ProofContext(mut next) = first.clone() else {
+            unreachable!()
+        };
+        next.resolver_version.push_str("-next");
+        let second = kin_model::ResolutionRecord::ProofContext(next);
+        assert_ne!(first.id(), second.id());
+        let add_context = |context: &kin_model::ResolutionRecord| {
+            state
+                .graph
+                .apply_transaction_delta(&kin_model::TransactionDelta {
+                    resolution_record_deltas: vec![kin_model::ResolutionRecordDelta::Added {
+                        new: context.clone(),
+                    }],
+                    ..Default::default()
+                })
+                .unwrap();
+        };
+        // Both contexts are unused and absent from committed authority. A
+        // writer between capture and cleanup must first refuse the mirror.
+        add_context(&first);
+        let captured = state.graph.semantic_observation();
+        add_context(&second);
+        let refused = state
+            .mirror_published_enrichment_bookkeeping(
+                &captured,
+                &[],
+                &[],
+                std::slice::from_ref(&first),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            refused.contains("live bookkeeping capture changed"),
+            "{refused}"
+        );
+        assert!(state.enrichment_bookkeeping_pending.load(Ordering::SeqCst));
+        assert!(!state
+            .post_commit_finalization_pending
+            .load(Ordering::SeqCst));
+        state.mark_clean();
+        assert!(
+            state.is_dirty(),
+            "a refused mirror retains its retry demand"
+        );
+
+        let before = DaemonState::flush_workspace_graph_builds();
+        state.save_snapshot().unwrap();
+        assert_eq!(state.snapshot_generation.load(Ordering::SeqCst), generation);
+        assert!(state
+            .graph
+            .semantic_observation()
+            .resolution_records
+            .is_empty());
+        assert!(!state.enrichment_bookkeeping_pending.load(Ordering::SeqCst));
+        assert!(!state
+            .post_commit_finalization_pending
+            .load(Ordering::SeqCst));
+        assert_eq!(DaemonState::flush_workspace_graph_builds(), before + 1);
+        assert!(DaemonState::durable_read_index_matches_generation(
+            &state.layout,
+            generation
+        ));
+
+        state.save_snapshot().unwrap();
+        assert_eq!(
+            DaemonState::flush_workspace_graph_builds(),
+            before + 1,
+            "successful bookkeeping repair must leave the next idle flush free of graph builds"
         );
     }
 

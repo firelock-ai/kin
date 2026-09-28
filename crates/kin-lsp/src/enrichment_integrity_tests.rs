@@ -3665,7 +3665,7 @@ async fn an_answer_on_an_overload_signature_proves_the_implementation() {
     let run = entity_at("run", "source.ts", (0, 2), (0, 9), EntityKind::Function);
     let module = entity_at("lib", "lib.ts", (0, 5), (0, 0), EntityKind::Module);
     let pick = entity_at("pick", "lib.ts", (3, 5), (3, 16), EntityKind::Function);
-    let index = EntityIndex::new(vec![run.clone(), module, pick.clone()], &root.0);
+    let index = EntityIndex::new(vec![run.clone(), module.clone(), pick.clone()], &root.0);
     let mut responses = json!({});
     responses[format!("{DEFINITION}@{}#4", root.uri("source.ts"))] =
         json!({"result": [root.at("lib.ts", 1, 16, 20)]});
@@ -3692,6 +3692,14 @@ async fn an_answer_on_an_overload_signature_proves_the_implementation() {
             crate::call_sites::DEFINITION_RULE
         )],
         "{pass:?}"
+    );
+    assert!(
+        has_edge(&pass.relations, RelationKind::References, pick.id),
+        "the answered overload must reference its implementation: {pass:?}"
+    );
+    assert!(
+        !has_edge(&pass.relations, RelationKind::References, module.id),
+        "the module containing the overload signature is not its reference target: {pass:?}"
     );
 }
 
@@ -3786,6 +3794,10 @@ async fn an_overload_is_mapped_only_across_signatures_of_its_own_name() {
     .unwrap();
     server.shutdown().await.unwrap();
     assert!(pass.site_answers.is_empty(), "{pass:?}");
+    assert!(
+        !has_edge(&pass.relations, RelationKind::References, pick.id),
+        "a refused overload placement must not create an implementation reference: {pass:?}"
+    );
 }
 
 /// `const { reject } = make()` binds `reject` locally, and the server answers
@@ -4533,14 +4545,32 @@ async fn a_reference_keeps_its_earliest_site_whatever_the_order_asked() {
 async fn a_typescript_call_through_a_union_receiver_proves_nothing() {
     use kin_model::EntityKind;
     let root = Workspace::new("union-receiver");
-    let text =
-        "function run() {\n    d.wrap(1)\n       y = (d as A | B).wrap(2)\n        e.wrap(3)\n}\n";
-    let run = entity_at("run", "source.ts", (0, 4), (0, 9), EntityKind::Function);
+    let text = "function run() {\n    d.wrap(1)\n       y = (d as A | B).wrap(2)\n        e.wrap(3)\n           same.wrap(4)\n              sole.wrap(5)\n}\n";
+    let run = entity_at("run", "source.ts", (0, 6), (0, 9), EntityKind::Function);
     let a = entity_at("A", "lib.ts", (0, 2), (0, 6), EntityKind::Class);
     let a_wrap = entity_at("A.wrap", "lib.ts", (1, 1), (1, 2), EntityKind::Method);
     let b = entity_at("B", "lib.ts", (3, 5), (3, 6), EntityKind::Class);
     let b_wrap = entity_at("B.wrap", "lib.ts", (4, 4), (4, 2), EntityKind::Method);
-    let index = EntityIndex::new(vec![run.clone(), a, a_wrap.clone(), b, b_wrap], &root.0);
+    // Both classes start on one line; D's method is on the next line:
+    // class C { wrap() {} } class D {
+    //   wrap() {}
+    // }
+    let c = entity_at("C", "lib.ts", (7, 7), (7, 6), EntityKind::Class);
+    let d = entity_at("D", "lib.ts", (7, 9), (7, 28), EntityKind::Class);
+    let d_wrap = entity_at("D.wrap", "lib.ts", (8, 8), (8, 2), EntityKind::Method);
+    let index = EntityIndex::new(
+        vec![
+            run.clone(),
+            a,
+            a_wrap.clone(),
+            b,
+            b_wrap,
+            c,
+            d,
+            d_wrap.clone(),
+        ],
+        &root.0,
+    );
     let source = root.uri("source.ts");
     let mut responses = json!({});
     for column in [6, 24, 10] {
@@ -4550,6 +4580,14 @@ async fn a_typescript_call_through_a_union_receiver_proves_nothing() {
     responses[format!("{TYPES}@{source}#4")] =
         json!({"result": [root.at("lib.ts", 0, 6, 7), root.at("lib.ts", 3, 6, 7)]});
     responses[format!("{TYPES}@{source}#8")] = json!({"result": [root.at("lib.ts", 0, 6, 7)]});
+    for column in [16, 19] {
+        responses[format!("{DEFINITION}@{source}#{column}")] =
+            json!({"result": [root.at("lib.ts", 8, 2, 6)]});
+    }
+    responses[format!("{TYPES}@{source}#11")] =
+        json!({"result": [root.at("lib.ts", 7, 6, 7), root.at("lib.ts", 7, 28, 29)]});
+    responses[format!("{TYPES}@{source}#14")] =
+        json!({"result": [root.at("lib.ts", 7, 28, 29), root.at("lib.ts", 7, 28, 29)]});
     let server = LspServer::scripted_for_tests(PEER, responses);
     let pass = crate::file_enrichment::enrich_file_definitions(
         &server,
@@ -4564,14 +4602,185 @@ async fn a_typescript_call_through_a_union_receiver_proves_nothing() {
     server.shutdown().await.unwrap();
     assert_eq!(
         site_answers_of(text, &pass),
-        [(
-            "wrap",
-            3,
-            run.id,
-            Placed::Entity(a_wrap.id),
-            crate::call_sites::DEFINITION_RULE
-        )],
+        [
+            (
+                "wrap",
+                3,
+                run.id,
+                Placed::Entity(a_wrap.id),
+                crate::call_sites::DEFINITION_RULE
+            ),
+            (
+                "wrap",
+                5,
+                run.id,
+                Placed::Entity(d_wrap.id),
+                crate::call_sites::DEFINITION_RULE
+            ),
+        ],
         "{pass:?}"
+    );
+    assert!(
+        pass.unproven_sites.iter().any(|site| site.source == run.id
+            && site.start_byte == text.find("wrap(4)").unwrap()
+            && site.answer == crate::call_sites::UnprovenAnswer::AnswersDisagree),
+        "the receiver's two same-line class declarations stay distinct: {pass:?}"
+    );
+}
+
+/// A receiver that is a call's result has no name to ask the type of, so the
+/// member is asked instead. Through a union the server names every
+/// constituent's declaration of it, and the call proves nothing. Through one
+/// type it names the proven declaration alone, or only what the method
+/// returns, and the call stays proven. An answer that names nothing, as an
+/// intersection's member is answered, leaves the receiver open as well.
+#[tokio::test]
+async fn a_typescript_call_through_a_union_behind_a_call_result_proves_nothing() {
+    use kin_model::EntityKind;
+    let root = Workspace::new("union-call-result");
+    // The scripted server answers by column alone, so each `wrap` starts at a
+    // column no other identifier in the file starts at.
+    let text = "function run() {\n    get().wrap(1)\n       pick().wrap(2)\n         other().wrap(3)\n           both().wrap(4)\n}\n";
+    let run = entity_at("run", "source.ts", (0, 5), (0, 9), EntityKind::Function);
+    let a = entity_at("A", "lib.ts", (0, 2), (0, 6), EntityKind::Class);
+    let a_wrap = entity_at("A.wrap", "lib.ts", (1, 1), (1, 2), EntityKind::Method);
+    let b = entity_at("B", "lib.ts", (3, 5), (3, 6), EntityKind::Class);
+    let b_wrap = entity_at("B.wrap", "lib.ts", (4, 4), (4, 2), EntityKind::Method);
+    let result = entity_at("Result", "lib.ts", (7, 7), (7, 6), EntityKind::Class);
+    let index = EntityIndex::new(
+        vec![run.clone(), a, a_wrap.clone(), b, b_wrap, result],
+        &root.0,
+    );
+    let source = root.uri("source.ts");
+    let mut responses = json!({});
+    for column in [10, 14, 17, 18] {
+        responses[format!("{DEFINITION}@{source}#{column}")] =
+            json!({"result": [root.at("lib.ts", 1, 2, 6)]});
+    }
+    // `get()` returns a union: both classes' `wrap`.
+    responses[format!("{TYPES}@{source}#10")] =
+        json!({"result": [root.at("lib.ts", 1, 2, 6), root.at("lib.ts", 4, 2, 6)]});
+    // `pick()` returns one class whose `wrap` returns nothing: `wrap` itself.
+    responses[format!("{TYPES}@{source}#14")] = json!({"result": [root.at("lib.ts", 1, 2, 6)]});
+    // `other()` returns one class whose `wrap` returns `Result`.
+    responses[format!("{TYPES}@{source}#17")] = json!({"result": [root.at("lib.ts", 7, 6, 12)]});
+    // `both()` returns an intersection of the two classes: nothing.
+    responses[format!("{TYPES}@{source}#18")] = json!({"result": []});
+    let server = LspServer::scripted_for_tests(PEER, responses);
+    let pass = crate::file_enrichment::enrich_file_definitions(
+        &server,
+        &root.0.join("source.ts"),
+        text,
+        &index,
+        &root.0,
+        None,
+    )
+    .await
+    .unwrap();
+    server.shutdown().await.unwrap();
+    let proven: Vec<_> = site_answers_of(text, &pass)
+        .into_iter()
+        .map(|(name, line, source, target, _)| (name, line, source, target))
+        .collect();
+    assert_eq!(
+        proven,
+        [
+            ("wrap", 2, run.id, Placed::Entity(a_wrap.id)),
+            ("wrap", 3, run.id, Placed::Entity(a_wrap.id)),
+        ],
+        "{pass:?}"
+    );
+    for call in ["wrap(1)", "wrap(4)"] {
+        let open_site = pass
+            .unproven_sites
+            .iter()
+            .find(|site| site.start_byte == text.find(call).unwrap())
+            .map(|site| site.answer);
+        assert_eq!(
+            open_site,
+            Some(crate::call_sites::UnprovenAnswer::AnswersDisagree),
+            "{call}: {pass:?}"
+        );
+    }
+}
+
+/// Two different methods can occupy one line. The member type answer must
+/// retain both columns, but repeated answers for one inherited declaration
+/// must not turn that single member into a union of implementations.
+#[tokio::test]
+async fn a_union_member_keeps_distinct_columns_and_one_inherited_declaration() {
+    use kin_model::EntityKind;
+    let root = Workspace::new("union-member-columns");
+    let text = "function run() {\n    get().wrap(1)\n       inherited().wrap(2)\n}\n";
+    let lib = "class A {\n  wrap() {} } class B { wrap() {}\n}\nclass Base {\n  wrap() {}\n}\n";
+    let b_column = lib.lines().nth(1).unwrap().rfind("wrap").unwrap() as u32;
+    let run = entity_at("run", "source.ts", (0, 3), (0, 9), EntityKind::Function);
+    let a = entity_at("A", "lib.ts", (0, 1), (0, 6), EntityKind::Class);
+    let a_wrap = entity_at("A.wrap", "lib.ts", (1, 1), (1, 2), EntityKind::Method);
+    let b_name = lib.lines().nth(1).unwrap().find("class B").unwrap() as u32 + 6;
+    let b = entity_at("B", "lib.ts", (1, 2), (1, b_name), EntityKind::Class);
+    let b_wrap = entity_at(
+        "B.wrap",
+        "lib.ts",
+        (1, 1),
+        (1, b_column),
+        EntityKind::Method,
+    );
+    let base = entity_at("Base", "lib.ts", (3, 5), (3, 6), EntityKind::Class);
+    let base_wrap = entity_at("Base.wrap", "lib.ts", (4, 4), (4, 2), EntityKind::Method);
+    let index = EntityIndex::new(
+        vec![
+            run.clone(),
+            a,
+            a_wrap.clone(),
+            b,
+            b_wrap,
+            base,
+            base_wrap.clone(),
+        ],
+        &root.0,
+    );
+    let source = root.uri("source.ts");
+    let mut responses = json!({});
+    let inherited_column = text.lines().nth(2).unwrap().find("wrap").unwrap();
+    responses[format!("{DEFINITION}@{source}#10")] =
+        json!({"result": [root.at("lib.ts", 1, 2, 6)]});
+    responses[format!("{TYPES}@{source}#10")] = json!({"result": [
+        root.at("lib.ts", 1, 2, 6),
+        root.at("lib.ts", 1, b_column, b_column + 4)
+    ]});
+    responses[format!("{DEFINITION}@{source}#{inherited_column}")] =
+        json!({"result": [root.at("lib.ts", 4, 2, 6)]});
+    responses[format!("{TYPES}@{source}#{inherited_column}")] = json!({"result": [
+        root.at("lib.ts", 4, 2, 6), root.at("lib.ts", 4, 2, 6)
+    ]});
+    let server = LspServer::scripted_for_tests(PEER, responses);
+    let documents = |file: &str| (file == "lib.ts").then(|| lib.to_owned());
+    let pass = crate::file_enrichment::enrich_file_definitions(
+        &server,
+        &root.0.join("source.ts"),
+        text,
+        &index,
+        &root.0,
+        Some(&documents),
+    )
+    .await
+    .unwrap();
+    server.shutdown().await.unwrap();
+    let proven: Vec<_> = site_answers_of(text, &pass)
+        .into_iter()
+        .map(|(name, line, source, target, _)| (name, line, source, target))
+        .collect();
+    assert_eq!(
+        proven,
+        [("wrap", 2, run.id, Placed::Entity(base_wrap.id))],
+        "{pass:?}"
+    );
+    assert!(
+        pass.unproven_sites.iter().any(|site| site.source == run.id
+            && site.start_byte == text.find("wrap(1)").unwrap()
+            && site.answer == crate::call_sites::UnprovenAnswer::AnswersDisagree),
+        "the two same-line declarations must remain distinct: {pass:?}"
     );
 }
 

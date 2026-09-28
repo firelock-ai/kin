@@ -290,6 +290,7 @@ fn trace_callees(
         &RequestRepositoryAuthority::pinned(absent_binding()),
         graph,
         &TraceDataFlowRequest {
+            cursor: None,
             focal: entity_id(files, focal),
             depth: Some(3),
             direction: Some(TraceDirection::Calls),

@@ -468,7 +468,7 @@ impl AuthorityFrame {
     /// Version 3 appends [`CollaborationPatch`]. A frame is written at the
     /// version its contents need ([`Self::wire_version`]), so only a frame
     /// that carries collaboration is a version 3 frame.
-    pub const CURRENT_VERSION: u32 = Self::CALL_SITE_LEDGERS_VERSION;
+    pub const CURRENT_VERSION: u32 = Self::CONTEXT_VALIDATIONS_VERSION;
 
     /// The version a schema5 frame whose owed derivation ledger did not move
     /// is written at, binding-history capability included.
@@ -502,6 +502,10 @@ impl AuthorityFrame {
     /// its header instead.
     pub const CALL_SITE_LEDGERS_VERSION: u32 = 8;
 
+    /// A context validation in an operation, workspace or appended change.
+    /// The layout is unchanged, but older readers must refuse before replay.
+    pub const CONTEXT_VALIDATIONS_VERSION: u32 = 9;
+
     /// The oldest frame format version this binary reads, and the version a
     /// frame that carries no collaboration is still written at.
     ///
@@ -518,7 +522,8 @@ impl AuthorityFrame {
     /// The version these exact contents are written at.
     ///
     /// Derived from the contents, as a snapshot's version is: a frame that
-    /// carries a call-site ledger uses version8, one that carries any other
+    /// carries a context validation uses version9, one that carries a call-site
+    /// ledger uses version8, one that carries any other
     /// resolution record uses version7, one that carries enrichment marks uses
     /// version6, and one that moves the owed derivation ledger uses version5,
     /// at any schema. A ledger is a record, so only a frame that carries
@@ -527,6 +532,9 @@ impl AuthorityFrame {
     /// capability. In legacy schemas, collaboration uses version3 and a frame
     /// without it keeps the version2 body byte for byte.
     pub fn wire_version(&self) -> u32 {
+        if self.carries_context_validations() {
+            return Self::CONTEXT_VALIDATIONS_VERSION;
+        }
         if self.carries_resolution_records() {
             return if self.carries_call_site_ledgers() {
                 Self::CALL_SITE_LEDGERS_VERSION
@@ -580,6 +588,19 @@ impl AuthorityFrame {
                 .changes
                 .iter()
                 .any(|change| moves_call_site_ledgers(&change.resolution_record_deltas))
+    }
+
+    /// Current or historical context validations require the validation rung.
+    fn carries_context_validations(&self) -> bool {
+        use super::format::moves_context_validations;
+        super::format::operation_moves_context_validations(&self.operation)
+            || self.workspaces.iter().any(|workspace| {
+                moves_context_validations(workspace.semantic_overlay.resolution_record_deltas())
+            })
+            || self
+                .changes
+                .iter()
+                .any(|change| moves_context_validations(&change.resolution_record_deltas))
     }
 
     /// Whether this frame's operation records or retires enrichment marks, or
@@ -733,7 +754,8 @@ impl AuthorityFrame {
         if frame.wire_version() != declared {
             return Err(KinDbError::StorageError(format!(
                 "authority frame declares version {declared} but its contents are written at \
-                 version {}; call-site ledgers require version8, other resolution records \
+                 version {}; context validations require version9, call-site ledgers \
+                 require version8, other resolution records \
                  require version7, enrichment marks require version6, a moved owed derivation \
                  ledger requires version5, schema5 requires version4, while legacy frames use \
                  version3 with collaboration records and version2 without them",
@@ -1831,11 +1853,11 @@ mod tests {
     fn frame_versions_outside_the_supported_range_refuse_by_name() {
         let body = b"never decoded";
         for (version, needle) in [
-            (1, "this kin-db reads versions 2 to 8"),
+            (1, "this kin-db reads versions 2 to 9"),
             (
                 AuthorityFrame::CURRENT_VERSION + 1,
                 "a newer kin-db wrote it, so open this store with a kin built on a kin-db that \
-                 reads frame version 9",
+                 reads frame version 10",
             ),
         ] {
             let mut bytes = frame_bytes_from(body);

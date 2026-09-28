@@ -603,14 +603,41 @@ pub(crate) fn load_bearing_classes(requested: &[String]) -> Vec<String> {
     requested.to_vec()
 }
 
+/// Pending and failed readiness are distinct from a missing installation.
+/// Only a named language can carry this qualification: an unresolved focal
+/// has no language-server observation to interpret.
+///
+/// Switched-off enrichment is a completed finding, not a pending one, so it
+/// carries no readiness clause here. The answer's graph coverage decides it,
+/// and the call-site block names the switched-off enrichment wherever a site
+/// is left unproven by it.
+pub(crate) fn reference_readiness_gap(coverage: &serde_json::Map<String, Value>) -> Option<String> {
+    let language = coverage
+        .get("language")
+        .and_then(Value::as_str)
+        .filter(|language| {
+            !language.trim().is_empty() && *language != crate::edge_coverage::NO_RESOLVED_LANGUAGE
+        })?;
+    match coverage.get("reference_enrichment").and_then(Value::as_str) {
+        Some("unknown") => Some(format!(
+            "reference_enrichment_unknown: this process has no completed language-server readiness \
+             observation for {language}, so reference-enrichment availability is not established"
+        )),
+        Some("language_server_unusable") => Some(format!(
+            "reference_enrichment_unusable: a language server for {language} failed to initialize \
+             on this host, so its reference-enrichment capability is unavailable"
+        )),
+        _ => None,
+    }
+}
+
 /// Whether this answer's own observation says cross-file reference edges were
 /// producible where it ran: this build wires an adapter for the language AND the
 /// host carries the server.
 ///
-/// `unsupported` and `no_language_server` are the two ways the class could never
-/// have existed, and [`absence_coverage_gap`] already refuses both by name.
-/// `unknown` is an unread host, and unmeasured is not a finding anywhere else in
-/// this module either.
+/// Only a completed usable observation establishes availability. Unsupported,
+/// absent, failed and pending readiness each retain their own qualification in
+/// [`absence_coverage_gap`]; pending is not evidence that a server is missing.
 pub(crate) fn references_producible(payload: &Value) -> bool {
     payload
         .get(crate::edge_coverage::EDGE_COVERAGE_KEY)
@@ -691,20 +718,11 @@ pub(crate) fn deciding_classes(requested: &[String], references_producible: bool
 /// dependency in [`absence_cross_file_classes`] and publish the observation
 /// before it can certify anything.
 ///
-/// The extraction side grew a richer statement of the same fact under FIR-2354:
-/// `kin_core::reference_coverage::ReferenceEdgeCoverage`, whole-graph counts plus a
-/// per-language entry carrying `reference_enrichment`, which knows something a
-/// witness scan cannot observe from the graph alone. Half of that now reaches
-/// this gate: [`crate::edge_coverage`] publishes `reference_enrichment`, and the
-/// build half of it (a language this build wires no adapter for, so its reference
-/// edges are unproducible rather than unobserved) is read below. The host half (a
-/// wired adapter whose server is not installed) still reaches the CLI surfaces
-/// only, because probing it costs a filesystem lookup per query, so it publishes
-/// as `unknown` and gates nothing. When a payload carries the whole-graph object,
-/// this gate should prefer it, mapping zero cross-file entity relations to
-/// `absent` for every class and a language's zero to `absent` for that language;
-/// [`crate::edge_coverage`] can then be retired, since it is called from exactly
-/// three payload builders.
+/// [`crate::edge_coverage`] publishes both the build's adapter support and the
+/// daemon's completed readiness observations. The latter are process-owned
+/// observations, not filesystem probes made by this query. A missing observation
+/// remains unknown until a usable, absent or failed finding is published, and
+/// neither pending nor failed readiness can certify an absence.
 pub(crate) fn absence_coverage_gap(tool: &str, payload: &Value) -> Option<String> {
     let clauses = absence_coverage_clauses(tool, payload);
     (!clauses.is_empty()).then(|| clauses.join(crate::verdict::CLAUSE_SEPARATOR))
@@ -770,7 +788,7 @@ pub(crate) fn absence_coverage_clauses(tool: &str, payload: &Value) -> Vec<Strin
         .unwrap_or("an unreported language");
     let states = coverage.get("classes").and_then(Value::as_object);
 
-    let mut gaps: Vec<String> = Vec::new();
+    let mut gaps: Vec<String> = reference_readiness_gap(coverage).into_iter().collect();
 
     if !requested.is_empty() {
         let required = deciding_classes(&requested, references_producible(payload));
@@ -967,13 +985,8 @@ pub(crate) fn absence_coverage_clauses(tool: &str, payload: &Value) -> Vec<Strin
     // tool claimed decides the first split; whether an operator can DO anything
     // decides the second. A build limit no amount of installing will move reads
     // differently from a host gap one command closes.
-    // Fires only on a POSITIVE finding about a real language. `available` means
-    // the program was resolved, and `unknown` means the observation named no
-    // language at all, which is what a focal that never resolved reports. A gate
-    // that fired on `unknown` would answer a question nobody asked, in the words
-    // "nothing established that a language server resolved no resolved language
-    // on this host", and it would displace the real limiting factor a reader
-    // needs. Unmeasured is not a finding anywhere else in this module either.
+    // These are completed capability findings. Pending observations for a
+    // named language retain their separate readiness qualification above.
     let cause = match coverage.get("reference_enrichment").and_then(Value::as_str) {
         Some("unsupported") => Some(format!(
             "this build wires no language-server adapter for {language}"
@@ -1082,7 +1095,7 @@ pub(crate) fn absence_coverage_clauses(tool: &str, payload: &Value) -> Vec<Strin
 /// missing key reads as a question the tool does not answer. Only a group that
 /// is present and populated makes this false, so the rows phrasing is reached
 /// from evidence of rows rather than from the absence of evidence.
-fn answer_claims_absence(tool: &str, payload: &Value) -> bool {
+pub(crate) fn answer_claims_absence(tool: &str, payload: &Value) -> bool {
     let Some(spec) = spec_for(tool) else {
         return false;
     };
@@ -1250,7 +1263,16 @@ fn classes_in_state<'a>(
 /// graph links calls and imports across files, it holds no reference edges, and
 /// the claim rests on the first fact rather than the second.
 pub(crate) fn edge_coverage_degradation_labels(tool: &str, payload: &Value) -> Vec<String> {
+    edge_coverage_signal_labels(tool, payload, false)
+}
+
+fn edge_coverage_signal_labels(tool: &str, payload: &Value, bounding_only: bool) -> Vec<String> {
     let requested = absence_cross_file_classes(tool, payload);
+    let requested = if bounding_only {
+        deciding_classes(&requested, references_producible(payload))
+    } else {
+        requested
+    };
     let language_scoped = absence_is_language_scoped(tool);
     if requested.is_empty() && !language_scoped {
         return Vec::new();
@@ -1270,6 +1292,7 @@ pub(crate) fn edge_coverage_degradation_labels(tool: &str, payload: &Value) -> V
         .iter()
         .filter_map(|class| match class_state(states, class) {
             "present" => None,
+            state if bounding_only && !matches!(state, "absent" | "unproduced" | "unknown") => None,
             state => Some(format!("edge_coverage:{class}_{state}")),
         })
         .collect();
@@ -1284,6 +1307,10 @@ pub(crate) fn edge_coverage_degradation_labels(tool: &str, payload: &Value) -> V
         Some("unsupported") | Some("no_language_server")
     ) {
         labels.push("edge_coverage:reference_enrichment_unsupported".to_string());
+    }
+    if let Some(gap) = reference_readiness_gap(coverage) {
+        let code = gap.split(':').next().expect("readiness clause has a code");
+        labels.push(format!("edge_coverage:{code}"));
     }
     // Disclosed on the same terms as the two above: what the verdict rests on is
     // named in the signals beside it, so a reader never has to parse the reason
@@ -2186,7 +2213,7 @@ pub(crate) fn payload_degradation_labels(payload: &Value) -> Vec<String> {
         .collect()
 }
 
-/// Every degraded signal that bears on this answer: the daemon's own flags
+/// Every degraded signal disclosed beside this answer: the daemon's own flags
 /// first, then the ones the payload reported about this query, then the coverage
 /// shortfalls its own `edge_coverage` names, deduplicated and in a stable order.
 ///
@@ -2204,6 +2231,33 @@ fn degraded_signals(tool: &str, payload: &Value, envelope: &Envelope) -> Vec<Str
     for label in payload_degradation_labels(payload)
         .into_iter()
         .chain(edge_coverage_degradation_labels(tool, payload))
+    {
+        if !labels.contains(&label) {
+            labels.push(label);
+        }
+    }
+    labels
+}
+
+/// The disclosed signals that independently bound this answer, using the
+/// substrate, payload-degradation and coverage policies the verdict reads.
+/// This is distinct from every active signal and never inferred from prose:
+/// several gates report a generic clause rather than naming each signal.
+fn bounding_signals(
+    tool: &str,
+    payload: &Value,
+    envelope: &Envelope,
+    class: NegativeClass,
+) -> Vec<String> {
+    let mut labels: Vec<String> = envelope
+        .degraded
+        .bounding_labels(absence_substrate(tool, class))
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    for label in payload_degradation_labels(payload)
+        .into_iter()
+        .chain(edge_coverage_signal_labels(tool, payload, true))
     {
         if !labels.contains(&label) {
             labels.push(label);
@@ -2289,6 +2343,8 @@ fn structural_coverage_clause(payload: &Value, envelope: &Envelope) -> String {
             Some("no_language_server") => {
                 "an adapter wired for it but no language server installed"
             }
+            Some("language_server_unusable") => "its language server failed to initialize",
+            Some("enrichment_disabled") => "language-server enrichment switched off",
             _ => "its language-server availability unprobed",
         };
         return format!("graph coverage for {language} ({classes}; {enrichment})");
@@ -2594,6 +2650,9 @@ fn cross_repo_unavailable_qualifier(cross_repo: &Value) -> CrossRepoQualifier {
         .get("reason")
         .and_then(Value::as_str)
         .unwrap_or("the cross-repo spine could not answer");
+    // A provider's explanatory punctuation must not become another machine
+    // clause when the composed negative is read by the verdict.
+    let reason = reason.replace(crate::verdict::CLAUSE_SEPARATOR, ", ");
     let qualifier = format!("{}: {reason}", code.unwrap_or("cross_repo_unavailable"));
     if code == Some(crate::handlers::entities::SPINE_REPO_UNREGISTERED) {
         CrossRepoQualifier::Note(qualifier)
@@ -2785,6 +2844,16 @@ fn cross_repo_bulk_qualifier(payload: &Value) -> CrossRepoQualifier {
     }
 }
 
+// A real substrate gap keeps its clause label. Healthy substrate text is
+// explanatory prose within the ranking clause, never a second limitation.
+fn ranking_substrate_clause(trustworthy: bool, reason: &str) -> String {
+    if trustworthy {
+        format!(". Observed substrate state: {reason}")
+    } else {
+        format!("{}{reason}", crate::verdict::CLAUSE_SEPARATOR)
+    }
+}
+
 /// Build the trust qualifier for `tool`'s `payload`, enriched from `envelope`,
 /// or `None` when the tool is not retrieval.
 ///
@@ -2857,6 +2926,10 @@ pub fn negative_for(
     // limiting factor when this one applies and none of them may be reported as
     // if it were.
     if let Some(gap) = absence_coverage_gap(tool, payload) {
+        push_gap(&mut trustworthy, &mut trust_reason, gap);
+    }
+
+    if let Some(gap) = crate::verdict::enrichment_gap(payload) {
         push_gap(&mut trustworthy, &mut trust_reason, gap);
     }
 
@@ -3088,25 +3161,23 @@ pub fn negative_for(
         // name absent from a window says nothing about the rows outside it. The
         // surfaces that CAN answer existence resolve a name directly, so the
         // advice sends the caller to those instead.
+        let substrate = ranking_substrate_clause(trustworthy, &trust_reason);
         trustworthy = false;
-        // The substrate reason is kept after the gap rather than replaced. It is
-        // still true and still useful, and on a complete index it reads
-        // "the substrate is fine, the ranking is the limit", which is exactly
-        // the distinction that was being collapsed.
         trust_reason = format!(
             "ranking_is_bounded: no ranked entity carries the name, and a ranking is a bounded \
              candidate set rather than an enumeration of the graph, so the name may belong to an \
-             entity this query never ranked; observed substrate state: {trust_reason}"
+             entity this query never ranked{substrate}"
         );
     } else if relevance_unverified {
         kind = "relevance_unverified";
         subject = "the query described a concept and every returned row is a nearest neighbour; \
                    this ranking publishes no measured relevance floor";
+        let substrate = ranking_substrate_clause(trustworthy, &trust_reason);
         trustworthy = false;
         trust_reason = format!(
             "relevance_floor_unmeasured: every row this response returned was a fallback \
              neighbour and the response publishes no calibrated threshold establishing that any \
-             of them answers the concept; observed substrate state: {trust_reason}"
+             of them answers the concept{substrate}"
         );
     }
     if tool == "graph_neighborhood" {
@@ -3319,6 +3390,10 @@ pub fn negative_for(
         )),
     );
     negative.insert("degraded_signals".to_string(), json!(degraded_signals));
+    negative.insert(
+        "bounding_signals".to_string(),
+        json!(bounding_signals(tool, payload, envelope, spec.class)),
+    );
     // Stated conditions that are NOT limits, kept in their own key so nothing
     // downstream can read one as a gap. `trust`, `trust_reason` and `advice` are
     // computed above and none of them sees this array.
@@ -3566,6 +3641,12 @@ pub fn resolution_miss_for(tool: &str, message: &str, envelope: &Envelope) -> Op
         )),
     );
     negative.insert("degraded_signals".to_string(), json!(degraded_signals));
+    negative.insert(
+        "bounding_signals".to_string(),
+        json!(envelope
+            .degraded
+            .bounding_labels(AbsenceSubstrate::EntityIndex)),
+    );
     Some(Value::Object(negative))
 }
 
@@ -3798,6 +3879,40 @@ mod tests {
                 "unmeasured_reason": null,
             },
         })
+    }
+
+    #[test]
+    fn bounding_signals_distinguish_vector_flags_from_relation_and_query_gaps() {
+        let envelope = Envelope::daemon().with_health(&json!({
+            "initialized": true, "graph_loaded": true, "graph_entity_count": 3,
+            "embed_worker_failed": true
+        }));
+        let payload = authoritative_empty_references("function");
+        let negative = negative_for("find_references", &payload, &envelope).unwrap();
+        assert_eq!(negative["safe_to_conclude_absent"], true, "{negative}");
+        assert_eq!(negative["degraded_signals"], json!(["embed_worker_failed"]));
+        assert_eq!(negative["bounding_signals"], json!([]));
+
+        let vector = negative_for("semantic_locate", &json!({"results": []}), &envelope).unwrap();
+        assert_eq!(vector["bounding_signals"], json!(["embed_worker_failed"]));
+        let miss =
+            resolution_miss_for("find_references", "Entity not found: absent", &envelope).unwrap();
+        assert_eq!(miss["bounding_signals"], json!([]));
+        assert_eq!(miss["degraded_signals"], json!(["embed_worker_failed"]));
+
+        let mut short = payload;
+        short["edge_coverage"]["classes"]["calls"] = json!("absent");
+        short["degradations"] = json!([{"component": "query", "reason": "incomplete"}]);
+        let negative = negative_for("find_references", &short, &envelope).unwrap();
+        assert_eq!(negative["safe_to_conclude_absent"], false);
+        assert_eq!(
+            negative["bounding_signals"],
+            json!(["query:incomplete", "edge_coverage:calls_absent"])
+        );
+        assert!(negative["degraded_signals"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("embed_worker_failed")));
     }
 
     /// FIR-2775, the reproduction. A Python package under `src/` whose test
@@ -5701,7 +5816,7 @@ mod tests {
     fn a_javascript_module_export_is_not_certified_absent_without_reference_enrichment() {
         let mut payload = authoritative_empty_references("function");
         payload["focal_entity"]["name"] = json!("createApplication");
-        payload["focal_entity"]["file_path"] = json!("lib/express.js");
+        payload["focal_entity"]["projection"] = json!({ "path": "lib/express.js" });
         payload["edge_coverage"] = json!({
             "scope": "language",
             "language": "JavaScript",
@@ -5787,7 +5902,7 @@ mod tests {
     fn a_python_graph_whose_import_edges_were_never_produced_does_not_certify_an_unused_symbol() {
         let mut payload = authoritative_empty_references("function");
         payload["focal_entity"]["name"] = json!("never_used_anywhere");
-        payload["focal_entity"]["file_path"] = json!("pkg/parsing.py");
+        payload["focal_entity"]["projection"] = json!({ "path": "pkg/parsing.py" });
         payload["edge_coverage"] = json!({
             "scope": "language",
             "language": "Python",
@@ -5970,6 +6085,83 @@ mod tests {
                 "{tool} must still certify when every requested class is present"
             );
         }
+    }
+
+    #[test]
+    fn readiness_transitions_preserve_negative_and_verdict_uncertainty() {
+        use kin_core::reference_coverage::{
+            reference_enrichment_for, LanguageServerReadiness, LanguageServerReadinessMap,
+        };
+        for (finding, expected_code) in [
+            (None, Some("reference_enrichment_unknown")),
+            (Some(LanguageServerReadiness::Usable), None),
+            (
+                Some(LanguageServerReadiness::Absent),
+                Some("reference_enrichment_no_language_server"),
+            ),
+            (
+                Some(LanguageServerReadiness::Unusable {
+                    reason: "initialize failed".into(),
+                }),
+                Some("reference_enrichment_unusable"),
+            ),
+            // Switched off is completed, not pending: graph coverage decides,
+            // as it did before pending readiness was told apart.
+            (Some(LanguageServerReadiness::Disabled), None),
+        ] {
+            let mut readiness = LanguageServerReadinessMap::new();
+            if let Some(finding) = finding {
+                readiness.insert(kin_model::LanguageId::Python, finding);
+            }
+            let mut coverage = cross_file_edges_observed();
+            coverage["language"] = json!("Python");
+            coverage["reference_enrichment"] = json!(reference_enrichment_for(
+                kin_model::LanguageId::Python,
+                &readiness
+            ));
+            let payload = json!({"entity_impacts":[], "dependents":[], "edge_coverage":coverage});
+            let envelope = structural_ready_envelope();
+            let negative = negative_for("impact_analysis", &payload, &envelope).unwrap();
+            let verdict = crate::verdict::Verdict::compute(
+                "impact_analysis",
+                &payload,
+                &envelope,
+                Some(&negative),
+            )
+            .unwrap()
+            .to_value();
+            if let Some(code) = expected_code {
+                assert!(absence_coverage_gap("impact_analysis", &payload).is_some());
+                assert_eq!(negative["safe_to_conclude_absent"], false);
+                assert_eq!(verdict["safe_to_conclude_absent"], false);
+                assert_eq!(verdict["state"], "inconclusive");
+                assert_eq!(verdict["inputs"]["edge_coverage"], "inconclusive");
+                assert!(
+                    verdict["limiting_factor"].as_str().unwrap().contains(code),
+                    "{verdict}"
+                );
+                let reason = negative["trust_reason"].as_str().unwrap();
+                if code != "reference_enrichment_no_language_server" {
+                    assert!(
+                        !reason.contains("no language server for Python is installed"),
+                        "{reason}"
+                    );
+                    assert!(!reason.contains("were producible here"), "{reason}");
+                    assert!(reason.contains(code), "{reason}");
+                }
+            } else {
+                assert_eq!(absence_coverage_gap("impact_analysis", &payload), None);
+                assert_eq!(verdict["inputs"]["edge_coverage"], "certified");
+            }
+        }
+    }
+
+    #[test]
+    fn unresolved_language_does_not_invent_a_pending_server() {
+        let mut coverage = cross_file_edges_observed();
+        coverage["language"] = json!(crate::edge_coverage::NO_RESOLVED_LANGUAGE);
+        coverage["reference_enrichment"] = json!("unknown");
+        assert!(reference_readiness_gap(coverage.as_object().unwrap()).is_none());
     }
 
     /// FIR-2672. This used to assert the opposite, under the reasoning that Kin
@@ -8245,6 +8437,63 @@ mod tests {
     }
 
     #[test]
+    fn ranking_preserves_original_substrate_gap_codes() {
+        for query in ["missing_symbol", "how request handlers transform data"] {
+            let mut payload = empty_fused_locate_page(query);
+            payload["entities"] = json!([fused_locate_hit("nearby_symbol")]);
+            payload["total_ranked"] = json!(1);
+            payload["all_fallback"] = json!(true);
+            let envelope = semantic_authoritative_envelope();
+            let negative = super::negative_for(
+                "semantic_locate",
+                &payload,
+                &envelope,
+                &["local_binding_unproven: selected relation evidence is unavailable".into()],
+            )
+            .unwrap();
+            let verdict = crate::verdict::Verdict::compute(
+                "semantic_locate",
+                &payload,
+                &envelope,
+                Some(&negative),
+            )
+            .unwrap()
+            .to_value();
+            let factor = verdict["limiting_factor"].as_str().unwrap();
+            assert!(
+                factor
+                    .split(crate::verdict::CLAUSE_SEPARATOR)
+                    .any(|code| code == "local_binding_unproven"),
+                "{verdict}"
+            );
+            assert!(!factor.contains("unlisted_clause"), "{verdict}");
+            assert_eq!(negative["safe_to_conclude_absent"], false);
+        }
+    }
+
+    #[test]
+    fn spine_reason_punctuation_keeps_one_condition() {
+        let payload = json!({"cross_repo": {
+            "status": "unavailable",
+            "code": "spine_candidate_representation_gap",
+            "reason": "inferred member is present; federation cannot preserve its authority"
+        }});
+        let Some(CrossRepoQualifier::Gap(reason)) =
+            cross_repo_qualifier("find_references", &payload)
+        else {
+            panic!("a configured federation gap must stay bounding");
+        };
+        assert!(
+            !reason.contains(crate::verdict::CLAUSE_SEPARATOR),
+            "{reason}"
+        );
+        assert!(reason.contains("federation cannot preserve"), "{reason}");
+        for tool in ["semantic_search", "graph_neighborhood", "get_entity_source"] {
+            assert!(cross_repo_qualifier(tool, &payload).is_none(), "{tool}");
+        }
+    }
+
+    #[test]
     fn an_unnamed_ranking_never_certifies_that_the_symbol_is_absent() {
         // A dogfood on the shipped artifact asked a fully covered store for
         // `prune_orphaned_vectors`, got ten wrong rows, and the envelope stamped
@@ -9217,7 +9466,7 @@ mod tests {
             "language": "Python",
             "requested_classes": ["calls", "imports", "references"],
             "classes": {"calls": "present", "imports": "present", "references": "present"},
-            "reference_enrichment": "unknown",
+            "reference_enrichment": "available",
             "budget_exhausted": false,
         });
         assert_eq!(

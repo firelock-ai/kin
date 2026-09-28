@@ -15,6 +15,48 @@ use std::time::Duration;
 
 use crate::commands::language_servers;
 
+/// Set while `kin setup` prints its short form.
+static SHORT_FORM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// This module's full record: every line `kin setup --verbose`, a pipe and a
+/// CI log print, and the short form on a terminal holds back.
+///
+/// Holding a line back loses no fact. The short form is built from what each
+/// step returns, not from what it printed, so a failure or a change on disk
+/// reaches it either way. Errors go to stderr and are never held back.
+macro_rules! say {
+    () => {
+        if !short_form_running() {
+            println!()
+        }
+    };
+    ($($arg:tt)*) => {
+        if !short_form_running() {
+            println!($($arg)*)
+        }
+    };
+}
+
+fn short_form_running() -> bool {
+    SHORT_FORM.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Holds the full record back while it lives.
+struct ShortFormScope;
+
+impl ShortFormScope {
+    fn enter() -> Self {
+        SHORT_FORM.store(true, std::sync::atomic::Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for ShortFormScope {
+    fn drop(&mut self) {
+        SHORT_FORM.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Embedded shell hooks (from kin-vfs/shell/)
 // ---------------------------------------------------------------------------
@@ -1120,6 +1162,8 @@ pub struct WizardOptions {
     /// pin there. `None` gives each client its own default, and keeps a
     /// profile set by hand. See [`choose_tool_profile`].
     pub tool_profile: Option<String>,
+    /// Print the full record on a terminal instead of the short summary.
+    pub verbose: bool,
 }
 
 /// First-run intent — what the user wants out of Kin. Each intent maps to a
@@ -1157,7 +1201,7 @@ impl SetupIntent {
     fn title(self) -> &'static str {
         match self {
             Self::LocalOnly => "Local-only (CLI development)",
-            Self::AgentOnly => "AI agents (the wedge)",
+            Self::AgentOnly => "AI agents",
             Self::Editor => "Editor (VS Code + kin-editor)",
             Self::Hosted => "Hosted / KinLab (connect this machine)",
             Self::Advanced => "Advanced / manual (all toggles)",
@@ -1167,7 +1211,7 @@ impl SetupIntent {
     fn description(self, editor_extension_installed: bool) -> &'static str {
         match self {
             Self::LocalOnly => "shell integration + auto-daemon; no AI client config",
-            Self::AgentOnly => "configure Kin's MCP server for detected AI clients + auto-daemon",
+            Self::AgentOnly => "connect Kin to the AI clients on this machine",
             Self::Editor if editor_extension_installed => {
                 "local-only, with the kin-editor extension already installed"
             }
@@ -1592,6 +1636,14 @@ fn bash_login_rc_in(home: &Path) -> PathBuf {
 /// fish and PowerShell read one file for both, so this returns [`shell_rc`] for
 /// them, and the arms below mirror that function's exactly, including its
 /// treatment of an unrecognized shell as zsh.
+///
+/// On macOS zsh also gets the line in `.zprofile`. Every new Terminal window is
+/// a login shell, and a login zsh runs `/etc/zprofile` after `.zshenv`; its
+/// `path_helper` puts the system directories back in front, so a `kin` in
+/// `/usr/local/bin` wins over the one in `.zshenv`. `.zprofile` runs after
+/// `/etc/zprofile`, which is why Homebrew asks for its own line there, and a
+/// line there is what a new terminal actually ends up with. `.zshenv` keeps its
+/// copy for the scripts and agents that never start a login shell.
 pub(crate) fn shell_path_rcs(shell: &str) -> Result<Vec<PathBuf>> {
     shell_path_rcs_in(&home_dir()?, shell)
 }
@@ -1599,9 +1651,16 @@ pub(crate) fn shell_path_rcs(shell: &str) -> Result<Vec<PathBuf>> {
 /// [`shell_path_rcs`] against a home the caller already resolved. Same reason as
 /// [`shell_rc_in`].
 pub(crate) fn shell_path_rcs_in(home: &Path, shell: &str) -> Result<Vec<PathBuf>> {
+    shell_path_rcs_for(home, shell, cfg!(target_os = "macos"))
+}
+
+/// [`shell_path_rcs_in`] with the platform taken as an argument, so both arms
+/// are tested wherever the tests run.
+fn shell_path_rcs_for(home: &Path, shell: &str, macos: bool) -> Result<Vec<PathBuf>> {
     Ok(match shell {
         "bash" => vec![home.join(".bashrc"), bash_login_rc_in(home)],
         "fish" | "powershell" => vec![shell_rc_in(home, shell)?],
+        _ if macos => vec![home.join(".zshenv"), home.join(".zprofile")],
         _ => vec![home.join(".zshenv")],
     })
 }
@@ -2689,7 +2748,43 @@ impl std::fmt::Display for RepoNotInitializedYet {
 
 impl std::error::Error for RepoNotInitializedYet {}
 
+std::thread_local! {
+    /// The repository a repository-bound client is bound to when the caller is
+    /// not standing in it. `kin clone` binds the checkout it just made, which is
+    /// below the directory it ran in.
+    static BINDING_REPO: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Names the repository a client is bound to for as long as it lives.
+struct BindingRepoScope;
+
+impl BindingRepoScope {
+    fn enter(repo_root: &Path) -> Self {
+        BINDING_REPO.with(|slot| *slot.borrow_mut() = Some(repo_root.to_path_buf()));
+        Self
+    }
+}
+
+impl Drop for BindingRepoScope {
+    fn drop(&mut self) {
+        BINDING_REPO.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
 fn current_initialized_setup_repo(client: &'static str) -> Result<PathBuf> {
+    if let Some(repo) = BINDING_REPO.with(|slot| slot.borrow().clone()) {
+        return repo
+            .canonicalize()
+            .ok()
+            .and_then(|root| canonical_initialized_repo(&root))
+            .ok_or_else(|| {
+                anyhow::Error::new(RepoNotInitializedYet {
+                    client,
+                    searched_from: repo,
+                })
+            });
+    }
     let cwd = env::current_dir().context("could not determine the current directory")?;
     crate::commands::managed_config_scope::discover_repo_root()
         .and_then(|root| root.canonicalize().ok())
@@ -2723,7 +2818,7 @@ fn configure_antigravity() -> Result<PathBuf> {
     // authority", which sent a stranger who had skipped Git on purpose to go
     // and get some.
     if ensure_workspace_mcp_git_excluded(&repo_root)?.is_none() {
-        println!(
+        say!(
             "      no Git directory at {}, so {} is not excluded from any version control; \
              to keep it out of Kin's own admission, add `{}` to .kinignore",
             repo_root.display(),
@@ -3096,7 +3191,7 @@ fn apply_discovery_reminders_for(
         } = target;
         if !registered_clients.contains(&client) {
             if discovery_reminder_present(&path) {
-                println!(
+                say!(
                     "  {} {label} reminder is present at {} but Kin's MCP server is not \
                      registered for it. `kin setup uninstall` removes it when a setup run \
                      recorded it; an unrecorded reminder stays until removed by hand",
@@ -3104,7 +3199,7 @@ fn apply_discovery_reminders_for(
                     path.display()
                 );
             } else {
-                println!(
+                say!(
                     "  {} {label} reminder skipped because Kin's MCP server was not registered for it",
                     style("→").cyan()
                 );
@@ -3119,7 +3214,7 @@ fn apply_discovery_reminders_for(
         });
         let block = discovery_block(&profile);
         if !discovery_reminder_marker_present(&path) {
-            println!(
+            say!(
                 "  {} {label}: appending the \"{KIN_DISCOVERY_MARKER}\" block to {}, a global \
                  instruction file every {label} session on this host reads",
                 style("→").cyan(),
@@ -3127,7 +3222,7 @@ fn apply_discovery_reminders_for(
             );
         }
         match upsert_discovery_block(&path, &block) {
-            Ok(BlockWrite::LeftAsEdited) => println!(
+            Ok(BlockWrite::LeftAsEdited) => say!(
                 "  {} {label}: {} carries a Kin-first discovery block that was edited by hand, \
                  so it was left as it is. Delete that block and run `kin setup` again to have \
                  Kin keep it current for the {profile} profile.",
@@ -3135,7 +3230,7 @@ fn apply_discovery_reminders_for(
                 path.display()
             ),
             Ok(_) => {
-                println!(
+                say!(
                     "  {} {label} discovery reminder ensured for the {profile} profile ({})",
                     style("✓").green(),
                     path.display()
@@ -3146,7 +3241,7 @@ fn apply_discovery_reminders_for(
                     snippet: block,
                 });
             }
-            Err(e) => println!("  {} {label} reminder failed: {e}", style("!").yellow()),
+            Err(e) => say!("  {} {label} reminder failed: {e}", style("!").yellow()),
         }
     }
     written
@@ -3395,6 +3490,224 @@ fn has_kin_mcp_config(path: &PathBuf) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// AI clients that wait for a repository
+// ---------------------------------------------------------------------------
+
+/// The `setup.toml` table and key that record the answer to "connect Kin to
+/// your AI clients?".
+const CLIENT_CONSENT_TABLE: &str = "ai_clients";
+const CLIENT_CONSENT_KEY: &str = "connect";
+
+/// Record the answer, so `kin clone` and `kin init` can finish the clients that
+/// need a repository without a second run of `kin setup`.
+fn record_client_consent(kin_home: &Path, consent: bool) -> Result<()> {
+    crate::commands::projection::record_setup_value(
+        kin_home,
+        CLIENT_CONSENT_TABLE,
+        CLIENT_CONSENT_KEY,
+        if consent { "yes" } else { "no" },
+    )
+}
+
+fn recorded_client_consent(kin_home: &Path) -> Option<bool> {
+    match crate::commands::projection::recorded_setup_value(
+        kin_home,
+        CLIENT_CONSENT_TABLE,
+        CLIENT_CONSENT_KEY,
+    )?
+    .as_str()
+    {
+        "yes" => Some(true),
+        "no" => Some(false),
+        _ => None,
+    }
+}
+
+/// What connecting one waiting client came to.
+#[derive(Debug)]
+pub(crate) struct ClientConnection {
+    pub(crate) client: &'static str,
+    /// The config written, or why it could not be.
+    pub(crate) outcome: std::result::Result<PathBuf, String>,
+}
+
+/// Connect the AI clients whose Kin entry has to name a repository to
+/// `repo_root`, when `kin setup` recorded consent and they have no Kin entry
+/// yet.
+///
+/// Codex CLI and Grok CLI keep one user-wide entry that names a repository, so
+/// setup run outside one could only say they were waiting. `kin clone` and
+/// `kin init` are where the repository appears, and connecting them there is
+/// what keeps a first run from needing setup twice. A client that already has
+/// a Kin entry is left alone: it was bound to another repository, and
+/// `kin setup` run inside this one moves it.
+///
+/// Google Antigravity waits too, but is not connected here. Its binding writes
+/// a workspace file, and that file's lock, into the repository itself, and a
+/// daemon watching the fresh checkout would try to admit them. It stays with
+/// `kin setup` run inside the repository, which is a choice a person makes.
+///
+/// `quiet` holds back the full record's lines, for a caller printing its own
+/// short form.
+pub(crate) fn connect_waiting_clients(repo_root: &Path, quiet: bool) -> Vec<ClientConnection> {
+    let Ok(kin_home) = kin_dir() else {
+        return Vec::new();
+    };
+    if recorded_client_consent(&kin_home) != Some(true) {
+        return Vec::new();
+    }
+    let _quiet = quiet.then(ShortFormScope::enter);
+    let assistants = detect_ai_assistants();
+    let mut connections = Vec::new();
+    let mut registered = Vec::new();
+    for idx in [IDX_CODEX, IDX_GROK] {
+        let Some(assistant) = assistants.get(idx) else {
+            continue;
+        };
+        if !assistant.detected
+            || mcp_config_path_for_index(idx).is_some_and(|path| has_kin_mcp_config(&path))
+        {
+            continue;
+        }
+        let result = {
+            let _repo = BindingRepoScope::enter(repo_root);
+            configure_assistant_by_index(idx)
+        };
+        match result {
+            Some(Ok(path)) => {
+                registered.push(idx);
+                connections.push(ClientConnection {
+                    client: assistant.name,
+                    outcome: Ok(path),
+                });
+            }
+            Some(Err(error)) => connections.push(ClientConnection {
+                client: assistant.name,
+                outcome: Err(format!("{error:#}")),
+            }),
+            None => {}
+        }
+    }
+    if !registered.is_empty() {
+        if let Ok(home) = home_dir() {
+            let written =
+                apply_discovery_reminders_for(&home, &registered, &client_profile_for_index);
+            record_discovery_reminders(&written);
+        }
+    }
+    connections
+}
+
+// ---------------------------------------------------------------------------
+// Which `kin` a new terminal runs
+// ---------------------------------------------------------------------------
+
+/// Which `kin` a new terminal would run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TerminalKin {
+    /// This install.
+    This,
+    /// Another binary comes first on the PATH.
+    Other(PathBuf),
+    /// Nothing named `kin` is on the PATH.
+    Missing,
+    /// The shell could not be asked in time, or is not one Kin knows how to ask.
+    Unknown,
+}
+
+/// How long the login shell gets to say which `kin` it resolves.
+const TERMINAL_KIN_BUDGET: Duration = Duration::from_secs(5);
+
+/// Ask a login, interactive shell which `kin` it resolves, the way a new
+/// terminal window starts one.
+///
+/// Setup can write a correct PATH line and still leave a new terminal running
+/// an older `kin`: macOS's `path_helper` puts the system directories back in
+/// front of the user's own, so a `kin` in `/usr/local/bin` wins over
+/// `~/.kin/bin`. Reading the rc files cannot see that. Asking the shell can.
+///
+/// The answer goes to a file rather than a pipe, because a shell's startup can
+/// leave a background helper holding its output open, and the shell is killed
+/// if it takes longer than [`TERMINAL_KIN_BUDGET`].
+pub(crate) fn terminal_kin(shell_name: &str) -> TerminalKin {
+    if !matches!(shell_name, "zsh" | "bash") {
+        return TerminalKin::Unknown;
+    }
+    let Ok(this) = env::current_exe().and_then(|path| path.canonicalize()) else {
+        return TerminalKin::Unknown;
+    };
+    let answer = env::temp_dir().join(format!("kin-setup-terminal-{}.txt", std::process::id()));
+    let _ = fs::remove_file(&answer);
+    // The path lookup itself, not `command -v`: Kin's own shell hook defines a
+    // `kin` function that runs `command kin`, and `command -v` names the
+    // function rather than the binary it runs.
+    let lookup = if shell_name == "zsh" {
+        "whence -p kin"
+    } else {
+        "type -P kin"
+    };
+    let script = format!(
+        "{lookup} > {} 2>/dev/null",
+        shell_single_quoted(&answer.to_string_lossy())
+    );
+    let Ok(mut child) = Command::new(shell_name)
+        .args(["-l", "-i", "-c", &script])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    else {
+        return TerminalKin::Unknown;
+    };
+    let deadline = std::time::Instant::now() + TERMINAL_KIN_BUDGET;
+    let finished = loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break true,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break false;
+            }
+        }
+    };
+    let written = fs::read_to_string(&answer).ok();
+    let _ = fs::remove_file(&answer);
+    if !finished {
+        return TerminalKin::Unknown;
+    }
+    resolve_terminal_kin(written.as_deref(), &this)
+}
+
+/// A value quoted for a POSIX shell.
+fn shell_single_quoted(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// The decision behind [`terminal_kin`], from what the shell wrote.
+fn resolve_terminal_kin(written: Option<&str>, this: &Path) -> TerminalKin {
+    let Some(written) = written else {
+        return TerminalKin::Unknown;
+    };
+    let answer = written.trim();
+    if answer.is_empty() {
+        return TerminalKin::Missing;
+    }
+    // An alias or a function prints its definition, not a path, and says
+    // nothing about which binary runs.
+    if !answer.starts_with('/') {
+        return TerminalKin::Unknown;
+    }
+    let path = PathBuf::from(answer);
+    match path.canonicalize() {
+        Ok(resolved) if resolved == this => TerminalKin::This,
+        _ => TerminalKin::Other(path),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Shell hook installation
 // ---------------------------------------------------------------------------
 
@@ -3530,7 +3843,7 @@ fn install_shell_hook(shell_name: &str, allow_path: bool) -> Result<(PathBuf, St
     let hook_file = shell_dir.join(hook_filename(shell_name));
     fs::write(&hook_file, hook_content(shell_name))
         .with_context(|| format!("failed to write {}", hook_file.display()))?;
-    println!("  Wrote shell hook: {}", hook_file.display());
+    say!("  Wrote shell hook: {}", hook_file.display());
 
     if let Some(shim_path) = find_shim() {
         let dest = lib_dir.join(shim_filename());
@@ -3540,10 +3853,10 @@ fn install_shell_hook(shell_name: &str, allow_path: bool) -> Result<(PathBuf, St
         // so the shim is never truncated onto itself.
         match copy_shim(&shim_path, &dest)? {
             ShimCopy::Skipped => {
-                println!("  VFS shim already in place: {}", dest.display());
+                say!("  VFS shim already in place: {}", dest.display());
             }
             ShimCopy::Copied => {
-                println!(
+                say!(
                     "  Copied VFS shim: {} -> {}",
                     shim_path.display(),
                     dest.display()
@@ -3558,8 +3871,8 @@ fn install_shell_hook(shell_name: &str, allow_path: bool) -> Result<(PathBuf, St
         if let Some((headline, command)) =
             missing_shim_guidance(exe.as_deref(), &kin_home, driver_present)
         {
-            println!("  {headline}");
-            println!("    {command}");
+            say!("  {headline}");
+            say!("    {command}");
         }
     }
 
@@ -3623,7 +3936,7 @@ fn write_rc_target(
         blocks,
     );
     for line in update.already_present.iter().chain(&update.skipped) {
-        println!("{line}");
+        say!("{line}");
     }
     if !update.applied.is_empty() {
         if let Some(parent) = rc_path.parent() {
@@ -3633,14 +3946,14 @@ fn write_rc_target(
         fs::write(rc_path, &update.content)
             .with_context(|| format!("failed to update {}", rc_path.display()))?;
         if !existed && target.seed_when_absent.is_some() {
-            println!(
+            say!(
                 "  Created {}, which is the file a bash login shell reads; \
                  it sources ~/.bashrc when the shell is interactive",
                 rc_path.display()
             );
         }
         for line in &update.applied {
-            println!("{line}");
+            say!("{line}");
         }
     }
     Ok(())
@@ -5134,7 +5447,7 @@ fn announce_mcp_launcher_origin() {
         return;
     };
     if let Some(warning) = unmanaged_mcp_launcher_warning(&launcher, &kin_home) {
-        println!("  {} {warning}", style("!").yellow());
+        say!("  {} {warning}", style("!").yellow());
     }
 }
 
@@ -13297,19 +13610,19 @@ fn record_projection_choice() -> Result<()> {
     // verdict the installer just gave, rather than a heading and a red row per
     // mode. Nothing is recorded, for the reason given at the end below.
     if projection_not_shipped(&driver, &shim, &modes) {
-        println!("{PROJECTION_NOT_SHIPPED_LINE}");
-        println!();
+        say!("{PROJECTION_NOT_SHIPPED_LINE}");
+        say!();
         return Ok(());
     }
 
-    println!("Filesystem projection:");
+    say!("Filesystem projection:");
     for probe in &modes {
         let mark = if probe.available {
             style("✓").green()
         } else {
             style("✗").red()
         };
-        println!("  {mark} {:<5} {}", probe.mode.as_str(), probe.evidence);
+        say!("  {mark} {:<5} {}", probe.mode.as_str(), probe.evidence);
     }
     if modes.iter().any(|probe| probe.available) {
         // A recorded mode is a claim that this host RUNS it, and setup engages
@@ -13333,18 +13646,18 @@ fn record_projection_choice() -> Result<()> {
         match to_record {
             Some(mode) => {
                 projection::record_mode(&kin_home, mode)?;
-                println!("  Using {mode}: {}", mode.description());
+                say!("  Using {mode}: {}", mode.description());
                 if mode == chosen {
-                    println!("  Change it with `kin vfs on --mode <shim|nfs|fuse>`.");
+                    say!("  Change it with `kin vfs on --mode <shim|nfs|fuse>`.");
                 } else {
-                    println!(
+                    say!(
                         "  {chosen} is available: engage it with `kin vfs on --mode {chosen}`, \
                          which records it once it is actually running."
                     );
                 }
             }
             None => {
-                println!(
+                say!(
                     "  {chosen} is available but needs `kin vfs on --mode {chosen}` to engage; \
                      nothing is recorded until a projection is actually running."
                 );
@@ -13355,12 +13668,12 @@ fn record_projection_choice() -> Result<()> {
         // that this host runs it, and `kin doctor` reads a recording that does
         // not run as a defect. Writing one here would manufacture that defect
         // on a machine the installer deliberately shipped without projection.
-        println!(
+        say!(
             "  No projection is available on this host. The CLI and daemon answer from the graph \
              without one."
         );
     }
-    println!();
+    say!();
     Ok(())
 }
 
@@ -13396,7 +13709,7 @@ fn prompt_choice(options: &[(&str, &str)], interactive: bool) -> usize {
         .collect();
     if !interactive {
         for (index, item) in items.iter().enumerate() {
-            println!("    [{}] {item}", index + 1);
+            say!("    [{}] {item}", index + 1);
         }
         return 0;
     }
@@ -13442,19 +13755,19 @@ fn hardware_check(opts: &WizardOptions, skipped: &mut Vec<SkippedDecision>) -> H
     let recommendation = setup_hardware::recommend_profile(&hardware);
     let recommended = recommendation.profile;
 
-    println!("Hardware check");
-    println!("  {}", setup_hardware::detected_sentence(&hardware));
+    say!("Hardware check");
+    say!("  {}", setup_hardware::detected_sentence(&hardware));
     for line in setup_hardware::detail_lines(&hardware) {
-        println!("    {line}");
+        say!("    {line}");
     }
-    println!();
-    println!(
+    say!();
+    say!(
         "  Recommended resource profile: {}",
         style(setup_hardware::profile_name(recommended)).bold()
     );
-    println!("    {}", recommendation.reason);
+    say!("    {}", recommendation.reason);
     if let Some(upgrade) = &recommendation.upgrade {
-        println!("    {upgrade}");
+        say!("    {upgrade}");
     }
 
     // An explicit flag is an answer, so it applies on every intent without a
@@ -13470,7 +13783,7 @@ fn hardware_check(opts: &WizardOptions, skipped: &mut Vec<SkippedDecision>) -> H
                 };
             }
             None => {
-                println!(
+                say!(
                     "  {} unrecognized --resource-profile '{requested}'; keeping the \
                      recommendation",
                     style("!").yellow()
@@ -13478,9 +13791,7 @@ fn hardware_check(opts: &WizardOptions, skipped: &mut Vec<SkippedDecision>) -> H
             }
         }
     } else {
-        println!(
-            "    Adjust it with `kin setup --intent advanced` or `--resource-profile <name>`."
-        );
+        say!("    Adjust it with `kin setup --intent advanced` or `--resource-profile <name>`.");
         skipped.push(SkippedDecision {
             decision: RESOURCE_PROFILE_DECISION,
             value: format!(
@@ -13491,7 +13802,7 @@ fn hardware_check(opts: &WizardOptions, skipped: &mut Vec<SkippedDecision>) -> H
                 .to_string(),
         });
     }
-    println!();
+    say!();
     HardwareCheck {
         recommended,
         answered_by_flag: false,
@@ -13520,9 +13831,9 @@ fn adjust_resource_profile(
     // telling someone a decision was made for them, on the same screen they just
     // made it on, is worse than not summarizing it at all.
     skipped.retain(|row| row.decision != RESOURCE_PROFILE_DECISION);
-    println!();
-    println!("Resource profile");
-    println!(
+    say!();
+    say!("Resource profile");
+    say!(
         "  {}",
         style(setup_hardware::ADVANCED_PROFILE_WARNING).yellow()
     );
@@ -13558,40 +13869,40 @@ fn record_resource_profile(
     if chosen == recommended {
         if had_record {
             match setup_hardware::record_profile(&kin_home, None) {
-                Ok(()) => println!(
+                Ok(()) => say!(
                     "  Cleared the recorded profile; this machine is back on kin's own default ({}).",
                     setup_hardware::profile_name(recommended)
                 ),
-                Err(error) => println!(
+                Err(error) => say!(
                     "  {} could not clear the recorded profile: {error:#}",
                     style("!").yellow()
                 ),
             }
         } else {
-            println!(
+            say!(
                 "  Keeping {}; nothing is recorded, so this machine follows kin's own default.",
                 setup_hardware::profile_name(recommended)
             );
         }
-        println!();
+        say!();
         return;
     }
     match setup_hardware::record_profile(&kin_home, Some(chosen)) {
         Ok(()) => {
-            println!(
+            say!(
                 "  Recorded {} for this machine. `kin` and `kin-daemon` adopt it at their next \
                  start; an exported KIN_RESOURCE_PROFILE and a repository's [resources] config \
                  both still outrank it.",
                 setup_hardware::profile_name(chosen)
             );
-            println!("  `kin resources inspect` reports the profile in effect and who chose it.");
+            say!("  `kin resources inspect` reports the profile in effect and who chose it.");
         }
-        Err(error) => println!(
+        Err(error) => say!(
             "  {} could not record the profile: {error:#}",
             style("!").yellow()
         ),
     }
-    println!();
+    say!();
 }
 
 /// Whether this `~/.kin` was provisioned by the npm launcher rather than by the
@@ -13647,13 +13958,13 @@ fn ask_bin_path(
         return true;
     }
 
-    println!();
-    println!("Command name on PATH");
-    println!(
+    say!();
+    say!("Command name on PATH");
+    say!(
         "  This install came from npm, which cannot edit your shell profile, so `kin` is not on \
          PATH yet."
     );
-    println!(
+    say!(
         "  Without it you keep typing `npx -y {CANONICAL_NPM_MCP_PACKAGE} ...`, which re-downloads \
          the release archive into the npx cache every run."
     );
@@ -13678,13 +13989,46 @@ fn ask_bin_path(
     ];
     let allow = prompt_choice(&options, interactive) == 0;
     if !allow {
-        println!(
+        say!(
             "  {} Left alone. Run `kin setup` again and answer yes, or add {} to PATH yourself.",
             style("→").cyan(),
             bin_dir.display()
         );
     }
     allow
+}
+
+/// The files the PATH line would go in, when this install needs the question
+/// asked at all.
+///
+/// Mirrors the gate in `ask_bin_path`: only an npm-provisioned install is
+/// asked, and only while the line is missing from a file the shell reads.
+fn bin_path_needs_asking(opts: &WizardOptions, shell_name: &str) -> Option<String> {
+    if opts.skip_path {
+        return None;
+    }
+    let kin_home = kin_dir().ok()?;
+    let bin_dir = kin_home.join("bin");
+    if !bin_dir.is_dir() || !npm_provisioned_install(&kin_home) {
+        return None;
+    }
+    let home = home_dir().ok()?;
+    let files = shell_path_rcs_in(&home, shell_name).ok()?;
+    let already = files.iter().all(|rc| {
+        fs::read_to_string(rc)
+            .map(|content| rc_declares_kin_bin(&content, &bin_dir))
+            .unwrap_or(false)
+    });
+    if already {
+        return None;
+    }
+    Some(
+        files
+            .iter()
+            .map(|rc| crate::screen::home_relative(rc))
+            .collect::<Vec<_>>()
+            .join(" and "),
+    )
 }
 
 /// Ask when the embedding model is fetched. Always asked, on every intent.
@@ -13709,10 +14053,10 @@ fn ask_embedding_model(
     // names a local directory) is not this question's to re-open.
     let declined_here = recorded.as_deref() == Some(crate::embed_model::MODEL_FETCH_DECLINED);
     let fetch = crate::embed_model::EmbedModelFetch::probe(false);
-    println!();
-    println!("Embedding model");
+    say!();
+    say!("Embedding model");
     if fetch.present {
-        println!(
+        say!(
             "  {} {} is already in the Hugging Face cache, so no download is owed.",
             style("✓").green(),
             fetch.model_id
@@ -13720,24 +14064,24 @@ fn ask_embedding_model(
         return;
     }
     if let Some(reason) = fetch.no_fetch_reason.as_deref() {
-        println!("  {} {}: {reason}", style("→").cyan(), fetch.model_id);
+        say!("  {} {}: {reason}", style("→").cyan(), fetch.model_id);
         if !declined_here {
             return;
         }
     }
 
-    println!(
+    say!(
         "  Semantic ranking needs {}, fetched {} from {} into the Hugging Face cache.",
         fetch.model_id,
         fetch.expected_download(),
         crate::embed_model::EMBED_MODEL_HOST
     );
-    println!(
+    say!(
         "  Without it `kin locate` and `kin search` answer from lexical and graph signals only, \
          and say so."
     );
     if declined_here {
-        println!(
+        say!(
             "  {} You recorded that this machine does not fetch it. Taking the recommendation \
              below clears that.",
             style("→").cyan()
@@ -13753,7 +14097,7 @@ fn ask_embedding_model(
             crate::embed_model::MODEL_FETCH_DEFERRED
         }
         Some(value) => {
-            println!(
+            say!(
                 "  {} unrecognized --embedding-model '{value}'; recording the recommendation",
                 style("!").yellow()
             );
@@ -13791,20 +14135,20 @@ fn ask_embedding_model(
         return;
     };
     if let Err(error) = crate::embed_model::record_model_fetch(&kin_home, decision) {
-        println!(
+        say!(
             "  {} could not record the embedding model decision: {error:#}",
             style("!").yellow()
         );
         return;
     }
     if decision == crate::embed_model::MODEL_FETCH_DECLINED {
-        println!(
+        say!(
             "  {} Recorded. Nothing fetches the model on this machine, and an air-gapped host \
              stays fine. `kin embed` starts the fetch if you change your mind.",
             style("→").cyan()
         );
     } else {
-        println!(
+        say!(
             "  {} Recorded. `kin embed` starts the fetch when you want it, and `kin init`'s first \
              embed pass starts it too. An air-gapped host stays fine.",
             style("→").cyan()
@@ -13824,9 +14168,9 @@ fn ask_embedding_provider(
     interactive: bool,
     skipped: &mut Vec<SkippedDecision>,
 ) {
-    println!();
-    println!("Where vectors are computed");
-    println!(
+    say!();
+    say!("Where vectors are computed");
+    say!(
         "  Local embedding runs in this process on your hardware. A remote OpenAI-compatible \
          provider sends entity text to the endpoint you configure, because that is what remote \
          embedding is."
@@ -13840,7 +14184,7 @@ fn ask_embedding_provider(
         Some("remote") | Some("openai") | Some("lmstudio") => true,
         Some("local") => false,
         Some(other) => {
-            println!(
+            say!(
                 "  {} unrecognized --embedding-provider '{other}'; keeping local",
                 style("!").yellow()
             );
@@ -13871,21 +14215,21 @@ fn ask_embedding_provider(
     };
 
     if !remote {
-        println!(
+        say!(
             "  {} Local. Nothing selects a remote provider on its own.",
             style("✓").green()
         );
         return;
     }
-    println!(
+    say!(
         "  {} Remote embedding sends entity text off this machine. Set these to use it:",
         style("!").yellow()
     );
-    println!("      KIN_EMBED_PROVIDER=openai   (or lmstudio, openai-compatible)");
-    println!("      KIN_EMBED_OPENAI_BASE_URL=<endpoint>");
-    println!("      KIN_EMBED_OPENAI_API_KEY=<key>");
-    println!("      KIN_EMBED_MODEL_ID=<model>  (optional; changing it re-embeds everything)");
-    println!(
+    say!("      KIN_EMBED_PROVIDER=openai   (or lmstudio, openai-compatible)");
+    say!("      KIN_EMBED_OPENAI_BASE_URL=<endpoint>");
+    say!("      KIN_EMBED_OPENAI_API_KEY=<key>");
+    say!("      KIN_EMBED_MODEL_ID=<model>  (optional; changing it re-embeds everything)");
+    say!(
         "    Setup collects no credential, so nothing is written here. `kin resources inspect` \
          reports the provider in effect."
     );
@@ -13904,8 +14248,8 @@ fn ask_mcp_round_trip(
     skipped: &mut Vec<SkippedDecision>,
 ) -> bool {
     if opts.skip_mcp_check {
-        println!();
-        println!(
+        say!();
+        say!(
             "MCP round trip: skipped, because --skip-mcp-check was passed. Nothing exercised the \
              entries this run."
         );
@@ -13919,13 +14263,13 @@ fn ask_mcp_round_trip(
         });
         return true;
     }
-    println!();
-    println!("MCP round trip");
-    println!(
+    say!();
+    say!("MCP round trip");
+    say!(
         "  Writing the config is not the same as the config working: a recorded launcher a `brew \
          upgrade` moved leaves a file that reads as valid while every call the agent makes fails."
     );
-    println!(
+    say!(
         "  Skipping it leaves that surfacing later, as \"the server is connected but the tools \
          report an empty graph\"."
     );
@@ -13951,11 +14295,11 @@ fn print_skipped_decisions(skipped: &[SkippedDecision], interactive: bool) {
     if skipped.is_empty() {
         return;
     }
-    println!();
+    say!();
     if interactive {
-        println!("Decided without asking:");
+        say!("Decided without asking:");
     } else {
-        println!("This run was not interactive, so it answered these for you:");
+        say!("This run was not interactive, so it answered these for you:");
     }
     for SkippedDecision {
         decision,
@@ -13963,8 +14307,8 @@ fn print_skipped_decisions(skipped: &[SkippedDecision], interactive: bool) {
         give_back,
     } in skipped
     {
-        println!("  {decision}: {value}");
-        println!("    change it later: {give_back}");
+        say!("  {decision}: {value}");
+        say!("    change it later: {give_back}");
     }
 }
 
@@ -13972,16 +14316,34 @@ fn print_skipped_decisions(skipped: &[SkippedDecision], interactive: bool) {
 // `kin setup` — interactive wizard (or non-interactive with flags)
 // ---------------------------------------------------------------------------
 
+#[path = "setup_short.rs"]
+mod short;
+
+/// End a setup the person cancelled with the status a terminal gives Ctrl-C.
+///
+/// The process exit sits in this module, the command's boundary, rather than
+/// in the short form's page module: ending the process is not something a page
+/// does, and that module stays inside the zero-file-search guard with no
+/// exemption.
+fn exit_cancelled() -> ! {
+    std::process::exit(130)
+}
+
 pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
     let interactive = !opts.no_interactive && is_tty();
+    // A person at a terminal gets the short form. `--verbose`, a pipe and a CI
+    // log get the full record below, which scripts and checks read.
+    if crate::screen::short_form(opts.verbose) && short::fits(&opts) {
+        return short::run(opts, interactive).await;
+    }
 
     // The logo opens an interactive run, and brings the blank line this
     // welcome would otherwise open with.
     if !crate::banner::print_once(interactive) {
-        println!();
+        say!();
     }
-    println!("Welcome to Kin setup. Let's get you to value in a few questions.");
-    println!();
+    say!("Welcome to Kin setup. Let's get you to value in a few questions.");
+    say!();
 
     // Every question the run answered without asking, collected as it goes so a
     // question added without a summary row shows up as a gap rather than as a
@@ -14002,15 +14364,15 @@ pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
     if !interactive && opts.intent.is_none() {
         skipped.push(SkippedDecision {
             decision: "Intent",
-            value: "agent (the smallest path to value)".to_string(),
+            value: "agent: connect the AI clients on this machine".to_string(),
             give_back: "kin setup --intent <local|agent|editor|hosted|advanced>".to_string(),
         });
     }
 
-    println!();
-    println!("Plan: {}", style(intent.title()).bold());
-    println!("      {}", intent.description(editor_extension_installed));
-    println!();
+    say!();
+    say!("Plan: {}", style(intent.title()).bold());
+    say!("      {}", intent.description(editor_extension_installed));
+    say!();
 
     let shell_name = opts.shell.as_deref().unwrap_or_else(|| detect_shell());
     let plan = build_plan(
@@ -14024,6 +14386,19 @@ pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
     )?;
 
     let applied = apply_plan(&plan, &assistants, shell_name, opts.tool_profile.as_deref()).await?;
+
+    // Asked only with a person present: it starts their login shell, which a
+    // scripted run has no reason to pay for.
+    if interactive && matches!(applied.shell_integration, ShellIntegration::Installed) {
+        if let TerminalKin::Other(path) = terminal_kin(shell_name) {
+            say!(
+                "  {} A new terminal runs {}, not this install. Remove it, or put ~/.kin/bin \
+                 first on PATH.",
+                style("!").yellow(),
+                path.display()
+            );
+        }
+    }
 
     print_intent_followups(&plan, interactive, editor_extension_installed);
 
@@ -14040,7 +14415,7 @@ pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
     provision_language_servers_in_wizard(&opts, interactive, &language_scope).await;
     record_language_tool_dirs_in_wizard();
 
-    report_notification_identity(interactive);
+    let _ = report_notification_identity(interactive);
 
     // The two always-asked items come last, after every intent-specific one, so
     // a `local`-intent run still gets told about the one thing it skipped. They
@@ -14052,9 +14427,9 @@ pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
 
     // The final checklist is the real first-run health engine — not a parallel
     // set of hardcoded probes. Every line below reflects probed state.
-    println!();
-    println!("=== Health checklist ===");
-    println!();
+    say!();
+    say!("=== Health checklist ===");
+    say!();
     let report = crate::commands::health::run_health_checks().await;
     print_human_report(&report, Some("Kin setup"));
 
@@ -14094,16 +14469,78 @@ async fn provision_language_servers_in_wizard(
     if missing.is_empty() {
         return;
     }
-    println!();
-    println!("Language servers (cross-file references):");
-    println!("  {}", scope.describe());
+    say!();
+    say!("Language servers (cross-file references):");
+    // Outside a repository nothing says which languages matter, and installing
+    // every server Kin knows is what had a first run build gopls from source for
+    // someone who may never open a Go file. So setup records whether Kin may
+    // install them, and `kin clone` and `kin init`, which know the repository's
+    // languages, install exactly those.
+    //
+    // `--install-language-servers` is the exception: it asks for the installs
+    // now, as its help says, so it records consent and falls through to them.
+    if opts.install_language_servers {
+        if let Ok(kin_home) = kin_dir() {
+            let _ = language_servers::record_install_consent(&kin_home, true);
+        }
+    }
+    if !opts.install_language_servers
+        && matches!(
+            scope,
+            language_servers::LanguageScope::Unknown(language_servers::UnknownScope::NoRepository)
+        )
+    {
+        let consent = if interactive {
+            Some(prompt_yn(
+                "  Install the language servers a repository needs when you clone or init it?",
+                true,
+                true,
+            ))
+        } else {
+            None
+        };
+        let recorded = match (consent, kin_dir()) {
+            (Some(consent), Ok(kin_home)) => {
+                language_servers::record_install_consent(&kin_home, consent)
+                    .map(|()| consent)
+                    .map_err(|error| {
+                        say!(
+                            "  {} could not record the answer: {error:#}",
+                            style("!").yellow()
+                        );
+                    })
+                    .ok()
+            }
+            _ => None,
+        };
+        match recorded {
+            Some(true) => say!(
+                "  {} Recorded. `kin clone` and `kin init` install the servers a repository's \
+                 languages need, and nothing else.",
+                style("✓").green()
+            ),
+            Some(false) => say!(
+                "  {} Recorded. Nothing installs them; `kin doctor --fix \
+                 --install-language-servers` does, inside a repository.",
+                style("→").cyan()
+            ),
+            None => say!(
+                "  {} Not recorded, so nothing installs them. `kin setup \
+                 --install-language-servers` lets `kin clone` and `kin init` install what a \
+                 repository needs.",
+                style("→").cyan()
+            ),
+        }
+        return;
+    }
+    say!("  {}", scope.describe());
     let consent = language_servers::InstallConsent::resolve(
         opts.install_language_servers,
         interactive && !opts.install_language_servers,
     );
     let outcome = apply_language_server_provisioning(&missing, consent).await;
     for line in &outcome.applied {
-        println!("  {} {line}", style("✓").green());
+        say!("  {} {line}", style("✓").green());
     }
     outcome.print_unfinished();
 }
@@ -14119,16 +14556,16 @@ fn record_language_tool_dirs_in_wizard() {
     match language_servers::record_language_tool_dirs() {
         Ok(added) if added.is_empty() => {}
         Ok(added) => {
-            println!();
-            println!(
+            say!();
+            say!(
                 "  {} {}",
                 style("✓").green(),
                 language_servers::recorded_tool_dirs_line(&added)
             );
         }
         Err(error) => {
-            println!();
-            println!(
+            say!();
+            say!(
                 "  {} could not record where this shell finds language servers, so a daemon an \
                  AI client starts may not find them: {error}",
                 style("!").yellow()
@@ -14144,27 +14581,32 @@ fn record_language_tool_dirs_in_wizard() {
 /// it. Setup is where all three are settled, because it is the one moment a
 /// person is present. When the first is not true, the remaining two cannot be
 /// fixed here, so the gap is reported instead of silently skipped.
-fn report_notification_identity(interactive: bool) {
+fn report_notification_identity(interactive: bool) -> Option<String> {
     if !cfg!(target_os = "macos") {
-        return;
+        return None;
     }
     let Ok(notifier) = kin_notify::Notifier::new() else {
-        return;
+        return None;
     };
     if let Some(degradation) = notifier.status().degradation() {
-        println!();
-        println!("  {} {degradation}", style("!").yellow());
-        return;
+        say!();
+        say!("  {} {degradation}", style("!").yellow());
+        return Some(degradation.to_string());
     }
     // The managed installer registers what it writes; a channel that installs
     // into its own prefix, such as a Homebrew formula, cannot, so setup does it
     // for whichever copy is actually resolved. It is not worth failing setup
     // over, but a silent failure would leave the authorization step below
     // asking about a bundle macOS does not know.
-    if let Err(error) = notifier.register_with_launch_services() {
-        println!("  {} {error:#}", style("!").yellow());
-    }
+    let issue = match notifier.register_with_launch_services() {
+        Ok(()) => None,
+        Err(error) => {
+            say!("  {} {error:#}", style("!").yellow());
+            Some(format!("{error:#}"))
+        }
+    };
     request_notification_authorization(interactive);
+    issue
 }
 
 /// Ask macOS for permission to post notifications, once, from the one place a
@@ -14206,18 +14648,18 @@ fn request_notification_authorization(interactive: bool) {
         return;
     }
 
-    println!();
-    println!("  macOS will ask whether Kin may send you notifications.");
-    println!("  These are update and health alerts; Kin posts nothing else.");
+    say!();
+    say!("  macOS will ask whether Kin may send you notifications.");
+    say!("  These are update and health alerts; Kin posts nothing else.");
     let granted = std::process::Command::new(&executable)
         .arg("--request-authorization")
         .status()
         .map(|status| status.success())
         .unwrap_or(false);
     if granted {
-        println!("  {} Notifications will arrive as Kin", style("✓").green());
+        say!("  {} Notifications will arrive as Kin", style("✓").green());
     } else {
-        println!(
+        say!(
             "  {} Notifications declined; Kin will stay quiet",
             style("·").dim()
         );
@@ -14235,7 +14677,7 @@ fn resolve_intent(
         if let Some(intent) = SetupIntent::from_flag(flag) {
             return intent;
         }
-        println!(
+        say!(
             "  {} unrecognized --intent '{}'; falling back to a prompt/default",
             style("!").yellow(),
             flag
@@ -14264,7 +14706,7 @@ fn resolve_intent(
         })
         .collect();
 
-    println!("What do you want Kin for?");
+    say!("What do you want Kin for?");
     match dialoguer::Select::new().items(&items).default(0).interact() {
         Ok(idx) => intents[idx],
         Err(_) => SetupIntent::AgentOnly,
@@ -14425,7 +14867,7 @@ fn build_advanced_plan(
             })
             .collect();
         let defaults: Vec<bool> = assistants.iter().map(|a| a.detected).collect();
-        println!("Configure Kin's MCP server for which AI clients?");
+        say!("Configure Kin's MCP server for which AI clients?");
         MultiSelect::new()
             .items(&items)
             .defaults(&defaults)
@@ -14471,6 +14913,8 @@ struct AppliedSetup {
     failed_clients: Vec<(String, String)>,
     /// What became of the shell-profile step.
     shell_integration: ShellIntegration,
+    /// What one real tool call through each registered client answered.
+    proofs: Vec<crate::commands::setup_verify::ClientProof>,
 }
 
 /// The error a setup run ends with when a client it set out to configure
@@ -14526,8 +14970,9 @@ async fn apply_plan(
     // discovery reminders below so a directive is never written for a client
     // Kin did not wire up.
     let mut registered_clients: Vec<usize> = Vec::new();
+    let mut client_proofs = Vec::new();
     if plan.configure_mcp {
-        println!("AI client MCP configuration:");
+        say!("AI client MCP configuration:");
         announce_mcp_launcher_origin();
         for idx in &plan.mcp_assistant_indices {
             let Some(a) = assistants.get(*idx) else {
@@ -14536,14 +14981,14 @@ async fn apply_plan(
             let existing_path = mcp_config_path_for_index(*idx);
             if let Some(p) = &existing_path {
                 if has_kin_mcp_config(p) {
-                    println!(
+                    say!(
                         "  {} {} already has a kin MCP entry at {}, so it is re-merged (other servers untouched).",
                         style("→").cyan(),
                         a.name,
                         p.display(),
                     );
                 } else if p.exists() {
-                    println!(
+                    say!(
                         "  {} {} has a config at {}, so the kin server entry is merged in (other servers untouched).",
                         style("→").cyan(),
                         a.name,
@@ -14564,13 +15009,13 @@ async fn apply_plan(
             };
             match result {
                 Some(Ok(path)) => {
-                    println!(
+                    say!(
                         "  {} {}",
                         style("✓").green(),
                         client_write_summary(a.name, a.detected, &path)
                     );
                     if let Some(choice) = &choice {
-                        println!("      {}", written_profile_line(choice));
+                        say!("      {}", written_profile_line(choice));
                     }
                     // Which repository a client ends up bound to is decided by
                     // the directory this ran in, and nothing said so. A later
@@ -14579,7 +15024,7 @@ async fn apply_plan(
                     // report calling a fresh, successful setup drifted. Name
                     // the repository where the choice is actually made.
                     if let Some(repo) = bound_repo_for_mcp_config(&path) {
-                        println!("      bound to repository {}", repo.display());
+                        say!("      bound to repository {}", repo.display());
                     }
                     registered_clients.push(*idx);
                     configured_assistants.push((a.name.to_string(), Some(path)));
@@ -14592,9 +15037,9 @@ async fn apply_plan(
                     };
                     for (position, line) in lines.iter().enumerate() {
                         if position == 0 {
-                            println!("  {mark} {line}");
+                            say!("  {mark} {line}");
                         } else {
-                            println!("      {line}");
+                            say!("      {line}");
                         }
                     }
                     match register {
@@ -14614,14 +15059,14 @@ async fn apply_plan(
             }
         }
         for a in assistants.iter().filter(|a| !a.detected) {
-            println!(
+            say!(
                 "  {} {} not detected ({})",
                 style("→").cyan(),
                 a.name,
                 a.install_hint
             );
         }
-        println!();
+        say!();
 
         // Writing the entry is not the same as the entry working. A recorded
         // launcher that no longer exists, or a server that cannot hold a
@@ -14637,7 +15082,10 @@ async fn apply_plan(
             &registered,
             plan.verify_mcp_round_trip,
         );
-        crate::commands::setup_verify::print_proofs(&proofs);
+        if !short_form_running() {
+            crate::commands::setup_verify::print_proofs(&proofs);
+        }
+        client_proofs = proofs;
     }
 
     // Agent discovery reminders.
@@ -14651,13 +15099,13 @@ async fn apply_plan(
     // call it makes fails.
     let mut written_reminders: Vec<WrittenReminder> = Vec::new();
     if plan.inject_discovery_reminders {
-        println!("Agent discovery reminders:");
+        say!("Agent discovery reminders:");
         written_reminders = apply_discovery_reminders_for(
             &home_dir()?,
             &registered_clients,
             &client_profile_for_index,
         );
-        println!();
+        say!();
     }
 
     // Shell integration comes after the clients on purpose, and its failure
@@ -14669,14 +15117,14 @@ async fn apply_plan(
     let shell_integration = if plan.install_shell_hook {
         apply_shell_integration(shell_name, plan.add_bin_to_path)
     } else {
-        println!("Shell integration: skipped.");
+        say!("Shell integration: skipped.");
         ShellIntegration::NotPlanned
     };
-    println!();
+    say!();
 
     // Daemon auto-start config.
     write_auto_daemon_config(plan.auto_daemon)?;
-    println!(
+    say!(
         "Daemon auto-start: {}.",
         if plan.auto_daemon {
             "enabled"
@@ -14685,9 +15133,9 @@ async fn apply_plan(
         }
     );
 
-    println!();
+    say!();
     if let Err(e) = record_projection_choice() {
-        println!(
+        say!(
             "  {} could not settle the projection mode: {e}",
             style("!").yellow()
         );
@@ -14702,6 +15150,7 @@ async fn apply_plan(
         deferred_clients,
         failed_clients,
         shell_integration,
+        proofs: client_proofs,
     })
 }
 
@@ -14731,19 +15180,19 @@ fn apply_shell_integration(shell_name: &str, allow_path: bool) -> ShellIntegrati
                 .map(|c| c.contains("kin-vfs"))
                 .unwrap_or(false);
         if already {
-            println!(
+            say!(
                 "Shell integration: {} already sources the kin-vfs hook, so the hook file is refreshed in place and your rc is left untouched.",
                 rc_path.display()
             );
         } else {
-            println!(
+            say!(
                 "Shell integration: adding one `source` line to {}.",
                 rc_path.display()
             );
         }
         install_shell_hook(shell_name, allow_path)?;
         if cfg!(target_os = "windows") {
-            println!(
+            say!(
                 "  {} On Windows the VFS shim/ProjFS is an optional feature and is not \
                  shell-auto-injected. The PowerShell hook only manages env state.",
                 style("!").yellow()
@@ -14753,16 +15202,16 @@ fn apply_shell_integration(shell_name: &str, allow_path: bool) -> ShellIntegrati
     };
     match attempt() {
         Ok(()) => {
-            println!("  Shell integration installed.");
+            say!("  Shell integration installed.");
             ShellIntegration::Installed
         }
         Err(error) => {
             let reason = format!("{error:#}");
-            println!(
+            say!(
                 "  {} Shell integration was not written: {reason}",
                 style("✗").red()
             );
-            println!(
+            say!(
                 "      Setup carries on without it. The lines to add by hand are listed at the \
                  end of this run."
             );
@@ -14985,7 +15434,7 @@ fn record_setup_ledger(plan: &SetupPlan, shell_name: &str, written_reminders: &[
         Ok(())
     });
     if let Err(e) = update {
-        println!(
+        say!(
             "  {} could not write install ledger: {e}",
             style("!").yellow()
         );
@@ -15055,33 +15504,33 @@ fn editor_followup(editor_extension_installed: bool) -> (bool, &'static str, &'s
 
 fn print_intent_followups(plan: &SetupPlan, interactive: bool, editor_extension_installed: bool) {
     if plan.show_editor_hint {
-        println!();
-        println!("Editor extension:");
+        say!();
+        say!("Editor extension:");
         let (installed, first, second) = editor_followup(editor_extension_installed);
         let mark = if installed {
             style("✓").green()
         } else {
             style("→").cyan()
         };
-        println!("  {mark} {first}");
-        println!("    {second}");
+        say!("  {mark} {first}");
+        say!("    {second}");
     }
     if plan.show_hosted_hint {
-        println!();
-        println!("Hosted / KinLab:");
+        say!();
+        say!("Hosted / KinLab:");
         let base_url = super::auth::hosted_base_url(None);
         match super::auth::hosted_credential_state(&base_url, interactive) {
             Ok(state) => {
                 for line in hosted_followup_lines(&base_url, &state) {
-                    println!("  {} {}", style("→").cyan(), line);
+                    say!("  {} {}", style("→").cyan(), line);
                 }
             }
             Err(error) => {
-                println!(
+                say!(
                     "  {} could not read the stored KinLab credential for {base_url}: {error}",
                     style("!").yellow()
                 );
-                println!("    `kin auth status` reports the same state directly.");
+                say!("    `kin auth status` reports the same state directly.");
             }
         }
     }
@@ -15179,46 +15628,46 @@ fn print_next_steps(
     deferred_clients: &[String],
     language_scope: &language_servers::LanguageScope,
 ) {
-    println!();
+    say!();
     match shell_integration {
         ShellIntegration::NotPlanned => {}
         ShellIntegration::Installed => {
-            println!("Open a new shell session to load the shell hook.");
-            println!();
+            say!("Open a new shell session to load the shell hook.");
+            say!();
         }
         ShellIntegration::NotWritten { reason, by_hand } => {
             let mut lines = shell_integration_by_hand_lines(reason, by_hand).into_iter();
             if let Some(first) = lines.next() {
-                println!("{} {first}", style("!").yellow());
+                say!("{} {first}", style("!").yellow());
             }
             for line in lines {
-                println!("{line}");
+                say!("{line}");
             }
-            println!();
+            say!();
         }
     }
     for line in install_check_block() {
-        println!("{line}");
+        say!("{line}");
     }
-    println!();
+    say!();
     for line in aftercare_block() {
-        println!("{line}");
+        say!("{line}");
     }
 
     if let Some(waiting) = deferred_clients_next_step(deferred_clients) {
-        println!();
-        println!("  {} {waiting}", style("→").cyan());
+        say!();
+        say!("  {} {waiting}", style("→").cyan());
     }
 
     if let Ok(kin_home) = kin_dir() {
         let model = crate::embed_model::EmbedModelFetch::probe(false);
-        println!();
+        say!();
         for line in footprint_lines(&kin_home, model.cache_dir.as_deref(), model.expected_bytes) {
-            println!("{line}");
+            say!("{line}");
         }
     }
 
-    println!();
+    say!();
     // Named here because this is the list a first run reads to the end. Cross-file
     // reference edges are the answer Kin is sold on and they need a server per
     // language, so a host missing one is owed the command rather than the
@@ -15237,17 +15686,17 @@ fn print_next_steps(
         language_servers::LanguageScope::Repository(_)
     );
     for line in next_step_block(&missing_servers, scoped) {
-        println!("{line}");
+        say!("{line}");
     }
 
     let configured_any = configured_assistants.iter().any(|(_, p)| p.is_some());
     if matches!(intent, SetupIntent::AgentOnly | SetupIntent::Advanced) && configured_any {
-        println!();
+        say!();
         for line in first_agent_prompt_block() {
-            println!("{line}");
+            say!("{line}");
         }
     }
-    println!();
+    say!();
 }
 
 /// The commands that check the install.
@@ -15359,15 +15808,22 @@ fn padded_steps(heading: &str, steps: &[(&str, &str)]) -> Vec<String> {
 // `kin setup status`
 // ---------------------------------------------------------------------------
 
-pub async fn status(json: bool) -> Result<()> {
+pub async fn status(json: bool, verbose: bool) -> Result<()> {
     let report = crate::commands::health::run_health_checks().await;
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
+        say!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
     }
 
-    print_human_report(&report, Some("Kin setup status"));
+    // The page `kin doctor` prints on a terminal, for the same engine: the
+    // checks that need something and one line for the rest. A pipe, CI and
+    // `--verbose` keep the full table.
+    if crate::screen::short_form(verbose) {
+        print_short_report(&report, "Kin setup status");
+    } else {
+        print_human_report(&report, Some("Kin setup status"));
+    }
     Ok(())
 }
 
@@ -15463,7 +15919,7 @@ fn wrap_words(text: &str, width: usize) -> Vec<String> {
 /// terminal, `width` is `None` and the line is printed exactly as it always was.
 fn print_labelled_line(label: &str, text: &str, width: Option<usize>) {
     for line in labelled_lines(label, text, width) {
-        println!("{line}");
+        say!("{line}");
     }
 }
 
@@ -15549,9 +16005,9 @@ fn print_human_report(report: &crate::commands::health::HealthReport, title: Opt
         &report.platform,
         crate::mark::MarkStyle::for_stdout(),
     ) {
-        println!("{line}");
+        say!("{line}");
     }
-    println!();
+    say!();
     for check in &report.checks {
         let mark = match check.status {
             HealthStatus::Healthy => style("✓").green(),
@@ -15563,20 +16019,20 @@ fn print_human_report(report: &crate::commands::health::HealthReport, title: Opt
             HealthStatus::Unsupported => style("→").cyan(),
         };
         match detail_layout(&check.detail, width) {
-            DetailLayout::Beside => println!(
+            DetailLayout::Beside => say!(
                 "  {mark} {:<26} {:<14} {}",
                 check.label,
                 status_label(&check.status),
                 check.detail
             ),
             DetailLayout::Below(lines) => {
-                println!(
+                say!(
                     "  {mark} {:<26} {}",
                     check.label,
                     status_label(&check.status)
                 );
                 for line in lines {
-                    println!("{}{line}", " ".repeat(DETAIL_CONTINUATION_INDENT));
+                    say!("{}{line}", " ".repeat(DETAIL_CONTINUATION_INDENT));
                 }
             }
         }
@@ -15589,9 +16045,9 @@ fn print_human_report(report: &crate::commands::health::HealthReport, title: Opt
             }
         }
     }
-    println!();
+    say!();
     let summary = report.summary();
-    println!(
+    say!(
         "Summary: {} passed, {} need attention, {} not applicable.",
         style(summary.passed).green(),
         if summary.attention > 0 {
@@ -15609,7 +16065,268 @@ fn print_human_report(report: &crate::commands::health::HealthReport, title: Opt
     } else {
         style("!").yellow()
     };
-    println!("{mark} {}", readiness.sentence);
+    say!("{mark} {}", readiness.sentence);
+}
+
+/// A terminal summary, with a bounded reason and next step for each attention
+/// group. The full diagnostic, paths and remediation stay in the verbose table
+/// and JSON. Rendering never reinterprets the prose as a fresh health reading.
+fn print_short_report(report: &crate::commands::health::HealthReport, title: &str) {
+    let style = crate::screen::Style::for_stdout();
+    for line in report_header(
+        Some(title),
+        &report.platform,
+        crate::mark::MarkStyle::for_stdout(),
+    ) {
+        println!("{line}");
+    }
+    println!();
+    for line in short_report_lines(report, title, crate::screen::terminal_width(), style) {
+        println!("{line}");
+    }
+}
+
+struct CompactAttention {
+    label: String,
+    family: Option<&'static str>,
+    state: &'static str,
+    priority: u8,
+    status: crate::screen::Status,
+    reason: &'static str,
+    action: &'static str,
+    count: usize,
+}
+
+/// The check ID and status are the health engine's contract. A check can carry
+/// several detailed causes, so only describe what those typed facts establish.
+/// In particular, a recorded pressure refusal is not a current memory probe.
+fn compact_attention(check: &crate::commands::health::HealthCheck) -> CompactAttention {
+    use crate::commands::health::HealthStatus;
+    use crate::screen::Status;
+
+    let status = match check.status {
+        HealthStatus::Missing | HealthStatus::Misconfigured | HealthStatus::Degraded => {
+            Status::Fail
+        }
+        HealthStatus::Stale => Status::Warn,
+        HealthStatus::Pending => Status::Off,
+        HealthStatus::Healthy | HealthStatus::Unsupported => Status::Ok,
+    };
+    let mut row = CompactAttention {
+        label: check.label.clone(),
+        family: None,
+        state: status_label(&check.status),
+        // Rank install failures and an unreadable semantic authority before
+        // advisory limits or work still in flight. This changes presentation
+        // order only; the health engine still owns every verdict and count.
+        priority: match check.status {
+            HealthStatus::Missing | HealthStatus::Misconfigured => 0,
+            HealthStatus::Stale if check.id == "semantic_query_readiness" => 0,
+            HealthStatus::Degraded => 1,
+            HealthStatus::Stale => 2,
+            HealthStatus::Pending => 3,
+            HealthStatus::Healthy | HealthStatus::Unsupported => 4,
+        },
+        status,
+        reason: match check.status {
+            HealthStatus::Missing => "Missing",
+            HealthStatus::Misconfigured => "Configuration needs repair",
+            HealthStatus::Stale => "Needs review",
+            HealthStatus::Pending => "Not ready yet",
+            HealthStatus::Degraded => "Limited; review diagnosis",
+            HealthStatus::Healthy => "Healthy",
+            HealthStatus::Unsupported => "Not applicable",
+        },
+        action: if check.fixable {
+            "kin doctor --fix"
+        } else {
+            "See full diagnosis"
+        },
+        count: 1,
+    };
+    if check.id.starts_with("mcp_client_") {
+        row.family = Some("mcp");
+        row.label = "AI clients".to_string();
+        row.reason = match check.status {
+            HealthStatus::Missing => "Kin configuration missing",
+            HealthStatus::Misconfigured => "Configuration needs repair",
+            _ => row.reason,
+        };
+    } else if check.id.starts_with("instructions_") {
+        row.family = Some("instructions");
+        row.label = "AI instructions".to_string();
+        if matches!(check.status, HealthStatus::Misconfigured) {
+            row.reason = "Tool profile mismatch";
+            row.action = "kin setup";
+        }
+    } else {
+        match (check.id.as_str(), &check.status) {
+            ("suspended_sweep", HealthStatus::Degraded) => {
+                row.label = "Enrichment".to_string();
+                row.reason = "Sweeps suspended";
+                row.action = "kin daemon sweep";
+            }
+            ("host_memory_pressure", HealthStatus::Degraded) => {
+                row.label = "Memory refusal".to_string();
+                row.reason = "Pressure history needs review";
+            }
+            ("daemon_memory_standing", HealthStatus::Degraded) => {
+                row.label = "Daemon memory".to_string();
+                row.reason = "Last report exceeds allowance";
+            }
+            ("daemon_kill_record", HealthStatus::Degraded) => {
+                row.label = "Daemon history".to_string();
+                row.reason = "Death record needs review";
+            }
+            ("interrupted_init" | "stranded_init_stage", _) => {
+                row.label = "Conversion".to_string();
+                row.reason = "Recovery needs review";
+            }
+            ("memory_floor", HealthStatus::Degraded) => {
+                row.label = "Memory capacity".to_string();
+                row.reason = "Below the measured host floor";
+            }
+            ("commit_memory_headroom", _) => {
+                row.label = "Commit headroom".to_string();
+                row.reason = "Review measured memory limits";
+            }
+            ("semantic_query_readiness" | "reference_edge_coverage" | "parse_coverage", _) => {
+                row.label = match check.id.as_str() {
+                    "semantic_query_readiness" => "Semantic search",
+                    "reference_edge_coverage" => "References",
+                    _ => "Source coverage",
+                }
+                .to_string();
+                row.reason = if matches!(check.status, HealthStatus::Pending) {
+                    "Coverage incomplete"
+                } else {
+                    "Coverage needs review"
+                };
+                row.action = "kin graph status";
+            }
+            ("background_work", _) => {
+                row.reason = "Background work needs review";
+                row.action = "kin status --json";
+            }
+            ("hydration_semantics", HealthStatus::Stale) => {
+                row.label = "Replay semantics".to_string();
+                row.reason = "Replay compatibility needs review";
+            }
+            ("embedding_model", HealthStatus::Pending | HealthStatus::Missing) => {
+                row.reason = "Model download outstanding";
+                row.action = "Review model access with --verbose";
+            }
+            _ => {}
+        }
+    }
+    row
+}
+
+fn short_report_lines(
+    report: &crate::commands::health::HealthReport,
+    title: &str,
+    width: usize,
+    style: crate::screen::Style,
+) -> Vec<String> {
+    use crate::commands::health::needs_attention;
+    use crate::screen::{self, Status};
+
+    // A summary must remain a page even when many independent checks fail.
+    // Omitted checks are counted explicitly; no status is promoted to healthy.
+    const MAX_GROUPS: usize = 6;
+    let edge = screen::right_edge_for(width);
+    let mut groups: Vec<CompactAttention> = Vec::new();
+    for check in report.checks.iter().filter(|check| needs_attention(check)) {
+        let row = compact_attention(check);
+        if let Some(group) = groups.iter_mut().find(|group| {
+            row.family.is_some()
+                && group.family == row.family
+                && group.state == row.state
+                && group.reason == row.reason
+                && group.action == row.action
+        }) {
+            group.count += 1;
+        } else {
+            groups.push(row);
+        }
+    }
+    groups.sort_by_key(|row| row.priority);
+    let mut lines = Vec::new();
+    for row in groups.iter().take(MAX_GROUPS) {
+        let label = if row.family.is_some() {
+            format!("{} ({})", row.label, row.count)
+        } else {
+            row.label.clone()
+        };
+        if console::measure_text_width(&label) <= screen::LABEL_WIDTH {
+            let value_width =
+                edge.saturating_sub(screen::INDENT.len() + 2 + screen::LABEL_WIDTH + 1);
+            lines.push(screen::row_to(
+                style,
+                screen::INDENT,
+                row.status,
+                &label,
+                &screen::fit(row.reason, value_width),
+                None,
+                edge,
+            ));
+        } else {
+            // Future checks need not invent a short label to stay readable.
+            // Keep their full identity above the reason instead of clipping it.
+            for (index, line) in screen::wrap(&label, edge.saturating_sub(4))
+                .iter()
+                .enumerate()
+            {
+                lines.push(if index == 0 {
+                    format!("{}{} {line}", screen::INDENT, style.glyph(row.status))
+                } else {
+                    format!("    {line}")
+                });
+            }
+            for line in screen::wrap(row.reason, edge.saturating_sub(4)) {
+                lines.push(format!("    {line}"));
+            }
+        }
+        for line in screen::wrap(&format!("Next: {}", row.action), edge.saturating_sub(4)) {
+            lines.push(format!("    {}", style.faint(&line)));
+        }
+    }
+    let remaining: usize = groups.iter().skip(MAX_GROUPS).map(|row| row.count).sum();
+    if remaining > 0 {
+        lines.push(format!(
+            "  + {remaining} more checks need attention; see full diagnosis."
+        ));
+    }
+    if !groups.is_empty() {
+        lines.push(String::new());
+    }
+    let summary = report.summary();
+    let readiness = readiness_line(report);
+    let glyph = if readiness.ready {
+        Status::Ok
+    } else if readiness.severe {
+        Status::Fail
+    } else {
+        Status::Warn
+    };
+    lines.push(format!(
+        "{}{} {}",
+        screen::INDENT,
+        style.glyph(glyph),
+        style.bold(&format!(
+            "{} passed, {} need attention, {} not applicable.",
+            summary.passed, summary.attention, summary.skipped
+        ))
+    ));
+    lines.push(format!(
+        "{}{}",
+        screen::INDENT,
+        style.faint(&format!(
+            "Full diagnosis: {} --verbose",
+            title.to_ascii_lowercase()
+        ))
+    ));
+    lines
 }
 
 /// The closing readiness line, and how loudly to print it.
@@ -15747,12 +16464,12 @@ fn print_unfinished_repairs(unfinished: &[UnfinishedRepair]) {
     if unfinished.is_empty() {
         return;
     }
-    println!();
-    println!("Repairs that did not complete:");
+    say!();
+    say!("Repairs that did not complete:");
     for repair in unfinished {
-        println!("  {} {}: {}", style("✗").red(), repair.what, repair.reason);
+        say!("  {} {}: {}", style("✗").red(), repair.what, repair.reason);
         for line in &repair.remediation {
-            println!("      {line}");
+            say!("      {line}");
         }
     }
 }
@@ -15861,7 +16578,7 @@ impl ProvisioningOutcome {
     fn print_unfinished(&self) {
         for repair in &self.unfinished {
             for line in &repair.remediation {
-                println!("      {line}");
+                say!("      {line}");
             }
         }
     }
@@ -15885,9 +16602,9 @@ async fn apply_language_server_provisioning(
         // `download rust-analyzer 2026-08-24 ...`" as though it were a command.
         let lines = language_servers::withheld_lines(missing);
         if let Some((first, rest)) = lines.split_first() {
-            println!("  {} {first}", style("!").yellow());
+            say!("  {} {first}", style("!").yellow());
             for line in rest {
-                println!("      {line}");
+                say!("      {line}");
             }
         }
         return ProvisioningOutcome::default();
@@ -15906,22 +16623,22 @@ async fn apply_language_server_provisioning(
             let default_yes = language_servers::install_by_default(recipe, |program| {
                 which::which(program).is_ok()
             });
-            println!();
-            println!(
+            say!();
+            say!(
                 "  Kin can resolve {} references across files, but its language server is not \
                  installed.",
                 recipe.language
             );
             if language_servers::route_is_a_command(route) {
-                println!("    Command:    {}", recipe.route_command_line(route));
+                say!("    Command:    {}", recipe.route_command_line(route));
             }
-            println!(
+            say!(
                 "    This will:  {}",
                 language_servers::route_disclosure(recipe, route)
             );
             if !default_yes {
                 if let Some(reason) = language_servers::default_no_reason(recipe) {
-                    println!("    Note:       {reason}");
+                    say!("    Note:       {reason}");
                 }
             }
             prompt_yn("  Install it now?", default_yes, true)
@@ -15931,9 +16648,9 @@ async fn apply_language_server_provisioning(
             // `--install-language-servers` used to print nothing until the
             // installers' own output, and one of them had already written into
             // the Homebrew prefix by then.
-            println!("  Installing the {} language server...", recipe.language);
+            say!("  Installing the {} language server...", recipe.language);
             if consent == InstallConsent::Granted {
-                println!(
+                say!(
                     "    This will:  {}",
                     language_servers::route_disclosure(recipe, route)
                 );
@@ -15946,7 +16663,7 @@ async fn apply_language_server_provisioning(
         Ok(reports) => reports,
         Err(error) => {
             let reason = format!("the language server installation worker did not finish: {error}");
-            println!("  {} {reason}", style("✗").red());
+            say!("  {} {reason}", style("✗").red());
             return ProvisioningOutcome {
                 applied: Vec::new(),
                 unfinished: vec![UnfinishedRepair {
@@ -15978,7 +16695,7 @@ async fn apply_language_server_provisioning(
         };
         if let Some((recipe, found)) = off_path {
             let (reason, remediation) = language_servers::off_path_installer_lines(recipe, &found);
-            println!(
+            say!(
                 "  {} did not install the {} language server: {reason}",
                 style("✗").red(),
                 report.language
@@ -16017,7 +16734,7 @@ async fn apply_language_server_provisioning(
                             which::which(program).is_ok()
                         })
                     {
-                        println!("  {} {gap}", style("!").yellow());
+                        say!("  {} {gap}", style("!").yellow());
                         unfinished.push(UnfinishedRepair {
                             what: format!(
                                 "produce cross-file reference edges for {}",
@@ -16041,7 +16758,7 @@ async fn apply_language_server_provisioning(
             // Kin pins, and the only safe reading is that the install must not
             // happen on this path today.
             InstallOutcome::ChecksumRefused { command, reason } => {
-                println!(
+                say!(
                     "  {} refused to install the {} language server: {reason}",
                     style("✗").red(),
                     report.language
@@ -16070,7 +16787,7 @@ async fn apply_language_server_provisioning(
             // gap it still is. Counting it as applied is how a closed-looking
             // row keeps an open gap.
             InstallOutcome::RanButStillMissing { command } => {
-                println!(
+                say!(
                     "  {} `{command}` succeeded but no {} server is on PATH",
                     style("✗").red(),
                     report.language
@@ -16088,7 +16805,7 @@ async fn apply_language_server_provisioning(
                 });
             }
             InstallOutcome::Failed { command, reason } => {
-                println!(
+                say!(
                     "  {} could not install the {} language server: {reason}",
                     style("✗").red(),
                     report.language
@@ -16107,7 +16824,7 @@ async fn apply_language_server_provisioning(
                     requested: true,
                 });
             }
-            InstallOutcome::Declined { .. } => println!(
+            InstallOutcome::Declined { .. } => say!(
                 "  {} {}",
                 style("-").dim(),
                 language_servers::declined_line(report.language)
@@ -16118,7 +16835,7 @@ async fn apply_language_server_provisioning(
             // install a language runtime behind a user's back. For Rust it
             // means a host Kin pins no release binary for.
             InstallOutcome::NoInstaller { program, command } => {
-                println!(
+                say!(
                     "  {} `{program}` is not installed and Kin has no other route to the {} \
                      language server on this host, so it cannot run `{command}`",
                     style("✗").red(),
@@ -16163,7 +16880,7 @@ async fn apply_language_server_provisioning(
             if let Some(LanguageServerReadiness::Unusable { reason }) = readiness.get(language) {
                 unusable = true;
                 applied.retain(|line| !line.contains(&language.to_string()));
-                println!(
+                say!(
                     "  {} the {language} language server installed but did not start: {reason}",
                     style("✗").red(),
                 );
@@ -16186,7 +16903,7 @@ async fn apply_language_server_provisioning(
                 } else {
                     style("!").yellow()
                 };
-                println!("  {mark} {message}");
+                say!("  {mark} {message}");
             }
         }
     }
@@ -16498,6 +17215,16 @@ fn observe_language_server_request(
 }
 
 pub async fn doctor(fix: bool, install_language_servers: bool, json: bool) -> Result<()> {
+    doctor_with(fix, install_language_servers, json, false).await
+}
+
+/// `kin doctor`, with `verbose` asking for every check on a terminal.
+pub async fn doctor_with(
+    fix: bool,
+    install_language_servers: bool,
+    json: bool,
+    verbose: bool,
+) -> Result<()> {
     // The run's one graph status, kept so the language census below reads the
     // answer the report already fetched rather than asking the daemon again.
     let graph_status = crate::commands::health::RunGraphStatus::for_run();
@@ -16529,7 +17256,9 @@ pub async fn doctor(fix: bool, install_language_servers: bool, json: bool) -> Re
 
     if !fix {
         if json {
-            println!("{}", serde_json::to_string_pretty(&report)?);
+            say!("{}", serde_json::to_string_pretty(&report)?);
+        } else if crate::screen::short_form(verbose) {
+            print_short_report(&report, "Kin doctor");
         } else {
             print_human_report(&report, Some("Kin doctor"));
         }
@@ -16543,8 +17272,8 @@ pub async fn doctor(fix: bool, install_language_servers: bool, json: bool) -> Re
     }
 
     // Apply only the safe, fixable repairs. Each maps to a check id family.
-    println!("Applying safe repairs...");
-    println!();
+    say!("Applying safe repairs...");
+    say!();
     let mut applied: Vec<String> = Vec::new();
     // Every repair below that fails records itself here, so the run closes
     // with what it could not do and the commands that close it, rather than
@@ -16568,7 +17297,7 @@ pub async fn doctor(fix: bool, install_language_servers: bool, json: bool) -> Re
             }
             Err(e) => {
                 let reason = e.to_string();
-                println!(
+                say!(
                     "  {} registry permission repair refused: {reason}",
                     style("✗").red()
                 );
@@ -16598,7 +17327,7 @@ pub async fn doctor(fix: bool, install_language_servers: bool, json: bool) -> Re
             }
             Err(e) => {
                 let reason = e.to_string();
-                println!(
+                say!(
                     "  {} shell hook reinstall failed: {reason}",
                     style("✗").red()
                 );
@@ -16629,7 +17358,7 @@ pub async fn doctor(fix: bool, install_language_servers: bool, json: bool) -> Re
         }
         Err(error) => {
             let reason = error.to_string();
-            println!(
+            say!(
                 "  {} could not record where this shell finds language servers: {reason}",
                 style("✗").red()
             );
@@ -16675,7 +17404,7 @@ pub async fn doctor(fix: bool, install_language_servers: bool, json: bool) -> Re
             )),
             Ok(None) => {
                 // No local shim source. Fetch the shim from the matching release.
-                println!(
+                say!(
                     "  No local VFS shim found; fetching it from the v{} release...",
                     env!("CARGO_PKG_VERSION")
                 );
@@ -16687,11 +17416,11 @@ pub async fn doctor(fix: bool, install_language_servers: bool, json: bool) -> Re
                     )),
                     Err(e) => {
                         let reason = e.to_string();
-                        println!(
+                        say!(
                             "  {} could not restore the VFS shim automatically: {reason}",
                             style("✗").red()
                         );
-                        println!(
+                        say!(
                             "      reinstall kin to restore it: \
                              curl -fsSL https://get.kinlab.dev/install | sh"
                         );
@@ -16708,7 +17437,7 @@ pub async fn doctor(fix: bool, install_language_servers: bool, json: bool) -> Re
             }
             Err(e) => {
                 let reason = e.to_string();
-                println!("  {} VFS shim reinstall failed: {reason}", style("✗").red());
+                say!("  {} VFS shim reinstall failed: {reason}", style("✗").red());
                 unfinished.push(UnfinishedRepair {
                     what: "reinstall the VFS shim".to_string(),
                     reason,
@@ -16735,7 +17464,7 @@ pub async fn doctor(fix: bool, install_language_servers: bool, json: bool) -> Re
             Ok(None) => {}
             Err(e) => {
                 let reason = e.to_string();
-                println!("  {} kin-daemon start failed: {reason}", style("✗").red());
+                say!("  {} kin-daemon start failed: {reason}", style("✗").red());
                 unfinished.push(UnfinishedRepair {
                     what: "start the repository daemon".to_string(),
                     reason,
@@ -16769,7 +17498,7 @@ pub async fn doctor(fix: bool, install_language_servers: bool, json: bool) -> Re
             );
             // Which languages this covers, said before anything installs.
             if let Some(scope) = &language_scope {
-                println!("  {}", scope.describe());
+                say!("  {}", scope.describe());
             }
             let outcome = apply_language_server_provisioning(missing, consent).await;
             applied.extend(outcome.applied);
@@ -16796,7 +17525,7 @@ pub async fn doctor(fix: bool, install_language_servers: bool, json: bool) -> Re
         Ok(_) => {}
         Err(e) => {
             let reason = e.to_string();
-            println!(
+            say!(
                 "  {} stale-daemon cleanup refused registry authority: {reason}",
                 style("✗").red()
             );
@@ -16819,9 +17548,9 @@ pub async fn doctor(fix: bool, install_language_servers: bool, json: bool) -> Re
         // it directly under its own four failure lines (FIR-2512), which is the
         // same defect as the closing line that could not read its rows.
         if unfinished.is_empty() {
-            println!("  Nothing to repair automatically.");
+            say!("  Nothing to repair automatically.");
         } else {
-            println!(
+            say!(
                 "  {} nothing was repaired; {} repair{} did not complete, listed below.",
                 style("✗").red(),
                 unfinished.len(),
@@ -16830,31 +17559,31 @@ pub async fn doctor(fix: bool, install_language_servers: bool, json: bool) -> Re
         }
     } else {
         for line in &applied {
-            println!("  {} {line}", style("✓").green());
+            say!("  {} {line}", style("✓").green());
         }
     }
-    println!();
+    say!();
 
     // Re-run the checks to report the post-fix state.
     let after = crate::commands::health::run_health_checks().await;
     if json {
-        println!("{}", serde_json::to_string_pretty(&after)?);
+        say!("{}", serde_json::to_string_pretty(&after)?);
         // The verdict still applies: a JSON caller reads the exit code, and a
         // repair that did not happen is exactly what it would otherwise have to
         // infer from a report that cannot see the attempt.
         return fix_verdict(&unfinished);
     }
-    println!("Re-running checks...");
-    println!();
+    say!("Re-running checks...");
+    say!();
     print_human_report(&after, Some("Kin doctor"));
 
     let still_manual = manual_attention_checks(&after);
     if !still_manual.is_empty() {
-        println!();
-        println!("Still needs manual steps:");
+        say!();
+        say!("Still needs manual steps:");
         for check in still_manual {
             if let Some(fix) = &check.manual_fix {
-                println!("  - {}: {fix}", check.label);
+                say!("  - {}: {fix}", check.label);
             }
         }
     }
@@ -16928,28 +17657,28 @@ pub fn ledger_status(json: bool) -> Result<()> {
     let verifications = verify_ledger(&path)?;
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&verifications)?);
+        say!("{}", serde_json::to_string_pretty(&verifications)?);
         return Ok(());
     }
 
     if verifications.is_empty() {
-        println!("No install ledger at {}.", path.display());
-        println!("Run `kin setup` to configure Kin and record what it writes.");
+        say!("No install ledger at {}.", path.display());
+        say!("Run `kin setup` to configure Kin and record what it writes.");
         return Ok(());
     }
 
-    println!("Install ledger: {}", path.display());
-    println!();
+    say!("Install ledger: {}", path.display());
+    say!();
     for v in &verifications {
         let mark = match v.state {
             EntryState::Verified => style("✓").green(),
             EntryState::Modified => style("!").yellow(),
             EntryState::Removed => style("✗").red(),
         };
-        println!("  {mark} {:<16} {}", v.entry.target, v.detail);
-        println!("      path: {}", v.entry.path.display());
+        say!("  {mark} {:<16} {}", v.entry.target, v.detail);
+        say!("      path: {}", v.entry.path.display());
     }
-    println!();
+    say!();
 
     let verified = verifications
         .iter()
@@ -16963,7 +17692,7 @@ pub fn ledger_status(json: bool) -> Result<()> {
         .iter()
         .filter(|v| matches!(v.state, EntryState::Removed))
         .count();
-    println!(
+    say!(
         "{} artifact(s) tracked: {} verified, {} modified, {} removed.",
         verifications.len(),
         style(verified).green(),
@@ -17289,6 +18018,9 @@ fn legacy_shell_path_targets(home: &Path) -> Vec<(String, PathBuf)> {
     // zsh's PATH line lives here, so an uninstall that swept only `.zshrc`
     // would leave the export behind pointing at a directory it had removed.
     targets.insert(("zsh".to_string(), home.join(".zshenv")));
+    // And on macOS here, where a login shell's `path_helper` would otherwise
+    // put the system directories back in front of it.
+    targets.insert(("zsh".to_string(), home.join(".zprofile")));
     targets.insert(("bash".to_string(), home.join(".bashrc")));
     // bash's PATH line also lives in whichever login file bash reads, and which
     // one that is depends on what existed when setup ran. An uninstall that
@@ -18231,9 +18963,9 @@ pub async fn uninstall(all: bool, dry_run: bool, force: bool, json: bool) -> Res
                     serde_json::json!([])
                 },
             });
-            println!("{}", serde_json::to_string_pretty(&payload)?);
+            say!("{}", serde_json::to_string_pretty(&payload)?);
         } else {
-            println!("{}", serde_json::to_string_pretty(&outcomes)?);
+            say!("{}", serde_json::to_string_pretty(&outcomes)?);
         }
         if blocked > 0 && all && !dry_run {
             anyhow::bail!(
@@ -18245,22 +18977,20 @@ pub async fn uninstall(all: bool, dry_run: bool, force: bool, json: bool) -> Res
 
     if outcomes.is_empty() {
         if all {
-            println!("No install ledger found. Continuing with full managed-install cleanup.");
+            say!("No install ledger found. Continuing with full managed-install cleanup.");
         } else {
-            println!("No install ledger found, so nothing is recorded to uninstall.");
-            println!(
-                "(The ledger is written by `kin setup`; run it first if you expected entries.)"
-            );
+            say!("No install ledger found, so nothing is recorded to uninstall.");
+            say!("(The ledger is written by `kin setup`; run it first if you expected entries.)");
             return Ok(());
         }
     }
 
     if dry_run {
-        println!("Dry run: no changes will be written.");
+        say!("Dry run: no changes will be written.");
     } else {
-        println!("Uninstalling Kin-written artifacts (ledger-verified)...");
+        say!("Uninstalling Kin-written artifacts (ledger-verified)...");
     }
-    println!();
+    say!();
     for o in &outcomes {
         let mark = match o.action {
             RemovalAction::Removed => style("✓").green(),
@@ -18268,9 +18998,9 @@ pub async fn uninstall(all: bool, dry_run: bool, force: bool, json: bool) -> Res
             RemovalAction::AlreadyAbsent => style("→").cyan(),
             RemovalAction::Failed => style("✗").red(),
         };
-        println!("  {mark} {}", o.detail);
+        say!("  {mark} {}", o.detail);
     }
-    println!();
+    say!();
 
     let removed = outcomes
         .iter()
@@ -18286,16 +19016,16 @@ pub async fn uninstall(all: bool, dry_run: bool, force: bool, json: bool) -> Res
         .count();
 
     if dry_run {
-        println!("Would remove {removed}, skip {skipped} (modified since install).");
+        say!("Would remove {removed}, skip {skipped} (modified since install).");
     } else {
-        println!("Removed {removed}, skipped {skipped} (modified since install), {failed} failed.");
+        say!("Removed {removed}, skipped {skipped} (modified since install), {failed} failed.");
         if skipped > 0 {
-            println!("Re-run with --force to remove entries modified since install.");
+            say!("Re-run with --force to remove entries modified since install.");
         }
     }
     if all {
         for action in &full_actions {
-            println!("  {}", action.detail);
+            say!("  {}", action.detail);
         }
         if blocked > 0 && !dry_run {
             anyhow::bail!(
@@ -18312,6 +19042,52 @@ mod tests {
     use super::{fix_verdict, readiness_line, UnfinishedRepair};
     use crate::commands::health::{HealthCheck, HealthReport, HealthStatus, HealthVerdict};
     use kin_model::LanguageId;
+
+    /// A new terminal that resolves this very binary is fine; a different one,
+    /// such as an older `kin` in `/usr/local/bin`, is named; nothing on the
+    /// PATH is missing; and an alias says nothing about which binary runs.
+    #[test]
+    fn the_terminal_check_names_the_kin_a_new_terminal_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let this = dir.path().join("kin");
+        fs::write(&this, b"").unwrap();
+        let this = this.canonicalize().unwrap();
+        let other = dir.path().join("older-kin");
+        fs::write(&other, b"").unwrap();
+
+        let answer = format!("{}\n", this.display());
+        assert_eq!(
+            resolve_terminal_kin(Some(&answer), &this),
+            TerminalKin::This
+        );
+        let answer = format!("{}\n", other.display());
+        assert_eq!(
+            resolve_terminal_kin(Some(&answer), &this),
+            TerminalKin::Other(other.clone())
+        );
+        assert_eq!(resolve_terminal_kin(Some(""), &this), TerminalKin::Missing);
+        assert_eq!(
+            resolve_terminal_kin(Some("alias kin='kin --json'"), &this),
+            TerminalKin::Unknown
+        );
+        assert_eq!(resolve_terminal_kin(None, &this), TerminalKin::Unknown);
+        assert_eq!(
+            shell_single_quoted("/tmp/it's here"),
+            "'/tmp/it'\\''s here'"
+        );
+    }
+
+    /// Consent to finish the waiting clients is recorded and read back, and a
+    /// client is never bound on a machine that did not give it.
+    #[test]
+    fn the_client_consent_round_trips() {
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(recorded_client_consent(home.path()), None);
+        record_client_consent(home.path(), true).unwrap();
+        assert_eq!(recorded_client_consent(home.path()), Some(true));
+        record_client_consent(home.path(), false).unwrap();
+        assert_eq!(recorded_client_consent(home.path()), Some(false));
+    }
 
     /// A row's detail stays on its row while it fits, and moves under it when
     /// it does not.
@@ -18629,6 +19405,272 @@ mod tests {
             fixable: false,
             manual_fix: None,
         }
+    }
+
+    #[test]
+    fn short_report_compacts_long_diagnostics_without_losing_attention_counts() {
+        let mut checks = Vec::new();
+        for client in ["alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta"] {
+            let mut row = check(
+                &format!("mcp_client_{client}"),
+                &format!("MCP: {client}"),
+                HealthStatus::Misconfigured,
+            );
+            row.detail = format!(
+                "/a/very/long/configuration/path/{client}/config.json {}",
+                "full diagnostic ".repeat(30)
+            );
+            row.manual_fix = Some("the complete client-specific repair instruction".repeat(10));
+            row.platform_note = Some("platform-specific diagnostic retained".to_string());
+            row.fixable = true;
+            checks.push(row);
+        }
+        checks.push(check(
+            "host_memory_pressure",
+            "Host memory pressure",
+            HealthStatus::Degraded,
+        ));
+        checks.push(check(
+            "stranded_init_stage",
+            "Stranded init staging",
+            HealthStatus::Degraded,
+        ));
+        checks.push(check("kin_binary", "kin binary", HealthStatus::Healthy));
+        checks.push(check(
+            "editor",
+            "Editor extension",
+            HealthStatus::Unsupported,
+        ));
+        let report = HealthReport::from_checks("test".to_string(), checks);
+        let full = serde_json::to_value(&report).unwrap();
+        for width in [60, 80, 120] {
+            let lines = super::short_report_lines(
+                &report,
+                "Kin setup status",
+                width,
+                crate::screen::Style::plain(),
+            );
+            let text = lines.join("\n");
+            assert!(lines.len() <= 12, "{width} columns: {text}");
+            assert!(
+                lines
+                    .iter()
+                    .all(|line| console::measure_text_width(line) <= width.saturating_sub(2)),
+                "{width} columns: {text}"
+            );
+            assert!(text.contains("AI clients (7)"), "{text}");
+            assert!(text.contains("Next: kin doctor --fix"), "{text}");
+            assert!(
+                text.contains("1 passed, 9 need attention, 1 not applicable."),
+                "{text}"
+            );
+            assert!(text.contains("kin setup status --verbose"), "{text}");
+            assert!(!text.contains("/a/very/long"), "{text}");
+            assert!(!text.contains("First-run ready"), "{text}");
+        }
+        assert_eq!(serde_json::to_value(&report).unwrap(), full);
+        assert!(full["checks"][0]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("/a/very/long"));
+        assert!(full["checks"][0]["manual_fix"]
+            .as_str()
+            .unwrap()
+            .contains("client-specific repair"));
+        assert_eq!(
+            full["checks"][0]["platform_note"],
+            "platform-specific diagnostic retained"
+        );
+        assert_eq!(report.verdict(), HealthVerdict::Failing);
+    }
+
+    #[test]
+    fn short_report_keeps_distinct_client_states_and_unknown_checks_visible() {
+        let mut missing = check("mcp_client_alpha", "MCP: alpha", HealthStatus::Missing);
+        missing.fixable = true;
+        let mut wrong = check("mcp_client_beta", "MCP: beta", HealthStatus::Misconfigured);
+        wrong.fixable = true;
+        let pending = check("mcp_client_gamma", "MCP: gamma", HealthStatus::Pending);
+        let future = check("future_check", "Future check", HealthStatus::Stale);
+        let report =
+            HealthReport::from_checks("test".to_string(), vec![missing, wrong, pending, future]);
+        let text =
+            super::short_report_lines(&report, "Kin doctor", 80, crate::screen::Style::plain())
+                .join("\n");
+        assert_eq!(text.matches("AI clients (1)").count(), 3, "{text}");
+        assert!(text.contains("Kin configuration missing"), "{text}");
+        assert!(text.contains("Configuration needs repair"), "{text}");
+        assert!(text.contains("Not ready yet"), "{text}");
+        assert!(text.contains("Future check"), "{text}");
+        assert!(text.contains("Next: See full diagnosis"), "{text}");
+        assert!(
+            text.contains("0 passed, 4 need attention, 0 not applicable."),
+            "{text}"
+        );
+        assert!(text.contains("kin doctor --verbose"), "{text}");
+    }
+
+    #[test]
+    fn short_report_shows_late_failures_before_capping_pending_work() {
+        let mut checks = (0..7)
+            .map(|i| {
+                check(
+                    &format!("future_{i}"),
+                    &format!("Future {i}"),
+                    HealthStatus::Pending,
+                )
+            })
+            .collect::<Vec<_>>();
+        checks.push(check("late_failure", "Late failure", HealthStatus::Missing));
+        checks.push(check(
+            "semantic_query_readiness",
+            "Read authority",
+            HealthStatus::Stale,
+        ));
+        let report = HealthReport::from_checks("test".to_string(), checks);
+        let text =
+            super::short_report_lines(&report, "Kin doctor", 60, crate::screen::Style::plain())
+                .join("\n");
+        let pending = text.find("Future 0").unwrap();
+        assert!(text.find("Late failure").unwrap() < pending, "{text}");
+        assert!(text.find("Semantic search").unwrap() < pending, "{text}");
+        assert!(text.contains("3 more checks need attention"), "{text}");
+        assert!(
+            text.contains("0 passed, 9 need attention, 0 not applicable."),
+            "{text}"
+        );
+        assert_eq!(report.verdict(), HealthVerdict::Failing);
+    }
+
+    #[test]
+    fn short_report_names_coverage_and_wraps_unknown_labels_without_clipping() {
+        let unknown_label =
+            "Future repository publication and resolver configuration compatibility check";
+        let report = HealthReport::from_checks(
+            "test".to_string(),
+            vec![
+                check(
+                    "semantic_query_readiness",
+                    "Semantic query readiness",
+                    HealthStatus::Pending,
+                ),
+                check(
+                    "reference_edge_coverage",
+                    "Reference edge coverage",
+                    HealthStatus::Pending,
+                ),
+                check("parse_coverage", "Parse coverage", HealthStatus::Pending),
+                check("future_check", unknown_label, HealthStatus::Pending),
+            ],
+        );
+        let lines = super::short_report_lines(
+            &report,
+            "Kin setup status",
+            60,
+            crate::screen::Style::plain(),
+        );
+        let text = lines.join("\n");
+        let words = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        for label in [
+            "Semantic search",
+            "References",
+            "Source coverage",
+            unknown_label,
+        ] {
+            assert!(words.contains(label), "missing {label}: {text}");
+        }
+        assert!(!text.contains('…'), "{text}");
+        assert!(!text.contains("..."), "{text}");
+        assert!(
+            lines
+                .iter()
+                .all(|line| console::measure_text_width(line) <= 58),
+            "{text}"
+        );
+        assert!(
+            text.contains("0 passed, 4 need attention, 0 not applicable."),
+            "{text}"
+        );
+        assert_eq!(text.matches("Next: kin graph status").count(), 3, "{text}");
+    }
+
+    #[test]
+    fn short_report_never_turns_memory_records_into_fresh_measurements() {
+        let mut checks = vec![
+            check(
+                "host_memory_pressure",
+                "Host memory pressure",
+                HealthStatus::Degraded,
+            ),
+            check(
+                "daemon_memory_standing",
+                "Daemon memory standing",
+                HealthStatus::Degraded,
+            ),
+            check("daemon_kill_record", "Daemon kills", HealthStatus::Degraded),
+        ];
+        for check in &mut checks {
+            check.detail = "old full diagnostic with 7.0 GiB at 01:23 UTC".to_string();
+        }
+        let report = HealthReport::from_checks("test".to_string(), checks);
+        let text =
+            super::short_report_lines(&report, "Kin doctor", 60, crate::screen::Style::plain())
+                .join("\n");
+        assert!(text.contains("Pressure history needs review"), "{text}");
+        assert!(text.contains("Last report exceeds allowance"), "{text}");
+        assert!(text.contains("Death record needs review"), "{text}");
+        for unsupported_claim in ["currently", "now", "7.0 GiB", "First-run ready"] {
+            assert!(!text.contains(unsupported_claim), "{text}");
+        }
+        assert_eq!(report.verdict(), HealthVerdict::NeedsAttention);
+    }
+
+    #[test]
+    fn short_report_bounds_many_checks_and_preserves_healthy_and_skipped_totals() {
+        let mut checks = (0..10)
+            .map(|i| {
+                check(
+                    &format!("future_{i}"),
+                    &format!("Future {i}"),
+                    HealthStatus::Pending,
+                )
+            })
+            .collect::<Vec<_>>();
+        checks.push(check("healthy", "Healthy", HealthStatus::Healthy));
+        checks.push(check("skipped", "Skipped", HealthStatus::Unsupported));
+        let report = HealthReport::from_checks("test".to_string(), checks);
+        let lines =
+            super::short_report_lines(&report, "Kin doctor", 60, crate::screen::Style::plain());
+        let text = lines.join("\n");
+        assert!(lines.len() <= 17, "{text}");
+        assert!(
+            lines
+                .iter()
+                .all(|line| console::measure_text_width(line) <= 58),
+            "{text}"
+        );
+        assert!(text.contains("4 more checks need attention"), "{text}");
+        assert!(
+            text.contains("1 passed, 10 need attention, 1 not applicable."),
+            "{text}"
+        );
+        assert!(!report.healthy());
+        let ready = HealthReport::from_checks(
+            "test".to_string(),
+            vec![
+                check("healthy", "Healthy", HealthStatus::Healthy),
+                check("skipped", "Skipped", HealthStatus::Unsupported),
+            ],
+        );
+        let text =
+            super::short_report_lines(&ready, "Kin doctor", 60, crate::screen::Style::plain())
+                .join("\n");
+        assert!(
+            text.contains("1 passed, 0 need attention, 1 not applicable."),
+            "{text}"
+        );
+        assert!(!text.contains("Next:"), "{text}");
+        assert!(ready.healthy());
     }
 
     /// The state the container run was actually in: the coverage row read
@@ -19104,6 +20146,7 @@ mod tests {
             embedding_provider: None,
             skip_path: false,
             tool_profile: None,
+            verbose: false,
         }
     }
 
@@ -21923,7 +22966,11 @@ printf 'LD=[%s]\n' "$LD_PRELOAD"
         let _home = EnvVarGuard::set("HOME", &home);
 
         let plan = rc_write_plan("zsh").unwrap();
-        assert_eq!(plan.len(), 2, "{plan:?}");
+        assert_eq!(
+            plan.len(),
+            2 + usize::from(cfg!(target_os = "macos")),
+            "{plan:?}"
+        );
         assert!(
             plan.iter().all(|target| target.path.starts_with(&home)),
             "every target must be about the home under test: {plan:?}"
@@ -22066,7 +23113,11 @@ printf 'LD=[%s]\n' "$LD_PRELOAD"
                 );
             }
             let zsh = rc_write_plan_in(&home, "zsh").unwrap();
-            assert_eq!(zsh.len(), 2, "zsh in {name}: {zsh:?}");
+            assert_eq!(
+                zsh.len(),
+                2 + usize::from(cfg!(target_os = "macos")),
+                "zsh in {name}: {zsh:?}"
+            );
             assert!(
                 zsh.iter().all(|target| target.path.starts_with(&home)),
                 "zsh in {name}: both files are about the home given: {zsh:?}"
@@ -22298,6 +23349,30 @@ printf 'LD=[%s]\n' "$LD_PRELOAD"
         );
         assert!(second.applied.is_empty(), "{:?}", second.applied);
         assert_eq!(second.content, first.content);
+    }
+
+    /// On macOS a new terminal is a login zsh, whose `/etc/zprofile` runs
+    /// `path_helper` after `.zshenv` and puts `/usr/local/bin` back in front.
+    /// The line has to be in `.zprofile` too, which runs after it; elsewhere
+    /// `.zshenv` alone is right.
+    #[test]
+    fn a_macos_login_shell_gets_the_path_line_after_path_helper() {
+        let home = Path::new("/home/u");
+        assert_eq!(
+            shell_path_rcs_for(home, "zsh", true).unwrap(),
+            vec![home.join(".zshenv"), home.join(".zprofile")]
+        );
+        assert_eq!(
+            shell_path_rcs_for(home, "zsh", false).unwrap(),
+            vec![home.join(".zshenv")]
+        );
+        let targets = legacy_shell_path_targets(home);
+        assert!(
+            targets
+                .iter()
+                .any(|(shell, path)| shell == "zsh" && path == &home.join(".zprofile")),
+            "uninstall sweeps .zprofile too: {targets:?}"
+        );
     }
 
     /// Uninstall has to sweep the file the PATH line was actually written to.

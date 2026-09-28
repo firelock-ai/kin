@@ -152,6 +152,12 @@ impl Default for McpServerConfig {
 }
 
 pub trait PersistableMcpStore: GraphStore {
+    /// A process-local selected-graph identity and completed truth revision.
+    /// Stores without a revision cannot attest a resumable trace snapshot.
+    fn trace_page_authority(&self) -> Option<serde_json::Value> {
+        None
+    }
+
     fn persist_primary_snapshot(&self, snapshot_path: Option<&Path>) -> Result<()> {
         let _ = snapshot_path;
         Ok(())
@@ -159,6 +165,13 @@ pub trait PersistableMcpStore: GraphStore {
 }
 
 impl PersistableMcpStore for kin_db::InMemoryGraph {
+    fn trace_page_authority(&self) -> Option<serde_json::Value> {
+        Some(serde_json::json!({
+            "graph": format!("{self:p}"), "root": self.compute_root_hash(),
+            "revision": self.truth_epoch(),
+        }))
+    }
+
     fn persist_primary_snapshot(&self, snapshot_path: Option<&Path>) -> Result<()> {
         let Some(snapshot_path) = snapshot_path else {
             return Ok(());
@@ -334,7 +347,12 @@ pub async fn run_stdio_daemon(
     let mut stdout = tokio::io::stdout();
     let mut reader = BufReader::new(stdin);
 
-    run_stdio_daemon_over(
+    // This process is an MCP session from here on: it holds an idle floor on
+    // whichever daemon it forwards to, so an attached daemon started with a
+    // shorter window cannot idle out between this session's tool calls.
+    crate::session_idle_floor::enable();
+
+    let served = run_stdio_daemon_over(
         &mut reader,
         &mut stdout,
         config,
@@ -343,7 +361,12 @@ pub async fn run_stdio_daemon(
         startup,
         initializer,
     )
-    .await
+    .await;
+
+    // The client closed the session. Hand the daemon back its own idle policy
+    // now, rather than one floor from now.
+    crate::session_idle_floor::release().await;
+    served
 }
 
 /// Transport-generic core of [`run_stdio_daemon`].
@@ -387,6 +410,10 @@ where
     let launch_root = config.client_root.clone();
 
     while let Some((message, framed)) = read_stdio_message(&mut *reader).await? {
+        // Where this message, when it is a `tools/call` whose client asked for
+        // progress, reports how far its wait for the daemon has come.
+        let mut call_progress: Option<CallProgressNotifier> = None;
+
         // The launcher's startup binding runs behind this loop so `initialize`
         // and `tools/list` are answered immediately. Once it settles with a
         // bound daemon, fold that into the roots-binding bookkeeping so a
@@ -405,6 +432,9 @@ where
         // `JsonRpcRequest` requires.
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(&message) {
             let method = value.get("method").and_then(|m| m.as_str());
+            if method == Some("tools/call") {
+                call_progress = CallProgressNotifier::for_request(&value);
+            }
 
             if method == Some("initialize") {
                 client_supports_roots = value.pointer("/params/capabilities/roots").is_some();
@@ -465,10 +495,13 @@ where
                 }
             }
 
-            // A `tools/call` racing the launcher's startup binding gets a
-            // bounded moment for a warm daemon to bind, then an honest
-            // still-starting answer: never minutes of silence, and never a
-            // remedy-flavored "no daemon" error while one is on its way up.
+            // A `tools/call` racing the launcher's startup binding waits for
+            // the daemon to become ready, within the call's own readiness
+            // budget, telling a client that asked for progress how far the
+            // daemon has come while it waits. Only a budget that truly runs
+            // out gets the honest still-starting answer, which says what is
+            // still loading and how far along it is. Never a remedy-flavored
+            // "no daemon" error while one is on its way up.
             //
             // The tool registry is exempt, because it reads no graph. Waiting on
             // the binding would answer "the daemon is still starting" to the one
@@ -505,12 +538,17 @@ where
                     // tool never opens the store and never runs an embedding
                     // pass. Set before the wait, because the wait is what the
                     // launcher's binding task is sitting on.
-                    // The bound this call gets, decided by whether it is the
-                    // call that started the daemon. See
-                    // `startup_bind_grace`.
-                    let grace = startup_bind_grace(startup.admit_daemon_spawn());
-                    if !startup.wait_until_settled(grace).await {
-                        if let Some(response) = startup_pending_response(&value, startup, grace) {
+                    startup.admit_daemon_spawn();
+                    if let Some(waited) = await_startup_binding(
+                        startup,
+                        daemon_delegate::readiness_budget(),
+                        call_progress.as_mut(),
+                        &mut *writer,
+                        framed,
+                    )
+                    .await?
+                    {
+                        if let Some(response) = startup_pending_response(&value, startup, waited) {
                             let response_json =
                                 serde_json::to_string(&response).map_err(McpError::Json)?;
                             write_stdio_message(&mut *writer, &response_json, framed).await?;
@@ -621,7 +659,14 @@ where
             }
         }
 
-        if let Some(mut response) = process_daemon_message(&message, &config).await {
+        let response = match call_progress.as_mut() {
+            Some(notifier) => {
+                forward_reporting_progress(&message, &config, notifier, &mut *writer, framed)
+                    .await?
+            }
+            None => process_daemon_message(&message, &config).await,
+        };
+        if let Some(mut response) = response {
             if is_tools_call(&message) {
                 stamp_client_folder(&mut response, binding.repo_root.as_deref(), &config);
             }
@@ -662,14 +707,6 @@ fn stamp_client_folder(
     repo_root: Option<&Path>,
     config: &McpServerConfig,
 ) {
-    let (Some(root), Some(client)) = (repo_root, config.client_root.as_deref()) else {
-        return;
-    };
-    let identity =
-        crate::first_contact::repository_identity(&(config.canonicalize)(root), Some(client));
-    let Some(warning) = identity.warning.clone() else {
-        return;
-    };
     let Some(block) = response
         .result
         .as_mut()
@@ -682,7 +719,52 @@ fn stamp_client_folder(
     let Some(text) = block.get("text").and_then(serde_json::Value::as_str) else {
         return;
     };
-    let stamped = match serde_json::from_str::<serde_json::Value>(text) {
+    let parsed = serde_json::from_str::<serde_json::Value>(text);
+    if let Ok(payload) = &parsed {
+        if crate::trace_pages::is_page(payload) {
+            // The daemon budgeted this exact repository/client presentation.
+            // Compare only with the connection's client folder, never with a
+            // later daemon/binder root or a newer health observation.
+            let client = config.client_root.as_deref().map(config.canonicalize);
+            let captured = payload
+                .pointer("/_kin/repository")
+                .cloned()
+                .and_then(|value| {
+                    serde_json::from_value::<crate::first_contact::RepositoryIdentity>(value).ok()
+                });
+            if captured.is_some_and(|identity| {
+                !identity.root.is_empty()
+                    && identity
+                        == crate::first_contact::repository_identity(
+                            Path::new(&identity.root),
+                            client.as_deref(),
+                        )
+            }) {
+                return;
+            }
+            // An older or mismatched daemon did not budget the needed warning.
+            // Appending one now would overrun the page and falsify accounting.
+            // Refuse this page rather than forwarding data with wrong identity.
+            response.result = Some(
+                serde_json::to_value(ToolCallResult::error(
+                    "The daemon page lacks the captured repository and client-folder presentation \
+                     required by this connection. Use matching current Kin binaries and restart \
+                     the query without a cursor.",
+                ))
+                .expect("tool error serializes"),
+            );
+            return;
+        }
+    }
+    let (Some(root), Some(client)) = (repo_root, config.client_root.as_deref()) else {
+        return;
+    };
+    let identity =
+        crate::first_contact::repository_identity(&(config.canonicalize)(root), Some(client));
+    let Some(warning) = identity.warning.clone() else {
+        return;
+    };
+    let stamped = match parsed {
         Ok(serde_json::Value::Object(mut payload)) => {
             let key = crate::envelope::ENVELOPE_KEY;
             let mut kin = match payload.remove(key) {
@@ -1183,48 +1265,114 @@ impl WorkspaceMismatch {
     }
 }
 
-/// How long a `tools/call` waits for the launcher's startup daemon binding to
-/// settle before answering that the daemon is still starting, once some earlier
-/// call has already admitted the spawn.
+/// Wait for the launcher's startup binding to settle, for at most `budget`.
 ///
-/// A warm daemon binds in well under a second, so a call racing the bind gets
-/// its real answer inside this window. A caller that reaches this bound has
-/// already been told once, by the call that started the daemon, so repeating
-/// the wait buys it nothing.
-const TOOLS_CALL_STARTUP_BIND_GRACE: Duration = Duration::from_secs(10);
+/// Returns `None` once it settles, bound or not, and `Some(waited)` when the
+/// budget ran out first. The wait ends the instant the binding settles, so a
+/// warm daemon that binds in milliseconds costs a call nothing, and a cold one
+/// is waited for rather than reported on after a fixed few seconds. While it
+/// waits it tells a client that asked for progress how far the daemon has
+/// come, every [`daemon_delegate::PROGRESS_INTERVAL`], which also keeps a
+/// client that resets its own timeout on progress from giving up first.
+async fn await_startup_binding<W: AsyncWrite + Unpin>(
+    startup: &StartupDaemonBinding,
+    budget: Duration,
+    mut progress: Option<&mut CallProgressNotifier>,
+    writer: &mut W,
+    framed: bool,
+) -> Result<Option<Duration>> {
+    let began = tokio::time::Instant::now();
+    let deadline = began + budget;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if startup
+            .wait_until_settled(remaining.min(daemon_delegate::PROGRESS_INTERVAL))
+            .await
+        {
+            return Ok(None);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(Some(began.elapsed()));
+        }
+        if let Some(progress) = progress.as_deref_mut() {
+            let line = format!("waiting for the repo daemon: {}", startup.progress_line());
+            progress.notify(writer, framed, &line, Some(budget)).await?;
+        }
+    }
+}
 
-/// How long the FIRST graph-reading `tools/call` of a session waits.
-///
-/// That call is the one that admits the daemon spawn, so it is the only one
-/// that can be waiting on a cold open rather than on a daemon somebody else
-/// already paid for, and ten seconds is measurably short for it. Measured on
-/// 2026-09-05 against kin `f6a29e329` on a 470 MiB store of 218 files: the
-/// first call gave up at 10 s and the next one bound after 15.3 s, so the bind
-/// wanted about 25 s and the session's first question failed anyway. The same
-/// bound is what a call racing an in-flight admission needs: a five-line edit
-/// on that store took the daemon 20 s to admit, and every `tools/call` during
-/// that window read as still starting.
-///
-/// 45 s is that measurement with margin, and it stays under the 60 s per-call
-/// timeout common MCP clients use, so a client times out on nothing this
-/// process chose. It is a ceiling and not a delay: `wait_until_settled` returns
-/// the instant the binding settles, so a warm session is exactly as fast as it
-/// was. A cold flagship-scale start still takes minutes, no defensible grace
-/// covers that, and the honest still-starting answer is still what it gets.
-///
-/// `kin setup`'s own MCP round trip is sized against this constant
-/// (`kin_cli::commands::setup_verify`), because a client budget shorter than
-/// this grace turns a still-starting answer into a killed process.
-pub const FIRST_TOOLS_CALL_STARTUP_BIND_GRACE: Duration = Duration::from_secs(45);
+/// Forward one message while relaying, as MCP progress notifications, what
+/// any wait inside it reports: a daemon that is listening and still opening,
+/// or a daemon being restarted after it stopped.
+async fn forward_reporting_progress<W: AsyncWrite + Unpin>(
+    message: &str,
+    config: &McpServerConfig,
+    notifier: &mut CallProgressNotifier,
+    writer: &mut W,
+    framed: bool,
+) -> Result<Option<JsonRpcResponse>> {
+    let (progress, mut lines) = daemon_delegate::CallProgress::channel();
+    let call =
+        daemon_delegate::with_call_progress(progress, process_daemon_message(message, config));
+    tokio::pin!(call);
+    loop {
+        tokio::select! {
+            biased;
+            response = &mut call => return Ok(response),
+            Some(line) = lines.recv() => notifier.notify(writer, framed, &line, None).await?,
+        }
+    }
+}
 
-/// The bound one `tools/call` gets to wait for the startup binding.
+/// The MCP progress notifications for one `tools/call` whose client sent a
+/// `progressToken`.
 ///
-/// Pure, so the policy is provable without a daemon, a process or a clock.
-const fn startup_bind_grace(first_graph_call: bool) -> Duration {
-    if first_graph_call {
-        FIRST_TOOLS_CALL_STARTUP_BIND_GRACE
-    } else {
-        TOOLS_CALL_STARTUP_BIND_GRACE
+/// Progress is the seconds this call has spent waiting so far, which only
+/// grows, as the protocol requires of it. A call with no token gets no
+/// notifications: the client did not ask for them.
+struct CallProgressNotifier {
+    token: serde_json::Value,
+    began: tokio::time::Instant,
+    last: Option<u64>,
+}
+
+impl CallProgressNotifier {
+    fn for_request(request: &serde_json::Value) -> Option<Self> {
+        let token = request.pointer("/params/_meta/progressToken")?;
+        (token.is_string() || token.is_number()).then(|| Self {
+            token: token.clone(),
+            began: tokio::time::Instant::now(),
+            last: None,
+        })
+    }
+
+    async fn notify<W: AsyncWrite + Unpin>(
+        &mut self,
+        writer: &mut W,
+        framed: bool,
+        message: &str,
+        total: Option<Duration>,
+    ) -> Result<()> {
+        let progress = self.began.elapsed().as_secs();
+        if self.last.is_some_and(|last| progress <= last) {
+            return Ok(());
+        }
+        self.last = Some(progress);
+        let mut params = serde_json::json!({
+            "progressToken": self.token,
+            "progress": progress,
+            "message": message,
+        });
+        if let Some(total) = total {
+            params["total"] = serde_json::json!(total.as_secs());
+        }
+        let notification = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/progress",
+            "params": params,
+        });
+        let text = serde_json::to_string(&notification).map_err(McpError::Json)?;
+        write_stdio_message(writer, &text, framed).await
     }
 }
 
@@ -1938,6 +2086,29 @@ async fn dispatch_tools_call<G: PersistableMcpStore>(
         return offline_envelope_success(id, refusal, &call_params.name, &budget);
     }
 
+    if call_params.name == "kin_graph_status" {
+        // Offline graph status still cannot claim daemon counters or source
+        // authority. Its actual registry can independently disclose staged work.
+        let result = (|| -> std::result::Result<ToolCallResult, String> {
+            let request =
+                crate::status_pages::StatusRequest::from_arguments(&call_params.arguments)?;
+            let unavailable =
+                crate::handlers::entities::handle_graph_status(&call_params.arguments, store)
+                    .map_err(|error| error.to_string())?;
+            let result = crate::status_pages::with_open_transactions(
+                unavailable,
+                &sessions.open_staged_transactions(),
+                &serde_json::json!({"registry":sessions as *const SessionRegistry as usize,
+                    "store":store as *const G as usize,"snapshot":config.snapshot_path}),
+            )?;
+            crate::status_pages::page(result, &request, crate::status_pages::offline_cursor_key())
+        })()
+        .unwrap_or_else(ToolCallResult::error);
+        let result = envelope::finalize(result, Envelope::offline(), &call_params.name);
+        let result = crate::status_pages::enforce_ceiling(result, budget.max_chars);
+        return JsonRpcResponse::success(id, serde_json::to_value(result).unwrap_or_default());
+    }
+
     if call_params.name == crate::handlers::tool_search::TOOL_NAME {
         let result = crate::handlers::tool_search::handle_tool_search_with_profile(
             &call_params.arguments,
@@ -1976,6 +2147,61 @@ async fn dispatch_tools_call<G: PersistableMcpStore>(
             &call_params.name,
             &budget,
         );
+    }
+
+    let reference_page = call_params.name == "find_references";
+    let trace_authority = (call_params.name == "trace_data_flow" || reference_page)
+        .then(|| store.trace_page_authority())
+        .flatten();
+    let trace_context = trace_authority.as_ref().map(|authority| {
+        let identity = serde_json::json!({
+            "store": authority, "snapshot_path": config.snapshot_path,
+        });
+        if reference_page {
+            crate::reference_pages::context(&call_params.arguments, &identity)
+        } else {
+            crate::trace_pages::Context::from_arguments(&call_params.arguments, &identity)
+        }
+    });
+    if call_params.name == "trace_data_flow" || reference_page {
+        if call_params
+            .arguments
+            .get("cursor")
+            .is_some_and(|value| !value.is_null() && !value.is_string())
+        {
+            return offline_envelope_success(
+                id,
+                ToolCallResult::error("cursor must be a string"),
+                &call_params.name,
+                &budget,
+            );
+        }
+        if let Some(cursor) = call_params
+            .arguments
+            .get("cursor")
+            .and_then(serde_json::Value::as_str)
+        {
+            let result = match trace_context.as_ref() {
+                Some(context) => (if reference_page {
+                    crate::reference_pages::resume(cursor, context, budget.max_chars)
+                } else {
+                    crate::trace_pages::resume(cursor, context, budget.max_chars)
+                })
+                .and_then(|page| {
+                    if store.trace_page_authority() != trace_authority {
+                        return Err(
+                            "trace graph changed while resuming; restart without cursor".into()
+                        );
+                    }
+                    Ok(ToolCallResult::text(page.to_string()))
+                })
+                .unwrap_or_else(ToolCallResult::error),
+                None => ToolCallResult::error(
+                    "this store cannot attest trace cursor revisions; restart without cursor",
+                ),
+            };
+            return offline_envelope_success(id, result, &call_params.name, &budget);
+        }
     }
 
     let mut handler = std::pin::pin!(handle_tool_call(
@@ -2037,6 +2263,32 @@ async fn dispatch_tools_call<G: PersistableMcpStore>(
                     return offline_envelope_success(id, error_result, &call_params.name, &budget);
                 }
             }
+            if let Some(context) = trace_context {
+                if store.trace_page_authority() != trace_authority {
+                    return offline_envelope_success(
+                        id,
+                        ToolCallResult::error(
+                            "trace graph changed during the walk; restart without cursor",
+                        ),
+                        &call_params.name,
+                        &budget,
+                    );
+                }
+                let paged = if reference_page {
+                    crate::reference_pages::finalize(result, Envelope::offline(), context, &budget)
+                } else {
+                    crate::trace_pages::finalize(
+                        result,
+                        Envelope::offline(),
+                        context,
+                        budget.max_chars,
+                    )
+                };
+                return JsonRpcResponse::success(
+                    id,
+                    serde_json::to_value(&paged).unwrap_or_default(),
+                );
+            }
             offline_envelope_success(id, result, &call_params.name, &budget)
         }
         Err(e) => offline_envelope_success(
@@ -2069,6 +2321,16 @@ fn present_routed_hints(response: &mut JsonRpcResponse, call_params: &ToolCallPa
     let Ok(mut result) = serde_json::from_value::<ToolCallResult>(value.clone()) else {
         return;
     };
+    if result.content.first().is_some_and(|block| {
+        let ContentBlock::Text { text } = block;
+        serde_json::from_str::<serde_json::Value>(text)
+            .is_ok_and(|payload| crate::trace_pages::is_page(&payload))
+    }) {
+        // Paging froze the semantic records and their original safety reading.
+        // Rewriting whole records here but not their UTF-8 fragments would make
+        // reconstructed content depend on the requested page size.
+        return;
+    }
     let budget = ResponseBudget::from_arguments(&call_params.arguments);
     let original = result.clone();
     crate::routed::rewrite_hints(&mut result, budget.max_chars);
@@ -2204,6 +2466,21 @@ async fn handle_tools_call_daemon(
     response
 }
 
+/// Connection-owned presentation metadata, supplied before the daemon freezes
+/// a trace/reference answer. It is not an agent argument or graph authority.
+fn bind_paged_client_folder(call: &mut ToolCallParams, config: &McpServerConfig) {
+    const ARGUMENT: &str = crate::trace_pages::CLIENT_ROOT_ARGUMENT;
+    call.arguments.remove(ARGUMENT);
+    if matches!(call.name.as_str(), "find_references" | "trace_data_flow") {
+        if let Some(client) = config.client_root.as_deref() {
+            call.arguments.insert(
+                ARGUMENT.into(),
+                serde_json::json!((config.canonicalize)(client).to_string_lossy()),
+            );
+        }
+    }
+}
+
 /// The daemon route from a named call to its enveloped answer.
 async fn forward_tools_call(
     id: Option<serde_json::Value>,
@@ -2326,6 +2603,10 @@ async fn forward_tools_call(
         return JsonRpcResponse::success(id, serde_json::to_value(&enveloped).unwrap_or_default());
     }
 
+    // Routing and discovery have resolved the real tool and arguments. Never
+    // let a supplied internal value impersonate this connection's folder.
+    bind_paged_client_folder(call_params, config);
+
     // Graph status carries its own selected-graph coverage observation. Mark
     // the beginning before forwarding so a refusal published during the call
     // cannot be discharged by counters that may have preceded it.
@@ -2446,6 +2727,7 @@ async fn forward_tools_call(
             graph_status_observation_started_at_unix
                 .expect("graph status records its observation start before forwarding"),
         );
+        let enveloped = crate::status_pages::enforce_ceiling(enveloped, budget.max_chars);
         return JsonRpcResponse::success(id, serde_json::to_value(&enveloped).unwrap_or_default());
     }
 
@@ -2622,6 +2904,25 @@ mod tests {
         let ContentBlock::Text { text } = result.content.first().expect("one content block");
         serde_json::from_str(text)
             .unwrap_or_else(|e| panic!("envelope-annotated payload for {tool} is not JSON: {e}"))
+    }
+
+    #[tokio::test]
+    async fn offline_reference_and_trace_reject_non_string_cursors_before_reading() {
+        for tool in ["find_references", "trace_data_flow"] {
+            for cursor in [serde_json::json!(7), serde_json::json!({"token":"x"})] {
+                let payload =
+                    call_tool_payload(tool, serde_json::json!({"query":"absent", "cursor":cursor}))
+                        .await;
+                assert!(
+                    payload.to_string().contains("cursor must be a string"),
+                    "{tool}: {payload}"
+                );
+                assert!(
+                    !payload.to_string().contains("entity not found"),
+                    "invalid transport must not become a graph answer"
+                );
+            }
+        }
     }
 
     /// Assert the offline envelope is present and well-formed on a payload.
@@ -2950,6 +3251,40 @@ mod tests {
 
     fn direct_graph_status_result() -> ToolCallResult {
         direct_graph_status_result_with_coverage(1, 1, 2)
+    }
+
+    #[test]
+    fn enrichment_status_final_envelope_budget_preserves_rows_or_refuses() {
+        let mut raw: serde_json::Value =
+            serde_json::from_str(match &direct_graph_status_result().content[0] {
+                ContentBlock::Text { text } => text,
+            })
+            .unwrap();
+        let enrichment = serde_json::json!({
+            "schema":"kin.enrichment-status.v1","scope":{"kind":"committed_graph","change":"selected-revision"},
+            "current":true,"truth_epoch":4,"snapshot_id":"a".repeat(64),
+            "proof_scope":"recorded_call_site_census","all_relationships_attested":false,
+            "files":[{"projection_path":kin_model::RepoPath::from_utf8("src/held.py").unwrap(),"proof":"unverified","current_completion":"unavailable_in_selected_scope","reason":"λ".repeat(1000)}],
+        });
+        raw["enrichment"] = enrichment.clone();
+        let wrapped = finalize_daemon_graph_status(
+            ToolCallResult::text(raw.to_string()),
+            Envelope::daemon(),
+            &[],
+            0,
+        );
+        assert_ne!(wrapped.is_error, Some(true));
+        let generous = crate::status_pages::enforce_ceiling(wrapped.clone(), 60000);
+        let ContentBlock::Text { text } = &generous.content[0];
+        let value: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(value["enrichment"], enrichment);
+        assert!(value.get("_kin").is_some());
+        assert!(text.len() <= 60000);
+        let floor = crate::status_pages::enforce_ceiling(wrapped, 2048);
+        assert_eq!(floor.is_error, Some(true));
+        let ContentBlock::Text { text } = &floor.content[0];
+        assert!(text.len() <= 2048);
+        assert!(text.contains("budget"));
     }
 
     /// The same report with its graph emptied, the shape a daemon answers with in
@@ -3599,6 +3934,63 @@ mod tests {
             SessionAuthorityMode::DaemonRequired
         );
         assert!(config.session_authority_mode.requires_daemon());
+    }
+
+    #[tokio::test]
+    async fn offline_graph_status_discloses_staged_work_without_inventing_graph_counters() {
+        let store = InMemoryGraph::new();
+        let sessions = SessionRegistry::new();
+        sessions.register("owner", "test");
+        let transaction = sessions
+            .begin_transaction("owner", "selected-entity")
+            .unwrap();
+        sessions
+            .stage_transaction(
+                &transaction.transaction_id,
+                vec![crate::session::McpMutationOperation {
+                    verb: "update".into(),
+                    target: "selected-entity".into(),
+                    payload: None,
+                    body: Some("private draft must not escape".into()),
+                    description: "edit".into(),
+                    destination: None,
+                }],
+            )
+            .unwrap();
+        let config = McpServerConfig {
+            session_authority_mode: SessionAuthorityMode::OfflineFallback,
+            allowed_tools: None,
+            ..Default::default()
+        };
+        let message = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params":{"name":"kin_graph_status","arguments":{"max_chars":60000}}})
+        .to_string();
+        let response = process_message(&message, &store, &config, &sessions)
+            .await
+            .unwrap();
+        let result: ToolCallResult = serde_json::from_value(response.result.unwrap()).unwrap();
+        assert_eq!(result.is_error, Some(true));
+        let crate::types::ContentBlock::Text { text } = &result.content[0];
+        let value: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(value["graph_status"], "unavailable");
+        assert_eq!(
+            value["open_transactions"]["items"][0]["transaction_id"],
+            transaction.transaction_id
+        );
+        assert!(value.get("entity_count").is_none());
+        assert!(value.get("completion_attested").is_none());
+        assert!(!text.contains("private draft must not escape"));
+        assert_ne!(value["_kin"]["verdict"]["safe_to_conclude_absent"], true);
+        sessions
+            .abort_transaction(&transaction.transaction_id)
+            .unwrap();
+        let response = process_message(&message, &store, &config, &sessions)
+            .await
+            .unwrap();
+        let result: ToolCallResult = serde_json::from_value(response.result.unwrap()).unwrap();
+        let crate::types::ContentBlock::Text { text } = &result.content[0];
+        let value: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(value["open_transactions"]["items"], serde_json::json!([]));
     }
 
     #[tokio::test]
@@ -5900,73 +6292,262 @@ mod tests {
             "an ordinary tool error carries the same empty degraded object it always did"
         );
     }
-    /// The bound one `tools/call` waits is decided by whether it is the call
-    /// that started the daemon.
+    /// A binding that settles long after the old fixed grace is waited for:
+    /// the call is answered from the settled binding, not told the daemon is
+    /// still starting.
     ///
-    /// The whole point of the fix is that the first ask is patient and the ones
-    /// behind it are not, so both arms are asserted. Asserting only the long one
-    /// would keep passing on the day every call got 45 s, which would put a
-    /// three-quarter-minute stall in front of every repeat question about a
-    /// daemon that is never coming up.
-    #[test]
-    fn only_the_call_that_starts_the_daemon_gets_the_long_wait() {
-        assert_eq!(
-            startup_bind_grace(true),
-            FIRST_TOOLS_CALL_STARTUP_BIND_GRACE
-        );
-        assert_eq!(startup_bind_grace(false), TOOLS_CALL_STARTUP_BIND_GRACE);
-        assert!(
-            FIRST_TOOLS_CALL_STARTUP_BIND_GRACE > TOOLS_CALL_STARTUP_BIND_GRACE,
-            "a first call that waited no longer than a repeat call is the defect this fixes"
-        );
-    }
-
-    /// The first-call bound has to clear what a cold bind actually costs and
-    /// stay under what an MCP client will wait.
-    ///
-    /// The lower bound is the measurement in the constant's own doc: a first
-    /// call gave up at 10 s and the next one bound after 15.3 s, so anything at
-    /// or under 25 s reproduces the gap. The upper bound is the 60 s per-call
-    /// timeout common clients use, which this must never reach or the client
-    /// times out instead of reading the report.
-    #[test]
-    fn the_first_call_bound_clears_the_measured_cold_bind_and_stays_under_a_client_timeout() {
-        assert!(
-            FIRST_TOOLS_CALL_STARTUP_BIND_GRACE > Duration::from_secs(25),
-            "a bound at or under the measured 25 s cold bind fixes nothing"
-        );
-        assert!(
-            FIRST_TOOLS_CALL_STARTUP_BIND_GRACE < Duration::from_secs(60),
-            "a bound at a client's own per-call timeout hands the reader a timeout, not a report"
-        );
-    }
-
-    /// A pending binding answers with the bound it waited, and the answer is
-    /// still the structured still-starting result the callers key on.
-    #[tokio::test]
-    async fn a_first_call_that_outlasts_its_bound_reports_the_bound_it_waited() {
+    /// The shape of the defect this replaces: a cold daemon on a large store
+    /// took minutes to bind, the first call gave up at 45 s and every later one
+    /// at 10 s, each with the same still-starting reply. The binding here
+    /// settles unbound so the call falls through to ordinary handling, which on
+    /// this config's empty allow-list answers "not enabled in this MCP
+    /// profile"; reaching that text proves the call waited for the settle.
+    #[tokio::test(start_paused = true)]
+    async fn a_call_waits_for_a_binding_that_settles_after_the_old_grace() {
         let startup = StartupDaemonBinding::new();
-        assert!(startup.admit_daemon_spawn());
-        let request = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 7,
-            "method": "tools/call",
-            "params": { "name": "kin_graph_status", "arguments": {} },
+        let settler = std::sync::Arc::clone(&startup);
+        let settle_after = Duration::from_secs(120);
+        assert!(settle_after < daemon_delegate::readiness_budget());
+        tokio::spawn(async move {
+            tokio::time::sleep(settle_after).await;
+            settler.resolve_unbound("settled after a cold start");
         });
-        let response =
-            startup_pending_response(&request, &startup, FIRST_TOOLS_CALL_STARTUP_BIND_GRACE)
-                .expect("a call carrying an id has a response channel");
-        let rendered = serde_json::to_string(&response).expect("serialize");
+
+        let began = tokio::time::Instant::now();
+        let responses = drive_daemon_loop_with_startup(
+            &[
+                serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}),
+                tool_call(3, "semantic_locate"),
+            ],
+            None,
+            None,
+            Some(startup),
+        )
+        .await;
+
+        let answer = responses
+            .iter()
+            .find(|value| value.get("id").and_then(|id| id.as_u64()) == Some(3))
+            .expect("the tool call must be answered");
+        let text = tool_error_text(answer);
         assert!(
-            rendered.contains(&format!(
-                "this call waited {}s",
-                FIRST_TOOLS_CALL_STARTUP_BIND_GRACE.as_secs()
-            )),
-            "the report must name the bound this call actually waited: {rendered}"
+            !text.contains("still starting"),
+            "a binding that settles inside the call's budget must be waited for: {text}"
         );
         assert!(
-            rendered.contains("still starting") && rendered.contains("retry"),
-            "the answer is still the honest still-starting report: {rendered}"
+            text.contains("not enabled in this MCP profile"),
+            "the call must be answered from the settled binding: {text}"
+        );
+        assert!(
+            began.elapsed() >= settle_after,
+            "the answer came before the binding settled, so nothing was waited for"
+        );
+    }
+
+    /// Every call gets the whole readiness budget, not only the first one.
+    ///
+    /// The first call here spends its whole budget and says so. The binding
+    /// then settles thirty seconds into the second call, three times longer
+    /// than a repeat call used to be allowed to wait, and the second call is
+    /// answered from it.
+    #[tokio::test(start_paused = true)]
+    async fn a_later_call_waits_as_long_as_the_first_one_did() {
+        let budget = daemon_delegate::readiness_budget();
+        let startup = StartupDaemonBinding::new();
+        let settler = std::sync::Arc::clone(&startup);
+        tokio::spawn(async move {
+            tokio::time::sleep(budget + Duration::from_secs(30)).await;
+            settler.resolve_unbound("settled during the second call");
+        });
+
+        let responses = drive_daemon_loop_with_startup(
+            &[
+                serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}),
+                tool_call(3, "kin_graph_status"),
+                tool_call(4, "semantic_locate"),
+            ],
+            None,
+            None,
+            Some(startup),
+        )
+        .await;
+
+        let first = responses
+            .iter()
+            .find(|value| value.get("id").and_then(|id| id.as_u64()) == Some(3))
+            .expect("the first call must be answered");
+        let first_text = tool_error_text(first);
+        assert!(
+            first_text.contains("still starting")
+                && first_text.contains(&format!("waited {}s", budget.as_secs())),
+            "a call whose budget runs out says so, with the budget it spent: {first_text}"
+        );
+
+        let second = responses
+            .iter()
+            .find(|value| value.get("id").and_then(|id| id.as_u64()) == Some(4))
+            .expect("the second call must be answered");
+        let second_text = tool_error_text(second);
+        assert!(
+            !second_text.contains("still starting")
+                && second_text.contains("not enabled in this MCP profile"),
+            "a repeat call must wait for the daemon too, not give up after a few seconds: \
+             {second_text}"
+        );
+    }
+
+    /// A call whose client sent a progress token hears how far the daemon has
+    /// come while it waits, and a call without one hears nothing extra.
+    #[tokio::test(start_paused = true)]
+    async fn a_waiting_call_reports_progress_to_a_client_that_asked_for_it() {
+        let startup = StartupDaemonBinding::new();
+        startup.set_phase_probe(Box::new(|| crate::startup_binding::StartupProgress {
+            phase: "phase: the daemon process is up and loading the repository graph",
+            last_open: Some(Duration::from_secs(400)),
+        }));
+        let settler = std::sync::Arc::clone(&startup);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(22)).await;
+            settler.resolve_unbound("settled");
+        });
+
+        let mut asked = tool_call(3, "kin_graph_status");
+        asked["params"]["_meta"] = serde_json::json!({"progressToken": "call-3"});
+        let responses = drive_daemon_loop_with_startup(
+            &[
+                serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}),
+                asked,
+            ],
+            None,
+            None,
+            Some(startup),
+        )
+        .await;
+
+        let notes: Vec<&serde_json::Value> = responses
+            .iter()
+            .filter(|value| {
+                value.get("method").and_then(|m| m.as_str()) == Some("notifications/progress")
+            })
+            .collect();
+        assert!(
+            notes.len() >= 3,
+            "a 22 s wait reported every 5 s must send several notifications: {responses:#?}"
+        );
+        let mut last = None;
+        for note in &notes {
+            assert_eq!(note["params"]["progressToken"], "call-3");
+            assert_eq!(
+                note["params"]["total"],
+                daemon_delegate::readiness_budget().as_secs()
+            );
+            let progress = note["params"]["progress"]
+                .as_u64()
+                .expect("numeric progress");
+            assert!(
+                last.is_none_or(|last| progress > last),
+                "progress must only grow: {notes:#?}"
+            );
+            last = Some(progress);
+            let message = note["params"]["message"].as_str().unwrap_or_default();
+            assert!(
+                message.contains("loading the repository graph")
+                    && message.contains("of the 400s the last open of this store took"),
+                "each notification says what is loading and how far along it is: {message}"
+            );
+        }
+        let answer_at = responses
+            .iter()
+            .position(|value| value.get("id").and_then(|id| id.as_u64()) == Some(3))
+            .expect("the call must be answered");
+        assert!(
+            responses[..answer_at]
+                .iter()
+                .filter(|value| value.get("method").is_some())
+                .all(|value| value["method"] == "notifications/progress"),
+            "only progress notifications may precede the answer"
+        );
+        assert!(
+            responses[answer_at..]
+                .iter()
+                .all(|value| value["method"] != "notifications/progress"),
+            "nothing may be reported for a call after it has been answered"
+        );
+
+        // The same wait without a token sends nothing but the answer.
+        let quiet = StartupDaemonBinding::new();
+        let settler = std::sync::Arc::clone(&quiet);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(22)).await;
+            settler.resolve_unbound("settled");
+        });
+        let responses = drive_daemon_loop_with_startup(
+            &[
+                serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}),
+                tool_call(3, "kin_graph_status"),
+            ],
+            None,
+            None,
+            Some(quiet),
+        )
+        .await;
+        assert!(
+            responses
+                .iter()
+                .all(|value| value["method"] != "notifications/progress"),
+            "a client that asked for no progress must get none: {responses:#?}"
+        );
+    }
+
+    /// When the budget truly runs out the answer is bounded and honest: it
+    /// says what is still loading and how far along it is, names the knob that
+    /// widens the wait, and still marks the daemon unreachable, never ready.
+    #[tokio::test(start_paused = true)]
+    async fn a_call_whose_budget_runs_out_says_what_is_loading_and_how_far_along() {
+        let startup = StartupDaemonBinding::new();
+        startup.set_phase_probe(Box::new(|| crate::startup_binding::StartupProgress {
+            phase: "phase: the daemon process is up and loading the repository graph",
+            last_open: Some(Duration::from_secs(900)),
+        }));
+
+        let began = tokio::time::Instant::now();
+        let responses = drive_daemon_loop_with_startup(
+            &[
+                serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}),
+                tool_call(3, "kin_graph_status"),
+            ],
+            None,
+            None,
+            Some(startup),
+        )
+        .await;
+        let budget = daemon_delegate::readiness_budget();
+        assert!(
+            began.elapsed() >= budget,
+            "the call must spend its whole budget before giving up"
+        );
+
+        let answer = responses
+            .iter()
+            .find(|value| value.get("id").and_then(|id| id.as_u64()) == Some(3))
+            .expect("the call must be answered");
+        let text = tool_error_text(answer);
+        for expected in [
+            "still starting",
+            &format!("waited {}s", budget.as_secs()),
+            "whole readiness budget",
+            "loading the repository graph",
+            "of the 900s the last open of this store took",
+            daemon_delegate::DAEMON_PATIENCE_ENV,
+            "retry",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?}: {text}");
+        }
+        let payload: serde_json::Value =
+            serde_json::from_str(&text).expect("the answer carries its envelope");
+        assert_eq!(
+            payload["_kin"]["degraded"]["daemon_unreachable"], true,
+            "a daemon that never became ready must not be reported as one that did: {payload:#?}"
         );
     }
 
@@ -6675,6 +7256,15 @@ mod tests {
     /// included, and `agent-routed-query` as `agent-query`.
     #[tokio::test]
     async fn each_routed_command_returns_its_named_tool_payload() {
+        // Both answers read the process environment, and `KIN_SOURCE_ROOT`
+        // decides every read path in them: set, the fixture's file reads as
+        // `.kin/source-root/src/routed.rs`, unset as `src/routed.rs`. Other
+        // tests in this binary set it through the environment guard while this
+        // one runs, and one that set or restored it between a routed call and
+        // its named call made the two answers differ in `hits[].file` and in
+        // the response size accounting that follows from it. Holding the
+        // guard's domain keeps the environment still for the whole comparison.
+        let _environment = kin_core::test_env::EnvVarGuard::new();
         let (store, entities) = routed_fixture();
         let id_of = |name: &str| {
             entities
@@ -6774,6 +7364,7 @@ mod tests {
             };
             for (routed, named) in pairs {
                 let sessions = SessionRegistry::new();
+                let observed_start = kin_model::Timestamp::now();
                 let routed_answer = process_message(
                     &tools_call(crate::routed::TOOL_NAME, routed_args.clone()),
                     &store,
@@ -6795,6 +7386,7 @@ mod tests {
                     "{routed_args} was a transport error"
                 );
                 let named_answer = presented_as_routed(named_answer, tool, named_args);
+                let observed_end = kin_model::Timestamp::now();
                 // A write opens its own transaction, so the two answers carry
                 // different transaction ids and nothing else.
                 let comparable = |result: &Option<serde_json::Value>| {
@@ -6813,6 +7405,22 @@ mod tests {
                                 if let Ok(mut payload) =
                                     serde_json::from_str::<serde_json::Value>(text)
                                 {
+                                    if *tool == "kin_graph_status" {
+                                        // Independent status calls observe the same live work
+                                        // at different instants. Check both actual timestamps,
+                                        // then compare every stable item and cursor identity.
+                                        let observed = payload
+                                            .pointer_mut("/open_transactions/observed_at")
+                                            .expect("status carries its observation time");
+                                        let timestamp: kin_model::Timestamp =
+                                            serde_json::from_value(observed.clone())
+                                                .expect("valid observation timestamp");
+                                        assert!(
+                                            timestamp >= observed_start
+                                                && timestamp <= observed_end
+                                        );
+                                        *observed = serde_json::to_value(&observed_start).unwrap();
+                                    }
                                     if let Some(explored) = payload
                                         .get_mut("explored")
                                         .and_then(serde_json::Value::as_array_mut)
@@ -7525,6 +8133,396 @@ mod tests {
         let mut unbound = answer(r#"{"message": "ok"}"#);
         stamp_client_folder(&mut unbound, None, &nested);
         assert_eq!(text_of(&unbound), r#"{"message": "ok"}"#);
+    }
+
+    #[test]
+    fn routed_hints_preserve_frozen_full_reading_and_fragment_pages() {
+        let hint = "Read it with get_entity_source.";
+        for tool in ["find_references", "trace_data_flow"] {
+            let call: ToolCallParams = serde_json::from_value(serde_json::json!({
+                "name": tool, "arguments": {"max_chars": 2000}
+            }))
+            .unwrap();
+            for payload in [
+                serde_json::json!({"_kin":{"page":{"version":1,"complete":true}},"hint":hint}),
+                serde_json::json!({"_kin":{"page":{"version":1,"complete":false}},
+                    "readings":[{"key":"_kin","value":{"advice":hint}}]}),
+                serde_json::json!({"_kin":{"page":{"version":1,"complete":false}},
+                    "record_fragment":{"collection":"readings","index":0,"key":"_kin",
+                        "field":"advice","encoding":"utf8","byte_offset":0,
+                        "total_bytes":hint.len(),"field_complete":true,"record_complete":true,"text":hint}}),
+            ] {
+                let text = serde_json::to_string_pretty(&payload).unwrap();
+                let mut response = JsonRpcResponse::success(
+                    Some(serde_json::json!(1)),
+                    serde_json::to_value(ToolCallResult::text(text)).unwrap(),
+                );
+                let before = serde_json::to_vec(&response).unwrap();
+                present_routed_hints(&mut response, &call);
+                assert_eq!(serde_json::to_vec(&response).unwrap(), before);
+            }
+            let mut ordinary = JsonRpcResponse::success(
+                Some(serde_json::json!(1)),
+                serde_json::to_value(ToolCallResult::text(
+                    serde_json::json!({
+                        "hint":hint,"_kin":{"advice":hint}
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+            );
+            present_routed_hints(&mut ordinary, &call);
+            let payload: serde_json::Value = serde_json::from_str(
+                ordinary.result.as_ref().unwrap()["content"][0]["text"]
+                    .as_str()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(payload["hint"], "Read it with kin source.");
+            assert_eq!(payload["_kin"]["advice"], hint);
+        }
+    }
+
+    #[test]
+    fn paged_client_folder_forwarding_uses_only_the_canonical_connection() {
+        fn canonicalize(path: &Path) -> PathBuf {
+            if path == Path::new("/link") {
+                PathBuf::from("/work/repo/app")
+            } else {
+                path.to_path_buf()
+            }
+        }
+        for tool in ["find_references", "trace_data_flow", "get_entity"] {
+            for client_root in [None, Some(PathBuf::from("/link"))] {
+                let mut call: ToolCallParams = serde_json::from_value(serde_json::json!({
+                    "name": tool,
+                    "arguments": {"query": "Target", "__kin_client_root": "/spoofed"}
+                }))
+                .unwrap();
+                let config = McpServerConfig {
+                    client_root: client_root.clone(),
+                    canonicalize,
+                    ..McpServerConfig::default()
+                };
+                bind_paged_client_folder(&mut call, &config);
+                assert_eq!(call.arguments["query"], "Target");
+                let expected = (client_root.is_some() && tool != "get_entity")
+                    .then(|| serde_json::json!("/work/repo/app"));
+                assert_eq!(
+                    call.arguments.get(crate::trace_pages::CLIENT_ROOT_ARGUMENT),
+                    expected.as_ref()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn paged_client_folder_preserves_frozen_identity_and_exact_wire_bytes() {
+        const CEILING: usize = 4000;
+        for tool in ["find_references", "trace_data_flow"] {
+            for client in ["/work/repo", "/work/repo/app"] {
+                for count in [0, 1, 24] {
+                    let config = McpServerConfig {
+                        client_root: Some(PathBuf::from(client)),
+                        ..McpServerConfig::default()
+                    };
+                    let identity = crate::first_contact::repository_identity(
+                        Path::new("/work/repo"),
+                        Some(Path::new(client)),
+                    );
+                    let primary = if tool == "find_references" {
+                        "references"
+                    } else {
+                        "chain"
+                    };
+                    let rows: Vec<_> = (0..count)
+                        .map(|index| {
+                            serde_json::json!({
+                                "entity_id": format!("row-{index}"), "step": index + 1,
+                                "parent_step": 0, "body": "x".repeat(300)
+                            })
+                        })
+                        .collect();
+                    let mut payload =
+                        serde_json::json!({"negative": {"safe_to_conclude_absent": false}});
+                    payload[primary] = serde_json::json!(rows);
+                    let context = crate::trace_pages::Context::new(
+                        &serde_json::json!({"tool": tool, "client": client, "count": count}),
+                        &serde_json::json!({"repo": "/work/repo", "generation": 7}),
+                    );
+                    let envelope = crate::Envelope::daemon().with_repository(
+                        &serde_json::json!({"repo_root": "/work/repo"}),
+                        Some(Path::new(client)),
+                        Path::to_path_buf,
+                    );
+                    let result = ToolCallResult::text(payload.to_string());
+                    let result = if tool == "find_references" {
+                        crate::reference_pages::finalize(
+                            result,
+                            envelope,
+                            context.clone(),
+                            &crate::budget::ResponseBudget {
+                                max_chars: CEILING,
+                                ..Default::default()
+                            },
+                        )
+                    } else {
+                        crate::trace_pages::finalize(result, envelope, context.clone(), CEILING)
+                    };
+                    assert_ne!(result.is_error, Some(true), "{result:?}");
+                    let crate::ContentBlock::Text { text } = &result.content[0];
+                    let mut page: serde_json::Value = serde_json::from_str(text).unwrap();
+                    let mut pages = 0;
+                    loop {
+                        pages += 1;
+                        assert!(pages < 100);
+                        let before = page.to_string();
+                        assert!(before.len() <= CEILING);
+                        assert_eq!(page["_kin"]["response"]["chars_after_budget"], before.len());
+                        assert_eq!(
+                            page["_kin"]["repository"],
+                            serde_json::to_value(&identity).unwrap()
+                        );
+                        let mut response = JsonRpcResponse::success(
+                            Some(serde_json::json!(1)),
+                            serde_json::to_value(ToolCallResult::text(before.clone())).unwrap(),
+                        );
+                        // A later binding must neither replace captured identity nor add bytes.
+                        stamp_client_folder(&mut response, Some(Path::new("/later/repo")), &config);
+                        assert_eq!(
+                            response.result.as_ref().unwrap()["content"][0]["text"],
+                            before
+                        );
+                        let Some(cursor) = page["next_cursor"].as_str() else {
+                            break;
+                        };
+                        page = crate::trace_pages::resume(cursor, &context, CEILING).unwrap();
+                    }
+                    if count == 24 {
+                        assert!(pages > 1);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn profiled_pages_preserve_captured_identity_through_stdio_presentation() {
+        use serde_json::json;
+
+        for tool in ["find_references", "trace_data_flow"] {
+            for agent_belt in [false, true] {
+                for client in ["/work/repo", "/work/repo/app"] {
+                    for count in [0, 3] {
+                        for requested_ceiling in [None, Some(2000), Some(8000), Some(60_000)] {
+                            let config = McpServerConfig {
+                                agent_belt,
+                                number_entity_lines: agent_belt,
+                                client_root: Some(PathBuf::from(client)),
+                                ..McpServerConfig::default()
+                            };
+                            let mut call: ToolCallParams = serde_json::from_value(json!({
+                                "name":tool, "arguments":{"query":"Context.pop"}
+                            }))
+                            .unwrap();
+                            if let Some(ceiling) = requested_ceiling {
+                                call.arguments.insert("max_chars".into(), json!(ceiling));
+                            }
+                            if config.agent_belt {
+                                crate::agent_belt::apply_belt_defaults(tool, &mut call.arguments);
+                            }
+                            bind_paged_client_folder(&mut call, &config);
+                            let budget = ResponseBudget::from_arguments(&call.arguments);
+                            assert_eq!(budget.answer_only, agent_belt && tool == "find_references");
+                            let context = crate::reference_pages::context(
+                                &call.arguments,
+                                &json!({"repo":"/work/repo", "generation":7}),
+                            );
+                            let mut envelope = Envelope::daemon().with_repository(
+                                &json!({"repo_root":"/work/repo"}),
+                                Some(Path::new(client)),
+                                Path::to_path_buf,
+                            );
+                            envelope.graph_as_of =
+                                Some(json!({"generation":7, "graph_root":"held"}));
+                            envelope.answered_by =
+                                crate::envelope::AnsweringDaemon::from_health(&json!({
+                                    "pid":42, "repo_root":"/work/repo", "repo_id":"held-repository",
+                                    "uptime_seconds":100, "version":"test"
+                                }));
+                            // A real resolved focal enters answer-only projection. The older
+                            // identity test omitted it and therefore never exercised that branch.
+                            let mut payload = json!({
+                                "focal_entity":{"entity_id":"focal", "name":"Context.pop"},
+                                "total_upstream":count,
+                                "call_sites":{
+                                    "candidate_count":2,
+                                    "candidates_by_reason":{(kin_model::call_site_reading::REACH_CALLEE_SPELLS):2},
+                                    "candidates":[{"caller":"other", "callee":"pop", "reason":kin_model::call_site_reading::REACH_CALLEE_SPELLS}],
+                                    "clauses":["proof_context_unverified: recorded proof is unverified"]
+                                },
+                                "source_derivation":crate::source_derivation::SourceDerivationObservation::unavailable(
+                                    &"source observation remains unproven ".repeat(220)
+                                ),
+                                "negative":{"safe_to_conclude_absent":false}
+                            });
+                            let primary = if tool == "find_references" {
+                                "references"
+                            } else {
+                                "chain"
+                            };
+                            payload[primary] = json!((0..count)
+                                .map(|index| json!({
+                                    "entity_id":format!("row-{index}"), "step":index+1,
+                                    "parent_step":0, "resolution":"type_resolved",
+                                    "signature":"held signature", "body":"semantic body"
+                                }))
+                                .collect::<Vec<_>>());
+                            let raw = ToolCallResult::text(payload.to_string());
+                            let page_result = if tool == "find_references" {
+                                crate::reference_pages::finalize(
+                                    raw,
+                                    envelope.clone(),
+                                    context.clone(),
+                                    &budget,
+                                )
+                            } else {
+                                crate::trace_pages::finalize(
+                                    raw,
+                                    envelope.clone(),
+                                    context.clone(),
+                                    budget.max_chars,
+                                )
+                            };
+                            assert_ne!(page_result.is_error, Some(true), "{page_result:?}");
+                            let ContentBlock::Text { text } = &page_result.content[0];
+                            let mut page: serde_json::Value = serde_json::from_str(text).unwrap();
+                            let mut pages = 0;
+                            let mut saw_fragment = false;
+                            loop {
+                                pages += 1;
+                                assert!(pages < 500, "continuation did not terminate");
+                                saw_fragment |= page.get("record_fragment").is_some();
+                                let before = page.to_string();
+                                assert!(before.len() <= budget.max_chars);
+                                assert_eq!(
+                                    page["_kin"]["response"]["chars_after_budget"],
+                                    before.len()
+                                );
+                                for key in ["repository", "graph_as_of", "answered_by", "runtime"] {
+                                    assert_eq!(
+                                        page["_kin"][key],
+                                        serde_json::to_value(&envelope).unwrap()[key],
+                                        "{tool}/{agent_belt}/{key}"
+                                    );
+                                }
+                                assert_eq!(
+                                    page["_kin"]["verdict"]["safe_to_conclude_absent"],
+                                    false
+                                );
+                                if page["_kin"]["page"]["complete"] == true {
+                                    if budget.answer_only {
+                                        assert_eq!(page["_kin"]["shape"], "answer_only");
+                                        assert_eq!(page["call_site_candidates"]["count"], 2);
+                                        assert_eq!(
+                                            page["call_site_candidates"]["named"]
+                                                .as_array()
+                                                .unwrap()
+                                                .len(),
+                                            1
+                                        );
+                                        assert_eq!(
+                                            page["call_site_candidates"]["named_withheld"],
+                                            1
+                                        );
+                                    }
+                                    assert_eq!(page[primary].as_array().unwrap().len(), count);
+                                    assert_eq!(
+                                        page["_kin"]["source_derivation"],
+                                        payload["source_derivation"]
+                                    );
+                                }
+                                // The real stdio sequence must not strip, rewrite or requalify
+                                // any frozen field, including fragments, safety readings and counts.
+                                let mut result = ToolCallResult::text(before.clone());
+                                present_result(&config, tool, &mut result);
+                                result = envelope::finalize_bounded(
+                                    result,
+                                    Envelope::daemon_unreachable(),
+                                    tool,
+                                    &budget,
+                                );
+                                let mut response = JsonRpcResponse::success(
+                                    Some(json!(1)),
+                                    serde_json::to_value(result).unwrap(),
+                                );
+                                stamp_client_folder(
+                                    &mut response,
+                                    Some(Path::new("/later/repository")),
+                                    &config,
+                                );
+                                assert_ne!(response.result.as_ref().unwrap()["isError"], true);
+                                assert_eq!(
+                                    response.result.as_ref().unwrap()["content"][0]["text"],
+                                    before
+                                );
+                                let Some(cursor) = page["next_cursor"].as_str() else {
+                                    break;
+                                };
+                                page =
+                                    crate::trace_pages::resume(cursor, &context, budget.max_chars)
+                                        .unwrap();
+                            }
+                            if requested_ceiling == Some(60_000) {
+                                assert_eq!(pages, 1, "complete-envelope control must fit");
+                            } else if requested_ceiling == Some(2000) {
+                                assert!(
+                                    pages > 1,
+                                    "floor control must traverse continuation pages"
+                                );
+                                assert!(
+                                    saw_fragment,
+                                    "floor control must preserve a fragmented safety reading"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn paged_client_folder_refuses_missing_or_stale_presentation_without_growth() {
+        let config = McpServerConfig {
+            client_root: Some(PathBuf::from("/work/repo/app")),
+            ..McpServerConfig::default()
+        };
+        for repository in [
+            serde_json::Value::Null,
+            serde_json::json!({"root": "/work/repo"}),
+            serde_json::to_value(crate::first_contact::repository_identity(
+                Path::new("/work/repo"),
+                Some(Path::new("/other/client")),
+            ))
+            .unwrap(),
+        ] {
+            let page = serde_json::json!({
+                "_kin": {"page": {"version": 1}, "repository": repository},
+                "references": [{"body": "x".repeat(1600)}], "next_cursor": "held"
+            });
+            let mut response = JsonRpcResponse::success(
+                Some(serde_json::json!(1)),
+                serde_json::to_value(ToolCallResult::text(page.to_string())).unwrap(),
+            );
+            stamp_client_folder(&mut response, Some(Path::new("/work/repo/app")), &config);
+            let result = response.result.unwrap();
+            assert_eq!(result["isError"], true);
+            let text = result["content"][0]["text"].as_str().unwrap();
+            assert!(text.len() < 2000);
+            assert!(text.contains("restart the query without a cursor"));
+            assert!(!text.contains("held"));
+        }
     }
 
     async fn drive_daemon_loop_with_config(

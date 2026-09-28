@@ -4,6 +4,7 @@
 //! Daemon-private access to the local repository-v6 authority pinned at startup.
 
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use anyhow::{bail, Result};
 use kin_db::{LocalFileBackend, RepositoryAuthorityManager};
@@ -147,7 +148,10 @@ impl RepositoryAuthorityBindRefusal {
 /// Command handlers must use this boundary instead of rediscovering repository
 /// or workspace identity from mutable manifests.
 pub(crate) struct ActiveLocalRepositoryAuthority {
-    pub(crate) manager: RepositoryAuthorityManager<LocalFileBackend>,
+    /// Shared with the daemon's other readers and writers when bound through
+    /// [`Self::open_bound`], so a command that commits through it leaves the
+    /// successor it wrote in the one authority the daemon holds.
+    pub(crate) manager: Arc<RepositoryAuthorityManager<LocalFileBackend>>,
     pub(crate) repository_id: RepositoryId,
     pub(crate) workspace_id: WorkspaceId,
 }
@@ -156,15 +160,34 @@ impl ActiveLocalRepositoryAuthority {
     /// Bind the startup-pinned authority, revalidating the retained
     /// per-repository namespace identity before any planning reads it.
     ///
-    /// The revalidation is deliberately ahead of the authority open so a
-    /// replaced or detached namespace is named as such, instead of surfacing as
+    /// The revalidation is deliberately ahead of the authority so a replaced
+    /// or detached namespace is named as such, instead of surfacing as
     /// whatever the authority decode happens to fail on. It reads namespace
     /// identity from metadata alone and classifies its own refusal, so a fault
-    /// that says nothing about identity stays internal and the bind still pays
-    /// exactly one authority load and one exclusive lock, in the open below.
-    /// That same open also refuses a retained namespace whose persisted
-    /// authority record is absent rather than accepting a fresh generation
-    /// zero in its place.
+    /// that says nothing about identity stays internal.
+    ///
+    /// The authority itself is the one the daemon already holds for the
+    /// current publication (see [`crate::api::held_repository_authority`]),
+    /// not an open of this command's own. An open decodes the complete
+    /// persisted authority and re-verifies every body in repository CAS, and
+    /// on a converted 26,000-object store that was minutes per branch command
+    /// for a store the daemon had already verified. Borrowing keeps every
+    /// guarantee the open gave:
+    ///
+    /// - The held authority is handed out only while `authority.json` reads as
+    ///   it did before that authority was loaded. A publication by anyone
+    ///   else, the CLI or a second daemon included, moves those bytes, and this
+    ///   bind then loads the new publication fresh, with the same recovery and
+    ///   validation an open performs, including the refusal of a namespace
+    ///   whose authority record is absent.
+    /// - A publication that lands after the bind is still caught where it
+    ///   always was: the commit's compare-and-swap against the durable head,
+    ///   under the exclusive repository lock, refuses a successor built on a
+    ///   head that is no longer current.
+    /// - Writers stay single: the manager serializes its own commits behind one
+    ///   writer permit, the exclusive repository lock serializes processes, and
+    ///   every command that commits through this bind already holds the
+    ///   daemon's persistence gate before it binds.
     pub(crate) fn open_bound(
         state: &DaemonState,
     ) -> std::result::Result<Self, RepositoryAuthorityBindRefusal> {
@@ -180,9 +203,9 @@ impl ActiveLocalRepositoryAuthority {
                     RepositoryAuthorityBindRefusal::Unavailable(error)
                 }
             })?;
-        let manager = context
-            .open()
-            .map_err(RepositoryAuthorityBindRefusal::Unavailable)?;
+        let manager = crate::api::held_repository_authority(state).map_err(|(_, message)| {
+            RepositoryAuthorityBindRefusal::Unavailable(kin_db::KinDbError::StorageError(message))
+        })?;
         Ok(Self {
             manager,
             repository_id: context.repository_id().clone(),
@@ -190,11 +213,22 @@ impl ActiveLocalRepositoryAuthority {
         })
     }
 
-    /// Bind for assertions that only need the refusal text. Command paths must
-    /// use [`Self::open_bound`] so they can answer with a typed status.
+    /// Open a fresh authority of the test's own, never the daemon's held one.
+    ///
+    /// Tests use this two ways, and both need an open rather than a borrow: to
+    /// read what is durable on disk, where a borrow would read back the
+    /// daemon's in-memory state and prove nothing about persistence, and to
+    /// publish as another writer would, where committing through the held
+    /// manager would make the daemon's own authority see a publication it is
+    /// supposed to discover. Command paths use [`Self::open_bound`].
     #[cfg(test)]
     pub(crate) fn open(state: &DaemonState) -> Result<Self> {
-        Self::open_bound(state).map_err(RepositoryAuthorityBindRefusal::into_error)
+        let context = LocalRepositoryAuthorityContext::from_state(state)?;
+        Ok(Self {
+            manager: Arc::new(context.open()?),
+            repository_id: context.repository_id().clone(),
+            workspace_id: context.workspace_id(),
+        })
     }
 }
 

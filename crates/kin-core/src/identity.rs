@@ -30,6 +30,9 @@ use crate::layout::KinLayout;
 /// user would have to edit to change it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IdentitySource {
+    /// At least one author field came from `GIT_AUTHOR_NAME` or
+    /// `GIT_AUTHOR_EMAIL`; the other may come from explicit configuration.
+    GitAuthorEnvironment,
     /// `default_author` in the repository's own `.kin/config.toml`.
     KinConfig,
     /// `user.name` / `user.email` set in this repository's or worktree's Git
@@ -45,6 +48,7 @@ impl IdentitySource {
     /// A stable machine-readable name for the surface, safe to assert on.
     pub fn id(self) -> &'static str {
         match self {
+            Self::GitAuthorEnvironment => "git-author-env",
             Self::KinConfig => "kin-config",
             Self::GitRepository => "git-repo",
             Self::GitGlobal => "git-global",
@@ -54,6 +58,7 @@ impl IdentitySource {
     /// How the surface is named to a person.
     pub fn label(self) -> &'static str {
         match self {
+            Self::GitAuthorEnvironment => "Git author environment",
             Self::KinConfig => "kin config default_author",
             Self::GitRepository => "git repository config",
             Self::GitGlobal => "git global config",
@@ -121,11 +126,45 @@ pub fn misplaced_identity_message(table: &str) -> String {
 
 /// Resolve who a newly minted change in this repository is authored by.
 ///
-/// Order is most specific first: the repository's own Kin setting, then the Git
-/// identity Git itself would use here (repository scope before host scope), then
-/// refusal. There is no fourth step, and no synthesized value is accepted at any
-/// step.
+/// `GIT_AUTHOR_NAME` and `GIT_AUTHOR_EMAIL` override their respective fields.
+/// Missing fields fall back to the repository's Kin setting, then explicit Git
+/// configuration (repository scope before host scope). No synthesized value is
+/// accepted. An explicitly invalid author override refuses rather than silently
+/// recording a different configured person.
+///
+/// Semantic changes record authorship. Git's separate `GIT_COMMITTER_*` role
+/// must neither replace nor complete that identity.
 pub fn resolve_commit_identity(layout: &KinLayout) -> Result<CommitIdentity, KinError> {
+    let name = author_environment_field("GIT_AUTHOR_NAME")?;
+    let email = author_environment_field("GIT_AUTHOR_EMAIL")?;
+    if name.is_some() || email.is_some() {
+        let kin_author = kin_config_author(layout);
+        let (kin_name, kin_email) = kin_author
+            .as_deref()
+            .map(split_author)
+            .map(|(name, email)| (Some(name.to_string()), email.map(str::to_string)))
+            .unwrap_or_default();
+        let (git_name, git_email, _) = git_identity_fields(layout.working_dir()).unwrap_or((
+            None,
+            None,
+            IdentitySource::GitGlobal,
+        ));
+        let name = name
+            .or(kin_name)
+            .or(git_name)
+            .ok_or_else(|| KinError::Config(unresolved_identity_message()))?;
+        let email = email
+            .or(kin_email)
+            .or(git_email)
+            .ok_or_else(|| KinError::Config(unresolved_identity_message()))?;
+        if is_fabricated_email(&email) {
+            return Err(KinError::Config(unresolved_identity_message()));
+        }
+        return Ok(CommitIdentity {
+            author: format!("{name} <{email}>"),
+            source: IdentitySource::GitAuthorEnvironment,
+        });
+    }
     if let Some(author) = kin_config_author(layout) {
         return Ok(CommitIdentity {
             author,
@@ -141,6 +180,27 @@ pub fn resolve_commit_identity(layout: &KinLayout) -> Result<CommitIdentity, Kin
         return Err(KinError::Config(misplaced_identity_message(&table)));
     }
     Err(KinError::Config(unresolved_identity_message()))
+}
+
+/// Absence permits a configured fallback; a present but unusable value does
+/// not. In particular an inherited empty override must not name somebody else.
+fn author_environment_field(key: &str) -> Result<Option<String>, KinError> {
+    match std::env::var(key) {
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Ok(raw) => match usable_field(&raw) {
+            Some(value) if key != "GIT_AUTHOR_EMAIL" || !is_fabricated_email(&value) => {
+                Ok(Some(value))
+            }
+            _ => Err(invalid_author_environment(key)),
+        },
+        Err(std::env::VarError::NotUnicode(_)) => Err(invalid_author_environment(key)),
+    }
+}
+
+fn invalid_author_environment(key: &str) -> KinError {
+    KinError::Config(format!(
+        "{key} is set but does not name a usable author. Set a valid value or unset it to use the configured identity.\n\n{IDENTITY_REMEDIATION}"
+    ))
 }
 
 /// The `[table]` a `default_author` key was written under, when the config
@@ -172,34 +232,47 @@ fn kin_config_author(layout: &KinLayout) -> Option<String> {
 /// at all, which is the ordinary shape of a native Kin repository, the host
 /// scopes are read on their own.
 fn git_identity(working_dir: &Path) -> Option<CommitIdentity> {
+    let (name, email, source) = git_identity_fields(working_dir)?;
+    let name = name?;
+    let email = email?;
+    if is_fabricated_email(&email) {
+        return None;
+    }
+    Some(CommitIdentity {
+        author: format!("{name} <{email}>"),
+        source,
+    })
+}
+
+/// Keep configured halves separate so an author environment override can
+/// supply the other half without Git inventing an account name or address.
+fn git_identity_fields(
+    working_dir: &Path,
+) -> Option<(Option<String>, Option<String>, IdentitySource)> {
     match gix::open(working_dir) {
         Ok(repository) => {
             let snapshot = repository.config_snapshot();
-            identity_from_config(snapshot.plumbing())
+            Some(identity_fields_from_config(snapshot.plumbing()))
         }
         Err(_) => {
             let globals = gix::config::File::from_globals().ok()?;
-            identity_from_config(&globals)
+            Some(identity_fields_from_config(&globals))
         }
     }
 }
 
 /// Read `user.name` and `user.email` out of one merged configuration.
 ///
-/// Both halves are required. Git will happily commit with only one of them by
-/// synthesizing the other from the local account and hostname, which is the
-/// fabrication this whole module exists to keep out of history, so a half-set
-/// identity is reported as no identity and the remediation names both commands.
-fn identity_from_config(config: &gix::config::File<'_>) -> Option<CommitIdentity> {
-    let name = config_field(config, "name")?;
-    let email = config_field(config, "email")?;
-    if is_fabricated_email(&email) {
-        return None;
-    }
-    Some(CommitIdentity {
-        author: format!("{name} <{email}>"),
-        source: user_scope(config),
-    })
+/// Unlike Git's inferred identity, these fields can only come from an explicit
+/// setting. The resolver requires both unless a Kin author was used unchanged.
+fn identity_fields_from_config(
+    config: &gix::config::File<'_>,
+) -> (Option<String>, Option<String>, IdentitySource) {
+    (
+        config_field(config, "name"),
+        config_field(config, "email"),
+        user_scope(config),
+    )
 }
 
 /// One `user.*` string, trimmed and checked for usability.
@@ -363,13 +436,166 @@ mod tests {
         /// is decided by the process environment, so a test that left the host's
         /// own `~/.gitconfig` reachable would pass or fail on whoever ran it.
         fn resolve(&self) -> Result<CommitIdentity, KinError> {
-            let _pinned = EnvVarGuard::new()
+            self.resolve_with_environment(&[])
+        }
+
+        fn resolve_with_environment(
+            &self,
+            values: &[(&str, &str)],
+        ) -> Result<CommitIdentity, KinError> {
+            let mut pinned = EnvVarGuard::new()
                 .with("GIT_CONFIG_NOSYSTEM", "1")
                 .with("GIT_CONFIG_GLOBAL", self.global_config())
                 .with("HOME", self._dir.path())
-                .without("XDG_CONFIG_HOME");
+                .without("XDG_CONFIG_HOME")
+                .without("GIT_AUTHOR_NAME")
+                .without("GIT_AUTHOR_EMAIL")
+                .without("GIT_COMMITTER_NAME")
+                .without("GIT_COMMITTER_EMAIL");
+            for (key, value) in values {
+                pinned.apply(key, Some(value));
+            }
             resolve_commit_identity(&self.layout)
         }
+    }
+
+    #[test]
+    fn author_environment_wins_over_kin_git_and_a_different_committer() {
+        let fixture = Fixture::new();
+        fixture.init_git();
+        fixture.set_global_identity("Global Author", "global@example.com");
+        fixture.set_repo_identity("Repo Author", "repo@example.com");
+        fixture.set_kin_author("Kin Author <kin@example.com>");
+        let identity = fixture
+            .resolve_with_environment(&[
+                ("GIT_AUTHOR_NAME", "Env Author"),
+                ("GIT_AUTHOR_EMAIL", "author@example.com"),
+                ("GIT_COMMITTER_NAME", "Different Committer"),
+                ("GIT_COMMITTER_EMAIL", "committer@example.com"),
+            ])
+            .unwrap();
+        assert_eq!(identity.author, "Env Author <author@example.com>");
+        assert_eq!(identity.source, IdentitySource::GitAuthorEnvironment);
+    }
+
+    #[test]
+    fn author_environment_needs_no_git_repository_or_configured_identity() {
+        let fixture = Fixture::new();
+        let identity = fixture
+            .resolve_with_environment(&[
+                ("GIT_AUTHOR_NAME", "Env Author"),
+                ("GIT_AUTHOR_EMAIL", "author@example.com"),
+            ])
+            .unwrap();
+        assert_eq!(identity.author, "Env Author <author@example.com>");
+        assert_eq!(identity.source, IdentitySource::GitAuthorEnvironment);
+    }
+
+    #[test]
+    fn partial_author_environment_keeps_kin_then_git_field_precedence() {
+        let fixture = Fixture::new();
+        fixture.init_git();
+        fixture.set_global_identity("Global Author", "global@example.com");
+        fixture.set_repo_identity("Repo Author", "repo@example.com");
+        for (key, value, expected) in [
+            (
+                "GIT_AUTHOR_NAME",
+                "Env Author",
+                "Env Author <repo@example.com>",
+            ),
+            (
+                "GIT_AUTHOR_EMAIL",
+                "env@example.com",
+                "Repo Author <env@example.com>",
+            ),
+        ] {
+            let identity = fixture.resolve_with_environment(&[(key, value)]).unwrap();
+            assert_eq!(identity.author, expected);
+            assert_eq!(identity.source, IdentitySource::GitAuthorEnvironment);
+        }
+        fixture.set_kin_author("Kin Author <kin@example.com>");
+        for (key, value, expected) in [
+            (
+                "GIT_AUTHOR_NAME",
+                "Env Author",
+                "Env Author <kin@example.com>",
+            ),
+            (
+                "GIT_AUTHOR_EMAIL",
+                "env@example.com",
+                "Kin Author <env@example.com>",
+            ),
+        ] {
+            let identity = fixture.resolve_with_environment(&[(key, value)]).unwrap();
+            assert_eq!(identity.author, expected);
+        }
+        // A configured half is usable when the matching author override
+        // supplies the other half. It need not form a complete identity alone.
+        let native = Fixture::new();
+        fs::write(
+            native.global_config(),
+            "[user]\nemail = global@example.com\n",
+        )
+        .unwrap();
+        assert_eq!(
+            native
+                .resolve_with_environment(&[("GIT_AUTHOR_NAME", "Env Author")])
+                .unwrap()
+                .author,
+            "Env Author <global@example.com>"
+        );
+    }
+
+    #[test]
+    fn committer_environment_cannot_replace_or_complete_semantic_authorship() {
+        let fixture = Fixture::new();
+        let committer = [
+            ("GIT_COMMITTER_NAME", "Committer"),
+            ("GIT_COMMITTER_EMAIL", "committer@example.com"),
+        ];
+        fixture.resolve_with_environment(&committer).unwrap_err();
+        for author in [
+            ("GIT_AUTHOR_NAME", "Author"),
+            ("GIT_AUTHOR_EMAIL", "author@example.com"),
+        ] {
+            let mut values = committer.to_vec();
+            values.push(author);
+            fixture.resolve_with_environment(&values).unwrap_err();
+        }
+        fixture.set_kin_author("Kin Author <kin@example.com>");
+        let identity = fixture.resolve_with_environment(&committer).unwrap();
+        assert_eq!(identity.author, "Kin Author <kin@example.com>");
+        assert_eq!(identity.source, IdentitySource::KinConfig);
+    }
+
+    #[test]
+    fn invalid_author_environment_refuses_instead_of_falling_back() {
+        let fixture = Fixture::new();
+        fixture.set_global_identity("Global Author", "global@example.com");
+        fixture.set_kin_author("Kin Author <kin@example.com>");
+        for (key, value) in [
+            ("GIT_AUTHOR_NAME", " "),
+            ("GIT_AUTHOR_NAME", "unknown"),
+            ("GIT_AUTHOR_EMAIL", ""),
+            ("GIT_AUTHOR_EMAIL", "unknown"),
+            ("GIT_AUTHOR_EMAIL", "user@host.local"),
+        ] {
+            let message = fixture
+                .resolve_with_environment(&[(key, value)])
+                .unwrap_err()
+                .to_string();
+            assert!(message.contains(key), "{message}");
+            assert!(message.contains("unset"), "{message}");
+        }
+    }
+
+    #[test]
+    fn an_author_override_cannot_admit_a_configured_synthesized_email() {
+        let fixture = Fixture::new();
+        fixture.set_global_identity("Configured Author", "user@host.local");
+        fixture
+            .resolve_with_environment(&[("GIT_AUTHOR_NAME", "Env Author")])
+            .unwrap_err();
     }
 
     #[test]
@@ -574,6 +800,7 @@ mod tests {
 
     #[test]
     fn source_ids_are_stable_and_distinct() {
+        assert_eq!(IdentitySource::GitAuthorEnvironment.id(), "git-author-env");
         assert_eq!(IdentitySource::KinConfig.id(), "kin-config");
         assert_eq!(IdentitySource::GitRepository.id(), "git-repo");
         assert_eq!(IdentitySource::GitGlobal.id(), "git-global");

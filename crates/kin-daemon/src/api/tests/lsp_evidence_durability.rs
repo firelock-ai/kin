@@ -18,6 +18,11 @@ fn wide_lsp_reference(
 ) -> kin_model::Relation {
     let mut relation = lsp_publication_call(caller, target);
     relation.kind = RelationKind::References;
+    relation.id = kin_lsp::relation_identity::language_server_relation_id(
+        RelationKind::References,
+        caller,
+        target,
+    );
     let site = relation.evidence[0].clone();
     relation.evidence = vec![site; sites];
     relation
@@ -31,9 +36,41 @@ fn accepted_evidence_record_len(state: &DaemonState) -> u64 {
 
 #[tokio::test]
 async fn accepted_evidence_past_the_old_record_limit_survives_a_restart_and_marks_its_file() {
-    let (_repo, state) = lsp_publication_fixture().await;
+    let (repo, state) = lsp_publication_fixture().await;
     let caller = waiting_entity(&state, "caller.py", "run");
     let target = waiting_entity(&state, "target.py", "work");
+
+    // Different ids over the same ends are now correctly merged as one edge.
+    // Admit enough distinct declarations for every stress row to have its own
+    // canonical identity. A serialized relation is a lower bound on its crash
+    // record line, so this reserves at least twice the bytes installed below.
+    const BATCH_SIZE: usize = 256;
+    let relation_bytes = serde_json::to_vec(&wide_lsp_reference(caller.id, target.id, 64))
+        .unwrap()
+        .len() as u64;
+    let target_count = (4 * OLD_ACCEPTED_EVIDENCE_LIMIT)
+        .div_ceil(relation_bytes)
+        .div_ceil(BATCH_SIZE as u64) as usize
+        * BATCH_SIZE;
+    let mut source = "def work():\n    return 7\n".to_owned();
+    for n in 0..target_count {
+        source.push_str(&format!("\ndef work_{n:05}():\n    return 7\n"));
+    }
+    std::fs::write(repo.path().join("target.py"), source).unwrap();
+    waiting_admit(&state, "distinct evidence targets").await;
+    waiting_commit(&state, "Admit distinct evidence targets").await;
+    let mut targets: Vec<_> = state
+        .graph
+        .query_entities(&kin_db::EntityFilter {
+            file_path: Some(kin_model::FilePathId::new("target.py")),
+            ..Default::default()
+        })
+        .unwrap()
+        .into_iter()
+        .filter(|entity| entity.name.starts_with("work_"))
+        .collect();
+    targets.sort_by(|a, b| a.name.cmp(&b.name));
+    assert_eq!(targets.len(), target_count);
 
     // Accept evidence the way the sweep does, in write batches, until the crash
     // record holds twice what it used to refuse at. The count is fixed from
@@ -41,9 +78,10 @@ async fn accepted_evidence_past_the_old_record_limit_survives_a_restart_and_mark
     // keep arriving after the old limit is crossed, which is the case the
     // refusal broke.
     let mut accepted = Vec::new();
-    let install = |accepted: &mut Vec<kin_model::Relation>| {
-        let batch: Vec<_> = (0..256)
-            .map(|_| wide_lsp_reference(caller.id, target.id, 64))
+    let install = |accepted: &mut Vec<kin_model::Relation>, targets: &[kin_model::Entity]| {
+        let batch: Vec<_> = targets
+            .iter()
+            .map(|target| wide_lsp_reference(caller.id, target.id, 64))
             .collect();
         crate::daemon::install_lsp_relations(&state, &batch);
         assert!(
@@ -54,12 +92,25 @@ async fn accepted_evidence_past_the_old_record_limit_survives_a_restart_and_mark
         );
         accepted.extend(batch);
     };
-    install(&mut accepted);
+    install(&mut accepted, &targets[..BATCH_SIZE]);
     let batch_bytes = accepted_evidence_record_len(&state).max(1);
-    let batches = (2 * OLD_ACCEPTED_EVIDENCE_LIMIT).div_ceil(batch_bytes);
-    for _ in 1..batches {
-        install(&mut accepted);
+    let batches = (2 * OLD_ACCEPTED_EVIDENCE_LIMIT).div_ceil(batch_bytes) as usize;
+    assert!(batches * BATCH_SIZE <= targets.len());
+    for batch in 1..batches {
+        install(
+            &mut accepted,
+            &targets[batch * BATCH_SIZE..(batch + 1) * BATCH_SIZE],
+        );
     }
+    assert_eq!(
+        accepted
+            .iter()
+            .map(|relation| relation.id)
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        accepted.len(),
+        "the stress record must contain distinct canonical edges"
+    );
     let record_len = accepted_evidence_record_len(&state);
     println!(
         "accepted {} relations in {batches} batches, record {record_len} bytes",
@@ -67,11 +118,7 @@ async fn accepted_evidence_past_the_old_record_limit_survives_a_restart_and_mark
     );
     assert!(record_len > OLD_ACCEPTED_EVIDENCE_LIMIT);
     assert!(
-        state
-            .lsp_evidence_unrecorded
-            .lock()
-            .unwrap()
-            .is_empty(),
+        state.lsp_evidence_unrecorded.lock().unwrap().is_empty(),
         "every accepted relation must be recorded"
     );
 

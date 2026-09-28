@@ -825,7 +825,10 @@ fn weakest_reference_enrichment(
             // below "nobody looked".
             ReferenceEnrichment::LanguageServerUnusable => 2,
             ReferenceEnrichment::Unknown => 3,
-            ReferenceEnrichment::Available => 4,
+            // Completed, but produces no server edge. A pending sibling still
+            // outranks it, so a batch never reads settled while one is pending.
+            ReferenceEnrichment::EnrichmentDisabled => 4,
+            ReferenceEnrichment::Available => 5,
         })
         .unwrap_or(ReferenceEnrichment::Unknown)
 }
@@ -841,13 +844,14 @@ fn weakest_reference_enrichment(
 /// It is how `daemon_mcp_bulk_reachability_uses_exact_federated_authority`
 /// passed here and failed in CI on the first attempt at this.
 ///
-/// The daemon publishes it once at startup, which is the same moment it decides
-/// whether to open its enrichment channel at all, so the value a query reads is
-/// the same fact the enrichment path acted on. Unpublished reads as unknown, and
-/// unknown establishes nothing, which is the conservative reading this module
-/// takes everywhere else.
+/// The daemon publishes completed findings as startup probes and enrichment
+/// attempts settle, and removes a language's finding while a refresh is pending.
+/// A daemon with enrichment switched off publishes that as its completed finding
+/// for every enrichable language before it serves. Unpublished languages read as
+/// unknown: that neither establishes availability nor reports a missing server,
+/// and it cannot certify an absence.
 fn published_language_servers() -> Option<LanguageServerReadinessMap> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(servers) = test_support::server_override() {
         return Some(servers);
     }
@@ -864,10 +868,9 @@ static PUBLISHED_SERVERS: std::sync::RwLock<Option<LanguageServerReadinessMap>> 
 ///
 /// Published by the process that probed, because deciding this needs a server
 /// started and a query path must not spawn subprocesses. Until it is called,
-/// every observation reports its languages' enrichment as unknown and the
-/// absence-trust gate stays silent about it, which is the behaviour a process
-/// that never looked should have, and is also the honest state while a probe is
-/// still in flight.
+/// every observation reports its languages' enrichment as unknown. The absence
+/// gate preserves that uncertainty without reporting servers missing, including
+/// while a probe is still in flight.
 ///
 /// Readiness rather than a set of installed binaries: a binary on `PATH` is not
 /// a working language server, and publishing presence as though it were is how
@@ -896,8 +899,8 @@ pub fn publish_language_server_readiness(readiness: LanguageServerReadinessMap) 
 /// is the one that runs in CI. The override is thread-local, so it holds for the
 /// test that set it whether the suite runs threaded under `cargo test` or one
 /// process per test under nextest.
-#[cfg(test)]
-pub(crate) mod test_support {
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support {
     use super::{LanguageId, LanguageServerReadinessMap};
     use kin_core::reference_coverage::LanguageServerReadiness;
     use std::cell::RefCell;
@@ -912,7 +915,7 @@ pub(crate) mod test_support {
 
     /// Restores the previous host on drop, including on unwind, so one test's
     /// environment never leaks into the next on a reused thread.
-    pub(crate) struct HostGuard(Option<LanguageServerReadinessMap>);
+    pub struct HostGuard(Option<LanguageServerReadinessMap>);
 
     impl Drop for HostGuard {
         fn drop(&mut self) {
@@ -924,11 +927,20 @@ pub(crate) mod test_support {
     /// `servers`, all of them usable. Bind the guard: dropping it immediately
     /// restores the host.
     #[must_use = "binding the guard is what keeps the declared host in force"]
-    pub(crate) fn scoped_language_servers(servers: &[LanguageId]) -> HostGuard {
+    pub fn scoped_language_servers(servers: &[LanguageId]) -> HostGuard {
         scoped_language_server_readiness(
-            &servers
+            &kin_core::reference_coverage::ENRICHABLE_LANGUAGES
                 .iter()
-                .map(|language| (*language, LanguageServerReadiness::Usable))
+                .map(|language| {
+                    (
+                        *language,
+                        if servers.contains(language) {
+                            LanguageServerReadiness::Usable
+                        } else {
+                            LanguageServerReadiness::Absent
+                        },
+                    )
+                })
                 .collect::<Vec<_>>(),
         )
     }
@@ -940,7 +952,7 @@ pub(crate) mod test_support {
     /// presence-only override could not express, which meant no test could fail
     /// when a broken server was reported as serving.
     #[must_use = "binding the guard is what keeps the declared host in force"]
-    pub(crate) fn scoped_language_server_readiness(
+    pub fn scoped_language_server_readiness(
         readiness: &[(LanguageId, LanguageServerReadiness)],
     ) -> HostGuard {
         HostGuard(SERVERS.with(|slot| {
@@ -950,7 +962,7 @@ pub(crate) mod test_support {
     }
 
     /// Run `body` on a host carrying exactly `servers`.
-    pub(crate) fn with_language_servers<T>(servers: &[LanguageId], body: impl FnOnce() -> T) -> T {
+    pub fn with_language_servers<T>(servers: &[LanguageId], body: impl FnOnce() -> T) -> T {
         let _guard = scoped_language_servers(servers);
         body()
     }
@@ -1902,7 +1914,16 @@ mod tests {
         );
         assert_eq!(
             weakest_reference_enrichment(&[LanguageId::Python, LanguageId::JavaScript], &none),
-            ReferenceEnrichment::NoLanguageServer
+            ReferenceEnrichment::Unknown,
+            "no completed observation is not a missing installation"
+        );
+        let absent = [(LanguageId::Python, LanguageServerReadiness::Absent)]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            weakest_reference_enrichment(&[LanguageId::Python, LanguageId::JavaScript], &absent),
+            ReferenceEnrichment::NoLanguageServer,
+            "an explicit missing installation still bounds an unobserved sibling"
         );
         assert_eq!(
             weakest_reference_enrichment(&[LanguageId::Python, LanguageId::JavaScript], &all),
@@ -1935,6 +1956,27 @@ mod tests {
             weakest_reference_enrichment(&[], &all),
             ReferenceEnrichment::Unknown,
             "no language observed establishes nothing"
+        );
+
+        // Switched-off enrichment is a completed finding. It holds a batch below
+        // a usable server, and a pending sibling still holds it below that.
+        let switched_off: LanguageServerReadinessMap = [
+            (LanguageId::Python, LanguageServerReadiness::Disabled),
+            (LanguageId::Rust, LanguageServerReadiness::Usable),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            weakest_reference_enrichment(&[LanguageId::Python, LanguageId::Rust], &switched_off),
+            ReferenceEnrichment::EnrichmentDisabled
+        );
+        assert_eq!(
+            weakest_reference_enrichment(
+                &[LanguageId::Python, LanguageId::JavaScript],
+                &switched_off
+            ),
+            ReferenceEnrichment::Unknown,
+            "a pending sibling must not read as settled"
         );
     }
 

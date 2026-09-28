@@ -4,6 +4,54 @@
 // Included into `api.rs`'s test module, beside the source-base tests whose
 // commit helper it reuses.
 
+mod name_candidates_trace_pages {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/support/trace_pages.rs"
+    ));
+}
+
+/// Drain the served pages through the same strict semantic-record assembler as
+/// the public transport tests. Check wire size and non-certifying page readings
+/// before reconstructed fields reach the ambiguity assertions below.
+async fn name_candidates_trace_answer(
+    state: &Arc<DaemonState>,
+    mut arguments: serde_json::Value,
+) -> serde_json::Value {
+    const CEILING: usize = 8_000;
+    let mut assembly = name_candidates_trace_pages::TraceAssembly::default();
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..1_000 {
+        let result = mcp_call(
+            router(Arc::clone(state)),
+            "trace_data_flow",
+            arguments.clone(),
+        )
+        .await;
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        let kin_mcp::ContentBlock::Text { text } = &result.content[0];
+        assert!(text.len() <= CEILING, "{} bytes", text.len());
+        let page = tool_result_payload(&result);
+        assert_eq!(page["_kin"]["page"]["version"], 1);
+        assert_eq!(page["_kin"]["response"]["chars_after_budget"], text.len());
+        assert_eq!(page["_kin"]["response"]["max_chars"], CEILING);
+        if page["_kin"]["page"]["complete"] == true {
+            assert!(
+                seen.is_empty(),
+                "a partial snapshot cannot become a full answer"
+            );
+            return page;
+        }
+        assembly.add(&page, text, CEILING);
+        let Some(cursor) = page["next_cursor"].as_str() else {
+            return assembly.finish();
+        };
+        assert!(seen.insert(cursor.to_owned()), "continuation must advance");
+        arguments["cursor"] = serde_json::json!(cursor);
+    }
+    panic!("bounded ambiguity fixture did not finish paging");
+}
+
 const NAME_CANDIDATES_SOURCE: &str = "class Scaffold:\n    def get(self, rule):\n        return rule\n\n    def route(self, rule):\n        return rule\n\n\nclass Globals:\n    def get(self, name):\n        return name\n\n\ndef get_db():\n    return {}\n";
 
 #[tokio::test]
@@ -24,11 +72,7 @@ async fn daemon_trace_ambiguity_public_route_fits_8000_bytes() {
         if !focal {
             args["target"] = serde_json::json!("get");
         }
-        let result = mcp_call(router(Arc::clone(&state)), "trace_data_flow", args).await;
-        assert_ne!(result.is_error, Some(true), "{result:?}");
-        let kin_mcp::ContentBlock::Text { text } = &result.content[0];
-        assert!(text.len() <= 8000, "{} bytes", text.len());
-        let value = tool_result_payload(&result);
+        let value = name_candidates_trace_answer(&state, args).await;
         let listing = if focal {
             &value
         } else {
@@ -37,24 +81,29 @@ async fn daemon_trace_ambiguity_public_route_fits_8000_bytes() {
         assert_eq!(listing["candidate_count"], 200, "{listing}");
         assert_eq!(listing["resolution"], "shared_member_name");
         let count = listing["candidates"].as_array().map_or(0, Vec::len)
-            + listing["more_candidates"].as_array().map_or(0, Vec::len)
-            + listing["omitted_candidates"].as_u64().unwrap_or(0) as usize;
+            + listing["more_candidates"].as_array().map_or(0, Vec::len);
+        assert_eq!(listing["omitted_candidates"].as_u64().unwrap_or(0), 0);
         assert_eq!(count, 200);
         if focal {
             assert_eq!(value["ambiguous_focal"], true);
-            for key in [
-                "body",
-                "source_base",
-                "chain",
-                "focal_entity",
-                "bodies_included",
-            ] {
+            assert!(value["chain"].as_array().is_none_or(Vec::is_empty));
+            assert!(value.get("negative").is_none());
+            for key in ["body", "source_base", "focal_entity", "bodies_included"] {
                 assert!(value.get(key).is_none(), "unexpected {key}: {value}");
             }
         } else {
             assert!(!value["chain"].as_array().unwrap().is_empty(), "{value}");
             assert!(value.get("target_name").is_none() || value["target_name"].is_null());
+            assert_eq!(value["negative"]["safe_to_conclude_absent"], false);
+            assert!(value["degradations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["component"] == "target_reachability"
+                    && entry["reason"] == "target_ambiguous"));
         }
+        assert_eq!(value["_kin"]["verdict"]["safe_to_conclude_absent"], false);
+        assert_eq!(value["_kin"]["verdict"]["state"], "inconclusive");
     }
 }
 

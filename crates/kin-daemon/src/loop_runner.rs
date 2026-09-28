@@ -27,6 +27,15 @@ mod source_batch;
 
 pub(crate) const DISABLE_FILESYSTEM_RECONCILE_ENV: &str = "KIN_DAEMON_DISABLE_FILESYSTEM_RECONCILE";
 
+/// Callback-delivery deadline, measured after native watcher registration.
+const WATCH_DELIVERY_BOUND: Duration = Duration::from_secs(10);
+
+// Fixtures spawn the same loop as daemon startup, so their observer includes
+// scheduling and native registration. The narrower delivery deadline starts
+// inside FileWatcher only after registration and probe creation.
+#[cfg(test)]
+use crate::daemon::WATCH_ARMING_BOUND;
+
 fn env_flag_enabled(value: Option<String>) -> bool {
     value
         .as_deref()
@@ -3053,6 +3062,48 @@ fn admission_hold(streak: u64, ceiling: Duration) -> Option<Duration> {
     Some(held.min(ceiling))
 }
 
+/// Save all newly delivered loss signals before a pass captures or clears its
+/// durable generation. Failed persistence keeps the signal undisclosed here so
+/// the next tick retries it, and keeps health degraded even without a record.
+fn disclose_watcher_loss(
+    state: &DaemonState,
+    lost: kin_index::LostEvents,
+    disclosed: &mut u64,
+) -> bool {
+    if lost.generation <= *disclosed {
+        return true;
+    }
+    let persisted = crate::watcher_loss::record_loss(
+        &state.layout,
+        lost.generation - *disclosed,
+        lost.last_reason.as_deref(),
+    );
+    if persisted {
+        *disclosed = lost.generation;
+        state
+            .background_work
+            .reconcile()
+            .record_watcher_loss(crate::watcher_loss::standing(
+                &state.layout,
+                state.layout.working_dir(),
+            ));
+    } else {
+        let cause =
+            "the latest watcher loss could not be persisted; complete-tree recovery remains owed";
+        state.background_work.reconcile().record_watcher_loss(Some(
+            kin_cli::commands::resources::WatcherLossState {
+                generation: lost.generation,
+                recovered_through: 0,
+                at: None,
+                reason: lost.last_reason,
+                read_error: Some(cause.to_string()),
+                disclosure: cause.to_string(),
+            },
+        ));
+    }
+    persisted
+}
+
 /// The repository facts a hold was armed against.
 ///
 /// Two atomic loads rather than a read of the store, because this is compared on
@@ -4945,8 +4996,8 @@ pub async fn run_loop_armed(
     if *startup_cancel.borrow() {
         return Ok(());
     }
-    let watcher = tokio::select! {
-        result = FileWatcher::new_ready(working_dir, Duration::from_secs(10)) => {
+    let mut watcher = tokio::select! {
+        result = FileWatcher::new_ready(working_dir, WATCH_DELIVERY_BOUND) => {
             match result {
                 Ok(watcher) => watcher,
                 Err(error) => {
@@ -5033,7 +5084,10 @@ pub async fn run_loop_armed(
     // observed by nobody and nothing replays it. `catch_up` above names what
     // the host changed inside that stretch, tracked edits and deletions
     // included, and the first round below re-observes exactly those paths.
-    // Everything older is untouched: it predates the last admission, which
+    // A recorded watcher loss is the other reason to observe the whole tree:
+    // the backend has said its bounded observations are incomplete. It stays
+    // disclosed until the full recovery below succeeds for that generation.
+    // Everything older is otherwise untouched: it predates the last admission, which
     // already covered it, and divergence with no window to place it in stays
     // projection drift until an explicit seam admits it.
 
@@ -5082,6 +5136,11 @@ pub async fn run_loop_armed(
     // than for the function that computes it, because a local called
     // `admission_hold` shadows that function for the whole body.
     let mut held_admission: Option<AdmissionHoldState> = None;
+    // A pathless loss schedules a full pass even with no queued file events.
+    // Failures and a newer loss during that pass both retain recovery debt;
+    // neither may turn the normal 100ms poll into a complete-tree retry loop.
+    let mut watcher_recovery_after: Option<Instant> = None;
+    let mut watcher_recovery_attempts = 0_u64;
     // Up while `pending_events` holds anything this loop is still going to
     // attempt, across rounds; see [`QueuedEventsMark`].
     let mut queued_mark = QueuedEventsMark::default();
@@ -5215,28 +5274,15 @@ pub async fn run_loop_armed(
                 .reconcile()
                 .record_event_skipped(disclosure, tick_started);
         }
-        // A backend that lost events names no path, so nothing in the drain
-        // above carries it and nothing below will ever hear about the writes it
-        // stands for. This loop admits what it is told about, so no later tick
-        // closes the gap however long it runs: only a complete exact-tree
-        // admission can, and the founder's contract is that a person or an agent
-        // asks for one rather than the daemon healing quietly.
-        //
-        // Persisted before it is disclosed. The disclosure dies with this
-        // daemon; the loss does not.
-        let lost_events = watcher.lost_events();
-        if lost_events.generation > disclosed_watcher_loss {
-            let signals = lost_events.generation - disclosed_watcher_loss;
-            disclosed_watcher_loss = lost_events.generation;
-            crate::watcher_loss::record_loss(
-                &state.layout,
-                signals,
-                lost_events.last_reason.as_deref(),
-            );
-            state
-                .background_work
-                .reconcile()
-                .record_watcher_loss(crate::watcher_loss::standing(&state.layout, working_dir));
+        let loss_persisted =
+            disclose_watcher_loss(&state, watcher.lost_events(), &mut disclosed_watcher_loss);
+        let watcher_recovery_owed =
+            !loss_persisted || crate::watcher_loss::read(&state.layout).recovery_required();
+        let watcher_recovery_due = watcher_recovery_owed
+            && watcher_recovery_after.is_none_or(|after| tick_started >= after);
+        if !watcher_recovery_owed {
+            watcher_recovery_after = None;
+            watcher_recovery_attempts = 0;
         }
         // A graph-only repository member owns its own host subtree. Admission
         // already refuses to traverse one, so an event beneath it carries no
@@ -5306,7 +5352,7 @@ pub async fn run_loop_armed(
         // exception: it attempts nothing, so its events are not on their way
         // anywhere, and a read must not wait on them. Should that hold run out
         // during this round, the mark goes up again before the pass below.
-        if !pending_events.is_empty()
+        if (!pending_events.is_empty() || watcher_recovery_due)
             && !admission_is_held(
                 held_admission,
                 Instant::now(),
@@ -5336,7 +5382,7 @@ pub async fn run_loop_armed(
         // empty and the pass still owes work".
         let admission_owed_reading = admission_owed(&state);
         pass.set_deferred(
-            retry_lane.deferred_owed() || admission_owed_reading.is_some(),
+            retry_lane.deferred_owed() || admission_owed_reading.is_some() || watcher_recovery_owed,
             tick_started,
         );
         if let Some(owed) = &admission_owed_reading {
@@ -5356,7 +5402,7 @@ pub async fn run_loop_armed(
             admission_owed_disclosed = false;
         }
 
-        if pending_events.is_empty() {
+        if pending_events.is_empty() && !watcher_recovery_due {
             // Nothing queued, so nothing is on its way into the graph.
             queued_mark.release();
 
@@ -5517,6 +5563,69 @@ pub async fn run_loop_armed(
             .reconciliation_status
             .store(RECON_PROCESSING, Ordering::Relaxed);
         pass.working(Instant::now());
+
+        if watcher_recovery_due {
+            info!("recovering lost watcher events with a complete exact-tree admission");
+            let mut checkpoint_persisted = false;
+            // The watch receiver is Send but not Sync. Keep its exclusive
+            // borrow across the pass rather than sharing it between tasks.
+            let recovery_watcher = &mut watcher;
+            let recovery_state = &state;
+            let recovery_disclosed = &mut disclosed_watcher_loss;
+            let checkpoint_result = &mut checkpoint_persisted;
+            let outcome = crate::repository_admit::recover_watcher_loss(&state, move || {
+                *checkpoint_result = disclose_watcher_loss(
+                    recovery_state,
+                    recovery_watcher.lost_events(),
+                    recovery_disclosed,
+                );
+                *checkpoint_result
+            })
+            .await;
+            let now = Instant::now();
+            if let Err(error) = &outcome {
+                // An authority failure before a pass starts carries no report.
+                state
+                    .background_work
+                    .reconcile()
+                    .record_admission_failure(error.to_string(), now);
+            }
+            let recovered = checkpoint_persisted
+                && !crate::watcher_loss::read(&state.layout).recovery_required();
+            if recovered {
+                watcher_recovery_after = None;
+                watcher_recovery_attempts = 0;
+                commit_yields = 0;
+                pass.advanced(1, now);
+                info!("complete exact-tree admission recovered the recorded watcher loss");
+            } else {
+                watcher_recovery_attempts = watcher_recovery_attempts.saturating_add(1);
+                let held_for = admission_hold(
+                    watcher_recovery_attempts.saturating_add(
+                        kin_cli::commands::resources::ADMISSION_FAILURE_STREAK_ATTENTION,
+                    ),
+                    ADMISSION_HOLD_CEILING,
+                )
+                .unwrap_or(ADMISSION_HOLD_BASE);
+                watcher_recovery_after = Some(now + held_for);
+                warn!(
+                    retry_after_secs = held_for.as_secs(),
+                    "watcher-loss recovery remains owed; retaining its disclosure and retrying"
+                );
+            }
+            pass.set_deferred(
+                !recovered || retry_lane.deferred_owed() || admission_owed(&state).is_some(),
+                now,
+            );
+            // Events accumulated before or during the full pass remain queued.
+            // The next ordinary tick checks whether their bytes are now held.
+            queued_mark.release();
+            state
+                .reconciliation_status
+                .store(RECON_IDLE, Ordering::Relaxed);
+            stand_down_tick(&state, &pass);
+            continue;
+        }
 
         // Backpressure stays bounded. A large burst remains in `pending_events` and is
         // consumed over multiple iterations; processing the entire queue under the write
@@ -6833,8 +6942,9 @@ mod tests {
             cancel_rx,
             Some(WatchArmed::new(armed_tx)),
         ));
+        // Wait for the real delivery contract before the controlled observation.
         assert_eq!(
-            crate::daemon::await_watch_armed(armed_rx, Duration::from_secs(5)).await,
+            crate::daemon::await_watch_armed(armed_rx, WATCH_ARMING_BOUND).await,
             crate::daemon::WatchArming::Armed
         );
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -8100,11 +8210,19 @@ mod tests {
         );
 
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-        let mut handle = tokio::spawn(run_loop(
+        let (armed_tx, armed_rx) = tokio::sync::oneshot::channel();
+        let mut handle = tokio::spawn(run_loop_armed(
             Arc::clone(&state),
             LoopConfig::default(),
             cancel_rx,
+            Some(WatchArmed::new(armed_tx)),
         ));
+        assert_eq!(
+            crate::daemon::await_watch_armed(armed_rx, WATCH_ARMING_BOUND).await,
+            crate::daemon::WatchArming::Armed,
+            "startup repair is observed after the real watcher has armed"
+        );
+        // Keep the semantic-repair deadline separate from native registration.
         let deadline = Instant::now() + Duration::from_secs(30);
         while start_line(&state) != Some(17) {
             assert!(
@@ -8129,6 +8247,52 @@ mod tests {
             "a startup drain pays the parse in the derived graph and leaves the record for the \
              commit that makes it durable"
         );
+    }
+
+    #[test]
+    fn failed_watcher_loss_persistence_retains_the_signal_and_disclosure() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        let record = state.layout.kindb_dir().join("watcher-loss");
+        std::fs::create_dir(&record).unwrap();
+        let lost = kin_index::LostEvents {
+            generation: 1,
+            last_reason: Some("rescan: kernel dropped".to_string()),
+        };
+        let mut disclosed = 0;
+
+        assert!(!disclose_watcher_loss(&state, lost.clone(), &mut disclosed));
+        assert_eq!(disclosed, 0);
+        assert!(state
+            .background_work
+            .reconcile_report(Instant::now())
+            .watcher_loss
+            .unwrap()
+            .read_error
+            .is_some());
+
+        std::fs::remove_dir(record).unwrap();
+        assert!(disclose_watcher_loss(&state, lost, &mut disclosed));
+        assert_eq!(disclosed, 1);
+        assert!(crate::watcher_loss::read(&state.layout).recovery_required());
+    }
+
+    #[tokio::test]
+    async fn loop_recovers_persisted_watcher_loss_without_new_file_events() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        crate::watcher_loss::record_loss(&state.layout, 1, Some("rescan: kernel dropped"));
+        assert!(crate::watcher_loss::read(&state.layout).recovery_required());
+
+        // No source is written after the watch starts. This durable loss must
+        // schedule the full admission even when its ordinary event queue is empty.
+        serve_until(&state, "the recorded watcher-loss recovery", |state| {
+            !crate::watcher_loss::read(&state.layout).recovery_required()
+        })
+        .await;
+        let report = state.background_work.reconcile_report(Instant::now());
+        assert!(report.last_admission_success_at.is_some());
+        assert!(report.watcher_loss.is_none());
     }
 
     /// Run one daemon start's loop until `served` holds, then stop it.
@@ -12207,7 +12371,7 @@ mod tests {
         assert!(encoded["parked"]["reason"]
             .as_str()
             .unwrap()
-            .contains("was stopped"));
+            .contains("a stop was requested at its next checkpoint"));
         let decoded: kin_cli::commands::resources::ReconcileHealth =
             serde_json::from_value(encoded).unwrap();
         assert_eq!(decoded.parked, report.parked);
@@ -12981,7 +13145,7 @@ mod tests {
         ));
 
         assert_eq!(
-            crate::daemon::await_watch_armed(armed_rx, Duration::from_secs(5)).await,
+            crate::daemon::await_watch_armed(armed_rx, WATCH_ARMING_BOUND).await,
             crate::daemon::WatchArming::Armed,
             "a working-copy loop must not take the no-watch shortcut"
         );

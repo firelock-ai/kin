@@ -5,6 +5,7 @@ import copy
 import copy
 import importlib.util
 import io
+import json
 from pathlib import Path
 import unittest
 
@@ -138,6 +139,22 @@ class WitnessTests(unittest.TestCase):
         self.s.hood["entities"][-1]["name"] = "req.get"
         self.grade(m.FAIL)
         self.assertEqual(len(self.s.calls), 3)
+
+    def test_guessed_parent_cannot_be_proven_by_a_focused_child_query(self):
+        self.s.trace["chain"][3]["resolution"] = "name_only"
+        self.s.hood["entities"][-1]["name"] = "req.get"
+        self.grade(m.PASS)
+        self.assertEqual(len(self.s.calls), 2)
+
+    def test_uppercase_forbidden_descendant_is_counted(self):
+        self.s.trace["chain"].append({"entity_name": "escapeHTML",
+                                     "resolution": "type_resolved", "parent_step": 4})
+        self.grade(m.FAIL)
+
+    def test_uppercase_guessed_descendant_is_not_counted(self):
+        self.s.trace["chain"].append({"entity_name": "escapeHTML",
+                                     "resolution": "name_only", "parent_step": 4})
+        self.grade(m.PASS)
 
     def test_raw_forbidden_without_confirmation_is_unreadable(self):
         self.s.hood["entities"][-1]["name"] = "req.get"
@@ -343,6 +360,9 @@ class ExportReferenceTests(unittest.TestCase):
     """The export identity selects the answer before any site line is graded."""
 
     def setUp(self):
+        # Metadata-only graph inspect presents these starts as 1-based lines.
+        # The fixture stores zero-based starts to build relative sites.
+        self.starts = {}
         self.payloads = {}
         for export, caller, line in m.EXPRESS_MODULE_SOURCED_SITES:
             self.payloads[export] = self.body(export, "lib/express.js", "constant", caller, line)
@@ -350,14 +370,18 @@ class ExportReferenceTests(unittest.TestCase):
         self.module = self.body("response", "lib/response.js", "module", "lib/express.js", 21)
         self.other = self.body("app.response", "test/app.response.js", "module", "test/exports.js", 48)
 
-    @staticmethod
-    def body(name, file_path, kind, caller, line):
+    def body(self, name, file_path, kind, caller, line):
         identity = file_path + ":" + name
-        return {"focal_entity": {"id": identity, "name": name, "file_path": file_path,
-                                 "kind": kind},
+        module_id = "module:" + caller
+        self.starts[module_id] = 0
+        return {"focal_entity": {"id": identity, "name": name,
+                                 "projection": {"path": file_path}, "kind": kind},
                 "entity_id": identity, "owner_qualified_name": name,
-                "references": [{"file_path": caller, "kind": "Module",
-                                "reference_lines": [line]}]}
+                "references": [{"entity_id": module_id, "kind": "Module",
+                                "projection": {"path": caller}, "site_count": 1,
+                                "sites": [{"line_in_entity": line - 1, "callee": None,
+                                           "callee_unavailable": "caller_source_unavailable"}],
+                                "sites_absent_reason": None}]}
 
     def sections(self, *bodies):
         self.payloads["response"] = {"ambiguous_focal": True,
@@ -376,6 +400,20 @@ class ExportReferenceTests(unittest.TestCase):
         self.assertEqual(tool, "find_references")
         return self.payloads[args["query"]]
 
+    def kin_run(self, args, repo, timeout):
+        self.assertEqual((repo, timeout), ("fixture", 30))
+        self.assertEqual((args[:2], args[3:]), (["graph", "inspect"], ["--json"]))
+        entity_id = args[2]
+        start = self.starts.get(entity_id)
+        if start is None:
+            return 0, json.dumps({"error": "Entity not found", "lines": []}), ""
+        lines = ["Entity: consumer (Module)", "  ID: " + entity_id,
+                 "  File: " + entity_id.removeprefix("module:"),
+                 "  Span: lines %d-%d" % (start + 1, start + 100)]
+        if hasattr(self, "metadata_override"):
+            lines = self.metadata_override(lines)
+        return 0, json.dumps({"error": None, "lines": lines}), ""
+
     def grade(self, expected):
         result = m.check_11(self)
         self.assertEqual(result.status, expected, result.asserts)
@@ -393,9 +431,60 @@ class ExportReferenceTests(unittest.TestCase):
                 self.grade(m.PASS)
 
     def test_other_section_cannot_supply_missing_export_line(self):
-        self.export["references"][0]["reference_lines"] = []
+        row = self.export["references"][0]
+        row.update(sites=[], site_count=0, sites_absent_reason="no_evidence_span")
         self.sections(self.other, self.module, self.export)
         self.grade(m.FAIL)
+
+    def test_a_site_is_placed_through_its_callers_span(self):
+        # The file line is the caller's 0-based span start plus one plus the
+        # site's offset inside it, so moving either alone moves the line off the
+        # pinned one, and moving both keeps it.
+        # test/exports.js is one module entity holding two exports' sites, so
+        # both of them move with its span.
+        module_id = self.export["references"][0]["entity_id"]
+        sites = [row["sites"][0] for body in self.payloads.values()
+                 for row in body["references"] if row["entity_id"] == module_id]
+        self.assertEqual(len(sites), 2)
+        self.starts[module_id] = 2
+        self.grade(m.FAIL)
+        for site in sites:
+            site["line_in_entity"] -= 2
+        self.grade(m.PASS)
+        self.export["references"][0]["sites"][0]["line_in_entity"] += 1
+        self.grade(m.FAIL)
+
+    def test_a_site_kin_cannot_place_inside_its_caller_names_no_line(self):
+        self.export["references"][0]["sites"][0]["line_in_entity"] = None
+        self.grade(m.FAIL)
+
+    def test_an_unreadable_caller_record_is_unreadable_not_a_wrong_line(self):
+        del self.starts[self.export["references"][0]["entity_id"]]
+        self.grade(m.UNREADABLE)
+
+    def test_stale_or_wrong_module_metadata_cannot_place_a_site(self):
+        for old, new in (("Span: lines", "Span: stale lines"),
+                         ("ID: module:", "ID: unrelated:"),
+                         ("File: test/", "File: other/"),
+                         ("(Module)", "(Function)")):
+            with self.subTest(replacement=new):
+                self.metadata_override = lambda lines: [line.replace(old, new) for line in lines]
+                self.grade(m.UNREADABLE)
+
+    def test_a_site_outside_the_current_module_span_fails(self):
+        self.metadata_override = lambda lines: [
+            "  Span: lines 1-2" if "Span: " in line else line for line in lines]
+        self.grade(m.FAIL)
+
+    def test_module_metadata_timeout_is_unreadable(self):
+        def timed_out(*args, **kwargs):
+            raise m.subprocess.TimeoutExpired("graph inspect", 30)
+        self.kin_run = timed_out
+        self.grade(m.UNREADABLE)
+
+    def test_sites_without_a_caller_id_are_unreadable(self):
+        del self.export["references"][0]["entity_id"]
+        self.grade(m.UNREADABLE)
 
     def test_other_section_cannot_supply_missing_export_consumer(self):
         self.export["references"] = []
@@ -403,7 +492,8 @@ class ExportReferenceTests(unittest.TestCase):
         self.grade(m.FAIL)
 
     def test_wrong_consumer_kind_or_file_does_not_pass(self):
-        for key, value in [("kind", "Method"), ("file_path", "test/unrelated.js")]:
+        for key, value in [("kind", "Method"), ("projection", {"path": "test/unrelated.js"}),
+                           ("projection", None), ("projection", "test/exports.js")]:
             with self.subTest(key=key):
                 original = self.export["references"][0][key]
                 self.export["references"][0][key] = value
@@ -429,7 +519,11 @@ class ExportReferenceTests(unittest.TestCase):
 
     def test_each_export_identity_component_must_match(self):
         for key, value in (("name", "other"), ("kind", "module"),
-                           ("file_path", "lib/other.js")):
+                           ("projection", {"path": "lib/other.js"}),
+                           ("projection", None), ("projection", "lib/express.js"),
+                           # A focal still carrying a bare file path is the
+                           # retired shape, even beside a matching projection.
+                           ("file_path", "lib/express.js")):
             with self.subTest(key=key):
                 malformed = copy.deepcopy(self.export)
                 malformed["focal_entity"][key] = value
@@ -475,12 +569,180 @@ class ExportReferenceTests(unittest.TestCase):
         self.payloads["response"] = {"message": "Entity not found"}
         self.grade(m.UNREADABLE)
 
-    def test_malformed_reference_lines_stay_unreadable(self):
-        for malformed in ("48", [48, "49"], [False], [0]):
-            with self.subTest(lines=malformed):
-                self.export["references"][0]["reference_lines"] = malformed
+    def test_malformed_reference_sites_stay_unreadable(self):
+        for malformed in ("48", [47], [None], [{"line_in_entity": "47"}],
+                          [{"line_in_entity": False}], [{"line_in_entity": -1}],
+                          [{"line_in_entity": 47.0}], [{"line_in_entity": 47, "callee": 7}]):
+            with self.subTest(sites=malformed):
+                self.export["references"][0]["sites"] = malformed
                 self.sections(self.export, self.module)
                 self.grade(m.UNREADABLE)
+
+    def test_a_site_count_that_miscounts_its_sites_is_unreadable(self):
+        for count in (0, 2, True, "1"):
+            with self.subTest(site_count=count):
+                self.export["references"][0]["site_count"] = count
+                self.sections(self.export, self.module)
+                self.grade(m.UNREADABLE)
+
+
+class PinnedCallSiteTests(unittest.TestCase):
+    """Checks 2 and 3 place each counted caller's site in its file and read the call there."""
+
+    SESSION_START = m.REAL_CALLER_ONE_LINE - 25
+    DIGEST_START = m.REAL_CALLER_TWO_LINE - 40
+
+    def setUp(self):
+        self.reference_requests = []
+        self.starts = {"session-send": self.SESSION_START + 1,
+                       "digest-401": self.DIGEST_START + 1}
+        self.payload = {
+            "focal_entity": {"id": "adapter-send", "name": m.HTTPADAPTER_SEND},
+            "total_upstream": 2,
+            "references": [
+                self.row("session-send", m.REAL_CALLER_ONE, m.REAL_CALLER_ONE_FILE,
+                         m.REAL_CALLER_ONE_LINE - 1 - self.SESSION_START,
+                         m.REAL_CALLER_ONE_CALL),
+                self.row("digest-401", m.REAL_CALLER_TWO, m.REAL_CALLER_TWO_FILE,
+                         m.REAL_CALLER_TWO_LINE - 1 - self.DIGEST_START,
+                         m.REAL_CALLER_TWO_CALL)],
+            "candidates": []}
+        self.bodies = {}
+        for row in self.payload["references"]:
+            site = row["sites"][0]
+            lines = ["# unrelated"] * (site["line_in_entity"] + 2)
+            lines[site["line_in_entity"]] = "return %s()" % site["callee"]
+            self.bodies[row["entity_id"]] = "\n".join(lines)
+
+    @staticmethod
+    def row(entity_id, name, path, offset, callee):
+        return {"entity_id": entity_id, "name": name, "kind": "Method",
+                "projection": {"path": path}, "resolution": "type_resolved",
+                "relation_kinds": ["calls"], "site_count": 1,
+                "sites": [{"line_in_entity": offset, "callee": callee}],
+                "sites_absent_reason": None, "sites_partial_reason": None}
+
+    def sweep_gate(self, name, dependencies=None):
+        self.assertEqual(name, "requests")
+
+    def fixture(self, name):
+        self.assertEqual(name, "requests")
+        return "requests-fixture"
+
+    def references(self, name, query, max_chars=None):
+        self.assertEqual((name, query), ("requests", m.HTTPADAPTER_SEND))
+        return m.Suite.references(self, name, query, max_chars)
+
+    def cached(self, repo, tool, args):
+        if tool == "find_references":
+            self.reference_requests.append(args)
+            return self.payload
+        self.assertEqual((repo, tool), ("requests-fixture", "get_entity_source"))
+        start = self.starts.get(args["entity_id"])
+        if start is None:
+            raise m.ProbeError("mcp get_entity_source isError: Entity not found")
+        return {"id": args["entity_id"], "start_line": start,
+                "body": self.bodies[args["entity_id"]]}
+
+    def site(self, index):
+        return self.payload["references"][index]["sites"][0]
+
+    def grade(self, check, expected):
+        result = check(self)
+        self.assertEqual(result.status, expected, result.asserts)
+        return result
+
+    def test_both_pinned_call_sites_pass(self):
+        self.grade(m.check_2, m.PASS)
+        self.grade(m.check_3, m.PASS)
+
+    def test_recall_requests_larger_budget_without_changing_relation_scope(self):
+        self.grade(m.check_2, m.PASS)
+        self.assertEqual(self.reference_requests,
+                         [{"query": m.HTTPADAPTER_SEND, "max_chars": 60000}])
+
+    def test_a_bounded_reply_cannot_grade_missing_caller_or_negative_control(self):
+        for disclosure in (
+                {"_kin": {"response": {"bounded": True, "max_chars": 12000}}},
+                {"_kin": {"response": {"bounded": True, "max_chars": 60000}}},
+                {"degradations": [{"component": "response_budget", "code": "response_over_budget"}]},
+                {"truncated": True}):
+            with self.subTest(disclosure=disclosure):
+                self.setUp()
+                self.payload["references"] = self.payload["references"][1:]
+                self.payload.update(disclosure)
+                result = self.grade(m.check_2, m.UNREADABLE)
+                self.assertFalse(any(row["status"] in (m.PASS, m.FAIL) for row in result.asserts))
+
+    def test_an_unbounded_missing_caller_still_fails(self):
+        self.payload["references"] = self.payload["references"][1:]
+        self.payload["_kin"] = {"response": {"bounded": False, "max_chars": 60000}}
+        self.grade(m.check_2, m.FAIL)
+
+    def test_a_bare_name_quote_is_the_pinned_call(self):
+        # A language server's span is the name alone, and the quote reads `send`.
+        self.site(0)["callee"] = "send"
+        self.site(1)["callee"] = "connection.send"
+        self.grade(m.check_2, m.PASS)
+        self.grade(m.check_3, m.PASS)
+
+    def test_a_site_one_line_off_fails(self):
+        for index, check in ((0, m.check_2), (1, m.check_3)):
+            for delta in (-1, 1):
+                with self.subTest(check=check.__name__, delta=delta):
+                    self.setUp()
+                    self.site(index)["line_in_entity"] += delta
+                    self.grade(check, m.FAIL)
+
+    def test_the_callers_span_start_decides_the_file_line(self):
+        self.starts["session-send"] += 1
+        self.grade(m.check_2, m.FAIL)
+
+    def test_the_wrong_text_at_the_right_line_fails(self):
+        for callee in ("adapter.close", "r.send", "HTTPAdapter", "", None):
+            with self.subTest(callee=callee):
+                self.setUp()
+                self.site(0)["callee"] = callee
+                self.site(1)["callee"] = callee
+                self.grade(m.check_2, m.FAIL)
+                self.grade(m.check_3, m.FAIL)
+
+    def test_a_site_kin_cannot_place_inside_its_caller_fails(self):
+        self.site(0)["line_in_entity"] = None
+        self.grade(m.check_2, m.FAIL)
+
+    def test_a_caller_projected_into_another_file_fails(self):
+        self.payload["references"][0]["projection"] = {"path": "src/requests/adapters.py"}
+        self.grade(m.check_2, m.FAIL)
+
+    def test_a_row_with_no_sites_fails(self):
+        row = self.payload["references"][1]
+        row.update(sites=[], site_count=0, sites_absent_reason="no_evidence_span")
+        self.grade(m.check_3, m.FAIL)
+
+    def test_an_unreadable_caller_record_is_unreadable(self):
+        del self.starts["digest-401"]
+        self.grade(m.check_3, m.UNREADABLE)
+
+    def test_a_pinned_line_and_quote_do_not_pass_without_the_entity_call(self):
+        for body in ("", "return unrelated()", "\n" * 100):
+            with self.subTest(body=body):
+                self.bodies["session-send"] = body
+                self.grade(m.check_2, m.FAIL)
+
+    def test_missing_body_or_invalid_one_based_start_is_unreadable(self):
+        for start, body in ((0, "code"), (-1, "code"), (True, "code"), (1, None)):
+            with self.subTest(start=start, body=body):
+                self.starts["session-send"] = start
+                self.bodies["session-send"] = body
+                self.grade(m.check_2, m.UNREADABLE)
+
+    def test_malformed_sites_are_unreadable_not_a_wrong_line(self):
+        for sites in ("+23", [23], [{"line_in_entity": "23"}], [{"line_in_entity": -1}]):
+            with self.subTest(sites=sites):
+                self.setUp()
+                self.payload["references"][0]["sites"] = sites
+                self.grade(m.check_2, m.UNREADABLE)
 
 
 if __name__ == "__main__":

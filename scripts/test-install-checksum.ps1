@@ -395,6 +395,63 @@ if ($null -eq $X86Failure -or -not $X86Failure.Contains("32-bit PowerShell is no
     throw "32-bit PowerShell must fail before selecting an archive; got '$X86Failure'"
 }
 
+# Run the release workflow's own sidecar writer against stand-in archives and
+# read back the bytes it wrote. Set-Content ends a line with CRLF on Windows,
+# and a sidecar ending in CRLF names a file that sha256sum -c on Linux or macOS
+# cannot find. The statement is read from release.yml, so this proves the
+# shipped writer rather than a copy of it.
+$ReleaseWorkflowPath = Join-Path (Split-Path -Parent $ScriptsDir) ".github/workflows/release.yml"
+$WorkflowLines = @(Get-Content -LiteralPath $ReleaseWorkflowPath)
+$WriterStart = -1
+for ($Index = 0; $Index -lt $WorkflowLines.Count; $Index++) {
+    if ($WorkflowLines[$Index] -match '^(\s*)foreach \(\$ArchivePath in @\("\$env:ARTIFACT\.zip", "\$env:ARTIFACT\.tar\.gz"\)\) \{$') {
+        $WriterStart = $Index
+        $WriterIndent = $Matches[1]
+        break
+    }
+}
+if ($WriterStart -lt 0) {
+    throw "release.yml no longer carries the Windows sidecar writer this harness proves"
+}
+$WriterEnd = -1
+for ($Index = $WriterStart + 1; $Index -lt $WorkflowLines.Count; $Index++) {
+    if ($WorkflowLines[$Index] -ceq "$WriterIndent}") {
+        $WriterEnd = $Index
+        break
+    }
+}
+if ($WriterEnd -lt 0) {
+    throw "release.yml's Windows sidecar writer never closes"
+}
+$Writer = ($WorkflowLines[$WriterStart..$WriterEnd] |
+    ForEach-Object { $_.Substring([Math]::Min($WriterIndent.Length, $_.Length)) }) -join "`n"
+$SidecarRoot = Join-Path ([System.IO.Path]::GetTempPath()) "kin-sidecar-test-$(Get-Random)"
+New-Item -ItemType Directory -Path $SidecarRoot -Force | Out-Null
+$PreviousArtifact = $env:ARTIFACT
+Push-Location $SidecarRoot
+try {
+    $env:ARTIFACT = "kin-windows-x86_64"
+    Set-Content -NoNewline -Encoding ascii -Path "$env:ARTIFACT.zip" -Value "zip stand-in"
+    Set-Content -NoNewline -Encoding ascii -Path "$env:ARTIFACT.tar.gz" -Value "tar stand-in"
+    Invoke-Expression $Writer
+    foreach ($ArchiveName in @("$env:ARTIFACT.zip", "$env:ARTIFACT.tar.gz")) {
+        $Bytes = [System.IO.File]::ReadAllBytes((Join-Path $SidecarRoot "$ArchiveName.sha256"))
+        if ($Bytes -contains 13) {
+            throw "$ArchiveName.sha256 contains a carriage return, so sha256sum -c cannot verify it"
+        }
+        $ArchiveHash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $SidecarRoot $ArchiveName)).Hash.ToLowerInvariant()
+        $Written = [System.Text.Encoding]::ASCII.GetString($Bytes)
+        if ($Written -cne "$ArchiveHash  $ArchiveName`n") {
+            throw "$ArchiveName.sha256 is not the single LF-terminated line sha256sum writes: '$Written'"
+        }
+    }
+} finally {
+    Pop-Location
+    $env:ARTIFACT = $PreviousArtifact
+    Remove-Item -LiteralPath $SidecarRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
+Write-Host "PASS: the release workflow writes each Windows sidecar as one LF-terminated line"
+
 if ($global:LASTEXITCODE -ne 0) {
     throw "test harness leaked native exit status $global:LASTEXITCODE after expected child failures"
 }

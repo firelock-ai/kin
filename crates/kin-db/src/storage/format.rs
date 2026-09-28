@@ -15,7 +15,7 @@ use crate::storage::change_map::{
 };
 use crate::storage::change_validation::{validate_semantic_change_entries, AdmittedChangeMap};
 use crate::storage::repository::{
-    GitProjectionTreeReplay, PersistedRepositoryAuthority, RootRecomputation,
+    GitProjectionTreeReplay, HistoryProof, PersistedRepositoryAuthority, RootRecomputation,
 };
 use crate::types::*;
 
@@ -810,8 +810,9 @@ pub struct GraphSnapshot {
     ///
     /// Appended after every v22 field. A body that carries records anywhere,
     /// here or inside the envelope, is v23 (v24 with a section), or v25 (v26)
-    /// when one of them is a call-site ledger, and 37 elements wide, with the
-    /// section slot written absent when there is no section, so width stays a
+    /// when one is a call-site ledger, or v27 (v28) with a context validation.
+    /// Each is 37 elements wide, with the section slot written absent when
+    /// there is no section, so width stays a
     /// function of the version.
     #[serde(default)]
     pub resolution_records: HashMap<ResolutionRecordId, ResolutionRecord>,
@@ -1020,7 +1021,10 @@ impl GraphSnapshot {
     /// one and then mishandle it, so it refuses at the header instead. A store
     /// whose records are proof contexts or dispatch sets only keeps v23/v24 and
     /// the bytes it had.
-    pub const CURRENT_VERSION: u32 = Self::CALL_SITE_LEDGERS_SECTION_VERSION;
+    /// v27/v28 carry a context validation (without/with a section), including
+    /// in history. They add no layout but require a reader that understands
+    /// the language's current validation state before admitting its proofs.
+    pub const CURRENT_VERSION: u32 = Self::CONTEXT_VALIDATIONS_SECTION_VERSION;
 
     pub const LEGACY_SECTION_TRIMMED_VERSION: u32 = 16;
     pub const BINDING_HISTORY_VERSION: u32 = 17;
@@ -1054,6 +1058,12 @@ impl GraphSnapshot {
     /// section.
     pub const CALL_SITE_LEDGERS_SECTION_VERSION: u32 = 26;
 
+    /// Context validations and no section.
+    pub const CONTEXT_VALIDATIONS_VERSION: u32 = 27;
+
+    /// Context validations and a section.
+    pub const CONTEXT_VALIDATIONS_SECTION_VERSION: u32 = 28;
+
     /// A section, and receipts that still embed their operation records.
     pub const SECTION_VERSION: u32 = 14;
 
@@ -1079,9 +1089,16 @@ impl GraphSnapshot {
     /// the same way: every binary that reads v21 reads a ledger too, and
     /// resolution records outrank marks: every binary that reads v23 reads
     /// marks too. Call-site ledgers outrank the other records the same way:
-    /// every binary that reads v25 reads v23 too. A ledger is a record, so
-    /// only a store that carries records is asked whether it carries one.
+    /// every binary that reads v25 reads v23 too. Context validations outrank
+    /// ledgers and include records held in a materialized section.
     pub fn wire_version(&self) -> u32 {
+        if self.carries_context_validations() {
+            return if self.materialized_graph.is_some() {
+                Self::CONTEXT_VALIDATIONS_SECTION_VERSION
+            } else {
+                Self::CONTEXT_VALIDATIONS_VERSION
+            };
+        }
         if self.carries_resolution_records() {
             return match (
                 self.carries_call_site_ledgers(),
@@ -1169,21 +1186,62 @@ impl GraphSnapshot {
             || self.changes.may_carry_call_site_ledgers()
     }
 
+    /// Whether a current record, authority overlay, logged operation or
+    /// historical change carries a context validation. Encoded and appended
+    /// history answer from flags recorded when their changes were observed,
+    /// without decoding the history again.
+    pub fn carries_context_validations(&self) -> bool {
+        self.resolution_records.values().any(is_context_validation)
+            || self.materialized_graph.as_ref().is_some_and(|section| {
+                section
+                    .state
+                    .resolution_records
+                    .values()
+                    .any(is_context_validation)
+            })
+            || self
+                .repository_authority
+                .as_ref()
+                .is_some_and(|a| a.carries_context_validations())
+            || self.changes.may_carry_context_validations()
+    }
+
     /// The version of a graph-only body, one with no repository authority and
     /// no section, whose resolution records are `records` in the top-level
     /// slot: v13 without records, v23 with them, and v25 when one of them is a
-    /// call-site ledger.
+    /// call-site ledger, or v27 when one is a context validation.
     pub(crate) fn graph_only_version<'a>(
         records: impl IntoIterator<Item = &'a ResolutionRecord>,
     ) -> u32 {
-        let mut records = records.into_iter().peekable();
-        if records.peek().is_none() {
-            Self::MIN_SUPPORTED_VERSION
-        } else if records.any(is_call_site_ledger) {
+        records
+            .into_iter()
+            .fold(Self::MIN_SUPPORTED_VERSION, |version, record| {
+                version.max(if is_context_validation(record) {
+                    Self::CONTEXT_VALIDATIONS_VERSION
+                } else if is_call_site_ledger(record) {
+                    Self::CALL_SITE_LEDGERS_VERSION
+                } else {
+                    Self::RESOLUTION_RECORDS_VERSION
+                })
+            })
+    }
+
+    /// A graph-only export may retain historical records after its live record
+    /// was removed. The history flags include lazy and appended changes.
+    pub(crate) fn graph_only_version_with_history<'a>(
+        records: impl IntoIterator<Item = &'a ResolutionRecord>,
+        changes: &ChangeMap,
+    ) -> u32 {
+        let history_version = if changes.may_carry_context_validations() {
+            Self::CONTEXT_VALIDATIONS_VERSION
+        } else if changes.may_carry_call_site_ledgers() {
             Self::CALL_SITE_LEDGERS_VERSION
-        } else {
+        } else if changes.may_carry_resolution_records() {
             Self::RESOLUTION_RECORDS_VERSION
-        }
+        } else {
+            Self::MIN_SUPPORTED_VERSION
+        };
+        Self::graph_only_version(records).max(history_version)
     }
 
     /// Whether any persisted receipt names its operation rather than carrying
@@ -1214,11 +1272,12 @@ impl GraphSnapshot {
                 | Self::ENRICHMENT_MARKS_SECTION_VERSION
                 | Self::RESOLUTION_RECORDS_SECTION_VERSION
                 | Self::CALL_SITE_LEDGERS_SECTION_VERSION
+                | Self::CONTEXT_VALIDATIONS_SECTION_VERSION
         )
     }
 
     /// Whether a body at this version carries the resolution-record slot: the
-    /// records rungs and the ledger rungs above them.
+    /// records rungs and the ledger and validation rungs above them.
     pub(crate) const fn version_carries_resolution_records(version: u32) -> bool {
         matches!(
             version,
@@ -1226,6 +1285,8 @@ impl GraphSnapshot {
                 | Self::RESOLUTION_RECORDS_SECTION_VERSION
                 | Self::CALL_SITE_LEDGERS_VERSION
                 | Self::CALL_SITE_LEDGERS_SECTION_VERSION
+                | Self::CONTEXT_VALIDATIONS_VERSION
+                | Self::CONTEXT_VALIDATIONS_SECTION_VERSION
         )
     }
 
@@ -1260,9 +1321,10 @@ impl GraphSnapshot {
     /// elements inside workspace deltas and changes, which their own
     /// `serde(default)` read as no records. v25 and v26 are v23 and v24
     /// declared by a store that carries a call-site ledger, so they add no
-    /// element and are read by the same decoder. One decoder reads every rung
-    /// and no second copy of the field list exists to drift.
-    pub const MAX_SUPPORTED_VERSION: u32 = Self::CALL_SITE_LEDGERS_SECTION_VERSION;
+    /// element and are read by the same decoder. v27 and v28 similarly carry
+    /// context validations in the existing record slot. One decoder reads
+    /// every rung and no second copy of the field list exists to drift.
+    pub const MAX_SUPPORTED_VERSION: u32 = Self::CONTEXT_VALIDATIONS_SECTION_VERSION;
 
     /// Magic bytes for the file header: "KNDB"
     pub const MAGIC: [u8; 4] = *b"KNDB";
@@ -1517,7 +1579,8 @@ impl GraphSnapshot {
         if self.version != wire_version {
             return Err(crate::error::KinDbError::StorageError(format!(
                 "refusing to serialize a snapshot whose body declares v{} while its contents \
-                 serialize as v{}; call-site ledgers require v{}/v{} without/with a section; \
+                 serialize as v{}; context validations require v{}/v{} without/with a section; \
+                 call-site ledgers require v{}/v{} without/with a section; \
                  other resolution records require v{}/v{} without/with a section; \
                  enrichment marks require v{}/v{} without/with a section; \
                  owed derivation work requires v{}/v{} without/with a section; \
@@ -1526,6 +1589,8 @@ impl GraphSnapshot {
                  it v{}",
                 self.version,
                 wire_version,
+                Self::CONTEXT_VALIDATIONS_VERSION,
+                Self::CONTEXT_VALIDATIONS_SECTION_VERSION,
                 Self::CALL_SITE_LEDGERS_VERSION,
                 Self::CALL_SITE_LEDGERS_SECTION_VERSION,
                 Self::RESOLUTION_RECORDS_VERSION,
@@ -1699,6 +1764,7 @@ impl GraphSnapshot {
         let change_count = map_entry_count(element)?;
         let mut history_carries_records = false;
         let mut history_carries_ledgers = false;
+        let mut history_carries_validations = false;
         let index = {
             let _span = tracing::info_span!(
                 "kindb.snapshot.stream_change_map",
@@ -1710,6 +1776,8 @@ impl GraphSnapshot {
                 history_carries_records |= !change.resolution_record_deltas.is_empty();
                 history_carries_ledgers = history_carries_ledgers
                     || moves_call_site_ledgers(&change.resolution_record_deltas);
+                history_carries_validations = history_carries_validations
+                    || moves_context_validations(&change.resolution_record_deltas);
                 visit_change(change)
             })?;
             if index.len() != change_count {
@@ -1743,7 +1811,8 @@ impl GraphSnapshot {
             EncodedChanges::new(source, changes, change_count, body_checksum)
                 .with_index(index)
                 .with_resolution_records(history_carries_records)
-                .with_call_site_ledgers(history_carries_ledgers),
+                .with_call_site_ledgers(history_carries_ledgers)
+                .with_context_validations(history_carries_validations),
         );
         debug_assert_eq!(snapshot.version, snapshot.wire_version());
         let persisted_root_hash = Self::decode_root_hash_trailer(data, &frame)?;
@@ -1977,6 +2046,7 @@ impl GraphSnapshot {
             replay,
             RootRecomputation::Required,
             AuthorityEnvelope::Validated,
+            HistoryProof::Required,
         )
     }
 
@@ -1990,14 +2060,20 @@ impl GraphSnapshot {
     /// bundle it did not itself fold still has it checked against the contents.
     ///
     /// [`validate_storage_admission_with`]: Self::validate_storage_admission_with
+    ///
+    /// `history` is the successor's [`HistoryProof`], stated by the same caller
+    /// for the same reason: it built the successor and knows which of its
+    /// inputs the transaction left exactly as the predecessor held them.
     pub(crate) fn validate_storage_admission_with_proven_roots(
         &self,
         replay: GitProjectionTreeReplay,
+        history: HistoryProof,
     ) -> Result<(), crate::error::KinDbError> {
         self.validate_admission_with_envelope(
             replay,
             RootRecomputation::Proven,
             AuthorityEnvelope::Validated,
+            history,
         )
     }
 
@@ -2017,6 +2093,7 @@ impl GraphSnapshot {
             GitProjectionTreeReplay::Required,
             RootRecomputation::Required,
             AuthorityEnvelope::Ignored,
+            HistoryProof::Required,
         )
     }
 
@@ -2025,6 +2102,7 @@ impl GraphSnapshot {
         replay: GitProjectionTreeReplay,
         roots: RootRecomputation,
         envelope: AuthorityEnvelope,
+        history: HistoryProof,
     ) -> Result<(), crate::error::KinDbError> {
         let mut timer = crate::storage::repository::PublicationPhaseTimer::start();
         // Indexed recovery either verified an exact durable proof or admitted
@@ -2039,7 +2117,7 @@ impl GraphSnapshot {
         };
         let changes_ms = timer.lap_ms();
         self.validate_storage_admission_after_changes(
-            replay, roots, &admitted, envelope, changes_ms, timer,
+            replay, roots, &admitted, envelope, changes_ms, timer, history,
         )
     }
 
@@ -2096,7 +2174,15 @@ impl GraphSnapshot {
             ));
         }
         let timer = crate::storage::repository::PublicationPhaseTimer::start();
-        self.validate_storage_admission_after_changes(replay, roots, admitted, envelope, 0, timer)
+        self.validate_storage_admission_after_changes(
+            replay,
+            roots,
+            admitted,
+            envelope,
+            0,
+            timer,
+            HistoryProof::Required,
+        )
     }
 
     fn validate_storage_admission_after_changes(
@@ -2107,6 +2193,7 @@ impl GraphSnapshot {
         envelope: AuthorityEnvelope,
         changes_ms: u128,
         mut timer: crate::storage::repository::PublicationPhaseTimer,
+        history: HistoryProof,
     ) -> Result<(), crate::error::KinDbError> {
         for (id, reference) in &self.external_references {
             validate_external_reference_entry(id, reference, "snapshot")?;
@@ -2156,7 +2243,7 @@ impl GraphSnapshot {
             AuthorityEnvelope::Ignored => None,
         };
         if let Some(authority) = envelope_to_validate {
-            authority.validate_against_snapshot_with(self, replay, roots, admitted)?;
+            authority.validate_against_snapshot_with(self, replay, roots, admitted, history)?;
         }
         let repository_authority_ms = timer.lap_ms();
         tracing::debug!(
@@ -2970,8 +3057,9 @@ impl<'a> Serialize for BorrowedGraphSnapshot<'a> {
         // A live mutable graph never carries a materialized section, so this is
         // a v13 body by the same rule `wire_version` applies: 35 elements, no
         // trailing field, and the version to match. A graph that holds
-        // resolution records is a v23 body instead, or a v25 body when one of
-        // them is a call-site ledger: 37 elements, the section slot absent.
+        // resolution records is a v23 body instead, v25 for a call-site ledger,
+        // or v27 for a context validation: 37 elements, the section slot absent.
+        // Historical records require the same capability as live ones.
         let version = self.version();
         let mut state =
             serializer.serialize_struct("GraphSnapshot", GraphSnapshot::body_width(version))?;
@@ -3076,10 +3164,13 @@ impl<'a> Serialize for BorrowedGraphSnapshot<'a> {
 }
 
 impl<'a> BorrowedGraphSnapshot<'a> {
-    /// The version these contents serialize as: v13, v23 when the graph holds
-    /// resolution records, or v25 when one of them is a call-site ledger.
+    /// The version these contents serialize as: v13, v23 with resolution
+    /// records, v25 with ledgers, or v27 with validations, live or historical.
     pub fn version(&self) -> u32 {
-        GraphSnapshot::graph_only_version(self.resolution_records.records().values())
+        GraphSnapshot::graph_only_version_with_history(
+            self.resolution_records.records().values(),
+            self.changes,
+        )
     }
 
     /// Serialize to the on-disk binary format (KNDB header + msgpack body + checksum).
@@ -3237,6 +3328,33 @@ pub(crate) fn operation_moves_call_site_ledgers(
         .as_ref()
         .is_some_and(|mutation| {
             moves_call_site_ledgers(mutation.semantic_delta.resolution_record_deltas())
+        })
+}
+
+/// Whether the record declares the current validation state of a language.
+pub(crate) fn is_context_validation(record: &ResolutionRecord) -> bool {
+    record.as_context_validation().is_some()
+}
+
+/// Both the previous and successor state are encoded, including on removal.
+pub(crate) fn moves_context_validations(deltas: &[ResolutionRecordDelta]) -> bool {
+    deltas.iter().any(|delta| {
+        delta
+            .old_state()
+            .into_iter()
+            .chain(delta.new_state())
+            .any(is_context_validation)
+    })
+}
+
+pub(crate) fn operation_moves_context_validations(
+    operation: &kin_model::RepositoryOperationRecord,
+) -> bool {
+    operation
+        .workspace_mutation
+        .as_ref()
+        .is_some_and(|mutation| {
+            moves_context_validations(mutation.semantic_delta.resolution_record_deltas())
         })
 }
 
@@ -5182,9 +5300,9 @@ mod tests {
             GRAPH_SNAPSHOT_FIELD_COUNT - 1,
             "v14 appends exactly one element to v13"
         );
-        // Fourteen contiguous rungs, including the required-capability pair,
+        // Sixteen contiguous rungs, including the required-capability pair,
         // the owed-derivation pair, the enrichment-marks pair, the
-        // resolution-records pair and the call-site-ledgers pair; the width is
+        // resolution-records, call-site-ledgers and context-validations pairs; the width is
         // a function of the version rather than a second opinion about it.
         // Asserted rather than described, because the reader's width check
         // reads the version and would silently demand the wrong element count
@@ -5205,8 +5323,10 @@ mod tests {
                 GraphSnapshot::RESOLUTION_RECORDS_SECTION_VERSION,
                 GraphSnapshot::CALL_SITE_LEDGERS_VERSION,
                 GraphSnapshot::CALL_SITE_LEDGERS_SECTION_VERSION,
+                GraphSnapshot::CONTEXT_VALIDATIONS_VERSION,
+                GraphSnapshot::CONTEXT_VALIDATIONS_SECTION_VERSION,
             ],
-            [13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26],
+            [13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28],
             "the ladder is contiguous, which is what lets one decoder read every \
              rung with defaulted trailing fields"
         );
@@ -5232,6 +5352,8 @@ mod tests {
             (GraphSnapshot::RESOLUTION_RECORDS_SECTION_VERSION, true),
             (GraphSnapshot::CALL_SITE_LEDGERS_VERSION, false),
             (GraphSnapshot::CALL_SITE_LEDGERS_SECTION_VERSION, true),
+            (GraphSnapshot::CONTEXT_VALIDATIONS_VERSION, false),
+            (GraphSnapshot::CONTEXT_VALIDATIONS_SECTION_VERSION, true),
         ] {
             assert_eq!(
                 GraphSnapshot::version_carries_a_section(version),
@@ -5256,8 +5378,8 @@ mod tests {
             RESOLUTION_RECORDS_FIELD_INDEX,
             GRAPH_SNAPSHOT_RECORDS_FIELD_COUNT - 1
         );
-        // The ledger rungs change no layout: each is its records rung,
-        // declared by a store that carries a call-site ledger.
+        // The ledger and validation rungs change no layout: each is its
+        // records rung, declaring the record variant it carries.
         for (ledgers, records) in [
             (
                 GraphSnapshot::CALL_SITE_LEDGERS_VERSION,
@@ -5265,6 +5387,14 @@ mod tests {
             ),
             (
                 GraphSnapshot::CALL_SITE_LEDGERS_SECTION_VERSION,
+                GraphSnapshot::RESOLUTION_RECORDS_SECTION_VERSION,
+            ),
+            (
+                GraphSnapshot::CONTEXT_VALIDATIONS_VERSION,
+                GraphSnapshot::RESOLUTION_RECORDS_VERSION,
+            ),
+            (
+                GraphSnapshot::CONTEXT_VALIDATIONS_SECTION_VERSION,
                 GraphSnapshot::RESOLUTION_RECORDS_SECTION_VERSION,
             ),
         ] {
@@ -5282,8 +5412,8 @@ mod tests {
         }
         assert_eq!(
             GraphSnapshot::MAX_SUPPORTED_VERSION,
-            GraphSnapshot::CALL_SITE_LEDGERS_SECTION_VERSION,
-            "a reader of the ledger rungs reads every earlier rung"
+            GraphSnapshot::CONTEXT_VALIDATIONS_SECTION_VERSION,
+            "a reader of the validation rungs reads every earlier rung"
         );
     }
 
@@ -5521,6 +5651,201 @@ mod tests {
             GraphSnapshot::RESOLUTION_RECORDS_VERSION,
             "the history the append was made over is unchanged"
         );
+    }
+
+    fn format_context_validations() -> [ResolutionRecord; 2] {
+        let context = ledger_test_context().as_proof_context().unwrap().clone();
+        [
+            ResolutionRecord::ContextValidation(kin_model::ContextValidation {
+                language: context.language,
+                state: kin_model::ContextValidationState::Validated { context },
+            }),
+            ResolutionRecord::ContextValidation(kin_model::ContextValidation {
+                language: LanguageId::Rust,
+                state: kin_model::ContextValidationState::Unverified {
+                    reason: "the server executable could not be identified".into(),
+                },
+            }),
+        ]
+    }
+
+    #[test]
+    fn context_validation_states_round_trip_at_both_snapshot_rungs() {
+        for record in format_context_validations() {
+            for section in [false, true] {
+                let mut snapshot = if section {
+                    a_v14_snapshot("preserved section entity")
+                } else {
+                    GraphSnapshot::empty()
+                };
+                let quiet_bytes = snapshot.to_bytes().unwrap();
+                snapshot
+                    .resolution_records
+                    .insert(record.id(), record.clone());
+                snapshot.version = snapshot.wire_version();
+                let expected = if section { 28 } else { 27 };
+                let bytes = snapshot.to_bytes().unwrap();
+                assert_eq!(ledger_test_header(&bytes), expected);
+                assert_eq!(encoded_field_count(&bytes[16..bytes.len() - 32]), 37);
+                let error = GraphSnapshot::check_readable_version(
+                    expected,
+                    GraphSnapshot::CALL_SITE_LEDGERS_SECTION_VERSION,
+                )
+                .unwrap_err();
+                assert!(matches!(error,
+                    crate::error::KinDbError::IncompatibleSnapshotVersion {
+                        found, max: 26, ..
+                    } if found == expected
+                ));
+                let reopened = GraphSnapshot::from_bytes(&bytes).unwrap();
+                assert_eq!(reopened.resolution_records.get(&record.id()), Some(&record));
+                assert_eq!(reopened.to_bytes().unwrap(), bytes);
+                GraphSnapshot::prove_pre_validated_round_trip(&bytes).unwrap();
+                let reused = GraphSnapshot::from_bytes_reusing_exact_validation(&bytes).unwrap();
+                assert_eq!(reused.resolution_records.get(&record.id()), Some(&record));
+                assert_eq!(
+                    AuthorityEnvelopeSnapshot::from_bytes(&bytes)
+                        .unwrap()
+                        .version,
+                    expected
+                );
+                LocateGraphSnapshot::from_bytes_with_persisted_root_hash(&bytes).unwrap();
+                if section {
+                    assert_eq!(
+                        reopened
+                            .materialized_graph
+                            .as_ref()
+                            .unwrap()
+                            .state
+                            .entities
+                            .values()
+                            .next()
+                            .unwrap()
+                            .name,
+                        "preserved section entity"
+                    );
+                }
+
+                // A declared older rung must not hide the record, and clearing
+                // the only validation restores the exact compatible bytes.
+                snapshot.version = if section { 26 } else { 25 };
+                assert!(snapshot
+                    .to_bytes()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("context validations require v27/v28"));
+                snapshot.resolution_records.clear();
+                snapshot.version = snapshot.wire_version();
+                assert_eq!(snapshot.to_bytes().unwrap(), quiet_bytes);
+            }
+        }
+    }
+
+    #[test]
+    fn a_materialized_section_alone_carries_context_validation_capability() {
+        for record in format_context_validations() {
+            let mut snapshot = a_v14_snapshot("section-only validation");
+            Arc::make_mut(snapshot.materialized_graph.as_mut().unwrap())
+                .state
+                .resolution_records
+                .insert(record.id(), record.clone());
+            assert!(snapshot.resolution_records.is_empty());
+            assert!(snapshot.changes.is_empty());
+            snapshot.version = snapshot.wire_version();
+            assert_eq!(
+                snapshot.version,
+                GraphSnapshot::CONTEXT_VALIDATIONS_SECTION_VERSION
+            );
+            let bytes = snapshot.to_bytes().unwrap();
+            let reopened = GraphSnapshot::from_bytes(&bytes).unwrap();
+            assert_eq!(
+                reopened
+                    .materialized_graph
+                    .unwrap()
+                    .state
+                    .resolution_records
+                    .get(&record.id()),
+                Some(&record)
+            );
+        }
+    }
+
+    #[test]
+    fn context_validation_history_preserves_lazy_spooled_and_graph_versions() {
+        for record in format_context_validations() {
+            for removed in [false, true] {
+                let mut change = a_history_change(0, None);
+                change.resolution_record_deltas = vec![if removed {
+                    ResolutionRecordDelta::Removed {
+                        old: record.clone(),
+                    }
+                } else {
+                    ResolutionRecordDelta::Added {
+                        new: record.clone(),
+                    }
+                }];
+                let change = seal_change(change);
+                let mut historical = GraphSnapshot::empty();
+                historical.changes.insert(change.id, change.clone());
+                historical.version = historical.wire_version();
+                assert_eq!(
+                    historical.version,
+                    GraphSnapshot::CONTEXT_VALIDATIONS_VERSION
+                );
+                let bytes = historical.to_bytes().unwrap();
+                let (opened, _) = decode_lazily(&bytes, memory_source(&bytes));
+                let before = decoded_on_this_thread();
+                assert_eq!(
+                    opened.wire_version(),
+                    GraphSnapshot::CONTEXT_VALIDATIONS_VERSION
+                );
+                assert!(!opened.changes.is_decoded());
+                assert_eq!(decoded_on_this_thread(), before);
+                assert_eq!(
+                    opened.changes.read_change(&change.id).unwrap(),
+                    Some(change.clone())
+                );
+
+                let quiet_bytes = GraphSnapshot::empty().to_bytes().unwrap();
+                let (quiet, _) = decode_lazily(&quiet_bytes, memory_source(&quiet_bytes));
+                let mut appended = quiet.clone();
+                appended.changes.append_change(change.clone()).unwrap();
+                assert!(!appended.changes.is_decoded());
+                assert_eq!(
+                    appended.wire_version(),
+                    GraphSnapshot::CONTEXT_VALIDATIONS_VERSION
+                );
+                assert_eq!(decoded_on_this_thread(), before);
+                assert_eq!(quiet.wire_version(), GraphSnapshot::MIN_SUPPORTED_VERSION);
+                appended.version = appended.wire_version();
+                let spooled_bytes = appended.to_bytes().unwrap();
+                let (spooled, _) = decode_lazily(&spooled_bytes, memory_source(&spooled_bytes));
+                assert_eq!(
+                    spooled.wire_version(),
+                    GraphSnapshot::CONTEXT_VALIDATIONS_VERSION
+                );
+                assert!(!spooled.changes.is_decoded());
+
+                // Neither export may lower the rung when only history retains
+                // the validation. This is independent of live-record presence.
+                let graph =
+                    crate::InMemoryGraph::from_snapshot_without_text_index(spooled).unwrap();
+                let owned = graph.to_snapshot();
+                assert!(owned.resolution_records.is_empty());
+                assert_eq!(owned.version, GraphSnapshot::CONTEXT_VALIDATIONS_VERSION);
+                owned.to_bytes().unwrap();
+                let (borrowed, _) = graph.serialize_snapshot_borrowed().unwrap();
+                assert_eq!(
+                    ledger_test_header(&borrowed),
+                    GraphSnapshot::CONTEXT_VALIDATIONS_VERSION
+                );
+                let reopened = GraphSnapshot::from_bytes(&borrowed).unwrap();
+                assert_eq!(
+                    reopened.changes.read_change(&change.id).unwrap(),
+                    Some(change)
+                );
+            }
+        }
     }
 
     // FIR-3064: an open leaves the change map on disk.

@@ -1529,6 +1529,28 @@ impl SpineBackend for FirestoreSpineBackend {
     }
 }
 
+#[cfg(feature = "firestore")]
+fn transport_error_chain(error: reqwest::Error) -> String {
+    // A request URL can contain credentials or query data. Request names already
+    // identify the operation, so keep only transport classes and nested causes.
+    let error = error.without_url();
+    let classification = format!(
+        "timeout={}, connect={}, body={}, decode={}",
+        error.is_timeout(),
+        error.is_connect(),
+        error.is_body(),
+        error.is_decode()
+    );
+    let mut messages = Vec::new();
+    let mut current: Option<&dyn std::error::Error> = Some(&error);
+    for _ in 0..8 {
+        let Some(cause) = current else { break };
+        messages.push(cause.to_string().chars().take(512).collect::<String>());
+        current = cause.source();
+    }
+    format!("{} [{classification}]", messages.join("; caused by: "))
+}
+
 /// Firestore-backed [`SpineStore`] using the v1 REST API.
 ///
 /// Authentication is via the GCE metadata server (Workload Identity on GKE).
@@ -1634,7 +1656,7 @@ impl FirestoreStore {
                 let attempt = self.run_async(async {
                     let response = match build().send().await {
                         Ok(response) => response,
-                        Err(error) => return Ok(Attempt::Transport(error.to_string())),
+                        Err(error) => return Ok(Attempt::Transport(transport_error_chain(error))),
                     };
                     let status = response.status();
                     // A Firestore Commit's successful status already
@@ -1657,11 +1679,15 @@ impl FirestoreStore {
                         Ok(body) => body,
                         Err(error) if status.is_success() => {
                             return Ok(Attempt::Transport(format!(
-                                "response body read failed after status {status}: {error}"
+                                "response body read failed after status {status}: {}",
+                                transport_error_chain(error)
                             )))
                         }
                         Err(error) => {
-                            format!("response body read failed after status {status}: {error}")
+                            format!(
+                                "response body read failed after status {status}: {}",
+                                transport_error_chain(error)
+                            )
                         }
                     };
                     Ok(Attempt::Response(status, body))
@@ -7804,6 +7830,50 @@ mod transient_retry_tests {
         assert!(requests
             .iter()
             .all(|request| request.method == "POST" && request.path.ends_with(":runQuery")));
+    }
+
+    #[test]
+    fn truncated_success_body_retains_its_transport_source_when_retry_is_refused() {
+        let server = ScriptedServer::serve(vec![Scripted::Truncated {
+            status: 200,
+            body: "[".to_string(),
+            claimed_len: 100,
+        }]);
+        let store = store_against(&server)
+            .with_transient_retry_gate(Arc::new(|| Err("lease no longer held".to_string())));
+        let error = store
+            .query_documents("spine_entities_v2", "publication_id", "pub", Some(1))
+            .unwrap_err();
+        let diagnostic = error.to_string();
+        assert!(
+            diagnostic.contains("response body read failed after status 200 OK"),
+            "{diagnostic}"
+        );
+        assert!(diagnostic.contains("caused by:"), "{diagnostic}");
+        assert!(diagnostic.contains("decode=true"), "{diagnostic}");
+        assert!(diagnostic.contains("lease no longer held"), "{diagnostic}");
+        assert_eq!(server.requests().len(), 1);
+    }
+
+    #[test]
+    fn request_transport_diagnostics_remove_url_credentials_and_keep_causes() {
+        let server = ScriptedServer::serve(vec![Scripted::Drop]);
+        let store = store_against(&server).with_transient_retry_gate(Arc::new(|| {
+            Err("stop after the observed failure".to_string())
+        }));
+        let url = format!("{}/?sensitive_query=hidden", server.base_url);
+        let error = store
+            .send_with_transient_retry(
+                "diagnostic fixture",
+                SuccessfulResponseBody::Required,
+                || store.client.get(&url),
+            )
+            .unwrap_err();
+        let diagnostic = error.to_string();
+        assert!(diagnostic.contains("caused by:"), "{diagnostic}");
+        assert!(!diagnostic.contains("sensitive_query"), "{diagnostic}");
+        assert!(!diagnostic.contains(&server.base_url), "{diagnostic}");
+        assert_eq!(server.requests().len(), 1);
     }
 
     #[test]

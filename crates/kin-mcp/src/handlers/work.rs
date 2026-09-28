@@ -18,12 +18,24 @@ scopes. Reach for it to capture a unit of work as first-class graph truth so it 
 linked to the actual entities it concerns, decomposed into children, blocked by other \
 work, and tracked through status changes. Returns the new work item's ID, which the \
 other kin_work_* tools operate on. This keeps planning attached to code rather than \
-living in a separate tracker.";
+living in a separate tracker. A scope naming a symbol outside the repository is refused \
+with external_symbol_not_served.";
 
 pub fn handle_work_create<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
 ) -> Result<ToolCallResult> {
+    if let Some(scope) = args.get("scopes") {
+        if let Some(refusal) = super::external_symbols::external_scope_refusal(
+            store,
+            scope,
+            "kin_work_create",
+            "scopes",
+        )? {
+            return Ok(ToolCallResult::error(refusal));
+        }
+    }
+
     let kind_str = get_string_param(args, "kind")?;
     let title = get_string_param(args, "title")?;
     let description = args
@@ -88,12 +100,21 @@ List work items, optionally filtered by status (proposed, planned, in_progress, 
 blocked, done, verified, archived), kind, or scope. Reach for it to survey the backlog \
 or current work: what's in progress, what's blocked, what touches a given scope. \
 Returns compact rows; use kin_work_show to pull the full detail (relationships, \
-annotations) of a specific item.";
+annotations) of a specific item. A scope filter naming a symbol outside the repository is \
+refused with external_symbol_not_served, since no work can be linked to one.";
 
 pub fn handle_work_list<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
 ) -> Result<ToolCallResult> {
+    if let Some(scope) = args.get("scope") {
+        if let Some(refusal) =
+            super::external_symbols::external_scope_refusal(store, scope, "kin_work_list", "scope")?
+        {
+            return Ok(ToolCallResult::error(refusal));
+        }
+    }
+
     let status = args.get("status").and_then(|v| v.as_str());
     let kind = args.get("kind").and_then(|v| v.as_str());
     let scope = args.get("scope").and_then(|v| v.as_str());
@@ -205,12 +226,24 @@ Link a work item to semantic scopes: the entities, contracts, or artifacts it co
 Reach for it to connect planning to code so the work item shows up in context when \
 someone looks at those scopes, and so impact/coverage reasoning can relate work to the \
 declarations it touches. This expresses what the work is *about*; use kin_work_implement \
-to record the scopes that actually *implement* it.";
+to record the scopes that actually *implement* it. A scope naming a symbol outside the \
+repository is refused with external_symbol_not_served; link one of its callers instead.";
 
 pub fn handle_work_link<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
 ) -> Result<ToolCallResult> {
+    if let Some(scope) = args.get("scopes") {
+        if let Some(refusal) = super::external_symbols::external_scope_refusal(
+            store,
+            scope,
+            "kin_work_link",
+            "scopes",
+        )? {
+            return Ok(ToolCallResult::error(refusal));
+        }
+    }
+
     let (work_id_str, id) = parse_work_id_param(args, "work_id")?;
 
     let scopes = parse_work_scopes(args.get("scopes"))?;
@@ -307,12 +340,24 @@ work item: the code that fulfills it. Reach for it once you've written or identi
 the implementation, so the graph ties the work to its realization: this powers \
 traceability (\"what code delivered this feature?\") and lets coverage/verification \
 relate tests back to the work. Distinct from kin_work_link, which marks what the work \
-is merely *about*.";
+is merely *about*. A scope naming a symbol outside the repository is refused with \
+external_symbol_not_served.";
 
 pub fn handle_work_implement<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
 ) -> Result<ToolCallResult> {
+    if let Some(scope) = args.get("scopes") {
+        if let Some(refusal) = super::external_symbols::external_scope_refusal(
+            store,
+            scope,
+            "kin_work_implement",
+            "scopes",
+        )? {
+            return Ok(ToolCallResult::error(refusal));
+        }
+    }
+
     let (work_id_str, work_id) = parse_work_id_param(args, "work_id")?;
     ensure_work_item_exists(store, &work_id, &work_id_str)?;
     let scopes = parse_work_scopes(args.get("scopes"))?;
@@ -512,13 +557,33 @@ changes, or work items), or across the graph when no targets are given. Set \
 include_stale to control whether annotations whose anchor has drifted are included. \
 Reach for it to surface the warnings, instructions, comments, and reasoning recorded \
 about the code you're about to touch. This is the read side of kin_annotation_add. Resolve \
-ones that no longer apply with kin_annotation_mark_resolved.";
+ones that no longer apply with kin_annotation_mark_resolved. A target naming a symbol \
+outside the repository is refused with external_symbol_not_served, since none can be \
+anchored there.";
 
 pub fn handle_annotation_list<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
 ) -> Result<ToolCallResult> {
     let include_stale = get_optional_bool(args, "include_stale", true);
+    // No annotation is anchored to a symbol outside the repository, since
+    // kin_annotation_add refuses one, so a target naming one is refused by
+    // what it names rather than answered with a list that reads as empty.
+    let argument = if args.contains_key("targets") {
+        "targets"
+    } else {
+        "scopes"
+    };
+    if let Some(targets) = args.get(argument) {
+        if let Some(refusal) = super::external_symbols::external_scope_refusal(
+            store,
+            targets,
+            "kin_annotation_list",
+            argument,
+        )? {
+            return Ok(ToolCallResult::error(refusal));
+        }
+    }
     let targets = parse_annotation_targets(args)?;
 
     let annotations = if targets.is_empty() {

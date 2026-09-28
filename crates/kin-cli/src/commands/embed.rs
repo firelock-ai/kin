@@ -541,6 +541,22 @@ pub async fn run(
     .entered();
     let layout = crate::commands::require_repository_layout()?;
 
+    // Running `kin embed` is how a machine that declined the model download
+    // changes its mind, and every surface that reports the decline says so.
+    // Recorded before the first pass, because the embedder asks for this
+    // decision at the moment it would download.
+    if let Ok(kin_home) = crate::commands::setup::kin_dir() {
+        if crate::embed_model::consent_to_model_fetch(&kin_home)? {
+            let line = "Semantic search turned on: this machine now downloads the search model \
+                        when it is needed (`kin setup --embedding-model never` turns it off).";
+            if json {
+                eprintln!("{line}");
+            } else {
+                println!("{line}");
+            }
+        }
+    }
+
     // Taken before the first pass, and reused by every pass, because the
     // counters it holds are cumulative for the container's whole life. A
     // reading taken only after a failure cannot say whether the kill it counts

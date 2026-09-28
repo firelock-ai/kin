@@ -36,6 +36,9 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+
+#[path = "status_short.rs"]
+mod short;
 use chrono::Utc;
 use kin_core::last_admission::LastAdmissionRead;
 use kin_model::{
@@ -605,6 +608,11 @@ pub struct RepositoryStatus {
     /// `RepositoryAuthorityManager::open` verifies every authority-referenced
     /// source body before this report can be produced.
     pub source_cas_verified: bool,
+    /// Live session work, independent of the persisted workspace dirty bit.
+    /// None means this reader could not observe the daemon's session registry.
+    /// Nested here so older status peers can ignore the additive observation.
+    #[serde(default)]
+    pub open_transactions: Option<kin_mcp::session::OpenTransactionObservation>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -791,6 +799,12 @@ pub struct CommandStatusResponse {
     /// the caller falls back to one local open and answers exactly as it did.
     #[serde(default)]
     pub authority_readings_taken: bool,
+    /// Whether the graph this repository's workspace selects carries checked
+    /// binding history, read off the same authority. Carried on the envelope
+    /// for the reason `merge` is, and `None` from a responder that did not
+    /// read it, which the caller then reads for itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding_history_checked: Option<bool>,
 }
 
 impl CommandStatusRequest {
@@ -876,6 +890,7 @@ pub fn inspect_at(
             ref_count: metadata.ref_state.refs.len(),
             default_ref: metadata.ref_state.default_ref.clone(),
             source_cas_verified: true,
+            open_transactions: None,
         },
         workspace: WorkspaceStatus {
             workspace_id: workspace.workspace_id,
@@ -884,7 +899,11 @@ pub fn inspect_at(
             base_target: workspace.base_target.clone(),
             base_tree_hash: workspace.base_tree_hash,
             tree_hash: workspace.tree_hash,
-            dirty: workspace.is_dirty(),
+            // Work the author has not committed. Language-server enrichment
+            // Kin published into the overlay is derived state and does not
+            // make a workspace dirty; every gate on a user action reads it
+            // the same way.
+            dirty: workspace.holds_uncommitted_work(),
             artifact_count,
         },
         semantic_enrichment,
@@ -977,6 +996,9 @@ pub struct StatusReading {
     /// because a running one admits before this command reads and owns the
     /// reading; `None` everywhere else.
     pub unwatched_changes: Option<UnwatchedChanges>,
+    /// Whether the workspace's graph carries checked binding history, when the
+    /// reading took it.
+    pub binding_history_checked: Option<bool>,
 }
 
 /// Tracked files the working copy edited or removed since the last complete
@@ -1101,10 +1123,12 @@ async fn read_status_once(
                 workspace_tip: workspace_tip_at(&authority),
                 source: AuthoritySource::RunningDaemonAndOwnOpen,
                 unwatched_changes: None,
+                binding_history_checked: Some(binding_history_checked_at(&authority)),
             })
         }
         Ok(response) => Ok(StatusReading {
             unwatched_changes: None,
+            binding_history_checked: response.binding_history_checked,
             report: response.report,
             merge: response.merge,
             // A responder that says it took the readings and then carries no tip
@@ -1139,6 +1163,7 @@ async fn read_status_once(
             Ok(StatusReading {
                 merge: merge_in_progress_at(&authority),
                 workspace_tip: workspace_tip_at(&authority),
+                binding_history_checked: Some(binding_history_checked_at(&authority)),
                 report,
                 // Only with no daemon at all. One that is running owns the
                 // working copy's reading and admits it on its own, so a second
@@ -1284,7 +1309,7 @@ where
 /// The `--json` arm returns the same code, and there it is the ONLY signal: the
 /// payload cannot carry the gap, because `StatusReportWire` denies unknown
 /// fields and a new key there makes an older CLI reject a newer daemon's report.
-pub async fn run(json: bool, wait_quiesce: std::time::Duration) -> Result<i32> {
+pub async fn run(json: bool, verbose: bool, wait_quiesce: std::time::Duration) -> Result<i32> {
     let layout = crate::commands::require_repository_layout()?;
     // One resolution of this repository's daemon for the whole command: the
     // supervisor's route, then the repository's own endpoint record. The
@@ -1301,6 +1326,32 @@ pub async fn run(json: bool, wait_quiesce: std::time::Duration) -> Result<i32> {
     let report = reading.report;
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
+    } else if crate::screen::short_form(verbose) {
+        // A person at a terminal gets the short page: whether the repository
+        // is in step with the files on disk, whether search is ready, and every
+        // warning the full record below would raise. The exit code is the
+        // same one the full record returns.
+        let style = crate::screen::Style::for_stdout();
+        let mut attention = short_attention(
+            &layout,
+            &pass,
+            reading.merge.as_ref(),
+            &reading.workspace_tip,
+            reading.binding_history_checked,
+        );
+        attention.extend(open_transaction_lines(
+            report.repository.open_transactions.as_ref(),
+        ));
+        let page = short_page(
+            style,
+            &report,
+            &pass,
+            reading.unwatched_changes.as_ref(),
+            attention,
+        );
+        for line in short::lines(style, &page, crate::screen::right_edge()) {
+            println!("{line}");
+        }
     } else {
         // The merge Kin is holding open and where this workspace sits relative
         // to its branch both came off the SAME authority the report did, in
@@ -1364,9 +1415,14 @@ pub async fn run(json: bool, wait_quiesce: std::time::Duration) -> Result<i32> {
         // record for the reason the lines above are, and printed exactly as
         // `kin graph status` and `kin doctor` print it, so a store an older build
         // wrote names `kin upgrade` on the first command a reader runs.
-        if let Some(line) = crate::commands::graph::hydration_semantics_line(
-            &kin_core::hydration_semantics::standing(&layout),
-        ) {
+        let standing = kin_core::hydration_semantics::standing(&layout);
+        if let Some(line) = crate::commands::graph::hydration_semantics_line(&standing) {
+            println!("{line}");
+        }
+        // The gap that line cannot see: a store that reads current and whose
+        // workspace graph still carries no checked binding history, with the
+        // same remedy, read from the same authority as the report.
+        if let Some(line) = binding_history_line(&standing, reading.binding_history_checked) {
             println!("{line}");
         }
         // What the working copy holds that graph truth does not. Appended for
@@ -1406,6 +1462,174 @@ pub async fn run(json: bool, wait_quiesce: std::time::Duration) -> Result<i32> {
         }
     }
     Ok(exit_code_for_admission(&pass))
+}
+
+/// The clause every "no daemon" admission skip opens with.
+const NO_DAEMON: &str = "no daemon is running for this repository";
+
+/// Every warning the full record raises beside its counts, as sentences that
+/// read on their own.
+///
+/// The full record interleaves these with authority facts; the short page
+/// states them after its rows, and drops none of them.
+fn short_attention(
+    layout: &kin_core::KinLayout,
+    pass: &StatusAdmission,
+    merge: Option<&MergeInProgress>,
+    tip: &crate::commands::workspace_tip::WorkspaceTip,
+    binding_history_checked: Option<bool>,
+) -> Vec<String> {
+    let mut attention = Vec::new();
+    if let Some(merge) = merge {
+        attention.push(short::standalone(&merge_line(merge)));
+    }
+    if matches!(
+        tip,
+        crate::commands::workspace_tip::WorkspaceTip::Behind { .. }
+    ) {
+        attention.push(short::standalone(&crate::commands::workspace_tip::line(
+            tip,
+        )));
+    }
+    // A skip for any reason but an absent daemon is a fault, not an idle
+    // repository, so it is said in full.
+    if let StatusAdmission::Skipped(why) = pass {
+        if !why.starts_with(NO_DAEMON) {
+            let mut sentence = why.clone();
+            if let Some(first) = sentence.get(..1) {
+                sentence.replace_range(..1, &first.to_uppercase());
+            }
+            attention.push(format!("{sentence}."));
+        }
+    }
+    if let Some(line) = kin_core::retained_parse::read(layout).describe(Utc::now()) {
+        attention.push(line);
+    }
+    if let Some(death) = crate::daemon_death::recorded_for_store(layout.root()) {
+        attention.push(death.summary());
+    }
+    let standing = kin_core::hydration_semantics::standing(layout);
+    if let Some(line) = crate::commands::graph::hydration_semantics_line(&standing) {
+        attention.push(line);
+    }
+    if let Some(line) = binding_history_line(&standing, binding_history_checked) {
+        attention.push(line);
+    }
+    if let Some(line) = admission_hold_line(pass) {
+        attention.push(line);
+    }
+    attention
+}
+
+/// The short page's rows, reduced from the report the full record prints.
+fn short_page(
+    style: crate::screen::Style,
+    report: &StatusReport,
+    pass: &StatusAdmission,
+    unwatched: Option<&UnwatchedChanges>,
+    attention: Vec<String>,
+) -> short::Page {
+    let dot = style.separator();
+    let name = report
+        .repo_root
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| report.repo_root.display().to_string());
+    let (branch, basis) = match &report.workspace.head {
+        WorkspaceHead::Symbolic { target } => {
+            let branch = short::branch_name(&target.to_string());
+            (branch.clone(), branch)
+        }
+        WorkspaceHead::Detached { .. } => ("detached".to_string(), "its change".to_string()),
+    };
+    let graph = match report.semantic_enrichment.presence {
+        SemanticEnrichmentPresence::Absent => "nothing imported yet".to_string(),
+        SemanticEnrichmentPresence::Present => format!(
+            "{} entities {dot} {} relations",
+            crate::screen::count(report.semantic_enrichment.entity_count as u64),
+            crate::screen::count(report.semantic_enrichment.relation_count as u64)
+        ),
+    };
+    let mut working_hint = None;
+    let mut untracked = None;
+    let working_tree = match pass {
+        StatusAdmission::Took(admitted) => {
+            let reconcile = &admitted.reconcile;
+            if !reconcile.untracked_observation_not_applicable
+                && reconcile.untracked_observed_age_seconds.is_some()
+                && reconcile.untracked_path_count > 0
+            {
+                untracked = Some(format!(
+                    "{} {} the graph doesn't hold {dot} kin admit takes them",
+                    crate::screen::count(reconcile.untracked_path_count),
+                    if reconcile.untracked_path_count == 1 {
+                        "file"
+                    } else {
+                        "files"
+                    }
+                ));
+            }
+            if report.workspace.dirty {
+                format!("has changes {basis} doesn't have")
+            } else {
+                format!("matches {basis}")
+            }
+        }
+        StatusAdmission::Skipped(why) if why.starts_with(NO_DAEMON) => match unwatched {
+            Some(UnwatchedChanges::Measured { changed, removed })
+                if changed.is_empty() && removed.is_empty() =>
+            {
+                working_hint = Some(
+                    "New files are checked only while a daemon runs. kin admit checks \
+                     everything now."
+                        .to_string(),
+                );
+                "tracked files unchanged since kin read them".to_string()
+            }
+            Some(UnwatchedChanges::Measured { changed, removed }) => {
+                let changed = changed.len() + removed.len();
+                working_hint = Some("kin admit takes them now.".to_string());
+                format!(
+                    "{} tracked {} changed since kin read them",
+                    crate::screen::count(changed as u64),
+                    if changed == 1 { "file" } else { "files" }
+                )
+            }
+            _ => {
+                working_hint = Some("kin admit checks it now.".to_string());
+                "not checked: no daemon is running".to_string()
+            }
+        },
+        // Named in full among the warnings.
+        StatusAdmission::Skipped(_) => "not checked".to_string(),
+    };
+    let search = match &report.embedding_coverage {
+        EmbeddingCoverage::Observed { total, .. } if *total == 0 => "no entries yet".to_string(),
+        EmbeddingCoverage::Observed { indexed, total, .. } if indexed >= total => {
+            format!("{} entries", crate::screen::count(*total as u64))
+        }
+        EmbeddingCoverage::Observed { indexed, total, .. } => format!(
+            "{} of {} entries",
+            crate::screen::count(*indexed as u64),
+            crate::screen::count(*total as u64)
+        ),
+        EmbeddingCoverage::Unobserved {
+            reason: EmbeddingCoverageUnobserved::NoRunningDaemon,
+        } => "not read: no daemon is running".to_string(),
+        EmbeddingCoverage::Unobserved { reason } => {
+            format!("not read: {}", unobserved_explanation(*reason))
+        }
+    };
+    short::Page {
+        name,
+        branch,
+        graph,
+        working_tree,
+        working_hint,
+        untracked,
+        search,
+        attention,
+    }
 }
 
 /// The `kin status` reading of a reconcile loop that has stood down.
@@ -1557,6 +1781,39 @@ fn daemon_memory_line(kin_root: &std::path::Path) -> Option<String> {
     Some(format!("Daemon memory: {}", published.line(now)))
 }
 
+fn open_transaction_lines(
+    observation: Option<&kin_mcp::session::OpenTransactionObservation>,
+) -> Vec<String> {
+    let Some(observation) = observation else {
+        return vec![
+            "Staged session work: not observed; a running daemon supplies this reading".into(),
+        ];
+    };
+    if observation.items.is_empty() {
+        return vec!["Staged session work: none".into()];
+    }
+    let mut lines = vec![format!(
+        "Staged session work: {} open transaction(s)",
+        observation.items.len()
+    )];
+    lines.extend(observation.items.iter().map(|transaction| {
+        let age = transaction
+            .age_seconds
+            .map(|seconds| format!("{seconds}s"))
+            .unwrap_or_else(|| "unknown (creation time was not recorded)".into());
+        format!(
+            "  Transaction {}: session {}, scope {}, {} staged operation(s), age {} ({})",
+            transaction.transaction_id,
+            transaction.session_id,
+            transaction.scope,
+            transaction.staged_count,
+            age,
+            transaction.state
+        )
+    }));
+    lines
+}
+
 pub fn build_command_status_response(
     report: StatusReport,
     json: bool,
@@ -1596,7 +1853,47 @@ pub fn build_command_status_response(
         // none has taken neither, and a `merge` of `None` from it means "not
         // read" rather than "no merge".
         authority_readings_taken: workspace_tip.is_some(),
+        binding_history_checked: None,
     })
+}
+
+/// Whether the graph this repository's workspace selects carries checked
+/// binding history, read from the authority envelope the caller already holds.
+///
+/// A witness names a workspace authority holds and is kept only while that
+/// workspace's selected graph is the one it proved, so its presence is the
+/// answer, with nothing to decode.
+pub fn binding_history_checked_at(authority: &ActiveRepositoryAuthority) -> bool {
+    authority
+        .manager()
+        .read_authority()
+        .metadata()
+        .binding_history
+        .iter()
+        .any(|witness| witness.workspace_id() == authority.workspace_id)
+}
+
+/// The line `kin status` prints for a store that records this build's replay
+/// semantics and whose workspace graph carries no checked binding history, or
+/// `None` when there is nothing to say.
+///
+/// A store whose semantics are behind already prints the hydration line, which
+/// names the same remedy, so this line is only for the gap that one misses: a
+/// store that reads current and still cannot certify a reference answer.
+pub(crate) fn binding_history_line(
+    standing: &kin_core::hydration_semantics::HydrationStanding,
+    checked: Option<bool>,
+) -> Option<String> {
+    if standing.is_gap() || checked != Some(false) {
+        return None;
+    }
+    Some(format!(
+        "⚠ binding history: unchecked, so reference and call answers over this store stay \
+         unproven. A daemon start checks it only when the store already serves exactly what \
+         this build derives. Remedy: run `kin upgrade` in this repository (`{}` when Kin runs \
+         through npm), which re-derives the state this store serves and checks it.",
+        kin_core::hydration_semantics::npm_upgrade_command()
+    ))
 }
 
 /// A merge this workspace is holding open.
@@ -1802,11 +2099,27 @@ fn author_refusal_summary(error: &anyhow::Error) -> String {
         .find(|line| !line.is_empty())
         .unwrap_or("no author identity")
         .trim_end_matches('.');
-    if first.contains("no author identity") {
+    if error
+        .downcast_ref::<kin_core::KinError>()
+        .is_some_and(super::is_missing_author_identity)
+    {
         format!(
-            "{first}; set one with `git config --global user.name` and `git config --global \
-             user.email`, or `default_author` in .kin/config.toml"
+            "{first}; run `git config --global user.name \"Your Name\"` then \
+             `git config --global user.email \"you@example.com\"`, or set \
+             `default_author = \"Your Name <you@example.com>\"` at the top level of \
+             .kin/config.toml, above the first [section]"
         )
+    } else if first.contains("no author identity") {
+        // A misplaced setting has the same opening sentence, followed by its
+        // exact wrong table and move-line repair. Keep that paragraph without
+        // repeating the full alternatives in every status row.
+        rendered
+            .split("\n\n")
+            .take(2)
+            .flat_map(str::lines)
+            .map(str::trim)
+            .collect::<Vec<_>>()
+            .join(" ")
     } else {
         first.to_string()
     }
@@ -2099,8 +2412,11 @@ fn render_text_with_tip(
     if let StatusAdmission::Skipped(why) = pass {
         lines.push(unmeasured_working_copy_banner(why));
     }
+    lines.push(format!("Repository: {}", report.repository.repository_id));
+    lines.extend(open_transaction_lines(
+        report.repository.open_transactions.as_ref(),
+    ));
     lines.extend([
-        format!("Repository: {}", report.repository.repository_id),
         format!("Authority generation: {}", report.repository.generation),
         format!("Workspace: {}", report.workspace.workspace_id),
         format!(
@@ -2225,36 +2541,36 @@ fn render_embedding_coverage(coverage: &EmbeddingCoverage) -> String {
             format!("{indexed}/{total} indexed, {pending} pending ({view})")
         }
         EmbeddingCoverage::Unobserved { reason } => {
-            let explanation = match reason {
-                EmbeddingCoverageUnobserved::NoRunningDaemon => {
-                    "no daemon holds this repository's live graph"
-                }
-                EmbeddingCoverageUnobserved::DaemonStatusUnavailable => {
-                    "the daemon's status response could not be used"
-                }
-                EmbeddingCoverageUnobserved::NoVectorIndexAttached => {
-                    "the live graph carries no vector index"
-                }
-                EmbeddingCoverageUnobserved::VectorSupportDisabled => {
-                    "this build ships no vector backend"
-                }
-                EmbeddingCoverageUnobserved::SamplingContended => "an embedding pass was in flight",
-                EmbeddingCoverageUnobserved::EmbeddingWorkLockPoisoned => {
-                    "the embedding work lock is poisoned; this daemon's embedding loop is dead \
+            format!("not observed ({})", unobserved_explanation(*reason))
+        }
+    }
+}
+
+/// Why coverage could not be observed, in the words both status surfaces use.
+fn unobserved_explanation(reason: EmbeddingCoverageUnobserved) -> &'static str {
+    match reason {
+        EmbeddingCoverageUnobserved::NoRunningDaemon => {
+            "no daemon holds this repository's live graph"
+        }
+        EmbeddingCoverageUnobserved::DaemonStatusUnavailable => {
+            "the daemon's status response could not be used"
+        }
+        EmbeddingCoverageUnobserved::NoVectorIndexAttached => {
+            "the live graph carries no vector index"
+        }
+        EmbeddingCoverageUnobserved::VectorSupportDisabled => "this build ships no vector backend",
+        EmbeddingCoverageUnobserved::SamplingContended => "an embedding pass was in flight",
+        EmbeddingCoverageUnobserved::EmbeddingWorkLockPoisoned => {
+            "the embedding work lock is poisoned; this daemon's embedding loop is dead \
                      and will not resume without a restart"
-                }
-                EmbeddingCoverageUnobserved::GraphMutationInFlight => {
-                    "a graph mutation was in flight across every sampling attempt"
-                }
-                EmbeddingCoverageUnobserved::SamplingFailed => {
-                    "the coverage sample did not complete"
-                }
-                EmbeddingCoverageUnobserved::DaemonNotAnswering => {
-                    "this repository's daemon is running and did not answer in time, so its live \
+        }
+        EmbeddingCoverageUnobserved::GraphMutationInFlight => {
+            "a graph mutation was in flight across every sampling attempt"
+        }
+        EmbeddingCoverageUnobserved::SamplingFailed => "the coverage sample did not complete",
+        EmbeddingCoverageUnobserved::DaemonNotAnswering => {
+            "this repository's daemon is running and did not answer in time, so its live \
                      graph was not read"
-                }
-            };
-            format!("not observed ({explanation})")
         }
     }
 }
@@ -2300,20 +2616,36 @@ mod tests {
 
     #[test]
     fn an_author_refusal_is_quoted_as_one_line_that_names_the_fix() {
-        let error = anyhow::anyhow!(
-            "config error: kin has no author identity to record for this change.\n\n\
-             Authorship is provenance.\n\nSet your Git identity:\n  git config --global \
-             user.name \"Your Name\""
-        );
+        let error = anyhow::Error::new(kin_core::KinError::Config(
+            kin_core::unresolved_identity_message(),
+        ));
         let summary = super::author_refusal_summary(&error);
         assert!(!summary.contains('\n'), "{summary}");
         assert!(summary
             .starts_with("config error: kin has no author identity to record for this change;"));
         assert!(
-            summary.contains("git config --global user.name"),
+            summary.contains("git config --global user.name \"Your Name\""),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("git config --global user.email \"you@example.com\""),
             "{summary}"
         );
         assert!(summary.contains("default_author"), "{summary}");
+        let misplaced = anyhow::Error::new(kin_core::KinError::Config(
+            kin_core::identity::misplaced_identity_message("resources"),
+        ));
+        let summary = super::author_refusal_summary(&misplaced);
+        assert!(!summary.contains('\n'), "{summary}");
+        assert!(
+            summary.contains("default_author under [resources]"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("Move the line to the top level"),
+            "{summary}"
+        );
+        assert!(!summary.contains("git config --global"), "{summary}");
         let other = anyhow::anyhow!("config error: .kin/config.toml is not valid TOML\n\ndetail");
         assert_eq!(
             super::author_refusal_summary(&other),
@@ -2469,6 +2801,7 @@ mod tests {
             merge: None,
             workspace_tip: Some(crate::commands::workspace_tip::WorkspaceTip::Detached),
             authority_readings_taken: true,
+            binding_history_checked: None,
         })
         .unwrap();
         let repo_root = layout
@@ -3813,6 +4146,73 @@ mod tests {
         inspect(&init.layout, &binding, unobserved_fixture()).unwrap()
     }
 
+    #[test]
+    fn staged_transaction_status_roundtrips_without_changing_workspace_dirty() {
+        let mut report = settle_base_report();
+        let dirty = report.workspace.dirty;
+        let registry = kin_mcp::SessionRegistry::new();
+        registry.register("status-owner", "test");
+        let tx = registry
+            .begin_transaction("status-owner", "selected-entity")
+            .unwrap();
+        registry
+            .stage_transaction(
+                &tx.transaction_id,
+                vec![kin_mcp::session::McpMutationOperation {
+                    verb: "update".into(),
+                    target: "selected-entity".into(),
+                    payload: None,
+                    body: Some("private staged body".into()),
+                    description: "edit".into(),
+                    destination: None,
+                }],
+            )
+            .unwrap();
+        report.repository.open_transactions = Some(registry.open_staged_transactions());
+        let wire = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            wire["repository"]["open_transactions"]["items"][0]["transaction_id"],
+            tx.transaction_id
+        );
+        assert!(!wire.to_string().contains("private staged body"));
+        let roundtrip: StatusReport = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(roundtrip.workspace.dirty, dirty);
+        assert_eq!(
+            roundtrip.repository.open_transactions,
+            report.repository.open_transactions
+        );
+        let rendered = render_text(
+            &roundtrip,
+            None,
+            None,
+            None,
+            &LastAdmissionRead::Absent,
+            &kin_core::retained_parse::RetainedParseRead::Absent,
+            &skipped_pass(),
+            None,
+        );
+        assert!(rendered.contains(&tx.transaction_id), "{rendered}");
+        assert!(
+            rendered.contains(
+                "session status-owner, scope selected-entity, 1 staged operation(s), age"
+            ),
+            "{rendered}"
+        );
+        let mut legacy = wire;
+        legacy["repository"]
+            .as_object_mut()
+            .unwrap()
+            .remove("open_transactions");
+        let legacy: StatusReport = serde_json::from_value(legacy).unwrap();
+        assert!(legacy.repository.open_transactions.is_none());
+        assert!(open_transaction_lines(None)[0].contains("not observed"));
+        registry.abort_transaction(&tx.transaction_id).unwrap();
+        assert_eq!(
+            open_transaction_lines(Some(&registry.open_staged_transactions())),
+            ["Staged session work: none"]
+        );
+    }
+
     fn carrying(base: &StatusReport, coverage: EmbeddingCoverage) -> StatusReport {
         let mut report = base.clone();
         report.embedding_coverage = coverage;
@@ -3851,6 +4251,7 @@ mod tests {
                     workspace_tip: crate::commands::workspace_tip::WorkspaceTip::Detached,
                     source: AuthoritySource::OwnAuthorityOpen,
                     unwatched_changes: None,
+                    binding_history_checked: None,
                 })
             }
         })

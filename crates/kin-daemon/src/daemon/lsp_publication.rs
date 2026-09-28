@@ -114,6 +114,13 @@ impl QueryInputs {
         }
     }
 
+    /// Exact absence from this admitted tree, not from the entity list. An
+    /// unparsed or unsupported artifact still exists and cannot retire a failure.
+    pub(crate) fn path_is_absent(&self, path: &str) -> bool {
+        RepoPath::from_utf8(path.to_owned())
+            .is_ok_and(|path| self.tree.artifact_at_path(&path).is_none())
+    }
+
     pub(crate) fn document(&self, path: &str) -> Option<String> {
         // A server may mention external library files. Those have no authority
         // here and are not opened; an admitted source whose CAS read fails is
@@ -145,6 +152,30 @@ impl QueryInputs {
     pub(crate) async fn current(&self, state: &DaemonState) -> Result<(), Refused> {
         let _coordinated = state.coordination_gate.lock().await;
         self.validate(state)
+    }
+
+    /// Publish the context this sweep settled without invalidating its own
+    /// captured source universe. Validation can follow an awaited server start,
+    /// so freshness must be checked after acquiring coordination, before writing.
+    pub(crate) async fn record_context_validation(
+        &self,
+        state: &DaemonState,
+        language: kin_model::LanguageId,
+        settled: kin_model::ContextValidationState,
+    ) -> Result<(), Refused> {
+        let _coordinated = state.coordination_gate.lock().await;
+        self.validate(state)?;
+        let before = self.epoch.load(Ordering::SeqCst);
+        // The synchronous writer owns exactly one authority-mutation guard,
+        // including an identical validation: entry and drop each advance once.
+        // Accept only those edges, never an intervening unrelated writer's.
+        let after = before.checked_add(2).ok_or(Refused::Stale)?;
+        super::record_context_validation(state, language, settled);
+        if !state.graph_authority_epoch_is_current(after) {
+            return Err(Refused::Stale);
+        }
+        self.epoch.store(after, Ordering::SeqCst);
+        Ok(())
     }
 
     pub(crate) async fn mark_completed(

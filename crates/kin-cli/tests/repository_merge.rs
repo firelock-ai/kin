@@ -120,17 +120,39 @@ fn authority_generation(layout: &kin_core::KinLayout) -> u64 {
     generation
 }
 
-fn workspace_is_dirty(layout: &kin_core::KinLayout) -> bool {
+/// What the author owns in the local workspace: its head, the change it is
+/// based on, and its exact tree, as the persisted authority records them.
+/// Language-server enrichment a daemon publishes into the overlay is derived
+/// and can land at any time, so it is not part of this.
+fn workspace_authored(layout: &kin_core::KinLayout) -> String {
     let manager = open_authority(layout);
     let lease = manager.read_authority();
-    let dirty = lease
+    let workspace = lease
+        .metadata()
+        .workspaces
+        .first()
+        .expect("the repository has a local workspace");
+    let authored = format!(
+        "{:?} {:?} {:?} {:?}",
+        workspace.head, workspace.base_target, workspace.base_tree_hash, workspace.tree_hash
+    );
+    drop(lease);
+    authored
+}
+
+/// Whether the local workspace holds work nobody committed: a tree off its
+/// base, or an overlay holding anything beyond language-server enrichment.
+fn workspace_holds_uncommitted_work(layout: &kin_core::KinLayout) -> bool {
+    let manager = open_authority(layout);
+    let lease = manager.read_authority();
+    let holds = lease
         .metadata()
         .workspaces
         .first()
         .expect("the repository has a local workspace")
-        .is_dirty();
+        .holds_uncommitted_work();
     drop(lease);
-    dirty
+    holds
 }
 
 fn json_id<T: serde::Serialize>(id: &T) -> Value {
@@ -559,6 +581,7 @@ fn conflicting_merge_is_parked_as_a_durable_transaction_and_names_what_conflicte
     let main_before = branch_change(&layout, "main");
     let feature_before = branch_change(&layout, "feature");
     let generation_before = authority_generation(&layout);
+    let workspace_before = workspace_authored(&layout);
 
     let merged = run_kin(&runtime, &repo, &["merge", "feature"]);
     // The code, not merely success: a parked merge and a published one shared
@@ -601,8 +624,17 @@ fn conflicting_merge_is_parked_as_a_durable_transaction_and_names_what_conflicte
         b"pub fn base(value: u64) {}\n"
     );
 
+    // A parked merge leaves the workspace exactly as the author left it: the
+    // same head, base and tree, and no uncommitted work. Derived
+    // language-server enrichment may sit in the overlay, as it does on any
+    // workspace a daemon has swept, and is not partial merge state.
+    assert_eq!(
+        workspace_authored(&layout),
+        workspace_before,
+        "a parked merge leaves no partial workspace state"
+    );
     assert!(
-        !workspace_is_dirty(&layout),
+        !workspace_holds_uncommitted_work(&layout),
         "a parked merge leaves no partial workspace state"
     );
 }
@@ -647,6 +679,7 @@ fn merge_of_disjoint_edits_to_one_file_is_parked_atomically() {
     let main_before = branch_change(&layout, "main");
     let feature_before = branch_change(&layout, "feature");
     let generation_before = authority_generation(&layout);
+    let workspace_before = workspace_authored(&layout);
 
     let merged = run_kin(&runtime, &repo, &["merge", "feature"]);
     // The code, not merely success: a parked merge and a published one shared
@@ -679,8 +712,17 @@ fn merge_of_disjoint_edits_to_one_file_is_parked_atomically() {
         fs::read(repo.join("src/lib.rs")).unwrap(),
         b"pub fn alpha(value: u64) {}\n\npub fn beta() {}\n"
     );
+    // A parked merge leaves the workspace exactly as the author left it: the
+    // same head, base and tree, and no uncommitted work. Derived
+    // language-server enrichment may sit in the overlay, as it does on any
+    // workspace a daemon has swept, and is not partial merge state.
+    assert_eq!(
+        workspace_authored(&layout),
+        workspace_before,
+        "a parked merge leaves no partial workspace state"
+    );
     assert!(
-        !workspace_is_dirty(&layout),
+        !workspace_holds_uncommitted_work(&layout),
         "a parked merge leaves no partial workspace state"
     );
 }
@@ -709,6 +751,7 @@ fn merge_of_a_move_against_an_edit_is_parked_atomically() {
     let main_before = branch_change(&layout, "main");
     let feature_before = branch_change(&layout, "feature");
     let generation_before = authority_generation(&layout);
+    let workspace_before = workspace_authored(&layout);
 
     let merged = run_kin(&runtime, &repo, &["merge", "feature"]);
     // The code, not merely success: a parked merge and a published one were the
@@ -745,8 +788,17 @@ fn merge_of_a_move_against_an_edit_is_parked_atomically() {
         !repo.join("src/renamed.rs").exists(),
         "a parked merge does not materialize the source branch's move"
     );
+    // A parked merge leaves the workspace exactly as the author left it: the
+    // same head, base and tree, and no uncommitted work. Derived
+    // language-server enrichment may sit in the overlay, as it does on any
+    // workspace a daemon has swept, and is not partial merge state.
+    assert_eq!(
+        workspace_authored(&layout),
+        workspace_before,
+        "a parked merge leaves no partial workspace state"
+    );
     assert!(
-        !workspace_is_dirty(&layout),
+        !workspace_holds_uncommitted_work(&layout),
         "a parked merge leaves no partial workspace state"
     );
 }

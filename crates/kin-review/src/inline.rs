@@ -1018,8 +1018,8 @@ fn collect_modified_comments(
                 end_line: span.end_line,
                 kind: InlineCommentKind::Breaking,
                 message: format!(
-                    "Breaking change: signature modification affects {} downstream entity(ies)",
-                    consumer_count,
+                    "Breaking change: signature modification affects {} direct external consumer(s) of `{}`",
+                    consumer_count, new.name,
                 ),
             });
         } else if consumers_migrated > 0 {
@@ -1059,8 +1059,8 @@ fn collect_modified_comments(
                 end_line: span.end_line,
                 kind: InlineCommentKind::Breaking,
                 message: format!(
-                    "Breaking change: visibility reduced with {} consumer(s)",
-                    consumer_count,
+                    "Breaking change: visibility reduced with {} direct external consumer(s) of `{}`",
+                    consumer_count, new.name,
                 ),
             });
         } else if consumers_migrated > 0 {
@@ -1389,9 +1389,18 @@ mod tests {
         };
 
         let comments = collect_inline_comments(&diff, &impact);
-        assert!(comments
+        let breaking = comments
             .iter()
-            .any(|c| c.kind == InlineCommentKind::Breaking));
+            .find(|c| c.kind == InlineCommentKind::Breaking)
+            .expect("a breaking finding");
+        // The count says what it counts and whose it is, so a reader can find
+        // it in the impact section's per-entity rows rather than mistake it
+        // for the diff-wide total.
+        assert_eq!(
+            breaking.message,
+            "Breaking change: signature modification affects 1 direct external consumer(s) of \
+             `api_handler`"
+        );
     }
 
     #[test]

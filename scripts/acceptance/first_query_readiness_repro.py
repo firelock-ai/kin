@@ -65,9 +65,9 @@ FAIL = "FAIL"
 UNREADABLE = "UNREADABLE"
 
 # The disclosure the MCP server owes a caller whose daemon is still starting.
-# Formatted by `starting_report` in crates/kin-mcp/src/startup_binding.rs; the
-# grace that decides when it is emitted is TOOLS_CALL_STARTUP_BIND_GRACE in
-# crates/kin-mcp/src/server.rs. Matched on the two invariant halves rather than
+# Formatted by `starting_report` in crates/kin-mcp/src/startup_binding.rs, and
+# emitted once a call's readiness budget (KIN_MCP_DAEMON_PATIENCE_SECS) runs out
+# before the daemon binds. Matched on the two invariant halves rather than
 # the whole sentence, so a reworded middle does not silently stop matching while
 # a deleted disclosure still does.
 STILL_STARTING_OPENING = re.compile(
@@ -83,9 +83,17 @@ STILL_STARTING_ADVICE = "This is startup latency, not a failure"
 # and they ship with this consumer so neither is a branch nothing exercises.
 STARTUP_HOLD_ENV = "KIN_DAEMON_TEST_STARTUP_HOLD_SECS"
 HOLD_SWEEP_ENV = "KIN_DAEMON_TEST_HOLD_ENRICHMENT_SWEEP"
-# Comfortably past TOOLS_CALL_STARTUP_BIND_GRACE (10s), and comfortably inside
+# Comfortably past READINESS_BUDGET_SECONDS, and comfortably inside
 # FIRST_QUERY_BOUND_SECONDS, so the disclosure is reached and the run is short.
 STARTUP_HOLD_SECONDS = 20
+
+# How long one MCP call waits for its daemon before it discloses instead. The
+# server's default is minutes, because an agent's call is worth waiting for; a
+# call that waited out this suite's whole startup hold would answer, and the
+# disclosure contract graded below would never be reached. So this suite gives
+# its calls a budget shorter than the hold. A caller-set value wins.
+READINESS_BUDGET_ENV = "KIN_MCP_DAEMON_PATIENCE_SECS"
+READINESS_BUDGET_SECONDS = 10
 
 # How long the first query may take before silence stops being defensible. The
 # disclosure is what makes any wait acceptable, so this bounds the case where
@@ -114,9 +122,67 @@ def strip_ansi(text):
     return ANSI.sub("", text or "")
 
 
+# BEGIN failure evidence excerpt
+# Every suite carries this block byte for byte, because a suite is also copied
+# out and run as a single file. test_failure_excerpt.py keeps the copies equal.
+EVIDENCE_LIMIT = 4000
+EVIDENCE_LINE_LIMIT = 600
+EVIDENCE_PANICS = ("panicked at", "has overflowed its stack")
+EVIDENCE_ESCAPES = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+EVIDENCE_ERROR = re.compile(r"^(?:[\w./-]+:\s*)?(?:error|fatal)\b", re.IGNORECASE)
+EVIDENCE_LOG_ERROR = re.compile(r"\sERROR\s")
+
+
+def failure_excerpt(text, limit=EVIDENCE_LIMIT):
+    """Bounded evidence from a command's output that still says why it failed.
+
+    Output that fits is returned whole. Longer output keeps its opening and its
+    end, and between them every line that carries a Rust panic, with the
+    message line under it, and the last error line, wherever they fall. A
+    warning printed around the error cannot push it out, and a long log cannot
+    cut the panic out. `limit` only ever raises the bound, never lowers it.
+    """
+    text = (text or "").strip()
+    limit = max(int(limit), EVIDENCE_LIMIT)
+    if len(text) <= limit:
+        return text
+    head_end = limit // 4
+    tail_start = len(text) - limit // 2
+    lines = text.split("\n")
+    starts, offset = [], 0
+    panics, errors = [], []
+    for index, line in enumerate(lines):
+        starts.append(offset)
+        offset += len(line) + 1
+        plain = EVIDENCE_ESCAPES.sub("", line).strip()
+        if any(marker in plain for marker in EVIDENCE_PANICS):
+            panics.extend((index, index + 1))
+        if EVIDENCE_ERROR.match(plain) or EVIDENCE_LOG_ERROR.search(plain):
+            errors.append(index)
+    # The first panic and its message, then the last error line, then any
+    # later panics, for as long as the middle's share of the bound lasts.
+    order = panics[:2] + errors[-1:] + panics[2:]
+    budget, kept = limit // 4, set()
+    for index in order:
+        if index >= len(lines) or index in kept:
+            continue
+        start, end = starts[index], starts[index] + len(lines[index])
+        if end <= head_end or start >= tail_start:
+            continue
+        cost = min(len(lines[index]), EVIDENCE_LINE_LIMIT) + 1
+        if cost > budget:
+            continue
+        kept.add(index)
+        budget -= cost
+    middle = [lines[index][:EVIDENCE_LINE_LIMIT] for index in sorted(kept)]
+    parts = [text[:head_end], "[...]"] + middle + (["[...]"] if middle else [])
+    return "\n".join(parts + [text[tail_start:]])
+# END failure evidence excerpt
+
+
 def tail(text, limit=400):
-    text = strip_ansi(text or "").strip()
-    return text if len(text) <= limit else "..." + text[-limit:]
+    """Quote a command's output, colour removed, as evidence through failure_excerpt."""
+    return failure_excerpt(strip_ansi(text), limit)
 
 
 # ------------------------------------------------------------------- graders
@@ -325,11 +391,12 @@ class Suite(object):
         # takes its trivial branch, and the disclosure contract this suite
         # exists to grade is never reached. Measured: the first run of this
         # suite passed 2 of 2 with zero occurrences of the disclosure in its
-        # own log. Held longer than TOOLS_CALL_STARTUP_BIND_GRACE, which is 10s
-        # in crates/kin-mcp/src/server.rs, or the call settles before the grace
-        # matters and nothing changes. A caller-set value wins, so a
-        # falsification run can disarm it without editing this file.
+        # own log. Held longer than the call's readiness budget, set just
+        # below, or the call waits the hold out and nothing is disclosed. A
+        # caller-set value wins, so a falsification run can disarm it without
+        # editing this file.
         self.env.setdefault(STARTUP_HOLD_ENV, str(STARTUP_HOLD_SECONDS))
+        self.env.setdefault(READINESS_BUDGET_ENV, str(READINESS_BUDGET_SECONDS))
         # KIN_DAEMON_TEST_HOLD_ENRICHMENT_SWEEP is deliberately NOT set here.
         # Armed, it creates the thin-answer state, which is what `disclosed`
         # must go red on; the default run has to be the healthy one or the
@@ -668,11 +735,13 @@ def self_test():
 
     real = (
         "kin-mcp cannot answer 'find_references' yet: the repo daemon is still "
-        "starting (phase: opening durable state; 42s so far). The MCP transport "
-        "is up and `initialize` and `tools/list` are served; retry this call "
-        "once the daemon is ready. Large repositories can take minutes on a "
-        "fully cold start. This is startup latency, not a failure: do not "
-        "restart the MCP server or re-run `kin init`."
+        "starting (phase: opening durable state; 42s so far), about 35% of the "
+        "120s the last open of this store took. This call waited 10s for it, "
+        "its whole readiness budget. The MCP transport is up and `initialize` "
+        "and `tools/list` are served; retry this call and it waits again from "
+        "where the daemon has got to, or raise KIN_MCP_DAEMON_PATIENCE_SECS to "
+        "let one call wait longer. This is startup latency, not a failure: do "
+        "not restart the MCP server or re-run `kin init`."
     )
     cleanup_self_test()
     failures = []

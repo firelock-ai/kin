@@ -11,6 +11,7 @@ import { test } from 'node:test';
 
 import {
   archiveExtraction,
+  extractorEnvironment,
   artifactName,
   releaseDownloadUrl,
   parseSha256File,
@@ -24,6 +25,7 @@ import {
   ensureProvisioned,
   isTruthyEnv,
   persistentPathAdvice,
+  setupFollows,
 } from '../lib/provision.mjs';
 import { binaryName, readLauncherStamp, writeLauncherStamp } from '../lib/resolve.mjs';
 
@@ -67,6 +69,21 @@ test('the extractor is chosen by the host and the layout by the target', () => {
     );
     assert.deepEqual(unix.args, ['-xf', 'a.tar.gz', '-C', '.']);
   }
+});
+
+// GNU tar starts gzip through PATH. An empty or unusual PATH once broke
+// extraction on a Linux runner ("gzip: Cannot exec"), and a gzip earlier on
+// PATH would run in the system one's place, so the trusted directories lead.
+test('the extractor runs with the trusted system directories leading PATH', () => {
+  assert.equal(extractorEnvironment({ PATH: '' }, 'linux').PATH, '/usr/bin:/bin');
+  assert.equal(extractorEnvironment({}, 'darwin').PATH, '/usr/bin:/bin');
+  assert.equal(
+    extractorEnvironment({ PATH: '/opt/evil:/usr/bin:/home/me/bin', HOME: '/h' }, 'linux').PATH,
+    '/usr/bin:/bin:/opt/evil:/home/me/bin',
+  );
+  assert.equal(extractorEnvironment({ PATH: '/x', HOME: '/h' }, 'linux').HOME, '/h');
+  const winEnv = { Path: 'C:\\Windows\\System32' };
+  assert.equal(extractorEnvironment(winEnv, 'win32'), winEnv);
 });
 
 test('artifactName maps every released host and matches release.yml naming', () => {
@@ -1167,4 +1184,37 @@ test('persistentPathAdvice compares resolved paths, not spellings', () => {
     persistentPathAdvice(dir, {}).length > 0,
     'an absent PATH is not evidence the directory is reachable',
   );
+});
+
+test('setupFollows reads the forwarded command, not an option or a later word', () => {
+  assert.equal(setupFollows(['setup']), true);
+  assert.equal(setupFollows(['--no-color', 'setup', '--verbose']), true);
+  assert.equal(setupFollows(['init', 'setup']), false);
+  assert.equal(setupFollows(['--version']), false);
+  assert.equal(setupFollows([]), false);
+});
+
+test('provision says only the download when kin setup runs next', async () => {
+  for (const [follows, expectNotes] of [
+    [true, false],
+    [false, true],
+  ]) {
+    const { work, fetchImpl, platform, arch } = makeHostProvisionFixture();
+    const home = path.join(work, 'kin-home');
+    const lines = [];
+    await provision('9.9.9', {
+      env: { KIN_HOME: home, PATH: '' },
+      platform,
+      arch,
+      fetchImpl,
+      log: (line) => lines.push(line),
+      setupFollows: follows,
+    });
+    const noted = lines.some((line) => line.includes('installed at'));
+    assert.equal(noted, expectNotes, lines.join('\n'));
+    if (follows) {
+      assert.deepEqual(lines, [], 'setup reports the rest itself');
+    }
+    fs.rmSync(work, { recursive: true, force: true });
+  }
 });

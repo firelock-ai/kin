@@ -40,7 +40,9 @@ use kin_model::ids::EntityId;
 use kin_model::relation::{GraphNodeId, RelationKind};
 use kin_model::{ExternalReference, ExternalReferenceId, ExternalSymbol};
 
-use super::common::{read_entity_source_exact, HeldSourceAuthority, LAST_READ_SOURCE};
+use super::common::{
+    read_entity_source_exact_at, EntitySourceScope, HeldSourceAuthority, LAST_READ_SOURCE,
+};
 use crate::error::{McpError, Result};
 use crate::types::ToolCallResult;
 
@@ -338,7 +340,16 @@ pub fn external_not_served<G: GraphStore>(
 /// What a tool answers for an `external_reference:` address this graph holds
 /// no symbol under: the absence `get_entity` reports, never an invalid id.
 pub fn external_symbol_not_found(text: &str) -> ToolCallResult {
-    ToolCallResult::error(format!("External symbol not found: {}", text.trim()))
+    ToolCallResult::error(external_symbol_not_found_text(text))
+}
+
+/// The words an absence of an external symbol starts with.
+pub const EXTERNAL_SYMBOL_NOT_FOUND: &str = "External symbol not found";
+
+/// [`external_symbol_not_found`] as the text of an error, for a route that
+/// answers with a message rather than a tool result.
+pub fn external_symbol_not_found_text(text: &str) -> String {
+    format!("{EXTERNAL_SYMBOL_NOT_FOUND}: {}", text.trim())
 }
 
 /// The answer a tool that answers about repository entities gives an id
@@ -351,11 +362,88 @@ pub fn external_id_refusal<G: GraphStore>(
     argument: &str,
     why: &str,
 ) -> Result<Option<ToolCallResult>> {
+    Ok(external_id_refusal_text(store, text, tool, argument, why)?.map(ToolCallResult::error))
+}
+
+/// Refuse an external symbol where a tool expects a repository scope. Only
+/// entity spellings are inspected; artifact paths and other scope kinds keep
+/// their own meanings, and malformed shapes remain the scope parser's job.
+pub fn external_scope_refusal<G: GraphStore>(
+    store: &G,
+    scope: &serde_json::Value,
+    tool: &str,
+    argument: &str,
+) -> Result<Option<String>> {
+    if let Some(scopes) = scope.as_array() {
+        for scope in scopes {
+            if let Some(refusal) = external_scope_refusal(store, scope, tool, argument)? {
+                return Ok(Some(refusal));
+            }
+        }
+        return Ok(None);
+    }
+    let text = match scope {
+        serde_json::Value::String(text) => Some(text.as_str()),
+        serde_json::Value::Object(object) => object.get("Entity").and_then(|id| id.as_str()),
+        _ => None,
+    };
+    let Some(text) = text else { return Ok(None) };
+    let text = text.trim();
+    let id = text.strip_prefix("entity:").unwrap_or(text);
+    external_id_refusal_text(
+        store,
+        id,
+        tool,
+        argument,
+        "accepts repository scopes, not scopes on declarations outside this repository",
+    )
+}
+
+/// The shared refusal text for callers whose transport wraps tool errors.
+pub fn external_id_refusal_text<G: GraphStore>(
+    store: &G,
+    text: &str,
+    tool: &str,
+    argument: &str,
+    why: &str,
+) -> Result<Option<String>> {
     if let Some(node) = lookup_external_symbol(store, text)? {
-        return external_not_served(store, &node, tool, argument, why).map(Some);
+        return external_not_served_text(store, &node, tool, argument, why).map(Some);
     }
     if is_external_address(text) {
-        return Ok(Some(external_symbol_not_found(text)));
+        return Ok(Some(external_symbol_not_found_text(text)));
+    }
+    Ok(None)
+}
+
+/// Check raw relation endpoints before UUID decoding, so an explicit external
+/// address and its bare UUID receive the same refusal. The whole operation
+/// batch is checked before any of it is staged or applied.
+pub fn external_relation_refusal<G: GraphStore>(
+    store: &G,
+    operations: &serde_json::Value,
+    tool: &str,
+) -> Result<Option<String>> {
+    let Some(operations) = operations.as_array() else {
+        return Ok(None);
+    };
+    for (index, operation) in operations.iter().enumerate() {
+        let Some(relation) = operation.pointer("/payload/Relation") else {
+            continue;
+        };
+        for end in ["from", "to"] {
+            if let Some(id) = relation.get(end).and_then(|id| id.as_str()) {
+                if let Some(refusal) = external_id_refusal_text(
+                    store,
+                    id,
+                    tool,
+                    &format!("operations[{index}].payload.Relation.{end}"),
+                    "changes relationships between repository entities, not external symbols",
+                )? {
+                    return Ok(Some(refusal));
+                }
+            }
+        }
     }
     Ok(None)
 }
@@ -415,13 +503,32 @@ pub fn quote_site(
 pub struct CalleeText<'held, 'store, G: GraphStore> {
     held: &'held HeldSourceAuthority<'store, G>,
     bodies: RefCell<HashMap<EntityId, std::result::Result<String, &'static str>>>,
+    reads_max: usize,
+    scope: EntitySourceScope,
 }
 
 impl<'held, 'store, G: GraphStore> CalleeText<'held, 'store, G> {
     pub fn new(held: &'held HeldSourceAuthority<'store, G>) -> Self {
+        Self::with_read_limit(held, CALLEE_TEXT_READS_MAX)
+    }
+
+    /// A reader that reads at most `reads_max` bodies, for a reading that
+    /// weighs more callers than one answer's rows.
+    pub fn with_read_limit(held: &'held HeldSourceAuthority<'store, G>, reads_max: usize) -> Self {
+        Self::with_read_limit_at(held, reads_max, EntitySourceScope::WorkspaceHead)
+    }
+
+    /// Read site text from the same selected source scope as the graph answer.
+    pub fn with_read_limit_at(
+        held: &'held HeldSourceAuthority<'store, G>,
+        reads_max: usize,
+        scope: EntitySourceScope,
+    ) -> Self {
         Self {
             held,
             bodies: RefCell::new(HashMap::new()),
+            reads_max,
+            scope,
         }
     }
 }
@@ -444,14 +551,19 @@ impl<G: GraphStore> SiteText for CalleeText<'_, '_, G> {
         }
         let mut bodies = self.bodies.borrow_mut();
         if !bodies.contains_key(&caller.id) {
-            if bodies.len() >= CALLEE_TEXT_READS_MAX {
+            if bodies.len() >= self.reads_max {
                 return Err("callee_text_read_limit");
             }
             // The body read reports what it read through a thread-local the
             // surrounding answer may already have taken for its own body, so
             // it is put back as this read found it.
             let prior = LAST_READ_SOURCE.with(|cell| cell.get());
-            let body = match read_entity_source_exact(self.held, caller, CALLER_BODY_MAX_BYTES) {
+            let body = match read_entity_source_exact_at(
+                self.held,
+                caller,
+                CALLER_BODY_MAX_BYTES,
+                self.scope,
+            ) {
                 Ok(Some(source)) => Ok(source.body),
                 Ok(None) | Err(_) => Err("caller_source_unavailable"),
             };
@@ -673,6 +785,26 @@ pub fn external_references_reply<G: GraphStore>(
 ) -> Result<serde_json::Value> {
     let held = HeldSourceAuthority::new(store, repository_authority);
     let text = CalleeText::new(&held);
+    external_references_reply_quoted(
+        store,
+        node,
+        relation_kinds,
+        include_snippets,
+        min_resolution,
+        &text,
+    )
+}
+
+/// [`external_references_reply`] with the text at each site cut through
+/// `text`, the body reader the surface answering already holds.
+pub fn external_references_reply_quoted<G: GraphStore, T: SiteText + ?Sized>(
+    store: &G,
+    node: &ExternalSymbolNode,
+    relation_kinds: &[RelationKind],
+    include_snippets: bool,
+    min_resolution: RelationResolution,
+    text: &T,
+) -> Result<serde_json::Value> {
     let edges = ExternalEdgeReader::new(store)
         .incoming(&node.id, relation_kinds)
         .map_err(McpError::from)?;
@@ -716,20 +848,23 @@ pub fn external_references_reply<G: GraphStore>(
         spans.dedup_by_key(|span| (span.start_byte, span.end_byte));
         let sites: Vec<serde_json::Value> = spans
             .into_iter()
-            .map(|site| site_json(&caller, site, &text))
+            .map(|site| site_json(&caller, site, text))
             .collect();
         let file_path = caller
             .file_origin
             .as_ref()
             .map(|path| path.to_string())
             .unwrap_or_default();
+        // Addressed as every reference row is: by the caller's entity id, its
+        // sites inside it, and its file only as the projection it is.
         let mut row = serde_json::json!({
             "entity_id": caller.id.to_string(),
             "name": caller.name,
             "kind": format!("{:?}", caller.kind),
             "role": caller.role,
-            "file_path": caller.file_origin.as_ref().map(|path| path.to_string()),
-            "start_line": super::common::entity_presentation_start_line(&caller),
+            "projection": {
+                "path": caller.file_origin.as_ref().map(|path| path.to_string()),
+            },
             "relation_kinds": kinds,
             "resolution": resolution.as_str(),
             "site_state": if proven {
@@ -821,6 +956,141 @@ pub fn external_references_reply<G: GraphStore>(
                        this list is a floor.",
         }],
     }))
+}
+
+/// How a name matched the external symbols [`external_symbols_named`] found,
+/// as `focal_resolution.matched` reports it.
+pub const MATCHED_SCIP_SYMBOL: &str = "scip_symbol";
+/// See [`MATCHED_SCIP_SYMBOL`].
+pub const MATCHED_SCIP_DESCRIPTORS: &str = "scip_descriptors";
+/// See [`MATCHED_SCIP_SYMBOL`].
+pub const MATCHED_DISPLAY_NAME: &str = "display_name";
+
+/// The external symbols a name names, and how it named them, for a read that
+/// resolves a name no repository entity carries.
+///
+/// A name matches a symbol exactly in one of three spellings, tried in this
+/// order and the first that matches any symbol wins: its whole SCIP symbol,
+/// the package and the descriptor chain (`npm typescript 5.6.3
+/// `lib.es5.d.ts`/Array#map().`), with or without the scheme before them; its
+/// descriptor chain alone; or its name as a reader writes it (`Array.map`).
+/// Nothing is matched by prefix, substring or case, so a name matches only a
+/// symbol it spells. Several symbols can share a descriptor chain or a name,
+/// one per package version the resolver loaded, and all of them are returned.
+pub fn external_symbols_named<G: GraphStore>(
+    store: &G,
+    name: &str,
+) -> Result<(Vec<ExternalSymbolNode>, &'static str)> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Ok((Vec::new(), MATCHED_DISPLAY_NAME));
+    }
+    let nodes: Vec<ExternalSymbolNode> = store
+        .external_references()
+        .map_err(McpError::graph)?
+        .into_iter()
+        .map(|reference| ExternalSymbolNode {
+            id: reference.id,
+            reference,
+        })
+        .collect();
+    let scip = |node: &ExternalSymbolNode| {
+        let whole = format!(
+            "{} {}",
+            node.reference.canonical_source, node.reference.symbol
+        );
+        name == whole || name.ends_with(&format!(" {whole}"))
+    };
+    let descriptors = |node: &ExternalSymbolNode| node.reference.symbol == name;
+    let display = |node: &ExternalSymbolNode| node.display_name() == name;
+    let rules: [(&'static str, &dyn Fn(&ExternalSymbolNode) -> bool); 3] = [
+        (MATCHED_SCIP_SYMBOL, &scip),
+        (MATCHED_SCIP_DESCRIPTORS, &descriptors),
+        (MATCHED_DISPLAY_NAME, &display),
+    ];
+    for (matched, rule) in rules {
+        let found: Vec<ExternalSymbolNode> =
+            nodes.iter().filter(|node| rule(node)).cloned().collect();
+        if !found.is_empty() {
+            return Ok((found, matched));
+        }
+    }
+    Ok((Vec::new(), MATCHED_DISPLAY_NAME))
+}
+
+/// `find_references` for a name that names one external symbol: the answer
+/// [`external_references_reply`] gives its id, with `focal_resolution` saying
+/// the symbol was named and which spelling matched.
+pub fn external_references_reply_by_name<G: GraphStore>(
+    store: &G,
+    node: &ExternalSymbolNode,
+    matched: &'static str,
+    relation_kinds: &[RelationKind],
+    include_snippets: bool,
+    min_resolution: RelationResolution,
+    repository_authority: Option<&super::repository_authority::RequestRepositoryAuthority>,
+) -> Result<serde_json::Value> {
+    let mut reply = external_references_reply(
+        store,
+        node,
+        relation_kinds,
+        include_snippets,
+        min_resolution,
+        repository_authority,
+    )?;
+    reply["focal_resolution"] = serde_json::json!({
+        "addressed_by": "name",
+        "same_name_candidates": 1,
+        "matched": matched,
+        "other_candidates": [],
+    });
+    Ok(reply)
+}
+
+/// The answer a read about one symbol gives a name that several external
+/// symbols carry and no repository entity does: every candidate, addressable by
+/// its id, and no answer about any of them, in the shape an ambiguous entity
+/// name is answered with.
+pub fn external_name_candidates_json(
+    tool: &str,
+    name: &str,
+    matched: &'static str,
+    candidates: &[ExternalSymbolNode],
+) -> serde_json::Value {
+    let rows: Vec<serde_json::Value> = candidates
+        .iter()
+        .take(super::entities::NAME_CANDIDATES_LISTED_MAX)
+        .map(|node| {
+            let mut row = external_symbol_json(&node.id, Some(&node.reference));
+            row["entity_id"] = row["id"].clone();
+            row
+        })
+        .collect();
+    let omitted = candidates.len().saturating_sub(rows.len());
+    let mut value = serde_json::json!({
+        "ambiguous_focal": true,
+        "query": name,
+        "resolution": "same_name",
+        "matched": matched,
+        "candidate_count": candidates.len(),
+        "candidates": rows,
+        "degradations": [{
+            "component": "focal_resolution",
+            "reason": "ambiguous_name",
+            "detail": format!(
+                "'{}' names {} symbols declared outside this repository, one per package \
+                 or version the resolver loaded, so {tool} answered about none of them \
+                 rather than choosing one. Call {tool} again with one candidate's \
+                 `entity_id`.",
+                name.trim(),
+                candidates.len()
+            ),
+        }],
+    });
+    if omitted > 0 {
+        value["omitted_candidates"] = serde_json::json!(omitted);
+    }
+    value
 }
 
 /// The keys a `trace_data_flow` step carries about a symbol outside the

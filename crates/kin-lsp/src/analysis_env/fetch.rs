@@ -374,7 +374,10 @@ pub fn write_hashed(
         std::fs::create_dir_all(dir)
             .map_err(|error| FetchError::Io(format!("{}: {error}", dir.display())))?;
     }
-    let mut file = std::fs::File::create(destination)
+    let mut file = std::fs::File::options()
+        .write(true)
+        .create_new(true)
+        .open(destination)
         .map_err(|error| FetchError::Io(format!("{}: {error}", destination.display())))?;
     let mut hasher = sha2::Sha256::new();
     let mut total: u64 = 0;
@@ -515,6 +518,17 @@ mod tests {
         .unwrap();
         assert_eq!(downloaded.bytes, 8);
         assert!(destination.is_file());
+    }
+
+    #[test]
+    fn a_download_never_truncates_or_removes_another_attempt() {
+        let dir = crate::adapters::repo_scan::Fixture::new("fetch-owned");
+        let destination = dir.root.join("archive.part");
+        std::fs::write(&destination, b"other owner").unwrap();
+        let error =
+            write_hashed(&mut b"replacement".as_slice(), &destination, 1024, "u").unwrap_err();
+        assert!(matches!(error, FetchError::Io(_)));
+        assert_eq!(std::fs::read(&destination).unwrap(), b"other owner");
     }
 
     #[test]

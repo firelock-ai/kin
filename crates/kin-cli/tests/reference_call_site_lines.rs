@@ -32,8 +32,8 @@ use kin_index::{
     IndexPipeline,
 };
 use kin_model::{
-    ArtifactId, Entity, EntityStore, FilePathId, Hash256, LocatedEntry, Relation, RepoPath,
-    TransactionDelta, TreeDelta, TreeEntry,
+    ArtifactId, Entity, EntityStore, FilePathId, Hash256, LocatedEntry, Relation, RelationKind,
+    RepoPath, TransactionDelta, TreeDelta, TreeEntry,
 };
 
 /// A caller file that reaches `compute` twice, at lines the fixture states
@@ -497,9 +497,82 @@ async fn find_references(graph: &InMemoryGraph, target: &Entity) -> serde_json::
     serde_json::from_str(text).expect("find_references body is json")
 }
 
-/// Every resolved reference row carries the caller-file lines of the reference
-/// sites, on both ingest arms, and the CLI prints the same lines the MCP row
-/// carries.
+/// How `kin refs` prints a site of a caller the graph holds no span for.
+const SPANLESS_SITE: &str = "+? (caller has no span)";
+
+/// The `find_references` row of `caller`, as the collector the answer is served
+/// from holds it, before the answer cuts it at its counting floor.
+///
+/// The wire addresses each site inside its caller and never by a file line, and
+/// these fixtures strip entity spans, so a served site cannot say where it is.
+/// The exact 1-based file lines are pinned here instead, at the collector,
+/// where a row still keys its sites by them.
+fn collected_row(
+    graph: &InMemoryGraph,
+    target: &Entity,
+    caller: &str,
+) -> kin_mcp::handlers::common::ReferenceRow {
+    kin_mcp::handlers::common::collect_graph_reference_rows(
+        graph,
+        &target.id,
+        &[RelationKind::Calls],
+        None,
+    )
+    .expect("collect reference rows")
+    .into_iter()
+    .find(|row| row.name == caller)
+    .unwrap_or_else(|| panic!("the collector holds no row for caller `{caller}`"))
+}
+
+/// A served row whose caller the graph holds no span for: `count` sites, each
+/// addressed inside the caller and unable to give an offset or text, because a
+/// spanless caller has no first line to count from and no body to cut from.
+/// And no file address of any kind: the caller's address is its id, and its
+/// file is only the projection it is labelled as.
+fn assert_spanless_sites(row: &serde_json::Value, count: usize, context: &str) {
+    assert_eq!(
+        row["site_count"],
+        serde_json::json!(count),
+        "{context}: {row:#}"
+    );
+    let sites = row["sites"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{context}: `sites` array: {row:#}"));
+    assert_eq!(sites.len(), count, "{context}: {row:#}");
+    for site in sites {
+        assert_eq!(
+            site["line_in_entity"],
+            serde_json::Value::Null,
+            "{context}: {row:#}"
+        );
+        assert_eq!(
+            site["callee"],
+            serde_json::Value::Null,
+            "{context}: {row:#}"
+        );
+        assert_eq!(
+            site["callee_unavailable"], "caller_has_no_span",
+            "{context}: the fixture removes entity spans on purpose: {row:#}"
+        );
+    }
+    for retired in [
+        "file_path",
+        "start_line",
+        "reference_lines",
+        "reference_line_count",
+        "reference_lines_absent_reason",
+        "reference_lines_partial_reason",
+    ] {
+        assert!(
+            row.get(retired).is_none(),
+            "{context}: a reference row carries no `{retired}`: {row:#}"
+        );
+    }
+}
+
+/// Every resolved reference row carries one site per call, keyed at the
+/// collector by the caller-file lines the calls are written on, on both ingest
+/// arms, and the CLI prints the same sites the MCP row carries.
 #[tokio::test]
 async fn reference_rows_carry_call_site_lines_on_both_ingest_arms() {
     for fixture in FIXTURES {
@@ -561,32 +634,32 @@ async fn reference_rows_carry_call_site_lines_on_both_ingest_arms() {
                  distinguishable from a single position",
                 fixture.language,
             );
+            // The wire serves each site inside its caller, and a spanless
+            // caller cannot place one, so the lines the calls are written on
+            // are pinned at the collector the row is served from.
             assert_eq!(
-                row["reference_lines"],
-                serde_json::json!(expected_sites),
-                "{} {arm}: the row must name the lines the calls are written on: {row:#}",
+                collected_row(&graph, &target, fixture.caller_name).reference_lines,
+                expected_sites,
+                "{} {arm}: the row must key its sites by the lines the calls are written on",
                 fixture.language,
             );
+            let context = format!("{} {arm}: two calls are two sites", fixture.language);
+            assert_spanless_sites(row, 2, &context);
             assert_eq!(
-                row["reference_line_count"], 2,
-                "{} {arm}: two calls are two sites: {row:#}",
-                fixture.language,
-            );
-            assert_eq!(
-                row["reference_lines_absent_reason"],
+                row["sites_absent_reason"],
                 serde_json::Value::Null,
                 "{} {arm}: a row that HAS sites must claim no absence: {row:#}",
                 fixture.language,
             );
-            // Non-vacuity: the graph holds no entity span, so the row has no
-            // definition line to have copied. Every number above came from the
-            // relation's evidence or from nowhere.
             assert_eq!(
-                row["start_line"],
-                serde_json::Value::Null,
-                "{} {arm}: the fixture removes entity spans on purpose: {row:#}",
+                row["projection"]["path"], fixture.caller_path,
+                "{} {arm}: the caller is labelled with the file it is projected into: {row:#}",
                 fixture.language,
             );
+            // Non-vacuity: the graph holds no entity span, and the row carries
+            // no start_line or file line at all (checked above), so every line
+            // pinned at the collector came from the relation's evidence or
+            // from nowhere.
             if fixture.rows_field == "references" {
                 assert_eq!(
                     body["counts"]["reference_sites_complete"],
@@ -612,16 +685,36 @@ async fn reference_rows_carry_call_site_lines_on_both_ingest_arms() {
             )
             .expect("kin refs");
             let cli_text = cli.lines.join("\n");
-            let expected_label = format!("sites {},{}", expected_sites[0], expected_sites[1]);
+            let expected_label = format!("sites {SPANLESS_SITE}, {SPANLESS_SITE}");
+            let caller_rows: Vec<&String> = cli
+                .lines
+                .iter()
+                .filter(|line| line.starts_with(&format!("  {} [", fixture.caller_name)))
+                .collect();
+            assert_eq!(
+                caller_rows.len(),
+                1,
+                "{} {arm}: one row for the caller: {cli_text}",
+                fixture.language,
+            );
             assert!(
-                cli_text.contains(&expected_label),
-                "{} {arm}: `kin refs` must print the same sites the MCP row carries \
+                caller_rows[0].contains(&format!("(projection: {})", fixture.caller_path))
+                    && caller_rows[0].ends_with(&expected_label),
+                "{} {arm}: `kin refs` must print the same two sites the MCP row carries \
                  (`{expected_label}`): {cli_text}",
                 fixture.language,
             );
             assert!(
                 !cli_text.contains("sites none"),
                 "{} {arm}: no row may report an absent site set here: {cli_text}",
+                fixture.language,
+            );
+            assert!(
+                cli.lines
+                    .iter()
+                    .any(|line| line.starts_with("note: a site is +N")),
+                "{} {arm}: a row printed sites, so the answer says how a site is \
+                 addressed: {cli_text}",
                 fixture.language,
             );
         }
@@ -669,8 +762,22 @@ async fn mixed_parser_sites_are_partitioned_in_cli_and_mcp() {
                 .iter().filter(|row| row["name"] == "relay").collect();
             assert_eq!(confirmed.len(), 1, "{arm}: one counted caller: {body:#}");
             assert_eq!(candidates.len(), 1, "{arm}: one held caller: {body:#}");
-            assert_eq!(confirmed[0]["reference_lines"], serde_json::json!([proven]), "{arm}: {body:#}");
-            assert_eq!(candidates[0]["reference_lines"], serde_json::json!([held]), "{arm}: {body:#}");
+            assert_spanless_sites(confirmed[0], 1, &format!("{arm}: the proven site is counted"));
+            assert_spanless_sites(candidates[0], 1, &format!("{arm}: the guessed site is held"));
+            // The wire serves each site inside its caller, and a spanless
+            // caller cannot place one, so which line went where is pinned at
+            // the collector, cut by the floor `find_references` counts at.
+            // The guessed call is a receiver-name guess, which `kin refs`
+            // holds by its own rule too.
+            let row = collected_row(&graph, &target, "relay");
+            let mut both = vec![proven, held];
+            both.sort_unstable();
+            assert_eq!(row.reference_lines, both, "{arm}: one caller holds both sites");
+            let (counted, guessed) = kin_mcp::handlers::common::split_reference_row(row, |edge| {
+                edge.is_held_at(kin_index::RelationResolution::ImportScoped)
+            });
+            assert_eq!(counted.expect("a counted part").reference_lines, vec![proven], "{arm}");
+            assert_eq!(guessed.expect("a held part").reference_lines, vec![held], "{arm}");
             let temporary = tempfile::tempdir().unwrap();
             let layout = kin_core::KinLayout::new(temporary.path().join(".kin"));
             let cli = build_refs_response(&layout, &graph, &RefsRequest {
@@ -680,9 +787,18 @@ async fn mixed_parser_sites_are_partitioned_in_cli_and_mcp() {
                 "graph_entity_count": 6, "graph_generation": 1,
             }))).expect("kin refs");
             let text = cli.lines.join("\n");
-            assert!(text.contains(&format!("sites {proven}")), "{arm}: {text}");
-            assert!(text.contains(&format!("sites {held}")), "{arm}: {text}");
-            assert!(!text.contains("sites 4,5"), "{arm}: mixed sites must not be promoted: {text}");
+            // One counted row with the one proven site, one held row with the
+            // one guessed site, and no row carrying both.
+            let relay: Vec<&String> = cli.lines.iter().filter(|line| line.starts_with("  relay [")).collect();
+            assert_eq!(relay.len(), 2, "{arm}: {text}");
+            let held_note = " (its proven sites are counted above)";
+            let counted_rows: Vec<_> = relay.iter().filter(|line| !line.ends_with(held_note)).collect();
+            let held_rows: Vec<_> = relay.iter().filter(|line| line.ends_with(held_note)).collect();
+            assert_eq!(counted_rows.len(), 1, "{arm}: {text}");
+            assert_eq!(held_rows.len(), 1, "{arm}: {text}");
+            assert!(counted_rows[0].ends_with(&format!("sites {SPANLESS_SITE}")), "{arm}: {text}");
+            assert!(held_rows[0].ends_with(&format!("sites {SPANLESS_SITE}{held_note}")), "{arm}: {text}");
+            assert!(!text.contains(&format!("{SPANLESS_SITE}, {SPANLESS_SITE}")), "{arm}: mixed sites must not be promoted: {text}");
         }
     }
 }

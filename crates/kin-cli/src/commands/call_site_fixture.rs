@@ -6,9 +6,10 @@
 use kin_db::InMemoryGraph;
 use kin_model::entity::{EntityMetadata, SourceSpan};
 use kin_model::{
-    CallSite, CallSiteLedger, CallSiteState, Entity, EntityId, EntityKind, EntityRole, EntityStore,
-    FilePathId, FingerprintAlgorithm, Hash256, LanguageId, ProofContext, ResolutionRecord,
-    ResolutionRecordDelta, SemanticFingerprint, TransactionDelta, Visibility,
+    CallSite, CallSiteLedger, CallSiteState, ContextValidation, ContextValidationState, Entity,
+    EntityId, EntityKind, EntityRole, EntityStore, FilePathId, FingerprintAlgorithm, Hash256,
+    LanguageId, ProofContext, ResolutionRecord, ResolutionRecordDelta, SemanticFingerprint,
+    TransactionDelta, Visibility,
 };
 
 /// A Python function whose own text is `body`, starting at byte `start` of
@@ -50,6 +51,11 @@ pub(crate) fn spanned(name: &str, file: &str, start: usize, body: &str) -> Entit
 
 /// Put `entities` in the graph, then one proof context and a ledger for each
 /// `(caller, body, sites)`, each site's token found in the body in order.
+///
+/// The selected graph also validates that context, as the sweep that proved
+/// the ledgers under it records: a ledger whose context the graph never
+/// validated reads as `proof_context_unverified`, which is not what these
+/// fixtures stand for.
 pub(crate) fn admit(
     graph: &InMemoryGraph,
     entities: &[&Entity],
@@ -67,7 +73,16 @@ pub(crate) fn admit(
         environment_summary: "python 3.12".to_string(),
     });
     let context_id = context.id();
-    let mut records = vec![context];
+    let validation = ResolutionRecord::ContextValidation(ContextValidation {
+        language: LanguageId::Python,
+        state: ContextValidationState::Validated {
+            context: context
+                .as_proof_context()
+                .expect("the fixture's context is a proof context")
+                .clone(),
+        },
+    });
+    let mut records = vec![context, validation];
     for (caller, body, sites) in ledgers {
         let mut from = 0usize;
         let sites: Vec<CallSite> = sites

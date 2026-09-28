@@ -169,3 +169,119 @@ fn enrichment_marks_move_versions_and_a_store_without_them_moves_nothing() {
         .retain(|operation| !operation.carries_enrichment_marks());
     assert_eq!(stripped.wire_version(), quiet_version);
 }
+
+/// Full proof-input marks use the existing tuple wire shape, survive a real
+/// journal reopen, and retire on same-ID validation changes. Merely reading an
+/// older mark does not manufacture a version-eight completion.
+#[test]
+fn enrichment_proof_marks_reopen_without_promoting_legacy_and_retire_changed_context() {
+    let directory = TempDir::new().unwrap();
+    let (backend, manager) = framed_local_repository(&directory);
+    let path = "src/lib.rs";
+    let lease = manager.read_authority();
+    let workspace = &lease.metadata().workspaces[0];
+    let graph = lease
+        .workspace_graph_snapshot(&workspace.workspace_id)
+        .unwrap()
+        .unwrap();
+    let body = match workspace
+        .tree
+        .artifact_at_path(&RepoPath::from_utf8(path).unwrap())
+        .unwrap()
+        .entry
+    {
+        TreeEntry::Blob { hash, .. } => hash,
+        _ => panic!(),
+    };
+    let entity_file = |id: &kin_model::EntityId| {
+        graph
+            .entities
+            .get(id)
+            .and_then(|entity| entity.file_origin.as_ref())
+            .map(|file| file.0.as_str())
+    };
+    let legacy = kin_model::EnrichmentMark {
+        path: path.into(),
+        body,
+        version: 7,
+        relations: kin_model::enrichment_relations_digest(
+            path,
+            graph.relations.values(),
+            entity_file,
+            kin_model::enrichment_ledgers_by_file(graph.resolution_records.values(), entity_file)
+                .remove(path)
+                .unwrap_or_default(),
+        ),
+    };
+    let full = kin_model::EnrichmentMark {
+        version: kin_model::ENRICHMENT_PROOF_MARK_VERSION,
+        relations: kin_model::enrichment_proof_inputs_by_file(
+            [path],
+            graph.entities.values(),
+            graph.relations.values(),
+            graph.resolution_records.values(),
+        )
+        .unwrap()[path],
+        ..legacy.clone()
+    };
+    drop(lease);
+    manager
+        .commit_repository_transaction(enrichment_marks_transaction(
+            &manager,
+            0x0e3b_0001,
+            kin_model::EnrichmentMarksDelta {
+                retire_all: false,
+                marks: vec![legacy.clone()],
+            },
+        ))
+        .unwrap();
+    drop(manager);
+    let manager = RepositoryAuthorityManager::open(repository_id(), Arc::clone(&backend)).unwrap();
+    assert_eq!(
+        manager.read_authority().metadata().workspaces[0].enrichment_marks,
+        [legacy]
+    );
+    manager
+        .commit_repository_transaction(enrichment_marks_transaction(
+            &manager,
+            0x0e3b_0002,
+            kin_model::EnrichmentMarksDelta {
+                retire_all: false,
+                marks: vec![full.clone()],
+            },
+        ))
+        .unwrap();
+    drop(manager);
+    let manager = RepositoryAuthorityManager::open(repository_id(), Arc::clone(&backend)).unwrap();
+    assert_eq!(
+        manager.read_authority().metadata().workspaces[0].enrichment_marks,
+        [full]
+    );
+    let mut transaction = enrichment_marks_transaction(&manager, 0x0e3b_0003, Default::default());
+    let validation = kin_model::ResolutionRecord::ContextValidation(kin_model::ContextValidation {
+        language: LanguageId::Rust,
+        state: kin_model::ContextValidationState::Unverified {
+            reason: "selected environment changed".into(),
+        },
+    });
+    let mutation = transaction.workspace_mutation.as_mut().unwrap();
+    mutation.semantic_delta = mutation
+        .semantic_delta
+        .clone()
+        .with_resolution_records(vec![kin_model::ResolutionRecordDelta::Added {
+            new: validation,
+        }])
+        .unwrap();
+    manager.commit_repository_transaction(transaction).unwrap();
+    assert!(manager.read_authority().metadata().workspaces[0]
+        .enrichment_marks
+        .is_empty());
+    drop(manager);
+    let reopened = RepositoryAuthorityManager::open(repository_id(), backend).unwrap();
+    assert!(
+        reopened.read_authority().metadata().workspaces[0]
+            .enrichment_marks
+            .is_empty(),
+        "reopen cannot restore obsolete completion"
+    );
+}

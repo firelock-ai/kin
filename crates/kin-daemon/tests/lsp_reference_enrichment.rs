@@ -480,13 +480,27 @@ fn without_a_server_an_enrichable_language_reports_an_actionable_gap() {
         ReferenceEnrichment,
     };
 
-    let none_installed = LanguageServerReadinessMap::new();
-    for language in [
+    let languages = [
         LanguageId::Python,
         LanguageId::JavaScript,
         LanguageId::TypeScript,
         LanguageId::Rust,
-    ] {
+    ];
+    // A missing server is a completed finding. A language nothing has observed
+    // yet is pending, which is not the same fact and names no gap.
+    let unobserved = LanguageServerReadinessMap::new();
+    let none_installed: LanguageServerReadinessMap = languages
+        .iter()
+        .map(|language| (*language, LanguageServerReadiness::Absent))
+        .collect();
+    for language in languages {
+        let pending = reference_enrichment_for(language, &unobserved);
+        assert_eq!(
+            pending,
+            ReferenceEnrichment::Unknown,
+            "{language} unobserved"
+        );
+        assert!(!pending.is_actionable_gap(), "{language} unobserved");
         let state = reference_enrichment_for(language, &none_installed);
         assert_eq!(
             state,
@@ -1253,5 +1267,295 @@ async fn go_calls_through_an_interface_are_not_callers_of_the_concrete_method() 
         !interface_callers.contains(&GraphNodeId::Entity(direct)),
         "a direct call of the concrete method is not a caller of the interface method: \
          {relations:?}"
+    );
+}
+
+/// Index `sources` with Kin's own parser and write them under `root`, returning
+/// every entity as the enrichment passes see it.
+fn index_typescript_fixture(root: &Path, sources: &[(&str, &str)]) -> Vec<EntityRef> {
+    let pipeline = kin_index::IndexPipeline::new();
+    let mut refs = Vec::new();
+    for (path, text) in sources {
+        let file = root.join(path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, text).unwrap();
+        if !path.starts_with("src/") {
+            continue;
+        }
+        let indexed = pipeline
+            .index_file_content_with_tests(
+                &kin_model::FilePathId::new(*path),
+                text.as_bytes(),
+                kin_blobs::digest(text.as_bytes()),
+            )
+            .expect("fixture indexes")
+            .indexed_file;
+        refs.extend(
+            indexed
+                .entities
+                .iter()
+                .filter_map(|entity| kin_daemon::daemon::lsp_entity_ref(entity, path)),
+        );
+    }
+    refs
+}
+
+/// The entity named `name` in `file`, which the parser must mint.
+fn entity_named<'a>(refs: &'a [EntityRef], file: &str, name: &str) -> &'a EntityRef {
+    refs.iter()
+        .find(|entity| entity.file_path == file && entity.name == name)
+        .unwrap_or_else(|| {
+            let held: Vec<_> = refs.iter().map(|e| (&e.file_path, &e.name)).collect();
+            panic!("the parser must mint {file}:{name}; it minted {held:?}")
+        })
+}
+
+/// Ask `definition` at `(line, character)` of `file` until the server answers
+/// with a place in `expected`, which is when it has loaded the project.
+async fn wait_for_definition(
+    server: &kin_lsp::lifecycle::LspServer,
+    root: &Path,
+    file: &str,
+    (line, character): (u32, u32),
+    expected: &str,
+) {
+    let uri = kin_lsp::protocol::path_to_uri(&root.join(file));
+    let deadline = tokio::time::Instant::now() + INDEX_BUDGET;
+    loop {
+        let answer = server
+            .client
+            .request(
+                "textDocument/definition",
+                serde_json::json!({
+                    "textDocument": { "uri": uri },
+                    "position": { "line": line, "character": character },
+                }),
+            )
+            .await
+            .unwrap_or_default();
+        if answer.to_string().contains(expected) {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the server never resolved {file}:{line}:{character} into {expected}: {answer}"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// Write `sources` under `root`, start a TypeScript server on them, and run the
+/// definitions pass over `file`, which must be one of them.
+async fn typescript_file_pass(
+    test: &str,
+    root: &Path,
+    sources: &[(&str, &str)],
+    file: &str,
+    ready: (u32, u32),
+) -> Option<(
+    Vec<EntityRef>,
+    kin_lsp::file_enrichment::FileEnrichmentResult,
+)> {
+    let refs = index_typescript_fixture(root, sources);
+    let index = EntityIndex::new(refs.clone(), root);
+    let (command, args) = server_command_or_skip(LanguageId::TypeScript, test)?;
+    let server = start_server(&command, &args, root, LanguageId::TypeScript).await;
+    let opened: Vec<&str> = sources
+        .iter()
+        .map(|(path, _)| *path)
+        .filter(|path| path.starts_with("src/"))
+        .collect();
+    open_documents(&server, root, &opened, "typescript").await;
+    wait_for_definition(&server, root, file, ready, "lib.ts").await;
+    let documents = |path: &str| {
+        sources
+            .iter()
+            .find(|(held, _)| *held == path)
+            .map(|(_, text)| text.to_string())
+    };
+    let text = documents(file).expect("the file is a fixture source");
+    let pass = kin_lsp::file_enrichment::enrich_file_definitions(
+        &server,
+        &root.join(file),
+        &text,
+        &index,
+        root,
+        Some(&documents),
+    )
+    .await
+    .expect("the definitions pass answers");
+    server.shutdown().await.unwrap();
+    Some((refs, pass))
+}
+
+/// The entities a pass proved the call written as `token` on `line` of
+/// `text` to, from `caller`.
+fn proven_at(
+    pass: &kin_lsp::file_enrichment::FileEnrichmentResult,
+    text: &str,
+    caller: EntityId,
+    token: &str,
+    line: u32,
+) -> Vec<GraphNodeId> {
+    pass.site_answers
+        .iter()
+        .filter(|answer| {
+            answer.source == caller
+                && answer.site.start_line == line
+                && &text[answer.site.start_byte..answer.site.end_byte] == token
+        })
+        .map(|answer| match &answer.target {
+            kin_lsp::call_sites::SiteTarget::Entity(entity) => GraphNodeId::Entity(*entity),
+            kin_lsp::call_sites::SiteTarget::Outside(_) => {
+                panic!("{token} on line {line} was answered outside the repository")
+            }
+        })
+        .collect()
+}
+
+/// TypeScript proves a call through a receiver of one type, and not one
+/// through a union, whatever shape the receiver is written in and whatever
+/// the member returns.
+///
+/// `getDriver()` returns `SqliteDriver | NativeDriver`, so each call through
+/// it may run either class's method, whichever one the server's definition
+/// answer names: one that returns nothing, the same class from both
+/// (`Result`), a different class from each (`ResultA`, `ResultB`), `this`, or
+/// a `Promise`. `getSqlite()` returns one class, so the same calls through it
+/// are proven, and so is `new Loader().load()`. Two constituent members on
+/// one physical line stay distinct, while a union sharing one inherited
+/// member still proves that member.
+#[tokio::test(flavor = "multi_thread")]
+async fn typescript_proves_calls_through_one_type_and_not_through_a_union_behind_a_call() {
+    const TEST: &str =
+        "typescript_proves_calls_through_one_type_and_not_through_a_union_behind_a_call";
+    const DRIVER: &str = "{\n\
+         \x20 wrap(n: number): void {}\n\
+         \x20 run(): Result {\n\
+         \x20   return new Result();\n\
+         \x20 }\n\
+         \x20 pick(): RESULT {\n\
+         \x20   return new RESULT();\n\
+         \x20 }\n\
+         \x20 self(): this {\n\
+         \x20   return this;\n\
+         \x20 }\n\
+         \x20 later(): Promise<Result> {\n\
+         \x20   return Promise.resolve(new Result());\n\
+         \x20 }\n\
+         }\n";
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().canonicalize().expect("canonical tempdir");
+    let lib = format!(
+        "export class Result {{}}\n\
+         export class ResultA {{}}\n\
+         export class ResultB {{}}\n\
+         export class SqliteDriver {}\
+         export class NativeDriver {}\
+         export class Loader {{\n\
+         \x20 async load(): Promise<SqliteDriver> {{\n\
+         \x20   return new SqliteDriver();\n\
+         \x20 }}\n\
+         }}\n\
+         export function getDriver(): SqliteDriver | NativeDriver {{\n\
+         \x20 return new SqliteDriver();\n\
+         }}\n\
+         export function getSqlite(): SqliteDriver {{\n\
+         \x20 return new SqliteDriver();\n\
+         }}\n\
+         export class CompactA {{\n\
+         \x20 wrap() {{}} }} export class CompactB {{ wrap() {{}}\n\
+         }}\n\
+         export function getCompact(): CompactA | CompactB {{\n\
+         \x20 return new CompactA();\n\
+         }}\n\
+         export class InheritedBase {{\n\
+         \x20 wrap() {{}}\n\
+         }}\n\
+         export class InheritedA extends InheritedBase {{}}\n\
+         export class InheritedB extends InheritedBase {{}}\n\
+         export function getInherited(): InheritedA | InheritedB {{\n\
+         \x20 return new InheritedA();\n\
+         }}\n",
+        DRIVER.replace("RESULT", "ResultA"),
+        DRIVER.replace("RESULT", "ResultB"),
+    );
+    let sources = [
+        (
+            "tsconfig.json",
+            "{\"compilerOptions\": {\"strict\": true, \"target\": \"es2020\", \
+             \"module\": \"commonjs\"}, \"include\": [\"src\"]}\n",
+        ),
+        ("src/lib.ts", lib.as_str()),
+        (
+            "src/use.ts",
+            "import { getDriver, getSqlite, Loader, getCompact, getInherited } from \"./lib\";\n\
+             export function run(): void {\n\
+             \x20 getDriver().wrap(1);\n\
+             \x20 getDriver().run();\n\
+             \x20 getDriver().pick();\n\
+             \x20 getDriver().self();\n\
+             \x20 getDriver().later();\n\
+             \x20 getSqlite().wrap(2);\n\
+             \x20 getSqlite().run();\n\
+             \x20 getSqlite().pick();\n\
+             \x20 getSqlite().self();\n\
+             \x20 getSqlite().later();\n\
+             \x20 new Loader().load();\n\
+             \x20 getCompact().wrap();\n\
+             \x20 getInherited().wrap();\n\
+             }\n",
+        ),
+    ];
+    let Some((refs, pass)) =
+        typescript_file_pass(TEST, &root, &sources, "src/use.ts", (7, 16)).await
+    else {
+        return;
+    };
+    let text = sources[2].1;
+    let run = entity_named(&refs, "src/use.ts", "run").id;
+    let lib = |name: &str| GraphNodeId::Entity(entity_named(&refs, "src/lib.ts", name).id);
+    for (offset, member) in ["wrap", "run", "pick", "self", "later"].iter().enumerate() {
+        let through_union = 2 + offset as u32;
+        assert_eq!(
+            proven_at(&pass, text, run, member, through_union),
+            [],
+            "`getDriver().{member}()` goes through a union and proves nothing: {pass:?}"
+        );
+        let token = text.find(&format!("getDriver().{member}(")).unwrap() + "getDriver().".len();
+        assert!(
+            pass.unproven_sites.iter().any(|site| site.source == run
+                && site.start_byte == token
+                && site.answer == kin_lsp::call_sites::UnprovenAnswer::AnswersDisagree),
+            "`getDriver().{member}()` says its answers disagree: {pass:?}"
+        );
+        let through_one_class = 7 + offset as u32;
+        assert_eq!(
+            proven_at(&pass, text, run, member, through_one_class),
+            [lib(&format!("SqliteDriver.{member}"))],
+            "`getSqlite().{member}()` goes through one class and is proven: {pass:?}"
+        );
+    }
+    assert_eq!(
+        proven_at(&pass, text, run, "load", 12),
+        [lib("Loader.load")],
+        "a method returning a Promise is not read as a union: {pass:?}"
+    );
+    assert_eq!(
+        proven_at(&pass, text, run, "wrap", 13),
+        [],
+        "same-line constituent declarations are not one member: {pass:?}"
+    );
+    let compact_token = text.find("getCompact().wrap()").unwrap() + "getCompact().".len();
+    assert!(
+        pass.unproven_sites.iter().any(|site| site.source == run
+            && site.start_byte == compact_token
+            && site.answer == kin_lsp::call_sites::UnprovenAnswer::AnswersDisagree),
+        "the same-line union says its answers disagree: {pass:?}"
+    );
+    assert_eq!(
+        proven_at(&pass, text, run, "wrap", 14),
+        [lib("InheritedBase.wrap")],
+        "one member inherited by both constituents remains proven: {pass:?}"
     );
 }

@@ -107,10 +107,13 @@ async fn a_write_in_flight_delays_the_observation_without_holding_the_runtime() 
         let _ = released.recv_timeout(std::time::Duration::from_secs(10));
     });
     holding.recv().unwrap();
-    let observation = tokio::spawn(observe_live_head_sources_off_runtime(
+    let observation = tokio::spawn(observe_live_refs_sources_off_runtime(
         Arc::clone(&state),
         Arc::clone(&state.graph),
-        None,
+        kin_cli::commands::refs::RefsRequest {
+            entity: "unused for an all-relations source observation".to_string(),
+            kind: "all".to_string(),
+        },
     ));
     // This task runs again only if the observation's wait left the worker free.
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;

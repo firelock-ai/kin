@@ -232,21 +232,20 @@ async fn find_references_with(
     body(&handle_find_references(&args, store, None).await.unwrap())
 }
 
-/// `(name, reference_lines)` for every row in `rows`, in reply order.
-fn sites(rows: &serde_json::Value) -> Vec<(String, Vec<u64>)> {
+/// `(name, sites)` for every row in `rows`, in reply order.
+///
+/// A row serves its sites inside its caller, and these fixtures' callers carry
+/// no span, so each site is counted rather than placed. Which lines a split
+/// keeps is pinned where the row is cut, in `common`'s reference-site tests
+/// and in `parser_site_confidence`.
+fn sites(rows: &serde_json::Value) -> Vec<(String, usize)> {
     rows.as_array()
         .expect("an array of rows")
         .iter()
         .map(|row| {
-            (
-                row["name"].as_str().unwrap().to_string(),
-                row["reference_lines"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .map(|line| line.as_u64().unwrap())
-                    .collect(),
-            )
+            let sites = row["sites"].as_array().expect("every row lists its sites");
+            assert_eq!(row["site_count"], sites.len(), "{row:#}");
+            (row["name"].as_str().unwrap().to_string(), sites.len())
         })
         .collect()
 }
@@ -350,24 +349,20 @@ async fn a_concrete_method_confirms_only_the_sites_gopls_resolved_to_it() {
 
     assert_eq!(
         sites(&reply["references"]),
-        vec![("NewCreateContext".to_string(), vec![678, 723])],
+        vec![("NewCreateContext".to_string(), 2)],
         "only the direct calls are confirmed; 649 and 697 are calls on a ghrepo.Interface \
          value that nothing resolved to this method: {reply:#}"
     );
     let counted = row_named(&reply["references"], "NewCreateContext");
     assert_eq!(counted["resolution"], "type_resolved", "{reply:#}");
     assert_eq!(
-        counted["reference_lines_partial_reason"], "unconfirmed_sites_in_candidates",
+        counted["sites_partial_reason"], "unconfirmed_sites_in_candidates",
         "the counted row says its caller has more sites held as candidates: {reply:#}"
     );
 
     // Held, not dropped, and labelled with what resolved them: nothing.
     let held = row_named(&reply["candidates"], "NewCreateContext");
-    assert_eq!(
-        held["reference_lines"],
-        serde_json::json!([649, 697]),
-        "{reply:#}"
-    );
+    assert_eq!(held["site_count"], 2, "{reply:#}");
     assert_eq!(held["resolution"], "name_only", "{reply:#}");
     assert_eq!(
         held["relation_kinds"],
@@ -401,15 +396,11 @@ async fn an_interface_method_confirms_only_the_calls_written_against_it() {
 
     assert_eq!(
         sites(&reply["references"]),
-        vec![("NewCreateContext".to_string(), vec![649, 697])],
+        vec![("NewCreateContext".to_string(), 2)],
         "678 and 723 are calls on an *api.Repository: {reply:#}"
     );
     let held = row_named(&reply["candidates"], "NewCreateContext");
-    assert_eq!(
-        held["reference_lines"],
-        serde_json::json!([678, 723]),
-        "{reply:#}"
-    );
+    assert_eq!(held["site_count"], 2, "{reply:#}");
     assert_eq!(held["resolution"], "name_only", "{reply:#}");
 }
 
@@ -426,15 +417,11 @@ async fn the_wide_read_still_holds_a_counted_callers_fan_out_sites() {
     .await;
     assert_eq!(
         sites(&reply["references"]),
-        vec![("NewCreateContext".to_string(), vec![678, 723])],
+        vec![("NewCreateContext".to_string(), 2)],
         "{reply:#}"
     );
     let held = row_named(&reply["candidates"], "NewCreateContext");
-    assert_eq!(
-        held["reference_lines"],
-        serde_json::json!([649, 697]),
-        "{reply:#}"
-    );
+    assert_eq!(held["site_count"], 2, "{reply:#}");
 }
 
 /// Python, through pyright's shape: a counted caller keeps every site a
@@ -523,26 +510,24 @@ async fn every_proven_python_call_site_stays_confirmed() {
     assert_eq!(
         sites(&reply["references"]),
         vec![
-            ("HTTPDigestAuth.handle_401".to_string(), vec![262, 281]),
-            ("Session.request".to_string(), vec![575, 589]),
-            ("Session.send".to_string(), vec![784]),
+            ("HTTPDigestAuth.handle_401".to_string(), 2),
+            ("Session.request".to_string(), 2),
+            ("Session.send".to_string(), 1),
         ],
         "every site a proven edge recorded is confirmed: {reply:#}"
     );
     assert_eq!(
         sites(&reply["candidates"]),
-        vec![("Session.send".to_string(), vec![790])],
+        vec![("Session.send".to_string(), 1)],
         "and only the site nothing proved is held: {reply:#}"
     );
     assert!(
-        row_named(&reply["references"], "HTTPDigestAuth.handle_401")
-            ["reference_lines_partial_reason"]
+        row_named(&reply["references"], "HTTPDigestAuth.handle_401")["sites_partial_reason"]
             .is_null(),
         "a caller with nothing held still certifies its sites: {reply:#}"
     );
     assert!(
-        row_named(&reply["references"], "Session.request")["reference_lines_partial_reason"]
-            .is_null(),
+        row_named(&reply["references"], "Session.request")["sites_partial_reason"].is_null(),
         "two proven kinds from one caller are not a split: {reply:#}"
     );
 }
@@ -614,7 +599,7 @@ async fn a_composed_caller_keeps_its_proven_site_and_holds_the_guess() {
     let reply = find_references(&store, &focal).await;
     assert_eq!(
         sites(&reply["references"]),
-        vec![("Session.send".to_string(), vec![784])],
+        vec![("Session.send".to_string(), 1)],
         "{reply:#}"
     );
     assert_eq!(
@@ -624,7 +609,7 @@ async fn a_composed_caller_keeps_its_proven_site_and_holds_the_guess() {
     );
     assert_eq!(
         sites(&reply["candidates"]),
-        vec![("Session.send".to_string(), vec![790])],
+        vec![("Session.send".to_string(), 1)],
         "{reply:#}"
     );
 }
@@ -669,12 +654,12 @@ async fn a_name_only_reference_beside_an_import_scoped_call_follows_the_floor() 
     let reply = find_references(&store, &focal).await;
     assert_eq!(
         sites(&reply["references"]),
-        vec![("dispatch".to_string(), vec![412, 420])],
+        vec![("dispatch".to_string(), 2)],
         "{reply:#}"
     );
     assert_eq!(
         sites(&reply["candidates"]),
-        vec![("dispatch".to_string(), vec![433])],
+        vec![("dispatch".to_string(), 1)],
         "{reply:#}"
     );
     assert_eq!(
@@ -691,7 +676,7 @@ async fn a_name_only_reference_beside_an_import_scoped_call_follows_the_floor() 
     .await;
     assert_eq!(
         sites(&wide["references"]),
-        vec![("dispatch".to_string(), vec![412, 420, 433])],
+        vec![("dispatch".to_string(), 3)],
         "the wide read counts the name-only site again: {wide:#}"
     );
     assert_eq!(wide["candidates"], serde_json::json!([]), "{wide:#}");
@@ -769,7 +754,7 @@ async fn a_released_builds_widened_interface_references_confirm_nothing() {
     let reply = find_references(&store, &interface).await;
     assert_eq!(
         sites(&reply["references"]),
-        vec![("NewCreateContext".to_string(), vec![649, 697])],
+        vec![("NewCreateContext".to_string(), 2)],
         "the widened records confirm nothing, and cloneRun, which never calls the interface \
          method, is no caller of it: {reply:#}"
     );
@@ -797,7 +782,7 @@ async fn a_released_builds_widened_interface_references_confirm_nothing() {
     let reply = find_references(&store, &interface).await;
     assert_eq!(
         sites(&reply["references"]),
-        vec![("NewCreateContext".to_string(), vec![649, 697])],
+        vec![("NewCreateContext".to_string(), 2)],
         "{reply:#}"
     );
     assert_eq!(

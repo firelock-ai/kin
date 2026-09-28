@@ -214,6 +214,16 @@ pub struct UnaccountedFile {
     /// Callers in the file that no current ledger describes, which is why a
     /// row counted from parse against edges was not counted from ledgers.
     pub owed_callers: u64,
+    /// For a row counted from site ledgers, the unsettled sites left out
+    /// because they cannot be a call to the focal: their callee is another
+    /// name and the focal does not escape as a value. They are counted in
+    /// `resolved_call_edges` with the settled ones, as sites accounted for.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub ruled_out_by_name: u64,
+}
+
+fn is_zero(count: &u64) -> bool {
+    *count == 0
 }
 
 /// How a family file's call sites were counted.
@@ -269,6 +279,11 @@ pub struct CallerArrival {
     /// stay in `owed_callers`, and their files keep the parse-against-edge
     /// count, which still holds every call they make to account.
     pub owed_callers_cannot_name_focal: u64,
+    /// The store-wide reading of every caller that could call the focal, when
+    /// the answer took one. It narrows the family's ledger counts to the sites
+    /// that could call the focal, and its block, with a row for each such
+    /// site, is the `call_sites` block the answer serves.
+    pub scan: Option<std::sync::Arc<crate::call_sites::FocalScan>>,
 }
 
 impl CallerArrival {
@@ -284,14 +299,22 @@ impl CallerArrival {
             call_sites: None,
             owed_outside: Some(Vec::new()),
             owed_callers_cannot_name_focal: 0,
+            scan: None,
         }
     }
 
-    /// The `call_sites` block for the callers in the files that import the
-    /// focal's file, qualified by the owed callers outside them, or `None`
-    /// when the family could not be established. `find_references` and
-    /// `kin refs` both serve this one block.
+    /// The `call_sites` block `find_references` and `kin refs` both serve.
+    ///
+    /// With a store-wide reading, it is that reading's block: every caller in
+    /// the store that could call the focal, narrowed to the sites that could,
+    /// with a row for each unsettled one (see [`crate::call_sites::named_block`]).
+    /// Without one, it is the block for the callers in the files that import
+    /// the focal's file, qualified by the owed callers outside them, or `None`
+    /// when the family could not be established.
     pub fn call_sites_block(&self) -> Option<serde_json::Value> {
+        if let Some(scan) = self.scan.as_deref() {
+            return Some(crate::call_sites::named_block(scan));
+        }
         let tally = self.call_sites.as_ref()?;
         let mut block = crate::call_sites::family_block(tally, self.owed_outside.as_deref());
         if self.owed_callers_cannot_name_focal > 0 {
@@ -546,6 +569,8 @@ struct LedgerCount {
     census: u64,
     /// Of those, the sites a resolver settled.
     settled: u64,
+    /// Of those, the unsettled sites that cannot be a call to the focal.
+    ruled_out: u64,
     /// The rest, by the state each reads as.
     unsettled: std::collections::BTreeMap<&'static str, u64>,
 }
@@ -568,11 +593,13 @@ struct LedgerCount {
 /// name spells it there and keeps the file's owed callers counted. It is still
 /// owed, so it is still pushed onto `owed` and keeps the file on the
 /// arithmetic.
+#[allow(clippy::too_many_arguments)]
 fn ledger_count<F: kin_model::CallSiteFacts + ?Sized>(
     facts: &F,
     file: &FilePathId,
     entities: &[Entity],
     could_name: &dyn Fn(&Entity) -> bool,
+    could_call: &dyn Fn(&Entity, &kin_model::CallSite) -> bool,
     tally: &mut kin_model::CallSiteTally,
     owed: &mut Vec<OwedCaller>,
     cannot_name: &mut u64,
@@ -585,10 +612,17 @@ fn ledger_count<F: kin_model::CallSiteFacts + ?Sized>(
         let reading = kin_model::read_caller_sites(facts, entity);
         let unsettled_caller = matches!(
             reading,
-            CallerSites::OwedDerivation | CallerSites::OwedEnrichment | CallerSites::Stale(_)
+            CallerSites::OwedDerivation
+                | CallerSites::OwedEnrichment
+                | CallerSites::Stale(_)
+                | CallerSites::Unverified { .. }
         );
         if unsettled_caller && !could_name(entity) {
             *cannot_name += 1;
+        } else if let CallerSites::Current(_) = reading {
+            tally.add(&reading.retain_sites(|site| {
+                kin_model::SiteStateKind::of(&site.state).is_settled() || could_call(entity, site)
+            }));
         } else {
             tally.add(&reading);
         }
@@ -601,15 +635,18 @@ fn ledger_count<F: kin_model::CallSiteFacts + ?Sized>(
                     let kind = reading.site_kind(site);
                     if kind.is_settled() {
                         count.settled += 1;
-                    } else {
+                    } else if could_call(entity, site) {
                         *count.unsettled.entry(kind.wire()).or_insert(0) += 1;
+                    } else {
+                        count.ruled_out += 1;
                     }
                 }
             }
             CallerSites::OwedDerivation
             | CallerSites::OwedEnrichment
             | CallerSites::NoResolver { .. }
-            | CallerSites::Stale(_) => {
+            | CallerSites::Stale(_)
+            | CallerSites::Unverified { .. } => {
                 owed_here = true;
                 owed.push(OwedCaller {
                     id: entity.id.to_string(),
@@ -850,6 +887,37 @@ pub fn observe_file_call_sites<G: GraphStore>(
 /// focal in the store and put a floor under every absence in it. The cost now
 /// scales with the focal's file and its importers, not with the repository.
 pub fn observe_caller_arrival<G: GraphStore>(store: &G, focal: &Entity) -> CallerArrival {
+    observe_caller_arrival_with(store, focal, None)
+}
+
+/// [`observe_caller_arrival`] over `scan`, the store-wide reading of every
+/// caller that could call the focal, when the answer took one.
+///
+/// A family file counted from ledgers then counts only the unsettled sites
+/// the scan keeps: an unresolved `json.dumps` cannot be a call to
+/// `_make_timedelta`. The scan is store-wide, never the family alone, so a
+/// caller that reaches the focal without importing its file is still read,
+/// and its block is the `call_sites` block the answer serves. Without a scan
+/// every unsettled site in the family counts, as it always has.
+pub fn observe_caller_arrival_with<G: GraphStore>(
+    store: &G,
+    focal: &Entity,
+    scan: Option<std::sync::Arc<crate::call_sites::FocalScan>>,
+) -> CallerArrival {
+    let mut arrival = observe_family(store, focal, scan.as_deref());
+    arrival.scan = scan;
+    arrival
+}
+
+fn observe_family<G: GraphStore>(
+    store: &G,
+    focal: &Entity,
+    scan: Option<&crate::call_sites::FocalScan>,
+) -> CallerArrival {
+    let names = kin_model::focal_call_names(focal);
+    let could_call = |entity: &Entity, site: &kin_model::CallSite| {
+        scan.is_none_or(|scan| scan.keeps(entity.id, site))
+    };
     let Some(focal_file) = focal.file_origin.clone() else {
         return CallerArrival::unmeasured("the focal entity carries no file of origin");
     };
@@ -951,8 +1019,9 @@ pub fn observe_caller_arrival<G: GraphStore>(store: &G, focal: &Entity) -> Calle
                     store,
                     focal.language,
                     &std::collections::HashSet::from([focal_file.0.clone()]),
-                    &focal.name,
+                    &names,
                 ),
+                scan: None,
             };
         }
         return CallerArrival::unmeasured(
@@ -985,8 +1054,7 @@ pub fn observe_caller_arrival<G: GraphStore>(store: &G, focal: &Entity) -> Calle
     let mut tally = kin_model::CallSiteTally::default();
     let mut owed_callers: Vec<OwedCaller> = Vec::new();
     let mut owed_callers_cannot_name_focal = 0u64;
-    let could_name =
-        |entity: &Entity| crate::call_sites::could_name_focal(entity, focal.name.as_str());
+    let could_name = |entity: &Entity| crate::call_sites::could_name_focal(entity, &names);
     let mut files_from_site_ledgers = 0usize;
     for file in &family_files {
         let Some((entities, parsed)) = file_entities(store, file) else {
@@ -1000,6 +1068,7 @@ pub fn observe_caller_arrival<G: GraphStore>(store: &G, focal: &Entity) -> Calle
             file,
             &entities,
             &could_name,
+            &could_call,
             &mut tally,
             &mut owed_callers,
             &mut owed_callers_cannot_name_focal,
@@ -1011,13 +1080,14 @@ pub fn observe_caller_arrival<G: GraphStore>(store: &G, focal: &Entity) -> Calle
                 unaccounted.push(UnaccountedFile {
                     file: file.0.clone(),
                     parsed_call_sites: Some(count.census),
-                    resolved_call_edges: count.settled,
+                    resolved_call_edges: count.settled + count.ruled_out,
                     unaccounted_call_sites: Some(unsettled),
                     shortfall_is_floor: false,
                     count_source: CountSource::SiteLedgers,
                     count_exact: true,
                     unsettled_by_state: count.unsettled,
                     owed_callers: 0,
+                    ruled_out_by_name: count.ruled_out,
                 });
             }
             continue;
@@ -1094,8 +1164,9 @@ pub fn observe_caller_arrival<G: GraphStore>(store: &G, focal: &Entity) -> Calle
                 .map(|file| file.0.clone())
                 .chain(std::iter::once(focal_file.0.clone()))
                 .collect(),
-            &focal.name,
+            &names,
         ),
+        scan: None,
     }
 }
 
@@ -1382,25 +1453,42 @@ pub const IMPACT_ARRIVAL_NOT_APPLICABLE: &str = "not_applicable";
 /// evidence a reader audits them with, capped at [`EVIDENCE_ROW_CAP`] with the
 /// refusing ones first, and the block says when it truncated.
 ///
-/// Readings are taken once per file, because a reading consults its focal only
-/// through the focal's file and language.
+/// Readings are shared only when the focal's file, language and name match.
+/// The name decides which owed callers could reach this focal, so two entities
+/// in one file can have different readings.
 pub fn observe_impact_arrival<G: GraphStore>(
     store: &G,
     entities_without_consumers: &[EntityId],
 ) -> serde_json::Value {
-    let mut by_file: std::collections::HashMap<(FilePathId, kin_model::LanguageId), CallerArrival> =
-        std::collections::HashMap::new();
+    let mut by_focal: std::collections::HashMap<
+        (FilePathId, kin_model::LanguageId, String),
+        CallerArrival,
+    > = std::collections::HashMap::new();
     let mut entries: Vec<(EntityId, Option<String>, Option<String>, CallerArrival)> = Vec::new();
+    let mut outside_focals: std::collections::HashMap<
+        kin_model::LanguageId,
+        std::collections::HashMap<String, HashSet<String>>,
+    > = std::collections::HashMap::new();
     for id in entities_without_consumers {
         let (name, file, arrival) = match store.get_entity(id) {
             Ok(Some(entity)) => {
                 let arrival = match entity.file_origin.clone() {
-                    Some(file) => by_file
-                        .entry((file, entity.language))
+                    Some(file) => by_focal
+                        .entry((file, entity.language, entity.name.clone()))
                         .or_insert_with(|| observe_caller_arrival(store, &entity))
                         .clone(),
                     None => observe_caller_arrival(store, &entity),
                 };
+                if let Some(files) = &arrival.owed_outside {
+                    for file in files {
+                        outside_focals
+                            .entry(entity.language)
+                            .or_default()
+                            .entry(file.file.clone())
+                            .or_default()
+                            .extend(kin_model::focal_call_names(&entity));
+                    }
+                }
                 (
                     Some(entity.name),
                     entity.file_origin.map(|file| file.0),
@@ -1460,23 +1548,35 @@ pub fn observe_impact_arrival<G: GraphStore>(
         })
         .collect();
 
-    // Owed callers outside any examined entity's family, joined by file. A
-    // caller there can reach an entity without importing its file, so the
-    // zero consumer counts are not whole while one is owed.
-    let mut owed_outside: std::collections::BTreeMap<String, u64> =
-        std::collections::BTreeMap::new();
-    let mut owed_outside_unreadable = false;
-    for (_, _, _, arrival) in &entries {
-        match &arrival.owed_outside {
-            Some(files) => {
-                for file in files {
-                    let callers = owed_outside.entry(file.file.clone()).or_insert(0);
-                    *callers = (*callers).max(file.callers);
-                }
-            }
-            None => owed_outside_unreadable = true,
+    // Union caller identities before counting by file. Different focal names
+    // can select disjoint or overlapping callers in the same outside file:
+    // neither the maximum nor the sum of the per-focal counts is their union.
+    let mut owed_outside_unreadable = entries
+        .iter()
+        .any(|(_, _, _, arrival)| arrival.owed_outside.is_none());
+    let mut outside_callers = Vec::new();
+    let mut seen_callers = HashSet::new();
+    if !owed_outside_unreadable {
+        for (language, files) in outside_focals {
+            let Ok(entities) = store.query_entities(&EntityFilter {
+                languages: Some(vec![language]),
+                ..EntityFilter::default()
+            }) else {
+                owed_outside_unreadable = true;
+                break;
+            };
+            outside_callers.extend(entities.into_iter().filter(|entity| {
+                entity.span.as_ref().is_some_and(|span| {
+                    span.start_byte < span.end_byte
+                        && files.get(&span.file.0).is_some_and(|names| {
+                            let names: Vec<String> = names.iter().cloned().collect();
+                            crate::call_sites::could_name_focal(entity, &names)
+                        })
+                }) && seen_callers.insert(entity.id)
+            }));
         }
     }
+    let owed_outside = crate::call_sites::owed_files(store, &outside_callers);
 
     let mut block = json!({
         "state": state,
@@ -1492,12 +1592,8 @@ pub fn observe_impact_arrival<G: GraphStore>(
     } else if !owed_outside.is_empty() {
         block["owed_outside_scope"] = json!({
             "file_count": owed_outside.len(),
-            "callers": owed_outside.values().sum::<u64>(),
-            "files": owed_outside
-                .iter()
-                .take(EVIDENCE_ROW_CAP)
-                .map(|(file, callers)| json!({ "file": file, "callers": callers }))
-                .collect::<Vec<_>>(),
+            "callers": owed_outside.iter().map(|file| file.callers).sum::<u64>(),
+            "files": owed_outside.iter().take(EVIDENCE_ROW_CAP).collect::<Vec<_>>(),
         });
     }
     block
@@ -2372,6 +2468,7 @@ mod tests {
             call_sites: None,
             owed_outside: Some(Vec::new()),
             owed_callers_cannot_name_focal: 0,
+            scan: None,
         };
         vec![
             ("one shortfall file", build(vec![one.clone()])),
@@ -3013,14 +3110,152 @@ mod tests {
         }
     }
 
+    #[test]
+    fn impact_uses_each_same_file_focals_name_for_owed_family_callers() {
+        let (store, focal) = store_with(Some(1), 0, true);
+        let sibling = find_note();
+        let (mut module, mut caller) = caller_file_entities(Some(1));
+        for entity in [&mut module, &mut caller] {
+            entity.metadata.extra.insert(
+                kin_parser::extract::EMBEDDING_BODY_PREVIEW_KEY.into(),
+                json!("note_body()"),
+            );
+            store.upsert_entity(entity).unwrap();
+        }
+
+        for ids in [[focal.id, sibling.id], [sibling.id, focal.id]] {
+            let block = observe_impact_arrival(&store, &ids);
+            let rows = block["entities"].as_array().unwrap();
+            for (entity, cannot_name) in [(&focal, 0), (&sibling, 2)] {
+                let mut expected = observe_caller_arrival(&store, entity).fields_json();
+                expected["entity_id"] = json!(entity.id.to_string());
+                expected["name"] = json!(entity.name);
+                expected["file"] = json!(FOCAL_FILE);
+                let row = rows
+                    .iter()
+                    .find(|row| row["entity_id"] == entity.id.to_string())
+                    .unwrap();
+                assert_eq!(
+                    row, &expected,
+                    "a preceding focal cannot change this reading"
+                );
+                assert_eq!(
+                    row["owed_callers_cannot_name_focal"].as_u64().unwrap_or(0),
+                    cannot_name,
+                    "only note_body is named by the owed callers: {block}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn impact_keeps_owed_outside_callers_for_each_same_file_focal_in_either_order() {
+        let store = InMemoryGraph::new();
+        let focal = entity_in("note_body", FOCAL_FILE, Some(0));
+        let sibling = entity_in("find_note", FOCAL_FILE, Some(0));
+        let mut other = entity_in("elsewhere", "src/other.py", Some(0));
+        other.metadata.extra.insert(
+            kin_parser::extract::EMBEDDING_BODY_PREVIEW_KEY.into(),
+            json!("pass"),
+        );
+        let mut caller = entity_in("test_body", CALLER_FILE, Some(1));
+        caller.metadata.extra.insert(
+            kin_parser::extract::EMBEDDING_BODY_PREVIEW_KEY.into(),
+            json!("note_body()"),
+        );
+        for entity in [&focal, &sibling, &other, &caller] {
+            store.upsert_entity(entity).unwrap();
+        }
+        // Import linking works, but the caller reaches the focal without an
+        // import into its file, so only the outside-family reading sees it.
+        store
+            .upsert_relation(&edge(RelationKind::Imports, &focal, &other))
+            .unwrap();
+
+        for ids in [[focal.id, sibling.id], [sibling.id, focal.id]] {
+            let block = observe_impact_arrival(&store, &ids);
+            let rows = block["entities"].as_array().unwrap();
+            let focal_row = rows
+                .iter()
+                .find(|row| row["entity_id"] == focal.id.to_string())
+                .unwrap();
+            let sibling_row = rows
+                .iter()
+                .find(|row| row["entity_id"] == sibling.id.to_string())
+                .unwrap();
+            assert_eq!(focal_row["owed_outside_scope"]["callers"], 1, "{block}");
+            assert!(sibling_row.get("owed_outside_scope").is_none(), "{block}");
+            assert_eq!(block["owed_outside_scope"]["callers"], 1, "{block}");
+            assert_eq!(block["owed_outside_scope"]["file_count"], 1, "{block}");
+            assert_eq!(
+                block["owed_outside_scope"]["files"][0]["file"], CALLER_FILE,
+                "{block}"
+            );
+            let gaps = impact_arrival_gaps(&json!({ CALLER_ARRIVAL_KEY: block }));
+            assert_eq!(
+                gaps.len(),
+                1,
+                "the owed caller still limits impact: {gaps:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn impact_unions_distinct_and_shared_owed_outside_callers() {
+        let store = InMemoryGraph::new();
+        let focal = entity_in("note_body", FOCAL_FILE, Some(0));
+        let sibling = entity_in("find_note", FOCAL_FILE, Some(0));
+        let mut other = entity_in("elsewhere", "src/other.py", Some(0));
+        other.metadata.extra.insert(
+            kin_parser::extract::EMBEDDING_BODY_PREVIEW_KEY.into(),
+            json!("pass"),
+        );
+        for entity in [&focal, &sibling, &other] {
+            store.upsert_entity(entity).unwrap();
+        }
+        store
+            .upsert_relation(&edge(RelationKind::Imports, &focal, &other))
+            .unwrap();
+        for (name, body) in [
+            ("body_only", "note_body()"),
+            ("find_only", "find_note()"),
+            ("shared", "note_body(); find_note()"),
+        ] {
+            let mut caller = entity_in(name, CALLER_FILE, Some(4));
+            caller.metadata.extra.insert(
+                kin_parser::extract::EMBEDDING_BODY_PREVIEW_KEY.into(),
+                json!(body),
+            );
+            store.upsert_entity(&caller).unwrap();
+        }
+
+        for ids in [
+            vec![focal.id, sibling.id],
+            vec![sibling.id, focal.id],
+            vec![focal.id, sibling.id, focal.id],
+        ] {
+            let block = observe_impact_arrival(&store, &ids);
+            for row in block["entities"].as_array().unwrap() {
+                assert_eq!(row["owed_outside_scope"]["callers"], 2, "{block}");
+            }
+            assert_eq!(block["owed_outside_scope"]["callers"], 3, "{block}");
+            assert_eq!(block["owed_outside_scope"]["file_count"], 1, "{block}");
+            assert_eq!(
+                block["owed_outside_scope"]["files"][0]["callers"], 3,
+                "{block}"
+            );
+            let gap = owed_outside_gap(&json!({ CALLER_ARRIVAL_KEY: block })).unwrap();
+            assert!(gap.contains("3 caller(s) in 1 file(s)"), "{gap}");
+        }
+    }
+
     /// Several zeros at once, with every kind of gap and a clean one. Each kind
     /// makes one clause naming its entities, the clean entity makes none, and no
     /// clause carries the separator a reader splits the factor on.
     #[test]
     fn an_impact_answer_with_several_zeros_names_each_gap_once() {
         let (store, focal) = store_with(Some(3), 2, true);
-        // Shares the focal's file, so it shares the reading and is counted
-        // under the same gap without a second walk.
+        // Shares the focal's file and the same unaccounted call sites.
         let sibling = entity_in("find_note", FOCAL_FILE, Some(2));
         // An id the graph does not hold, which is how a removed entity arrives.
         let removed = EntityId::from_content("src/gone.py", "gone", "Function", 0);

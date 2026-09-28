@@ -54,7 +54,9 @@ use kin_mcp::budget::Elision;
 pub use kin_mcp::handlers::common::TRACE_DEFAULT_MAX_RESPONSE_CHARS as DEFAULT_MAX_RESPONSE_CHARS;
 #[cfg(test)]
 use kin_mcp::handlers::common::TRACE_DISCLOSURE_RESERVE_CHARS;
-use kin_mcp::handlers::common::{trace_response_budget, ReferenceLinesAbsent};
+use kin_mcp::handlers::common::{
+    trace_response_budget, EntitySourceScope, HeldSourceAuthority, ReferenceLinesAbsent,
+};
 use kin_mcp::remediation::counted;
 
 /// Wall-clock ceiling for one trace walk.
@@ -302,6 +304,9 @@ pub struct TraceDataFlowRequest {
     /// Focal entity to start tracing from. Accepts an entity UUID or an exact
     /// entity name (resolved via the same ranking path as `graph source`).
     pub focal: String,
+    /// Continue the same query with a cursor returned by a prior response.
+    #[serde(default)]
+    pub cursor: Option<String>,
     /// Maximum traversal depth from the focal (default 3, capped at 8).
     #[serde(default)]
     pub depth: Option<usize>,
@@ -427,9 +432,9 @@ pub struct TraceStep {
     /// Relation kind that linked this step to its parent (e.g., `Calls`,
     /// `Imports`, `References`).
     pub relation_kind: String,
-    /// How the edge INTO this step was resolved: `type_resolved`,
-    /// `import_scoped`, or `name_only`. A chain is only as trustworthy as its
-    /// weakest hop; a `name_only` hop was matched by name alone, so the flow it
+    /// The weakest resolution on the path from the focal to this step:
+    /// `type_resolved`, `import_scoped`, or `name_only`. A `name_only` hop
+    /// anywhere on that path was matched by name alone, so the flow this step
     /// claims may not exist. Defaulted on read so a payload recorded before the
     /// marker existed still deserializes.
     #[serde(default)]
@@ -550,6 +555,9 @@ pub struct TraceFanoutClip {
 /// Response from the trace-data-flow primitive.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TraceDataFlowResponse {
+    /// Committed source revision selected with a historical trace graph.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_change_id: Option<String>,
     /// Focal entity's source record. Present when a body was requested and
     /// readable, null otherwise; `focal_*` below always carry its identity, and
     /// `focal_span` its location, in both modes.
@@ -776,12 +784,14 @@ pub async fn run_seeded(
     max_response_chars: Option<usize>,
     include_type_edges: Option<bool>,
     target: Option<String>,
+    cursor: Option<String>,
 ) -> Result<()> {
     let direction = match direction {
         Some(value) => Some(TraceDirection::parse(&value)?),
         None => None,
     };
     let request = TraceDataFlowRequest {
+        cursor,
         focal,
         depth,
         direction,
@@ -793,14 +803,14 @@ pub async fn run_seeded(
     };
     let layout = crate::commands::require_repository_layout()?;
     let response = run_daemon_trace_data_flow(&layout, &request).await?;
-    println!("{}", render_response_json(&response)?);
+    println!("{}", serde_json::to_string(&response)?);
     Ok(())
 }
 
 async fn run_daemon_trace_data_flow(
     layout: &kin_core::KinLayout,
     request: &TraceDataFlowRequest,
-) -> Result<TraceDataFlowResponse> {
+) -> Result<serde_json::Value> {
     let daemon_url = std::env::var("KIN_DAEMON_URL")
         .ok()
         .filter(|value| !value.trim().is_empty())
@@ -843,6 +853,59 @@ pub fn build_trace_data_flow_response_within(
     request: &TraceDataFlowRequest,
     budget: TraceBudget,
 ) -> Result<TraceDataFlowResponse> {
+    build_trace_data_flow_response_inner(
+        repository_authority,
+        graph,
+        request,
+        budget,
+        true,
+        EntitySourceScope::WorkspaceHead,
+    )
+}
+
+/// Build one complete bounded-work trace for the shared lossless pager. No
+/// response-size cut runs before the final envelope is available.
+pub fn build_trace_data_flow_response_unpaged_within(
+    repository_authority: &RequestRepositoryAuthority,
+    graph: &kin_db::InMemoryGraph,
+    request: &TraceDataFlowRequest,
+    budget: TraceBudget,
+) -> Result<TraceDataFlowResponse> {
+    build_trace_data_flow_response_unpaged_at_within(
+        repository_authority,
+        graph,
+        request,
+        budget,
+        EntitySourceScope::WorkspaceHead,
+    )
+}
+
+/// A complete trace whose source reads use the scope selected with its graph.
+pub fn build_trace_data_flow_response_unpaged_at_within(
+    repository_authority: &RequestRepositoryAuthority,
+    graph: &kin_db::InMemoryGraph,
+    request: &TraceDataFlowRequest,
+    budget: TraceBudget,
+    source_scope: EntitySourceScope,
+) -> Result<TraceDataFlowResponse> {
+    build_trace_data_flow_response_inner(
+        repository_authority,
+        graph,
+        request,
+        budget,
+        false,
+        source_scope,
+    )
+}
+
+fn build_trace_data_flow_response_inner(
+    repository_authority: &RequestRepositoryAuthority,
+    graph: &kin_db::InMemoryGraph,
+    request: &TraceDataFlowRequest,
+    budget: TraceBudget,
+    bound_response: bool,
+    source_scope: EntitySourceScope,
+) -> Result<TraceDataFlowResponse> {
     let trimmed = request.focal.trim();
     if trimmed.is_empty() {
         anyhow::bail!("trace_data_flow requires a non-empty focal");
@@ -871,6 +934,17 @@ pub fn build_trace_data_flow_response_within(
         )
         .map_err(|error| anyhow::anyhow!("read external symbol {}: {error}", node.address()))?;
         anyhow::bail!(refusal);
+    }
+    if let Some(target) = request.target.as_deref() {
+        if let Some(refusal) = kin_mcp::handlers::external_symbols::external_id_refusal_text(
+            graph,
+            target.trim(),
+            "trace_data_flow",
+            "target",
+            kin_mcp::handlers::entities::TRACE_TARGET_EXTERNAL_WHY,
+        )? {
+            anyhow::bail!(refusal);
+        }
     }
 
     // A member name several owners share names none of them, so the walk is
@@ -904,7 +978,7 @@ pub fn build_trace_data_flow_response_within(
     // always optional per step, and hoisting the open must not turn a payload
     // that used to arrive body-less into a failed call — so the failure is
     // disclosed and the walk continues on identity alone.
-    let projection = match open_body_projection(repository_authority) {
+    let projection = match open_body_projection(repository_authority, graph, source_scope) {
         Ok(projection) => Some(projection),
         Err(error) => {
             record_degradation(
@@ -1060,6 +1134,9 @@ pub fn build_trace_data_flow_response_within(
     }
 
     let mut chain: Vec<TraceStep> = Vec::new();
+    // A proven child edge cannot establish the guessed path that reached its
+    // parent. Keyed by step so promoting a placeholder keeps its original path.
+    let mut path_resolutions = HashMap::from([(0, RelationResolution::TypeResolved)]);
     let mut visited: HashSet<EntityId> = HashSet::new();
     visited.insert(focal_entity.id);
     // Which step already stands for a symbol NAME.
@@ -1114,6 +1191,7 @@ pub fn build_trace_data_flow_response_within(
         next_frontier = Vec::new();
 
         for node in frontier.drain(..) {
+            let path_resolution = path_resolutions[&node.step];
             if node.depth >= depth {
                 continue;
             }
@@ -1473,11 +1551,13 @@ pub fn build_trace_data_flow_response_within(
                 );
                 candidate.normalize_reference_lines();
                 let reference_lines_absent_reason = candidate.reference_lines_absent_reason();
+                let resolution = path_resolution.min(candidate.resolution);
+                path_resolutions.insert(step_index, resolution);
                 chain.push(TraceStep {
                     step: step_index,
                     role: candidate.role.to_string(),
                     relation_kind: format!("{:?}", candidate.relation_kind),
-                    resolution: candidate.resolution.as_str().to_string(),
+                    resolution: resolution.as_str().to_string(),
                     parent_step: node.step,
                     depth: next_depth,
                     reference_lines: candidate.reference_lines,
@@ -1519,6 +1599,7 @@ pub fn build_trace_data_flow_response_within(
                         step_index,
                         node.step,
                         node.depth + 1,
+                        path_resolution,
                         &edge,
                         parent.as_ref(),
                         &parent_text,
@@ -1549,6 +1630,10 @@ pub fn build_trace_data_flow_response_within(
     }
 
     let mut response = TraceDataFlowResponse {
+        source_change_id: match source_scope {
+            EntitySourceScope::WorkspaceHead => None,
+            EntitySourceScope::At(change) => Some(change.to_string()),
+        },
         focal: focal_record,
         focal_id: focal_entity.id.to_string(),
         focal_name: focal_entity.name.clone(),
@@ -1595,7 +1680,13 @@ pub fn build_trace_data_flow_response_within(
         &step_language,
         &mut response,
     );
-    enforce_response_budget(&mut response)?;
+    if bound_response {
+        enforce_response_budget(&mut response)?;
+    } else {
+        record_unproven_steps(&mut response);
+        record_terminal_steps(&mut response);
+        record_spine_clipping(&mut response);
+    }
     Ok(response)
 }
 
@@ -2115,7 +2206,7 @@ fn sort_by_relevance(candidates: &mut [FanoutCandidate], node: &FrontierNode) {
 /// The text at an external call's sites, cut from the parent's own body as
 /// the walk's one authority serves it, each parent read once.
 struct ParentBodyText<'a> {
-    projection: Option<&'a BodyProjection>,
+    projection: Option<&'a BodyProjection<'a>>,
     bodies:
         std::cell::RefCell<HashMap<EntityId, std::result::Result<(usize, String), &'static str>>>,
 }
@@ -2149,6 +2240,7 @@ fn external_step(
     step: usize,
     parent_step: usize,
     depth: usize,
+    path_resolution: RelationResolution,
     edge: &kin_context::ExternalEdge,
     parent: Option<&Entity>,
     text: &ParentBodyText<'_>,
@@ -2161,7 +2253,10 @@ fn external_step(
         step,
         role: "callee".to_string(),
         relation_kind: format!("{:?}", edge.relation.kind),
-        resolution: RelationResolution::of(&edge.relation).as_str().to_string(),
+        resolution: path_resolution
+            .min(RelationResolution::of(&edge.relation))
+            .as_str()
+            .to_string(),
         parent_step,
         depth,
         reference_lines: Vec::new(),
@@ -2724,21 +2819,36 @@ fn resolve_trace_focal(graph: &kin_db::InMemoryGraph, query: &str) -> Result<Opt
 ///
 /// Held for the whole walk so the repeated per-step open is structurally
 /// impossible rather than merely avoided at the current call sites.
-struct BodyProjection {
-    authority: std::sync::Arc<ActiveRepositoryAuthority>,
-    workspace: kin_model::WorkspaceState,
+enum BodyProjection<'graph> {
+    Workspace {
+        authority: std::sync::Arc<ActiveRepositoryAuthority>,
+        workspace: kin_model::WorkspaceState,
+    },
+    Committed {
+        held: HeldSourceAuthority<'graph, kin_db::InMemoryGraph>,
+        scope: EntitySourceScope,
+    },
 }
 
-fn open_body_projection(
+fn open_body_projection<'graph>(
     repository_authority: &RequestRepositoryAuthority,
-) -> Result<BodyProjection> {
+    graph: &'graph kin_db::InMemoryGraph,
+    scope: EntitySourceScope,
+) -> Result<BodyProjection<'graph>> {
+    if matches!(scope, EntitySourceScope::At(_)) {
+        let source = repository_authority.source_authority()?;
+        return Ok(BodyProjection::Committed {
+            held: HeldSourceAuthority::new(graph, Some(&source)),
+            scope,
+        });
+    }
     let authority = repository_authority
         .open()
         .context("open repository authority for trace-data-flow")?;
     let workspace = authority
         .workspace()
         .context("resolve workspace for trace-data-flow")?;
-    Ok(BodyProjection {
+    Ok(BodyProjection::Workspace {
         authority,
         workspace,
     })
@@ -2753,11 +2863,43 @@ fn open_body_projection(
 /// that wrapper exists to answer a text query, and the walk already holds the
 /// entity the query would resolve back to.
 fn source_record_or_none(
-    projection: Option<&BodyProjection>,
+    projection: Option<&BodyProjection<'_>>,
     entity: &Entity,
 ) -> Option<GraphSourceRecord> {
     let projection = projection?;
-    graph_source_record_from(&projection.authority, &projection.workspace, entity).ok()
+    match projection {
+        BodyProjection::Workspace {
+            authority,
+            workspace,
+        } => graph_source_record_from(authority, workspace, entity).ok(),
+        BodyProjection::Committed { held, scope } => {
+            let source = kin_mcp::handlers::common::read_entity_source_exact_at(
+                held,
+                entity,
+                usize::MAX,
+                *scope,
+            )
+            .ok()??;
+            let span = entity.span.as_ref()?;
+            let (start_line, end_line) = kin_mcp::handlers::common::presentation_span_lines(span);
+            Some(GraphSourceRecord {
+                source_base: None,
+                id: entity.id.to_string(),
+                name: entity.name.clone(),
+                kind: format!("{:?}", entity.kind),
+                language: entity.language.to_string(),
+                file_path: source.path.as_utf8()?.to_owned(),
+                start_line,
+                end_line,
+                start_byte: span.start_byte,
+                end_byte: span.end_byte,
+                signature: entity.signature.clone(),
+                body: source.body,
+                span_coherence: source.span_coherence.label().to_owned(),
+                source_base_unavailable: None,
+            })
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2827,6 +2969,7 @@ mod tests {
         limit_per_step: usize,
     ) -> TraceDataFlowRequest {
         TraceDataFlowRequest {
+            cursor: None,
             focal: focal.to_string(),
             depth: Some(depth),
             direction: Some(direction),
@@ -2857,6 +3000,135 @@ mod tests {
             created_in: None,
             import_source: None,
             evidence: vec![],
+        }
+    }
+
+    fn both_trace_payloads(
+        graph: &InMemoryGraph,
+        focal: &EntityId,
+        direction: TraceDirection,
+        depth: usize,
+    ) -> Vec<serde_json::Value> {
+        let (_temp, binding) = empty_binding();
+        let mut request = trace_request(focal, depth, direction, 25);
+        request.include_body = Some(false);
+        request.max_response_chars = Some(60_000);
+        let cli = build_trace_data_flow_response(
+            &RequestRepositoryAuthority::pinned(binding),
+            graph,
+            &request,
+        )
+        .unwrap();
+        let args = HashMap::from([
+            ("focal".to_string(), serde_json::json!(focal.to_string())),
+            (
+                "direction".to_string(),
+                serde_json::json!(direction.as_str()),
+            ),
+            ("depth".to_string(), serde_json::json!(depth)),
+            ("limit_per_step".to_string(), serde_json::json!(25)),
+            ("include_body".to_string(), serde_json::json!(false)),
+            ("max_chars".to_string(), serde_json::json!(60_000)),
+        ]);
+        let offline = kin_mcp::handlers::entities::handle_trace_data_flow(&args, graph).unwrap();
+        let kin_mcp::types::ContentBlock::Text { text } = &offline.content[0];
+        vec![
+            serde_json::to_value(cli).unwrap(),
+            serde_json::from_str(text).unwrap(),
+        ]
+    }
+
+    #[test]
+    fn both_trace_walkers_preserve_weakest_resolution_across_descendants() {
+        for direction in [
+            TraceDirection::Calls,
+            TraceDirection::Callers,
+            TraceDirection::Both,
+        ] {
+            for (confidence, expected) in [
+                (0.3, "name_only"),
+                (0.9, "import_scoped"),
+                (1.0, "type_resolved"),
+            ] {
+                let graph = InMemoryGraph::new();
+                let focal = make_entity("focal", "src/focal.py");
+                let parent = make_entity("parent", "src/parent.py");
+                let child = make_entity("child", "src/child.py");
+                let direct = make_entity("direct", "src/direct.py");
+                for entity in [&focal, &parent, &child, &direct] {
+                    graph.upsert_entity(entity).unwrap();
+                }
+                for (from, to, strength) in [
+                    (focal.id, parent.id, confidence),
+                    (parent.id, child.id, 1.0),
+                    (focal.id, direct.id, 1.0),
+                ] {
+                    let (src, dst) = if matches!(direction, TraceDirection::Callers) {
+                        (to, from)
+                    } else {
+                        (from, to)
+                    };
+                    let mut relation = make_relation(src, dst, RelationKind::Calls);
+                    relation.confidence = strength;
+                    graph.upsert_relation(&relation).unwrap();
+                }
+                for payload in both_trace_payloads(&graph, &focal.id, direction, 2) {
+                    let steps = payload["chain"].as_array().unwrap();
+                    assert_eq!(steps.len(), 3, "{payload:#}");
+                    for name in ["parent", "child"] {
+                        let step = steps
+                            .iter()
+                            .find(|step| step["entity_name"] == name)
+                            .unwrap();
+                        assert_eq!(step["resolution"], expected, "{payload:#}");
+                    }
+                    let direct = steps
+                        .iter()
+                        .find(|step| step["entity_name"] == "direct")
+                        .unwrap();
+                    assert_eq!(direct["resolution"], "type_resolved", "{payload:#}");
+                    assert_eq!(
+                        payload["unproven_steps"].as_u64().unwrap_or(0),
+                        if expected == "name_only" { 2 } else { 0 },
+                        "{payload:#}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn both_trace_walkers_preserve_guessed_ancestry_after_placeholder_promotion() {
+        let graph = InMemoryGraph::new();
+        let focal = make_entity("focal", "src/focal.py");
+        let bridge = make_entity("bridge", "src/bridge.py");
+        let placeholder = make_external_entity("shared");
+        let admitted = make_entity("shared", "src/shared.py");
+        let child = make_entity("child", "src/child.py");
+        for entity in [&focal, &bridge, &placeholder, &admitted, &child] {
+            graph.upsert_entity(entity).unwrap();
+        }
+        for (src, dst, confidence) in [
+            (focal.id, placeholder.id, 0.3),
+            (focal.id, bridge.id, 1.0),
+            (bridge.id, admitted.id, 1.0),
+            (admitted.id, child.id, 1.0),
+        ] {
+            let mut relation = make_relation(src, dst, RelationKind::Calls);
+            relation.confidence = confidence;
+            graph.upsert_relation(&relation).unwrap();
+        }
+        for payload in both_trace_payloads(&graph, &focal.id, TraceDirection::Calls, 3) {
+            assert_eq!(payload["external_identities_merged"], 1, "{payload:#}");
+            let steps = payload["chain"].as_array().unwrap();
+            for name in ["shared", "child"] {
+                let step = steps
+                    .iter()
+                    .find(|step| step["entity_name"] == name)
+                    .unwrap();
+                assert_eq!(step["resolution"], "name_only", "{payload:#}");
+            }
+            assert_eq!(payload["unproven_steps"], 2, "{payload:#}");
         }
     }
 
@@ -2907,6 +3179,7 @@ mod tests {
             &RequestRepositoryAuthority::pinned(binding.clone()),
             &graph,
             &TraceDataFlowRequest {
+                cursor: None,
                 focal: "   ".to_string(),
                 depth: None,
                 direction: None,
@@ -2932,6 +3205,7 @@ mod tests {
             &RequestRepositoryAuthority::pinned(binding.clone()),
             &graph,
             &TraceDataFlowRequest {
+                cursor: None,
                 focal: "does_not_exist".to_string(),
                 depth: None,
                 direction: None,
@@ -2983,6 +3257,7 @@ mod tests {
             &RequestRepositoryAuthority::pinned(binding.clone()),
             &graph,
             &TraceDataFlowRequest {
+                cursor: None,
                 focal: focal_id.to_string(),
                 depth: Some(2),
                 direction: Some(TraceDirection::Calls),
@@ -3042,6 +3317,7 @@ mod tests {
             &RequestRepositoryAuthority::pinned(binding.clone()),
             &graph,
             &TraceDataFlowRequest {
+                cursor: None,
                 focal: focal_id.to_string(),
                 depth: Some(1),
                 direction: Some(TraceDirection::Callers),
@@ -3090,6 +3366,7 @@ mod tests {
             &RequestRepositoryAuthority::pinned(binding.clone()),
             &graph,
             &TraceDataFlowRequest {
+                cursor: None,
                 focal: focal_id.to_string(),
                 depth: Some(1),
                 direction: Some(TraceDirection::Calls),
@@ -3151,6 +3428,7 @@ mod tests {
 
     fn hub_request(focal_id: EntityId) -> TraceDataFlowRequest {
         TraceDataFlowRequest {
+            cursor: None,
             focal: focal_id.to_string(),
             depth: Some(2),
             direction: Some(TraceDirection::Calls),
@@ -3340,6 +3618,7 @@ mod tests {
         let (graph, focal_id) = hub_graph(400);
         let (_t, binding) = empty_binding();
         let request = TraceDataFlowRequest {
+            cursor: None,
             focal: focal_id.to_string(),
             depth: Some(2),
             direction: Some(TraceDirection::Calls),
@@ -4464,6 +4743,7 @@ mod tests {
             });
         }
         TraceDataFlowResponse {
+            source_change_id: None,
             focal: None,
             focal_id: entity.id.to_string(),
             focal_name: entity.name.clone(),
@@ -5562,6 +5842,27 @@ mod tests {
         for key in kin_mcp::handlers::external_symbols::EXTERNAL_TRACE_KEYS {
             assert!(admitted[key].is_null(), "{key}: {admitted}");
         }
+        // The external edge remains proven in isolation, but a guessed path
+        // into its caller cannot borrow that proof on either trace surface.
+        let root = make_entity("guessed_root", "src/root.py");
+        graph.upsert_entity(&root).unwrap();
+        let mut guess = make_relation(root.id, focal_id, RelationKind::Calls);
+        guess.confidence = 0.3;
+        graph.upsert_relation(&guess).unwrap();
+        for (root_id, depth, expected) in
+            [(focal_id, 1, "type_resolved"), (root.id, 2, "name_only")]
+        {
+            for payload in both_trace_payloads(&graph, &root_id, TraceDirection::Calls, depth) {
+                let step = payload["chain"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|step| step["entity_id"] == address)
+                    .unwrap();
+                assert_eq!(step["resolution"], expected, "{payload:#}");
+                assert_eq!(step["site_state"], "proven_external", "{payload:#}");
+            }
+        }
     }
 
     /// A walk cannot start from a symbol whose body and edges are outside the
@@ -5578,6 +5879,7 @@ mod tests {
                 &RequestRepositoryAuthority::pinned(binding.clone()),
                 &store.graph,
                 &TraceDataFlowRequest {
+                    cursor: None,
                     focal: focal.clone(),
                     depth: Some(2),
                     direction: Some(TraceDirection::Callers),
@@ -5602,6 +5904,26 @@ mod tests {
             assert_eq!(value["error"]["tool"], "trace_data_flow", "{value:#}");
             assert_eq!(value["error"]["id"], store.address(), "{value:#}");
             assert_eq!(value["error"]["symbol"]["name"], "Array.map", "{value:#}");
+        }
+    }
+
+    #[test]
+    fn an_external_target_is_refused_before_source_projection() {
+        let store = crate::commands::external_symbols::fixture::external_store(false);
+        let (_t, binding) = empty_binding();
+        for target in [store.address(), store.node.id.to_string()] {
+            let mut request = trace_request(&store.caller.id, 1, TraceDirection::Calls, 25);
+            request.target = Some(target);
+            let error = build_trace_data_flow_response(
+                &RequestRepositoryAuthority::pinned(binding.clone()),
+                &store.graph,
+                &request,
+            )
+            .unwrap_err();
+            let value: serde_json::Value = serde_json::from_str(&error.to_string()).unwrap();
+            assert_eq!(value["error"]["code"], "external_symbol_not_served");
+            assert_eq!(value["error"]["argument"], "target");
+            assert_eq!(value["error"]["id"], store.address());
         }
     }
 
@@ -6287,6 +6609,7 @@ mod boundary_and_ranking_tests {
             &RequestRepositoryAuthority::pinned(binding),
             &graph,
             &TraceDataFlowRequest {
+                cursor: None,
                 focal: focal.to_string(),
                 depth: Some(2),
                 direction: Some(TraceDirection::Calls),
@@ -6321,6 +6644,7 @@ mod boundary_and_ranking_tests {
             &RequestRepositoryAuthority::pinned(binding),
             &graph,
             &TraceDataFlowRequest {
+                cursor: None,
                 focal: focal.to_string(),
                 depth: Some(2),
                 direction: Some(TraceDirection::Calls),
@@ -6398,6 +6722,7 @@ mod boundary_and_ranking_tests {
             &RequestRepositoryAuthority::pinned(binding),
             &graph,
             &TraceDataFlowRequest {
+                cursor: None,
                 focal: focal.id.to_string(),
                 depth: Some(2),
                 direction: Some(TraceDirection::Calls),
@@ -6454,6 +6779,7 @@ mod boundary_and_ranking_tests {
             &RequestRepositoryAuthority::pinned(binding),
             &graph,
             &TraceDataFlowRequest {
+                cursor: None,
                 focal: focal.id.to_string(),
                 depth: Some(2),
                 direction: Some(TraceDirection::Calls),
@@ -6501,6 +6827,7 @@ mod boundary_and_ranking_tests {
             &RequestRepositoryAuthority::pinned(binding),
             &graph,
             &TraceDataFlowRequest {
+                cursor: None,
                 focal: focal.id.to_string(),
                 depth: Some(2),
                 direction: Some(TraceDirection::Calls),
@@ -6542,6 +6869,7 @@ mod boundary_and_ranking_tests {
             &RequestRepositoryAuthority::pinned(binding),
             &graph,
             &TraceDataFlowRequest {
+                cursor: None,
                 focal: focal.id.to_string(),
                 depth: Some(1),
                 direction: Some(TraceDirection::Calls),
@@ -6591,6 +6919,7 @@ mod boundary_and_ranking_tests {
             &RequestRepositoryAuthority::pinned(binding),
             &graph,
             &TraceDataFlowRequest {
+                cursor: None,
                 focal: focal.id.to_string(),
                 depth: Some(1),
                 direction: Some(TraceDirection::Calls),
@@ -6642,6 +6971,7 @@ mod boundary_and_ranking_tests {
             &RequestRepositoryAuthority::pinned(binding),
             &graph,
             &TraceDataFlowRequest {
+                cursor: None,
                 focal: focal.id.to_string(),
                 depth: Some(1),
                 direction: Some(TraceDirection::Calls),

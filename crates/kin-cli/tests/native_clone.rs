@@ -712,3 +712,170 @@ fn native_clone_refuses_clobber_and_retains_identity_for_retry_after_startup_fai
         "identity negotiation failure must not initialize a destination"
     );
 }
+
+/// What a stopped store's authority says: whether its workspace graph carries
+/// checked binding history, the generation it stands at, how many changes a
+/// daemon's start recorded to re-qualify it, and the change `trunk` names.
+fn stopped_store_reading(repo: &Path) -> (bool, u64, usize, String) {
+    let layout = kin_core::KinLayout::new(repo.join(".kin"));
+    let (manager, _) = kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout)
+        .unwrap()
+        .open_manager_with_payload_stats()
+        .unwrap();
+    let lease = manager.read_authority();
+    let workspace = lease.metadata().workspaces[0].workspace_id;
+    let checked = lease
+        .workspace_graph_snapshot(&workspace)
+        .unwrap()
+        .expect("the workspace has a committed graph")
+        .verified_binding_history
+        .is_some();
+    let requalifications = lease
+        .snapshot()
+        .changes
+        .values()
+        .filter(|change| {
+            change
+                .message
+                .contains("The Kin daemon recorded this change when it started on this store")
+        })
+        .count();
+    let trunk = kin_model::RefName::branch(b"trunk").unwrap();
+    let target = lease
+        .metadata()
+        .ref_state
+        .refs
+        .iter()
+        .find(|reference| reference.name == trunk)
+        .expect("the store has trunk")
+        .target
+        .clone();
+    let head = lease.resolve_target_change_id(&target).unwrap().to_string();
+    (checked, lease.roots().generation, requalifications, head)
+}
+
+/// A daemon start over a store a transfer just moved leaves its head where it
+/// was and records no change, and, where `checks` says the store serves
+/// exactly what its heads hold, leaves the lineage checked.
+fn assert_moved_nothing(
+    what: &str,
+    before: &(bool, u64, usize, String),
+    after: &(bool, u64, usize, String),
+    checks: bool,
+) {
+    assert_eq!(after.3, before.3, "a start after a {what} moved trunk");
+    assert_eq!(after.2, 0, "a start after a {what} recorded a change");
+    if checks {
+        assert!(after.0, "a start after a {what} left the lineage unproven");
+    }
+}
+
+/// Stop the store's daemon, read it, start a daemon on it the ordinary way,
+/// stop that one too, and read it again.
+fn read_across_a_daemon_start(
+    runtime: &common::IsolatedDaemonRuntime,
+    repo: &Path,
+    what: &str,
+) -> ((bool, u64, usize, String), (bool, u64, usize, String)) {
+    require_success(run(runtime, repo, &["daemon", "stop"]));
+    let before = stopped_store_reading(repo);
+    require_success(run(runtime, repo, &["graph", "status"]));
+    require_success(run(runtime, repo, &["daemon", "stop"]));
+    let after = stopped_store_reading(repo);
+    let log = fs::read_to_string(repo.join(".kin/daemon.log")).unwrap_or_default();
+    let said: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains("binding history"))
+        .collect();
+    eprintln!("{what}: before start {before:?}, after start {after:?}; the start said {said:#?}");
+    (before, after)
+}
+
+/// A clone, a pull and a push between two stores of this same build leave
+/// each receiving store's heads exactly where the transfer put them, across
+/// the next daemon start. A transfer ends the receiver's checked lineage, and
+/// the start checks it again only by proving the state it already serves: it
+/// records no change and moves no head, so neither side is ever ahead of the
+/// other for a commit nobody made.
+///
+/// Falsify by letting the start start its lineage with a change on the head:
+/// trunk moves and the replica's history grows past the source's.
+#[test]
+fn a_daemon_start_after_a_transfer_moves_no_head() {
+    let scratch = tempdir().unwrap();
+    let source = scratch.path().join("source");
+    let destination = scratch.path().join("replica");
+    let source_runtime = common::IsolatedDaemonRuntime::new(&source);
+    let clone_runtime = common::IsolatedDaemonRuntime::new(&destination);
+    let (repository, endpoint) = initialize_source(&source_runtime, &source);
+    require_success(clone_command(
+        &clone_runtime,
+        scratch.path(),
+        &destination,
+        &source,
+        &endpoint,
+        &repository,
+        None,
+    ));
+    let source_head = || {
+        serde_json::from_value::<kin_model::SemanticChangeId>(
+            history(&source_runtime, &source)["start_change"].clone(),
+        )
+        .expect("the source's log names the change it starts from")
+        .to_string()
+    };
+
+    // A person's clone has a commit author, which a daemon's start needs to
+    // record anything, so the replica gets one before it is ever restarted.
+    configure_author(&destination);
+    let (cloned, restarted) = read_across_a_daemon_start(&clone_runtime, &destination, "clone");
+    assert_eq!(
+        cloned.3,
+        source_head(),
+        "the clone serves the source's head"
+    );
+    assert_moved_nothing("clone", &cloned, &restarted, true);
+
+    fs::write(source.join("src/lib.rs"), b"pub fn answer() -> u8 { 7 }\n").unwrap();
+    require_success(run(
+        &source_runtime,
+        &source,
+        &["commit", "-m", "Advance the source"],
+    ));
+    pull(&clone_runtime, &destination, &source);
+    let (pulled, restarted) = read_across_a_daemon_start(&clone_runtime, &destination, "pull");
+    assert_eq!(pulled.3, source_head(), "the pull serves the source's head");
+    assert_moved_nothing("pull", &pulled, &restarted, true);
+    assert_exact_replicas(
+        &source_runtime,
+        &source,
+        &clone_runtime,
+        &destination,
+        &["src/lib.rs", "payload.bin"],
+    );
+
+    configure_author(&destination);
+    fs::write(
+        destination.join("src/lib.rs"),
+        b"pub fn answer() -> u8 { 8 }\n",
+    )
+    .unwrap();
+    require_success(run(
+        &clone_runtime,
+        &destination,
+        &["commit", "-m", "Advance the replica"],
+    ));
+    transfer(&clone_runtime, &destination, &source, "push");
+    let (received, restarted) = read_across_a_daemon_start(&source_runtime, &source, "push");
+    // The origin's workspace stays on the base it had while the push moves
+    // trunk past it, and a re-qualification derives every head together with
+    // the workspace's base, so the start leaves this store unchecked until its
+    // workspace moves. What matters here is the same: nothing moved.
+    assert_moved_nothing("push", &received, &restarted, false);
+    require_success(run(&clone_runtime, &destination, &["daemon", "stop"]));
+    assert_eq!(
+        stopped_store_reading(&destination).3,
+        received.3,
+        "the origin serves the head the replica pushed"
+    );
+}

@@ -354,6 +354,8 @@ pub(crate) struct EncodedChanges {
     /// Whether any change in these bytes moves a call-site ledger, observed
     /// the same way.
     carries_call_site_ledgers: bool,
+    /// Whether any change moves a context validation.
+    carries_context_validations: bool,
 }
 
 impl fmt::Debug for EncodedChanges {
@@ -396,6 +398,8 @@ struct ChangeOverlay {
     carries_resolution_records: bool,
     /// Whether any appended change moves a call-site ledger.
     carries_call_site_ledgers: bool,
+    /// Whether any change moves a context validation.
+    carries_context_validations: bool,
 }
 
 impl Deref for ChangeOverlay {
@@ -488,6 +492,8 @@ impl ChangeOverlay {
         self.carries_resolution_records |= !change.resolution_record_deltas.is_empty();
         self.carries_call_site_ledgers = self.carries_call_site_ledgers
             || super::format::moves_call_site_ledgers(&change.resolution_record_deltas);
+        self.carries_context_validations = self.carries_context_validations
+            || super::format::moves_context_validations(&change.resolution_record_deltas);
         Ok(())
     }
 }
@@ -510,6 +516,7 @@ impl EncodedChanges {
             stale_handle_recovery: None,
             carries_resolution_records: false,
             carries_call_site_ledgers: false,
+            carries_context_validations: false,
         }
     }
 
@@ -527,6 +534,12 @@ impl EncodedChanges {
     /// Record whether any change in these bytes moves a call-site ledger.
     pub(crate) fn with_call_site_ledgers(mut self, carries: bool) -> Self {
         self.carries_call_site_ledgers = carries;
+        self
+    }
+
+    /// Record whether any change in these bytes moves a context validation.
+    pub(crate) fn with_context_validations(mut self, carries: bool) -> Self {
+        self.carries_context_validations = carries;
         self
     }
 
@@ -1072,6 +1085,23 @@ impl ChangeMap {
             .encoded
             .as_ref()
             .is_some_and(|encoded| encoded.carries_call_site_ledgers)
+    }
+
+    /// Whether decoded, appended or still encoded history moves a context
+    /// validation. The open observes encoded records once; this never decodes.
+    pub fn may_carry_context_validations(&self) -> bool {
+        if self.overlay.carries_context_validations {
+            return true;
+        }
+        if let Some(decoded) = self.body.decoded.get() {
+            return decoded.values().any(|change| {
+                super::format::moves_context_validations(&change.resolution_record_deltas)
+            });
+        }
+        self.body
+            .encoded
+            .as_ref()
+            .is_some_and(|encoded| encoded.carries_context_validations)
     }
 
     /// A map that stays on disk until a reader asks for an entry.

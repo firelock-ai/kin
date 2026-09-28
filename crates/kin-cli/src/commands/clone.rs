@@ -4,6 +4,7 @@
 //! Clone exact repository authority through native Kin or Git transport.
 
 use std::fs;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -320,26 +321,60 @@ fn require_available_target(target: &Path) -> Result<bool> {
     }
 }
 
-pub async fn run(url: String, path: Option<String>, repository: Option<String>) -> Result<()> {
+/// `kin clone`. Returns the exit status: 0, or 7 and 8 with the meanings
+/// `kin init` gives them, because a Git clone now runs the same work after
+/// admission that `kin init` runs.
+pub async fn run(
+    url: String,
+    path: Option<String>,
+    repository: Option<String>,
+    verbose: bool,
+) -> Result<i32> {
     let native = native_source(&url, repository.as_deref())?;
     let target = derive_target_dir(&url, path);
     if let Some(source) = native {
-        return clone_native(source, &target).await;
+        clone_native(source, &target).await?;
+        return Ok(0);
     }
     let target_created_by_command = require_available_target(&target)?;
 
-    let status = Command::new("git")
-        .arg("clone")
-        .arg("--")
-        .arg(&url)
-        .arg(&target)
-        .status()
-        .context("launch Git clone transport")?;
-    if !status.success() {
-        anyhow::bail!("Git clone transport failed with {status}");
+    // A person at a terminal gets the short form; `--verbose`, a pipe and CI
+    // keep Git's own lines and the full record scripts read.
+    let view = crate::screen::short_form(verbose).then(|| {
+        std::sync::Arc::new(crate::first_run::Screen::new(
+            crate::screen::Style::for_stdout(),
+        ))
+    });
+    match &view {
+        Some(screen) => {
+            screen.lines(&[
+                String::new(),
+                format!(
+                    "  Cloning {} into {}",
+                    crate::first_run::clone_slug(&url),
+                    destination(&target)
+                ),
+                String::new(),
+            ]);
+            git_clone_showing_progress(screen, &url, &target)?;
+        }
+        None => {
+            let status = Command::new("git")
+                .arg("clone")
+                .arg("--")
+                .arg(&url)
+                .arg(&target)
+                .status()
+                .context("launch Git clone transport")?;
+            if !status.success() {
+                anyhow::bail!("Git clone transport failed with {status}");
+            }
+        }
     }
 
-    let admitted = kin_core::init_from_git(&target);
+    let admitted = crate::commands::init::admit_showing_progress(view.as_ref(), || {
+        kin_core::init_from_git(&target).map_err(anyhow::Error::from)
+    });
     let result = match admitted {
         Ok(result) => result,
         Err(error) => {
@@ -356,24 +391,156 @@ pub async fn run(url: String, path: Option<String>, repository: Option<String>) 
         }
     };
 
-    // Composed here as plain strings and painted at print time, so a pipe or a
-    // test reads the same bytes the admission reported.
-    let summary = [
-        format!(
-            "Cloned Git transport and admitted exact Kin repository authority at {}",
-            target.display()
-        ),
-        format!("  Repository: {}", result.repository_id),
-        format!("  Workspace: {}", result.workspace_id),
-        format!(
-            "  Authority generation: {}",
-            result.authority.receipt.generation
-        ),
-        "  Semantic enrichment: not run".to_string(),
-    ];
-    for line in &summary {
-        println!("{}", crate::output_style::paint_clone_line(line));
+    // The same work `kin init` does after admission, through the same
+    // function: the graph section, `.kin/` kept out of `git status`, the
+    // registry, the language servers the repository needs, linking and the
+    // first embedding pass. A clone used to stop at admission and say
+    // "Semantic enrichment: not run", and nothing told its reader that a
+    // separate `kin daemon sweep` was what finished it.
+    let after = crate::commands::init::after_admission(&result, false, view.clone()).await;
+
+    match &view {
+        Some(screen) => {
+            crate::commands::init::print_short_result(
+                screen,
+                &result,
+                &after,
+                Some(cd_target(&target)),
+            );
+        }
+        None => {
+            // Composed here as plain strings and painted at print time, so a
+            // pipe or a test reads the same bytes the admission reported.
+            let mut summary = vec![
+                format!(
+                    "Cloned Git transport and admitted exact Kin repository authority at {}",
+                    target.display()
+                ),
+                format!("  Repository: {}", result.repository_id),
+                format!("  Workspace: {}", result.workspace_id),
+                crate::commands::init::authority_generation_line(&after),
+            ];
+            summary.extend(crate::commands::init::enrichment_report_lines(&after));
+            for line in &summary {
+                println!("{}", crate::output_style::paint_clone_line(line));
+            }
+        }
     }
+    Ok(after.exit_code())
+}
+
+/// Where a clone lands, as the opening line names it: `./itsdangerous`.
+fn destination(target: &Path) -> String {
+    if target.is_absolute() {
+        crate::screen::home_relative(target)
+    } else if target.starts_with(".") || target.starts_with("..") {
+        target.display().to_string()
+    } else {
+        format!("./{}", target.display())
+    }
+}
+
+/// The directory the next action sends a clone's reader into.
+fn cd_target(target: &Path) -> String {
+    if target.is_absolute() {
+        crate::screen::home_relative(target)
+    } else {
+        target.display().to_string()
+    }
+}
+
+/// Run `git clone --progress`, drawing its progress on the live line, and
+/// leave the Downloaded row.
+///
+/// Git's progress arrives on stderr as redrawn frames, which the live line
+/// replaces. Its other lines are kept, and printed as Git wrote them when the
+/// clone fails, so a refused URL or a missing credential still reads in Git's
+/// own words.
+fn git_clone_showing_progress(
+    screen: &crate::first_run::Screen,
+    url: &str,
+    target: &Path,
+) -> Result<()> {
+    use std::io::Read as _;
+    screen.start("Downloading");
+    screen.note("connecting");
+    let mut child = Command::new("git")
+        .arg("clone")
+        .arg("--progress")
+        .arg("--")
+        .arg(url)
+        .arg(target)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("launch Git clone transport")?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .context("read Git clone transport's progress")?;
+
+    let mut said: Vec<String> = Vec::new();
+    let mut objects: Option<u64> = None;
+    let mut size: Option<String> = None;
+    let mut segment: Vec<u8> = Vec::new();
+    let mut take = |text: &str, ended_line: bool, said: &mut Vec<String>| {
+        if let Some(progress) = crate::first_run::parse_git_progress(text) {
+            if progress.phase == "Receiving objects" {
+                objects = Some(progress.total);
+                if progress.size.is_some() {
+                    size = progress.size.clone();
+                }
+                screen.progress(progress.done, progress.total, "objects");
+            } else if progress.phase == "Resolving deltas" {
+                screen.progress(progress.done, progress.total, "deltas");
+            } else {
+                screen.note(&progress.phase.to_lowercase());
+            }
+        }
+        // A frame ended by a carriage return is redrawn by the next one; a
+        // line ended by a newline is what Git meant to leave behind.
+        if ended_line && !text.trim().is_empty() {
+            said.push(text.to_string());
+        }
+    };
+    let mut buffer = [0u8; 4096];
+    loop {
+        let read = match stderr.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                return Err(error).context("read Git clone transport's progress");
+            }
+        };
+        for &byte in &buffer[..read] {
+            if byte == b'\r' || byte == b'\n' {
+                let text = String::from_utf8_lossy(&segment).into_owned();
+                segment.clear();
+                take(&text, byte == b'\n', &mut said);
+            } else {
+                segment.push(byte);
+            }
+        }
+    }
+    if !segment.is_empty() {
+        let text = String::from_utf8_lossy(&segment).into_owned();
+        take(&text, true, &mut said);
+    }
+    let status = child.wait().context("wait for Git clone transport")?;
+    if !status.success() {
+        screen.finish();
+        let mut err = std::io::stderr();
+        for line in &said {
+            let _ = writeln!(err, "{line}");
+        }
+        anyhow::bail!("Git clone transport failed with {status}");
+    }
+    screen.finish_row(
+        crate::screen::Status::Ok,
+        "Downloaded",
+        &crate::first_run::downloaded_value(objects, size.as_deref()),
+    );
     Ok(())
 }
 
