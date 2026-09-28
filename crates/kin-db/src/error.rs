@@ -47,6 +47,9 @@ pub enum KinDbError {
     #[error("serialization error: {0}")]
     SerializationError(#[from] serde_json::Error),
 
+    #[error("embedding cancelled at a completed-work checkpoint")]
+    EmbeddingCancelled,
+
     #[error("index error: {0}")]
     IndexError(String),
 

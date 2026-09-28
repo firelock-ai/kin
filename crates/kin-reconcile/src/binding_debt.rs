@@ -53,6 +53,110 @@ pub(crate) fn held<G: GraphStore>(
     Ok(held)
 }
 
+/// Guesses already withdrawn from these exact source bytes are not fresh
+/// evidence when a dependent is linked again. Keep their obligations until a
+/// different observation or authoritative resolver answer can settle them.
+///
+/// A disappeared/recreated target has a different artifact identity and is
+/// deliberately not covered: ordinary module restoration remains a new binding.
+pub(crate) fn withdrawn_guesses<G: GraphStore>(
+    graph: &G,
+    current: &IndexedFile,
+) -> Result<Vec<Relation>> {
+    let Some(artifact) = crate::coverage::admitted_artifact(graph, current)? else {
+        return Ok(vec![]);
+    };
+    withdrawn_guesses_at(
+        graph,
+        &current.file_id,
+        artifact,
+        kin_model::Hash256::from_bytes(current.blob_hash.0),
+    )
+}
+
+/// Whether this admitted file again holds exact weak calls recorded as
+/// withdrawn. This is a repair signal, never proof that its calls are complete.
+/// Outstanding debt without a returning row does not request another sweep.
+pub fn has_reintroduced_withdrawn_guess<G: GraphStore>(
+    graph: &G,
+    file: &kin_model::FilePathId,
+) -> Result<bool> {
+    let path = kin_model::RepoPath::from_utf8(file.0.clone()).map_err(invalid)?;
+    let Some(artifact) = graph.artifact_id_at_path(&path) else {
+        return Ok(false);
+    };
+    let Some(kin_model::TreeEntry::Blob { hash, .. }) = graph
+        .get_tree_entry(file)
+        .map_err(|error| ReconcileError::Graph(error.to_string()))?
+    else {
+        return Ok(false);
+    };
+    for old in withdrawn_guesses_at(graph, file, artifact, hash)? {
+        if exact(graph, old.id)?
+            .as_ref()
+            .is_some_and(|live| repeats_withdrawn_guess(live, &old))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn withdrawn_guesses_at<G: GraphStore>(
+    graph: &G,
+    file: &kin_model::FilePathId,
+    artifact: kin_model::ArtifactId,
+    digest: kin_model::Hash256,
+) -> Result<Vec<Relation>> {
+    let mut guesses = Vec::new();
+    for relation in held(graph, artifact)? {
+        let Some(debt) = decode_local_binding_debt(file, artifact, &relation).map_err(invalid)?
+        else {
+            continue;
+        };
+        if debt.observed_source_digest != digest {
+            continue;
+        }
+        for obligation in debt.obligations {
+            let old = obligation.retired_relation;
+            if old.origin != kin_model::RelationOrigin::Inferred
+                || old.kind != kin_model::RelationKind::Calls
+                || obligation.source_digest != digest
+                || obligation
+                    .prior_source_file
+                    .as_ref()
+                    .is_some_and(|prior| prior != file)
+            {
+                continue;
+            }
+            let path = kin_model::RepoPath::from_utf8(obligation.target_file.0.clone())
+                .map_err(invalid)?;
+            if graph.artifact_id_at_path(&path) != Some(obligation.target_artifact) {
+                continue;
+            }
+            let Some(target) = old.dst.as_entity() else {
+                continue;
+            };
+            if graph
+                .get_entity(&target)
+                .map_err(|error| ReconcileError::Graph(error.to_string()))?
+                .is_some_and(|target| target.file_origin.as_ref() == Some(&obligation.target_file))
+            {
+                guesses.push(old);
+            }
+        }
+    }
+    Ok(guesses)
+}
+
+pub(crate) fn repeats_withdrawn_guess(new: &Relation, old: &Relation) -> bool {
+    // A new derivation has no historical creation change yet. Everything
+    // identifying its actual evidence, including confidence, stays exact.
+    let mut comparable = new.clone();
+    comparable.created_in = old.created_in;
+    &comparable == old
+}
+
 /// A complete parse may retain an obligation, but only current source plus a
 /// real matching local binding (or proven removal of the old occurrence) clears
 /// it. The returned changes publish beside the corresponding source/edge delta.

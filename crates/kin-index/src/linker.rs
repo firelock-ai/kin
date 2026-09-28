@@ -3858,6 +3858,32 @@ fn file_name_slot_admits(candidate: EntityKind, occupant: EntityKind) -> bool {
     candidate != EntityKind::Module || occupant == EntityKind::Module
 }
 
+/// The entity each name's `(file, name)` slot holds among one file's
+/// `entities`, filled the way both linkers fill theirs: in source order, each
+/// admitted entity displacing the one before it (see [`file_name_slot_admits`]).
+///
+/// The per-file resolver binds a same-file call through this index, so every
+/// path that derives a file binds the call alike. Taking the first same-named
+/// entity instead bound a function's call to itself to the first of its
+/// `@overload` stubs on every live re-derivation, beside the implementation
+/// edge the linker binds, while a fresh import bound the implementation alone.
+/// An edit followed by its exact revert then left that stub edge behind as an
+/// authored change on a tree identical to its base.
+pub(crate) fn file_name_slots(entities: &[Entity]) -> HashMap<&str, &Entity> {
+    let mut in_source_order: Vec<&Entity> = entities.iter().collect();
+    in_source_order.sort_by(|left, right| entity_link_order(left, right));
+    let mut slots: HashMap<&str, &Entity> = HashMap::new();
+    for entity in in_source_order {
+        let admitted = slots
+            .get(entity.name.as_str())
+            .is_none_or(|occupant| file_name_slot_admits(entity.kind, occupant.kind));
+        if admitted {
+            slots.insert(entity.name.as_str(), entity);
+        }
+    }
+    slots
+}
+
 fn is_class_like(kind: Option<&EntityKind>) -> bool {
     matches!(
         kind,
@@ -9199,10 +9225,30 @@ fn resolve_default_export_incremental(
 /// what stops the two from drifting apart again.
 const PROGRESS_BAR_MIN_FILES: usize = 50;
 
+/// Whether this process has asked the linker to draw no bar at all.
+static PROGRESS_BAR_SUPPRESSED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Keep the in-place linking bar off stderr for the rest of this process, or
+/// allow it again.
+///
+/// For a command that draws its own progress while the linker runs inside it.
+/// The linker runs once per commit during admission, and on a terminal its bar
+/// redrew inside the admission display: a Flask admission left about 4,700
+/// stacked `Linking:` lines behind. A command showing one line for the whole
+/// admission turns the bar off rather than have it written through that line.
+pub fn suppress_progress_bar(suppressed: bool) {
+    PROGRESS_BAR_SUPPRESSED.store(suppressed, Ordering::Relaxed);
+}
+
 /// Whether this link pass prints a progress bar, and therefore whether it has a
 /// line to terminate.
 fn shows_progress_bar(total_files: usize) -> bool {
-    progress_bar_is_drawn(total_files, std::io::stderr().is_terminal())
+    progress_bar_is_drawn(
+        total_files,
+        std::io::stderr().is_terminal(),
+        PROGRESS_BAR_SUPPRESSED.load(Ordering::Relaxed),
+    )
 }
 
 /// The bar decision, split from the terminal probe so both halves are testable.
@@ -9213,8 +9259,11 @@ fn shows_progress_bar(total_files: usize) -> bool {
 /// a terminal the surrounding phase ladder already reports this phase with a
 /// start line and an end line carrying its elapsed time, which is the whole of
 /// what a log needs.
-fn progress_bar_is_drawn(total_files: usize, stderr_is_terminal: bool) -> bool {
-    total_files > PROGRESS_BAR_MIN_FILES && stderr_is_terminal
+///
+/// `suppressed` is a command's own request, through [`suppress_progress_bar`],
+/// and it wins over the terminal.
+fn progress_bar_is_drawn(total_files: usize, stderr_is_terminal: bool, suppressed: bool) -> bool {
+    !suppressed && total_files > PROGRESS_BAR_MIN_FILES && stderr_is_terminal
 }
 
 /// Draw one frame of the in-place bar, or the newline that ends it.
@@ -10911,10 +10960,27 @@ mod tests {
 
     #[test]
     fn the_progress_gate_excludes_its_own_threshold() {
-        assert!(!progress_bar_is_drawn(0, true));
-        assert!(!progress_bar_is_drawn(1, true));
-        assert!(!progress_bar_is_drawn(PROGRESS_BAR_MIN_FILES, true));
-        assert!(progress_bar_is_drawn(PROGRESS_BAR_MIN_FILES + 1, true));
+        assert!(!progress_bar_is_drawn(0, true, false));
+        assert!(!progress_bar_is_drawn(1, true, false));
+        assert!(!progress_bar_is_drawn(PROGRESS_BAR_MIN_FILES, true, false));
+        assert!(progress_bar_is_drawn(
+            PROGRESS_BAR_MIN_FILES + 1,
+            true,
+            false
+        ));
+    }
+
+    /// A command that draws its own progress line turns the bar off, and the
+    /// terminal cannot turn it back on. The per-commit bar inside admission is
+    /// what flooded a Flask recording with thousands of lines.
+    #[test]
+    fn a_suppressed_bar_is_never_drawn_even_on_a_terminal() {
+        assert!(!progress_bar_is_drawn(
+            PROGRESS_BAR_MIN_FILES + 1,
+            true,
+            true
+        ));
+        assert!(!progress_bar_is_drawn(100_000, true, true));
     }
 
     /// The bar redraws with a carriage return, which only a terminal reads as an
@@ -10928,8 +10994,12 @@ mod tests {
     /// every time it runs.
     #[test]
     fn the_in_place_bar_is_never_drawn_off_a_terminal() {
-        assert!(!progress_bar_is_drawn(PROGRESS_BAR_MIN_FILES + 1, false));
-        assert!(!progress_bar_is_drawn(100_000, false));
+        assert!(!progress_bar_is_drawn(
+            PROGRESS_BAR_MIN_FILES + 1,
+            false,
+            false
+        ));
+        assert!(!progress_bar_is_drawn(100_000, false, false));
     }
 
     /// A progress bar and the newline that terminates it must be decided by the

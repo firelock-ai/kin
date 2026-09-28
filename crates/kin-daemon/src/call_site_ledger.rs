@@ -30,10 +30,11 @@
 //! Then the file's `Calls` proofs are made to agree with its ledgers. A
 //! proven site is carried by an edge to its target under the ledger's proof
 //! context, with an evidence record added where no edge carried it yet. When
-//! the file's passes all finished, a proof the ledger does not hold is
-//! retracted: evidence under another context or under none, at a site this
-//! pass settled differently or did not prove, leaves its edge, and an edge
-//! left with no site is retired. A file whose passes failed is never
+//! the file's passes all finished, a proof at a census site this pass settled
+//! differently or did not prove leaves its edge, and an edge left with no
+//! site is retired. Outside the census, only a definite answer can replace
+//! the old proof. Unanswered implicit calls, such as property accesses, stay
+//! unchanged under their prior context. A file whose passes failed is never
 //! retracted; its proofs are only stamped and completed.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -475,10 +476,11 @@ pub(crate) struct ProofRewrite {
 ///
 /// `held` are the edges the graph holds from the file's callers, of every
 /// origin; only language-server `Calls` edges are touched. With `retract`,
-/// the file's passes all finished and a proof the ledger does not hold
-/// leaves: evidence at a census site the ledger settled otherwise, or at a
-/// span this pass did not prove, under any other context or none. Without
-/// it, nothing is removed.
+/// the file's passes all finished and a proof at a census site the ledger
+/// settled otherwise leaves. A positive answer outside the census can also
+/// replace that site's prior target. An unanswered span outside the census
+/// stays unchanged: explicit calls do not measure implicit property calls.
+/// Without `retract`, nothing is removed.
 pub(crate) fn rewrite_proofs(
     ledgers: &FileLedgers,
     pass: &FilePass<'_>,
@@ -536,9 +538,19 @@ pub(crate) fn rewrite_proofs(
                     carried.insert((caller, edge.dst, offset, length));
                 }
                 kept.push(stamped);
-            } else if retract {
+            } else if retract
+                && (site.is_some()
+                    || ledgers
+                        .answered
+                        .contains_key(&(caller, span.start_byte, span.end_byte)))
+            {
                 rewrite.retracted_records += 1;
             } else {
+                // A property/getter access can be a call-hierarchy proof
+                // without being an explicit parser call. No census site and
+                // no answer leaves its prior evidence unmeasured, not
+                // disproven. Retain its old context rather than stamping it
+                // with this pass's context.
                 kept.push(record.clone());
             }
         }
@@ -1143,6 +1155,155 @@ mod tests {
                 })
                 .collect(),
         )
+    }
+
+    #[test]
+    fn a_call_census_retains_unanswered_property_evidence_without_restamping_it() {
+        const SOURCE: &str =
+            "def run(self):\n    assert self.request.endpoint is not None\n    self.adapter.send()\n";
+        let mut world = world();
+        world.run.span.as_mut().unwrap().end_byte = SOURCE.len();
+        world.run.span.as_mut().unwrap().end_line = 3;
+        world.index = kin_lsp::EntityIndex::new(
+            vec![crate::daemon::lsp_entity_ref(&world.run, FILE).unwrap()],
+            &world.root,
+        );
+        let uri = uri(&world);
+        let entities = [&world.run];
+        let cited = |name: &str| {
+            let start = SOURCE.find(name).unwrap();
+            let line = SOURCE[..start].matches('\n').count() as u32;
+            SourceSpan {
+                file: FilePathId::new(FILE),
+                start_byte: start,
+                end_byte: start + name.len(),
+                start_line: line,
+                start_col: (start - SOURCE[..start].rfind('\n').unwrap() - 1) as u32,
+                end_line: line,
+                end_col: (start - SOURCE[..start].rfind('\n').unwrap() - 1 + name.len()) as u32,
+            }
+        };
+        let property = cited("endpoint");
+        let explicit = cited("send");
+        let old_context = format!("ctx:{}", uuid::Uuid::from_u128(5));
+        let property_edge = lsp_edge(
+            &world.run,
+            &world.helper,
+            &[(
+                property.clone(),
+                CALL_HIERARCHY_RULE,
+                Some(old_context.clone()),
+            )],
+        );
+        let contradicted = lsp_edge(
+            &world.run,
+            &world.helper,
+            &[(explicit.clone(), CALL_HIERARCHY_RULE, Some(old_context))],
+        );
+        // One held edge has both an unmeasured property and an explicit call.
+        // The latter's current positive answer names a different target.
+        let mut held = property_edge.clone();
+        held.evidence.extend(contradicted.evidence);
+        let answers = [SiteAnswer {
+            source: world.run.id,
+            site: explicit,
+            target: SiteTarget::Entity(world.send.id),
+            rule: DEFINITION_RULE,
+        }];
+        let mut complete = pass(&world, &uri, &entities, &answers, &[], PassEnding::Complete);
+        complete.text = SOURCE;
+        complete.body = Hash256::from_bytes(kin_blobs::digest(SOURCE.as_bytes()).0);
+        let ledgers = build_ledgers(&complete).unwrap();
+        assert_eq!(ledgers.counts.expressions, 1);
+        let ledger = &ledgers.ledgers[&world.run.id];
+        assert_eq!(ledger.sites.len(), 1);
+        let property_key = site_key(0, property.start_byte, property.end_byte).unwrap();
+        assert!(ledger.site(property_key.0, property_key.1).is_none());
+        assert!(!ledgers.answered.contains_key(&(
+            world.run.id,
+            property.start_byte,
+            property.end_byte
+        )));
+
+        let rewrite = rewrite_proofs(&ledgers, &complete, std::slice::from_ref(&held), true);
+        assert!(rewrite.retired.is_empty());
+        assert_eq!(rewrite.retracted_records, 1);
+        let retained = rewrite
+            .written
+            .iter()
+            .find(|edge| edge.id == held.id)
+            .unwrap();
+        assert_eq!(
+            retained, &property_edge,
+            "the unmeasured evidence stays exact"
+        );
+        assert_ne!(
+            retained.evidence[0].token,
+            Some(world.context.context_token())
+        );
+        assert!(rewrite.written.iter().any(|edge| {
+            edge.dst == GraphNodeId::Entity(world.send.id)
+                && edge
+                    .evidence
+                    .iter()
+                    .all(|evidence| evidence.token == Some(world.context.context_token()))
+        }));
+        let (backed, refused) =
+            backed_ledgers(&ledgers, &complete, std::slice::from_ref(&held), &rewrite);
+        assert!(refused.is_empty(), "{refused:?}");
+        assert_eq!(backed.len(), 1);
+
+        // With only the unmeasured property, the original edge is left exact:
+        // there is no synthetic write that could promote its proof context.
+        let mut legacy_property = property_edge.clone();
+        legacy_property.evidence[0].token = None;
+        for held in [&property_edge, &legacy_property] {
+            let rewrite = rewrite_proofs(&ledgers, &complete, std::slice::from_ref(held), true);
+            assert!(rewrite.retired.is_empty());
+            assert_eq!(rewrite.retracted_records, 0);
+            assert!(rewrite.written.iter().all(|edge| edge.id != held.id));
+        }
+
+        // A definite answer at that exact property token still has authority:
+        // the same target is stamped, and a different target retires the old
+        // proof. Merely completing the explicit-call census did neither.
+        for target in [&world.helper, &world.send] {
+            let direct = [
+                answers[0].clone(),
+                SiteAnswer {
+                    source: world.run.id,
+                    site: property.clone(),
+                    target: SiteTarget::Entity(target.id),
+                    rule: CALL_HIERARCHY_RULE,
+                },
+            ];
+            let observed = FilePass {
+                answers: &direct,
+                ..complete
+            };
+            let observed_ledgers = build_ledgers(&observed).unwrap();
+            let rewrite = rewrite_proofs(
+                &observed_ledgers,
+                &observed,
+                std::slice::from_ref(&property_edge),
+                true,
+            );
+            if target.id == world.helper.id {
+                let current = rewrite
+                    .written
+                    .iter()
+                    .find(|edge| edge.id == property_edge.id)
+                    .unwrap();
+                assert_eq!(
+                    current.evidence[0].token,
+                    Some(world.context.context_token())
+                );
+                assert!(rewrite.retired.is_empty());
+            } else {
+                assert_eq!(rewrite.retired, vec![property_edge.clone()]);
+                assert_eq!(rewrite.retracted_records, 1);
+            }
+        }
     }
 
     #[test]

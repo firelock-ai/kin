@@ -4,6 +4,7 @@
 pub mod assignments;
 pub mod change_shape;
 pub mod diff;
+pub mod enrichment;
 pub mod error;
 pub mod format;
 pub mod gate;
@@ -30,7 +31,10 @@ pub use diff::{
 };
 pub use error::ReviewError;
 pub use format::{
-    format_diff, format_impact, format_inline_comments, format_review, format_risk_highlights,
+    format_diff, format_diff_with, format_impact, format_inline_comments, format_review,
+    format_review_with, format_risk_highlights, format_summary, graph_node_name, not_settled_line,
+    NodeNamer, PendingEnrichment, PendingEntity, ReviewRenderOptions, PENDING_ENTITIES_NAMED,
+    RELATION_CHANGES_LISTED_BY_DEFAULT,
 };
 pub use gate::{derive_decision, GateStatus, ReviewDecision, ReviewFinding, ReviewSignalKind};
 pub use impact::{analyze_impact, analyze_impact_at, EntityImpact, ImpactGraph, ImpactReport};

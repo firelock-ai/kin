@@ -29,7 +29,7 @@
 
 use std::path::{Path, PathBuf};
 
-use super::super::fetch::{download_verified, Fetcher};
+use super::super::fetch::Fetcher;
 use super::super::unpack;
 
 /// The python-build-standalone release every pinned build comes from.
@@ -284,47 +284,449 @@ pub fn ensure(
         return Ok((interpreter, 0));
     }
     let interpreters = store.join("interpreters");
-    let unique = super::store::unique_suffix();
-    let archive = store
-        .join("downloads")
-        .join(format!("{}.{unique}.part", pinned.store_name()));
-    let downloaded = download_verified(
-        fetcher,
-        &pinned.url(),
-        &archive,
-        pinned.sha256,
-        pinned.size + 1,
-    )
-    .map_err(|error| error.to_string())?;
-    let staging = interpreters.join(format!(".{}.{unique}.tmp", pinned.store_name()));
-    let unpacked = unpack::untar_gz(&archive, &staging, unpack::TarLayout::TOOLCHAIN);
-    let _ = std::fs::remove_file(&archive);
-    if let Err(error) = unpacked {
-        let _ = std::fs::remove_dir_all(&staging);
-        return Err(format!("{}: {error}", pinned.asset()));
-    }
-    let destination = interpreters.join(pinned.store_name());
-    if destination.exists() {
-        // A build unpacked without its executables by an earlier Kin.
-        let retired = interpreters.join(format!(".{}.{unique}.old", pinned.store_name()));
-        let _ = std::fs::rename(&destination, &retired);
-        let _ = std::fs::remove_dir_all(&retired);
-    }
-    super::store::publish_dir(&staging, &destination)?;
-    installed(store, pinned)
-        .map(|interpreter| (interpreter, downloaded.bytes))
-        .ok_or_else(|| {
-            format!(
-                "{} holds no python3.{} binary",
+    let attempt = super::store::OwnedAttempt::new(&interpreters)?;
+    let archive = attempt.0.join("archive.part");
+    let mut receipt = ArchiveReceipt::new(pinned);
+    let result = (|| -> Result<(PathBuf, u64), String> {
+        receipt.phase = "download";
+        let downloaded = fetcher
+            .download(&pinned.url(), &archive, pinned.size + 1)
+            .map_err(|error| error.to_string())?;
+        receipt.phase = "disk-verification";
+        let mut file = std::fs::File::open(&archive).map_err(|error| error.to_string())?;
+        let (digest, bytes) = hash_archive(&mut file, pinned.size + 1)?;
+        receipt.disk_sha256 = Some(digest.clone());
+        receipt.disk_bytes = Some(bytes);
+        if digest != pinned.sha256
+            || bytes != pinned.size
+            || !downloaded.sha256.eq_ignore_ascii_case(&digest)
+            || downloaded.bytes != bytes
+        {
+            return Err("the archive on disk does not match the pinned SHA-256 and size or the completed download; nothing was unpacked".into());
+        }
+        use std::io::{Seek, SeekFrom};
+        file.seek(SeekFrom::Start(0))
+            .map_err(|error| error.to_string())?;
+        receipt.phase = "destination-probe";
+        let case_insensitive = insensitive_destination(&attempt.0)?;
+        let staging = attempt.0.join("unpacked");
+        unpack::untar_gz_checked(
+            &mut file,
+            &staging,
+            unpack::TarLayout::TOOLCHAIN,
+            case_insensitive,
+        )
+        .map_err(|error| {
+            receipt.phase = error.phase;
+            receipt.compressed_bytes_read = Some(error.compressed_bytes_read);
+            receipt.decoded_bytes_read = Some(error.decoded_bytes_read);
+            error.reason
+        })?;
+        receipt.phase = "publish";
+        let destination = interpreters.join(pinned.store_name());
+        // Download and decode in parallel; serialize only the final check and
+        // atomic publication. Otherwise legacy-incomplete repair could retire
+        // a complete winner published after an earlier installed() check.
+        let locks = store.join("locks");
+        std::fs::create_dir_all(&locks).map_err(|error| error.to_string())?;
+        let publication_lock = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(locks.join(pinned.store_name()))
+            .map_err(|error| error.to_string())?;
+        publication_lock.lock().map_err(|error| error.to_string())?;
+        // Another complete publisher may have won during our download.
+        if let Some(interpreter) = installed(store, pinned) {
+            return Ok((interpreter, downloaded.bytes));
+        }
+        if destination.exists() {
+            // A build unpacked without its executables by an earlier Kin.
+            // Retire it only inside this attempt's exclusively owned directory.
+            std::fs::rename(&destination, attempt.0.join("retired"))
+                .map_err(|error| error.to_string())?;
+        }
+        super::store::publish_dir(&staging, &destination)?;
+        installed(store, pinned)
+            .map(|interpreter| (interpreter, downloaded.bytes))
+            .ok_or_else(|| {
+                format!(
+                    "{} holds no python3.{} binary",
+                    pinned.asset(),
+                    pinned.minor
+                )
+            })
+    })();
+    result.map_err(|reason| {
+        // This runs before OwnedAttempt removes the archive and partial tree.
+        // Record only metadata, with one bounded receipt per pinned minor and platform.
+        receipt.reason = reason.chars().take(4096).collect();
+        let json = serde_json::to_string(&receipt)
+            .expect("archive receipt contains only strings and integers");
+        let saved = save_failure_receipt(store, pinned, &attempt.0, json.as_bytes());
+        match saved {
+            Ok(path) => format!(
+                "{}: {}; archive diagnostic {json}; saved at {}",
                 pinned.asset(),
-                pinned.minor
-            )
-        })
+                receipt.reason,
+                path.display()
+            ),
+            Err(error) => format!(
+                "{}: {}; archive diagnostic {json}; could not save local receipt: {error}",
+                pinned.asset(),
+                receipt.reason
+            ),
+        }
+    })
+}
+
+/// Offsets are read counters with possible decoder lookahead, not an assertion
+/// that the byte at that position is corrupt. None means that phase did not run.
+#[derive(serde::Serialize)]
+struct ArchiveReceipt {
+    asset: String,
+    expected_sha256: String,
+    expected_bytes: u64,
+    disk_sha256: Option<String>,
+    disk_bytes: Option<u64>,
+    phase: &'static str,
+    compressed_bytes_read: Option<u64>,
+    decoded_bytes_read: Option<u64>,
+    reason: String,
+}
+
+impl ArchiveReceipt {
+    fn new(pinned: &PinnedPython) -> Self {
+        Self {
+            asset: pinned.asset(),
+            expected_sha256: pinned.sha256.into(),
+            expected_bytes: pinned.size,
+            disk_sha256: None,
+            disk_bytes: None,
+            phase: "download",
+            compressed_bytes_read: None,
+            decoded_bytes_read: None,
+            reason: String::new(),
+        }
+    }
+}
+
+fn hash_archive(file: &mut std::fs::File, max_bytes: u64) -> Result<(String, u64), String> {
+    use sha2::Digest;
+    use std::io::Read;
+    let mut hash = sha2::Sha256::new();
+    let mut total = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(|error| error.to_string())?;
+        if read == 0 {
+            break;
+        }
+        total = total.saturating_add(read as u64);
+        if total > max_bytes {
+            return Err("archive on disk exceeds its pinned byte limit".into());
+        }
+        hash.update(&buffer[..read]);
+    }
+    Ok((crate::adapters::contract::hex(&hash.finalize()), total))
+}
+
+fn insensitive_destination(attempt: &Path) -> Result<bool, String> {
+    let lower = attempt.join("case-probe");
+    std::fs::File::options()
+        .write(true)
+        .create_new(true)
+        .open(&lower)
+        .map_err(|error| format!("cannot check destination filename semantics: {error}"))?;
+    match std::fs::File::options()
+        .write(true)
+        .create_new(true)
+        .open(attempt.join("CASE-PROBE"))
+    {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(true),
+        Err(error) => Err(format!(
+            "cannot check destination filename semantics: {error}"
+        )),
+    }
+}
+
+fn diagnostic_name(pinned: &PinnedPython) -> String {
+    // Stable across pin upgrades: at most one receipt for each supported
+    // minor/platform, rather than an accumulating archive or failure history.
+    format!("cpython-3.{}-{}.json", pinned.minor, pinned.target)
+}
+
+fn save_failure_receipt(
+    store: &Path,
+    pinned: &PinnedPython,
+    attempt: &Path,
+    bytes: &[u8],
+) -> Result<PathBuf, String> {
+    use std::io::Write;
+    let directory = store.join("diagnostics");
+    std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+    let temporary = attempt.join("failure.json");
+    let mut file = std::fs::File::options()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(|error| error.to_string())?;
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| error.to_string())?;
+    drop(file);
+    let destination = directory.join(diagnostic_name(pinned));
+    std::fs::rename(&temporary, &destination).map_err(|error| error.to_string())?;
+    Ok(destination)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fixture_pin(bytes: &[u8]) -> PinnedPython {
+        use sha2::Digest;
+        PinnedPython {
+            minor: 12,
+            version: "3.12.0",
+            target: "aarch64-unknown-linux-gnu",
+            sha256: Box::leak(
+                crate::adapters::contract::hex(&sha2::Sha256::digest(bytes)).into_boxed_str(),
+            ),
+            size: bytes.len() as u64,
+        }
+    }
+
+    #[test]
+    fn verified_but_malformed_bytes_leave_a_bounded_receipt_before_cleanup() {
+        let fixture = crate::adapters::repo_scan::Fixture::new("interpreter-diagnostic");
+        let bytes = b"not gzip";
+        let pinned = fixture_pin(bytes);
+        let mut fetcher = super::super::super::fetch::testing::FixedFetcher::default();
+        fetcher.files.insert(pinned.url(), bytes.to_vec());
+        let error = ensure(&fetcher, &fixture.root, &pinned).unwrap_err();
+        let path = fixture
+            .root
+            .join("diagnostics")
+            .join(diagnostic_name(&pinned));
+        let data = std::fs::read(&path).unwrap();
+        let receipt: serde_json::Value = serde_json::from_slice(&data).unwrap();
+        assert_eq!(receipt["disk_sha256"], pinned.sha256);
+        assert_eq!(receipt["disk_bytes"], bytes.len() as u64);
+        assert!(receipt["compressed_bytes_read"].as_u64().unwrap() > 0);
+        assert!(receipt["decoded_bytes_read"].is_u64());
+        assert!(matches!(
+            receipt["phase"].as_str().unwrap(),
+            "destination-compatibility" | "tar-extract"
+        ));
+        assert!(error.contains(pinned.sha256), "{error}");
+        assert!(error.contains("archive diagnostic"));
+        assert!(data.len() < 8192);
+        assert!(!fixture
+            .root
+            .join("interpreters")
+            .join(pinned.store_name())
+            .exists());
+        assert_eq!(
+            std::fs::read_dir(fixture.root.join("interpreters"))
+                .unwrap()
+                .count(),
+            0
+        );
+        // Subsequent failures replace the same bounded minor/platform receipt.
+        ensure(&fetcher, &fixture.root, &pinned).unwrap_err();
+        assert_eq!(
+            std::fs::read_dir(fixture.root.join("diagnostics"))
+                .unwrap()
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn the_bytes_on_disk_must_match_even_when_the_fetcher_reports_the_pin() {
+        use super::super::super::fetch::{Downloaded, FetchError};
+        struct ChangedDownload {
+            claimed: Downloaded,
+        }
+        impl Fetcher for ChangedDownload {
+            fn document(&self, _: &str, _: &str) -> Result<(String, Vec<u8>), FetchError> {
+                unreachable!()
+            }
+            fn download(
+                &self,
+                _: &str,
+                destination: &Path,
+                _: u64,
+            ) -> Result<Downloaded, FetchError> {
+                std::fs::write(destination, b"changed!").unwrap();
+                Ok(self.claimed.clone())
+            }
+        }
+        let fixture = crate::adapters::repo_scan::Fixture::new("interpreter-disk-identity");
+        let pinned = fixture_pin(b"original");
+        let fetcher = ChangedDownload {
+            claimed: Downloaded {
+                sha256: pinned.sha256.into(),
+                bytes: 8,
+            },
+        };
+        let error = ensure(&fetcher, &fixture.root, &pinned).unwrap_err();
+        assert!(error.contains("disk-verification"), "{error}");
+        assert!(error.contains("nothing was unpacked"));
+        let receipt: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                fixture
+                    .root
+                    .join("diagnostics")
+                    .join(diagnostic_name(&pinned)),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(receipt["disk_sha256"], fixture_pin(b"changed!").sha256);
+        assert_eq!(receipt["compressed_bytes_read"], serde_json::Value::Null);
+        assert_eq!(
+            std::fs::read_dir(fixture.root.join("interpreters"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_compatible_interpreter_publishes_once_then_reuses_the_complete_build() {
+        let fixture = crate::adapters::repo_scan::Fixture::new("interpreter-publish");
+        let archive = fixture.root.join("fixture.tar.gz");
+        unpack::testing::write_toolchain_tar_gz(&archive);
+        let bytes = std::fs::read(archive).unwrap();
+        let pinned = fixture_pin(&bytes);
+        let mut fetcher = super::super::super::fetch::testing::FixedFetcher::default();
+        fetcher.files.insert(pinned.url(), bytes);
+        let store = fixture.root.join("store");
+        let (path, fetched) = ensure(&fetcher, &store, &pinned).unwrap();
+        assert!(is_executable(&path));
+        assert_eq!(fetched, pinned.size);
+        assert_eq!(ensure(&fetcher, &store, &pinned).unwrap(), (path, 0));
+        assert_eq!(fetcher.requests.lock().unwrap().len(), 1);
+        assert_eq!(
+            std::fs::read_dir(store.join("interpreters"))
+                .unwrap()
+                .count(),
+            1
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_attempts_preserve_a_complete_published_winner() {
+        use super::super::super::fetch::{Downloaded, FetchError};
+        struct SynchronizedFetcher {
+            inner: super::super::super::fetch::testing::FixedFetcher,
+            completed: std::sync::Barrier,
+        }
+        impl Fetcher for SynchronizedFetcher {
+            fn document(&self, _: &str, _: &str) -> Result<(String, Vec<u8>), FetchError> {
+                unreachable!()
+            }
+            fn download(
+                &self,
+                url: &str,
+                destination: &Path,
+                limit: u64,
+            ) -> Result<Downloaded, FetchError> {
+                let result = self.inner.download(url, destination, limit);
+                self.completed.wait();
+                result
+            }
+        }
+        let fixture = crate::adapters::repo_scan::Fixture::new("interpreter-concurrent");
+        let archive = fixture.root.join("fixture.tar.gz");
+        unpack::testing::write_toolchain_tar_gz(&archive);
+        let bytes = std::fs::read(archive).unwrap();
+        let pinned = fixture_pin(&bytes);
+        let mut inner = super::super::super::fetch::testing::FixedFetcher::default();
+        inner.files.insert(pinned.url(), bytes);
+        let fetcher = SynchronizedFetcher {
+            inner,
+            completed: std::sync::Barrier::new(2),
+        };
+        let store = fixture.root.join("store");
+        let destination = store.join("interpreters").join(pinned.store_name());
+        std::fs::create_dir_all(&destination).unwrap();
+        std::fs::write(destination.join("legacy-incomplete"), b"no executable").unwrap();
+        let (first, second) = std::thread::scope(|scope| {
+            let first = scope.spawn(|| ensure(&fetcher, &store, &pinned));
+            let second = scope.spawn(|| ensure(&fetcher, &store, &pinned));
+            (
+                first.join().unwrap().unwrap(),
+                second.join().unwrap().unwrap(),
+            )
+        });
+        assert_eq!(first.0, second.0);
+        assert!(is_executable(&first.0));
+        assert!(!destination.join("legacy-incomplete").exists());
+        assert_eq!(
+            std::fs::read_dir(store.join("interpreters"))
+                .unwrap()
+                .count(),
+            1
+        );
+        assert_eq!(fetcher.inner.requests.lock().unwrap().len(), 2);
+    }
+
+    /// Run against already downloaded public archives. No network or execution.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "requires retained pinned Linux and Darwin archives via KIN_TEST_CPYTHON_ARCHIVE_* paths"]
+    fn retained_linux_and_darwin_archives_match_destination_contract() {
+        let fixture = crate::adapters::repo_scan::Fixture::new("interpreter-retained-archives");
+        for (suffix, target) in [
+            ("LINUX", "aarch64-unknown-linux-gnu"),
+            ("DARWIN", "aarch64-apple-darwin"),
+        ] {
+            let path = std::env::var_os(format!("KIN_TEST_CPYTHON_ARCHIVE_{suffix}"))
+                .expect("retained archive path");
+            let pinned = pinned_for(14, target).unwrap().0;
+            let mut file = std::fs::File::open(path).unwrap();
+            let (digest, bytes) = hash_archive(&mut file, pinned.size + 1).unwrap();
+            assert_eq!(digest, pinned.sha256);
+            assert_eq!(bytes, pinned.size);
+            use std::io::Seek;
+            file.rewind().unwrap();
+            let destination = fixture.root.join(suffix);
+            let result = unpack::untar_gz_checked(
+                &mut file,
+                &destination,
+                unpack::TarLayout::TOOLCHAIN,
+                true,
+            );
+            if suffix == "LINUX" {
+                let error = result.unwrap_err();
+                assert_eq!(error.phase, "destination-compatibility");
+                assert!(error.reason.contains("case-insensitive"));
+                assert!(!destination.exists());
+                let probe = super::super::store::OwnedAttempt::new(&fixture.root).unwrap();
+                if !insensitive_destination(&probe.0).unwrap() {
+                    file.rewind().unwrap();
+                    unpack::untar_gz_checked(
+                        &mut file,
+                        &destination,
+                        unpack::TarLayout::TOOLCHAIN,
+                        false,
+                    )
+                    .unwrap();
+                    assert!(is_executable(&pinned.interpreter_in(&destination)));
+                }
+            } else {
+                result.unwrap();
+                assert!(is_executable(&pinned.interpreter_in(&destination)));
+            }
+        }
+    }
 
     #[test]
     fn every_host_has_every_pinned_minor() {

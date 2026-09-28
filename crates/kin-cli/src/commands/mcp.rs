@@ -99,6 +99,9 @@ pub async fn start(
     kin_mcp::first_contact::set_spelling(command_spelling());
 
     let startup = kin_mcp::StartupDaemonBinding::new();
+    // Before the binding task starts, so the daemon it binds gets this
+    // session's idle floor at bind time rather than at the first tool call.
+    kin_mcp::session_idle_floor::enable();
 
     // The stdio server always binds through the MCP client's advertised
     // workspace roots: late, when nothing bound from --repo/KIN_MCP_REPO/cwd
@@ -195,7 +198,7 @@ async fn run_startup_binding(
     if let Some(layout) = &discovered {
         let kin_root = layout.root().to_path_buf();
         startup.set_phase_probe(Box::new(move || {
-            crate::daemon_client::daemon_startup_phase(&kin_root)
+            crate::daemon_client::daemon_startup_progress(&kin_root)
         }));
     }
 
@@ -642,7 +645,7 @@ async fn bind_from_registry(startup: &kin_mcp::StartupDaemonBinding) -> Option<k
             if let Some(layout) = kin_core::KinLayout::discover(&path) {
                 let kin_root = layout.root().to_path_buf();
                 startup.set_phase_probe(Box::new(move || {
-                    crate::daemon_client::daemon_startup_phase(&kin_root)
+                    crate::daemon_client::daemon_startup_progress(&kin_root)
                 }));
             }
             match bind_daemon_when_asked(&path, startup).await {
@@ -930,6 +933,21 @@ fn resolve_repo_override(repo_arg: Option<PathBuf>) -> Option<PathBuf> {
 /// `initialize`/`tools/list` succeed even when no repository is bound yet,
 /// with individual `tools/call` requests failing loud instead.
 async fn bind_daemon_for_repo_dir(
+    dir: &Path,
+    mode: DaemonBindMode,
+) -> std::result::Result<String, BindRefusal> {
+    let url = resolve_daemon_for_repo_dir(dir, mode).await?;
+    // A daemon this session attached to was started with whatever window its
+    // starter chose, which for a CLI command is a minute. Hold the session's
+    // floor on it now, whichever branch bound it: attaching to a daemon that
+    // was already serving is exactly the case that inherited the short window.
+    kin_mcp::session_idle_floor::hold(&url).await;
+    Ok(url)
+}
+
+/// The daemon URL [`bind_daemon_for_repo_dir`] binds, without the session
+/// bookkeeping that follows a bind.
+async fn resolve_daemon_for_repo_dir(
     dir: &Path,
     mode: DaemonBindMode,
 ) -> std::result::Result<String, BindRefusal> {

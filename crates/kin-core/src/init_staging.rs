@@ -377,12 +377,144 @@ fn unregister_staging_path(path: &Path) {
 /// to allocate and walk directories. Only the signal path needs it: an init
 /// that returns removes its own directory by dropping it.
 #[cfg(unix)]
-fn remove_registered_staging() {
-    let Ok(mut paths) = staging_paths().lock() else {
-        return;
+/// How long a terminating signal waits for this init's capture directories to
+/// be removed before it is delivered again.
+#[cfg(unix)]
+const SIGNAL_CLEANUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// What a terminating signal's cleanup removed and what it left.
+#[cfg(unix)]
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SignalCleanup {
+    removed: Vec<PathBuf>,
+    left: Vec<PathBuf>,
+}
+
+/// Remove the registered capture directories until `deadline`.
+#[cfg(unix)]
+fn remove_registered_staging_until(deadline: std::time::Instant) -> SignalCleanup {
+    let paths = match staging_paths().lock() {
+        Ok(mut paths) => paths.drain(..).collect(),
+        Err(_) => Vec::new(),
     };
-    for path in paths.drain(..) {
-        remove_staging_tree(&path);
+    remove_captures_until(paths, deadline)
+}
+
+/// Remove each capture directory until `deadline`, answering which went and
+/// which stayed.
+#[cfg(unix)]
+fn remove_captures_until(paths: Vec<PathBuf>, deadline: std::time::Instant) -> SignalCleanup {
+    let mut outcome = SignalCleanup::default();
+    for path in paths {
+        if remove_capture_until(&path, deadline) {
+            outcome.removed.push(path);
+        } else {
+            outcome.left.push(path);
+        }
+    }
+    outcome
+}
+
+/// Remove one capture directory entry by entry, stopping at `deadline`, and
+/// answer whether it is gone.
+///
+/// The lease goes last. It is what lets the next init reap whatever is left: a
+/// capture directory without a published lease is retained and disclosed
+/// rather than removed, so a removal that ran out of time after taking the lease
+/// would strand the rest for good. Retries until the deadline, as
+/// [`remove_staging_tree`] does, against a writer still filling the tree.
+#[cfg(unix)]
+fn remove_capture_until(path: &Path, deadline: std::time::Instant) -> bool {
+    loop {
+        match try_remove_capture_until(path, deadline) {
+            Ok(()) => return true,
+            Err(_) if std::time::Instant::now() >= deadline => return false,
+            Err(_) => {}
+        }
+    }
+}
+
+#[cfg(unix)]
+fn try_remove_capture_until(path: &Path, deadline: std::time::Instant) -> std::io::Result<()> {
+    let entries = match std::fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name == CAPTURE_LEASE_NAME || name == CAPTURE_LEASE_PENDING_NAME {
+            continue;
+        }
+        remove_entry_until(&entry.path(), deadline)?;
+    }
+    for lease in [CAPTURE_LEASE_PENDING_NAME, CAPTURE_LEASE_NAME] {
+        match std::fs::remove_file(path.join(lease)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    match std::fs::remove_dir(path) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+        _ => Ok(()),
+    }
+}
+
+/// Remove one file or directory tree, checking `deadline` before each entry.
+#[cfg(unix)]
+fn remove_entry_until(path: &Path, deadline: std::time::Instant) -> std::io::Result<()> {
+    if std::time::Instant::now() >= deadline {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "signal cleanup budget spent",
+        ));
+    }
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let removed = if metadata.is_dir() {
+        for entry in std::fs::read_dir(path)? {
+            remove_entry_until(&entry?.path(), deadline)?;
+        }
+        std::fs::remove_dir(path)
+    } else {
+        std::fs::remove_file(path)
+    };
+    match removed {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+        _ => Ok(()),
+    }
+}
+
+/// Say on standard error what a stopped init removed and what it left.
+///
+/// Written with one `write` to the descriptor rather than through the standard
+/// error handle, whose lock the interrupted thread may be holding mid-line.
+#[cfg(unix)]
+fn report_signal_cleanup(signal: libc::c_int, outcome: &SignalCleanup) {
+    let name = match signal {
+        libc::SIGINT => "SIGINT",
+        libc::SIGTERM => "SIGTERM",
+        libc::SIGHUP => "SIGHUP",
+        _ => "a signal",
+    };
+    let mut message = format!("\nkin init: stopped by {name}");
+    if !outcome.removed.is_empty() {
+        message.push_str("; removed its Git capture directory");
+    }
+    for path in &outcome.left {
+        message.push_str(&format!(
+            "; left {} for the next kin init to remove",
+            path.display()
+        ));
+    }
+    message.push_str(".\n");
+    unsafe {
+        libc::write(2, message.as_ptr().cast(), message.len());
     }
 }
 
@@ -397,6 +529,13 @@ fn install_signal_cleanup() {}
 /// killed it and with the status that says so. Removing a directory tree from
 /// the handler would be shorter and could deadlock against an interrupted
 /// allocation, turning stranded bytes into a hang.
+///
+/// The removal has [`SIGNAL_CLEANUP_BUDGET`] and no more. A capture holds the
+/// source's whole object closure, tens of thousands of files on an ordinary
+/// history, and removing all of it on a busy disk kept a stopped init alive
+/// for most of a minute. What the budget does not cover stays behind with its
+/// lease, which the kernel releases when this process dies, so the next init
+/// reaps it; the thread says which on standard error before the signal lands.
 ///
 /// A signal something else already handles is left alone. Init is a library
 /// call as well as a command, and displacing a caller's own handler to clean up
@@ -481,7 +620,9 @@ fn install_signal_cleanup() {
                     // thread to clean up.
                     return;
                 };
-                remove_registered_staging();
+                let deadline = std::time::Instant::now() + SIGNAL_CLEANUP_BUDGET;
+                let outcome = remove_registered_staging_until(deadline);
+                report_signal_cleanup(signal, &outcome);
                 let mut default: libc::sigaction = unsafe { std::mem::zeroed() };
                 default.sa_sigaction = libc::SIG_DFL;
                 unsafe {
@@ -533,6 +674,78 @@ mod tests {
         );
         drop(staged);
         assert!(!path.exists(), "{} survived its owner", path.display());
+    }
+
+    /// A stopped init's cleanup that runs out of time leaves the lease, so the
+    /// next init can prove the directory abandoned and reap the rest.
+    #[cfg(unix)]
+    #[test]
+    fn signal_cleanup_out_of_time_keeps_the_lease_for_the_next_reap() {
+        let parent = tempfile::tempdir().expect("tempdir");
+        let capture = capture_dir(parent.path(), "stopped");
+        write_lease(&capture);
+        std::fs::create_dir(capture.join("objects")).expect("captured objects");
+        std::fs::write(capture.join("objects/body"), b"body").expect("body");
+
+        assert!(!remove_capture_until(&capture, std::time::Instant::now()));
+        assert!(
+            capture.join(CAPTURE_LEASE_NAME).is_file(),
+            "the lease must outlive the budget"
+        );
+        assert_eq!(reap_abandoned_git_captures(parent.path()).expect("reap"), 1);
+        assert!(!capture.exists());
+    }
+
+    /// Within its budget the cleanup removes the whole directory, lease last.
+    #[cfg(unix)]
+    #[test]
+    fn signal_cleanup_within_budget_removes_the_capture() {
+        let parent = tempfile::tempdir().expect("tempdir");
+        let capture = capture_dir(parent.path(), "stopped");
+        write_lease(&capture);
+        for directory in 0..16 {
+            let objects = capture.join(format!("objects/{directory:02x}"));
+            std::fs::create_dir_all(&objects).expect("object directory");
+            for body in 0..32 {
+                std::fs::write(objects.join(format!("{body:038x}")), b"body").expect("body");
+            }
+        }
+
+        // A deadline no loaded test host can miss: what is under test is that
+        // the whole tree goes, lease included, not how fast.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        assert!(remove_capture_until(&capture, deadline));
+        assert!(!capture.exists());
+    }
+
+    /// Each directory is reported as removed or left. Tested on explicit paths
+    /// rather than the process registry, which the tests running beside this
+    /// one fill with captures they still own.
+    #[cfg(unix)]
+    #[test]
+    fn signal_cleanup_reports_what_it_removed_and_what_it_left() {
+        let parent = tempfile::tempdir().expect("tempdir");
+        let left = capture_dir(parent.path(), "left");
+        write_lease(&left);
+        std::fs::write(left.join("body"), b"body").expect("body");
+        let removed = capture_dir(parent.path(), "removed");
+        write_lease(&removed);
+
+        let outcome = remove_captures_until(
+            vec![left.clone(), removed.clone()],
+            std::time::Instant::now(),
+        );
+        assert_eq!(
+            outcome,
+            SignalCleanup {
+                removed: vec![removed.clone()],
+                left: vec![left.clone()],
+            },
+            "a directory holding only its lease goes even with no time left, and one with \
+             more stays"
+        );
+        assert!(left.join(CAPTURE_LEASE_NAME).is_file());
+        assert!(!removed.exists());
     }
 
     /// The interrupted-init case: a directory whose lease nobody holds.

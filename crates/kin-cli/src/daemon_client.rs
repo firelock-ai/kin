@@ -32,6 +32,14 @@ use uuid::Uuid;
 
 pub(crate) mod probe_process;
 pub(crate) mod process_executable;
+mod starting_owner;
+#[cfg(all(test, unix))]
+pub(crate) use starting_owner::stand_in_as_starting_daemon_for_test;
+pub use starting_owner::{
+    capture_starting_daemon_owner, publish_starting_daemon_owner, revalidate_starting_daemon_owner,
+    starting_daemon_owner, StartingDaemonOwner, StartingDaemonOwnerPublication,
+    StartingDaemonSignalGuard, STARTING_OWNER_FILE_NAME,
+};
 
 static BUILD_MISMATCH_REPORTED: AtomicBool = AtomicBool::new(false);
 static BEHAVIOR_ENV_DIVERGENCE_REPORTED: AtomicBool = AtomicBool::new(false);
@@ -116,6 +124,119 @@ pub struct HealthResponse {
     /// while a module the graph has never met sat beside it (FIR-2820).
     #[serde(default)]
     pub reconcile: crate::commands::resources::ReconcileHealth,
+    /// The conditions that make the daemon report `attention`, so a client
+    /// can say which one it is rather than only that there is one.
+    #[serde(flatten)]
+    pub attention: AttentionFacts,
+}
+
+/// What the daemon's `/health` raises `attention` for, as it reports each.
+///
+/// Every field defaults, so a daemon that predates one reads as not having
+/// that condition rather than failing to parse.
+#[derive(Debug, Default, Deserialize)]
+pub struct AttentionFacts {
+    #[serde(default)]
+    pub reader_admitted: Option<bool>,
+    #[serde(default)]
+    pub mass_deletion_blocked: bool,
+    #[serde(default)]
+    pub embed_worker_failed: bool,
+    #[serde(default)]
+    pub embed_persistence_unavailable: bool,
+    #[serde(default)]
+    pub vector_index_discarded: Option<String>,
+    #[serde(default)]
+    pub vector_index_salvage: Option<serde_json::Value>,
+    #[serde(default)]
+    pub coordination_event_persist_failures: Option<u64>,
+    #[serde(default)]
+    pub background_passes: Vec<crate::commands::resources::BackgroundPassReport>,
+}
+
+/// Each reason a daemon reports `attention`, in plain words, with what it
+/// means for the answer a person is about to get.
+///
+/// A degraded daemon is still used, because its graph stays whole and
+/// queryable, and the notice has to say why it is degraded and whether the
+/// answer is affected. "Degraded" alone taught people nothing, and was the
+/// only thing a slow first query said.
+pub fn attention_causes(health: &HealthResponse) -> Vec<String> {
+    let facts = &health.attention;
+    let mut causes = Vec::new();
+    if facts.reader_admitted == Some(false) {
+        causes.push(
+            "its newest graph is not yet admitted for reads, so answers come from the one \
+             before it"
+                .to_string(),
+        );
+    }
+    if facts.mass_deletion_blocked {
+        causes.push(
+            "it is holding back a mass deletion from the working tree, so the graph keeps those \
+             files until you confirm"
+                .to_string(),
+        );
+    }
+    if facts.embed_worker_failed {
+        causes.push(
+            "its embedding worker stopped, so new code is not indexed for semantic search until \
+             it restarts; answers by name and from the graph are unaffected"
+                .to_string(),
+        );
+    }
+    if facts.embed_persistence_unavailable {
+        causes.push(
+            "this store keeps no vectors, so semantic search answers from names and the graph"
+                .to_string(),
+        );
+    }
+    // Both describe what happened when the daemon opened, and stay set for
+    // its life, so they are said as what happened then; `kin status` has the
+    // coverage as it is now.
+    if facts.vector_index_discarded.is_some() {
+        causes.push(
+            "it set aside the search index it found when it started and is re-indexing; \
+             kin status shows how far that has got"
+                .to_string(),
+        );
+    }
+    if facts.vector_index_salvage.is_some() {
+        causes.push(
+            "it retired some search-index entries when it started and re-indexes them; kin \
+             status shows how far that has got"
+                .to_string(),
+        );
+    }
+    if let Some(failures) = facts.coordination_event_persist_failures.filter(|n| *n > 0) {
+        causes.push(format!(
+            "{failures} coordination event(s) failed to save; answers are unaffected"
+        ));
+    }
+    for pass in facts
+        .background_passes
+        .iter()
+        .filter(|pass| pass.state == "stopped")
+    {
+        causes.push(format!(
+            "its {} background pass stopped, so that work is not being done",
+            pass.name
+        ));
+    }
+    if health.reconcile.degraded() {
+        let streak = health.reconcile.admission_failure_streak;
+        causes.push(if streak > 0 {
+            format!(
+                "recent working-tree changes failed to admit {streak} time(s) in a row, so \
+                 answers reflect the last admitted state"
+            )
+        } else {
+            "recent working-tree changes are not admitted yet, so answers reflect the last \
+             admitted state"
+                .to_string()
+        });
+    }
+    causes
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -140,6 +261,11 @@ struct ReadinessResponse {
     ready: bool,
     #[serde(default)]
     warming: bool,
+    /// What an opening daemon reported it is doing, such as re-qualifying
+    /// the store before it opens it. Absent from a daemon that reported
+    /// nothing, and from one that predates the field.
+    #[serde(default)]
+    progress: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -767,9 +893,12 @@ impl DaemonClient {
         request: reqwest::RequestBuilder,
         leaf: &str,
     ) -> Result<reqwest::Response> {
-        let resp = request
-            .send()
-            .await
+        let resp = request.send().await;
+        // The daemon answered, or the request failed. Either way the line that
+        // said it was ready has done its job, and what prints next is the
+        // answer or the error.
+        crate::progress::clear_transient();
+        let resp = resp
             .with_context(|| daemon_send_failure_message(&self.base_url, leaf, self.kin_root()))?;
         check_response_build_match(resp.headers())?;
         Ok(resp)
@@ -889,6 +1018,52 @@ impl DaemonClient {
         }
         let body: DaemonEntitiesResponse = resp.json().await?;
         Ok(body.entities)
+    }
+
+    /// The `limit` entities this repository most depends on, most first.
+    ///
+    /// `GET /repos/{repo_id}/entities?order=importance&include=ranking`, the
+    /// graph's own ranking by certified dependents: distinct entities that
+    /// call, import or reference each one. `kin clone` and `kin init` read it
+    /// to suggest a first `kin refs` on a function the reader's repository
+    /// actually leans on.
+    pub async fn ranked_entities(
+        &self,
+        repo_id: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<crate::first_run::RankedEntity>> {
+        #[derive(Deserialize)]
+        struct Row {
+            name: String,
+            kind: String,
+            file_path: Option<String>,
+            #[serde(default)]
+            dependents: Option<usize>,
+        }
+        #[derive(Deserialize)]
+        struct Page {
+            entities: Vec<Row>,
+        }
+        let url = format!(
+            "{}/repos/{}/entities?order=importance&include=ranking&limit={limit}",
+            self.base_url,
+            urlencoding::encode(repo_id)
+        );
+        let resp = self.send(self.client.get(&url), "ranked entities").await?;
+        if !resp.status().is_success() {
+            return Err(self.http_refusal("ranked entities", resp).await);
+        }
+        let page: Page = resp.json().await?;
+        Ok(page
+            .entities
+            .into_iter()
+            .map(|row| crate::first_run::RankedEntity {
+                name: row.name,
+                kind: row.kind,
+                file_path: row.file_path,
+                dependents: row.dependents.unwrap_or(0),
+            })
+            .collect())
     }
 
     /// Get the entity count from the daemon health endpoint.
@@ -1617,7 +1792,7 @@ impl DaemonClient {
     pub async fn trace_data_flow(
         &self,
         request: &crate::commands::trace_data_flow::TraceDataFlowRequest,
-    ) -> Result<crate::commands::trace_data_flow::TraceDataFlowResponse> {
+    ) -> Result<serde_json::Value> {
         let resp = self
             .send(
                 self.client
@@ -1654,9 +1829,31 @@ impl DaemonClient {
         resp.json().await.context("parse daemon path response")
     }
 
+    /// Read the same bounded semantic reference page served by MCP.
+    pub async fn reference_page(
+        &self,
+        arguments: std::collections::HashMap<String, serde_json::Value>,
+    ) -> Result<kin_mcp::ToolCallResult> {
+        let response = self
+            .send(
+                self.client
+                    .post(format!("{}/mcp/tools/call", self.base_url))
+                    .json(&kin_mcp::ToolCallParams {
+                        name: "find_references".into(),
+                        arguments,
+                    }),
+                "reference page",
+            )
+            .await?;
+        if !response.status().is_success() {
+            return Err(self.http_refusal("reference page", response).await);
+        }
+        response.json().await.context("parse daemon reference page")
+    }
+
     pub async fn refs(
         &self,
-        request: &crate::commands::refs::RefsRequest,
+        request: &crate::commands::refs::RefsCommandRequest,
     ) -> Result<crate::commands::refs::RefsResponse> {
         let resp = self
             .send(
@@ -4774,11 +4971,145 @@ pub fn repo_daemon_recorded_endpoint(kin_root: &Path) -> (Option<u32>, Option<u1
 /// declared daemon-lifecycle IO boundary, because the transport crate and the
 /// `kin mcp` launcher deliberately carry no filesystem primitive at all; they
 /// receive this as an injected probe.
+///
+/// Before either marker, a starting daemon that is checking or re-qualifying
+/// its store's binding history says so in its startup record, which counts
+/// only while the process that wrote it is alive. That step runs before the
+/// daemon opens its state or publishes an endpoint, so the record is the one
+/// place a waiting client can learn it.
 pub fn daemon_startup_phase(kin_root: &Path) -> &'static str {
+    if let Some(record) = read_startup_requalification(kin_root) {
+        return if record.requalifying {
+            DAEMON_STARTUP_REQUALIFYING_PHASE
+        } else {
+            "phase: the daemon is checking this store's binding history before opening it"
+        };
+    }
     match repo_daemon_recorded_endpoint(kin_root) {
         (_, Some(_)) => "phase: the daemon is listening and finishing readiness checks",
         (Some(_), None) => "phase: the daemon process is up and loading the repository graph",
         (None, None) => "phase: resolving or spawning the repo daemon process",
+    }
+}
+
+/// File a starting daemon writes while it checks its store's binding history,
+/// and re-qualifies it when it must, before it opens the store.
+///
+/// A daemon publishes its endpoint only once its state is open, so before
+/// that a client waiting on its start can read nothing from it. This is the
+/// one thing the start says meanwhile: what it is doing, for the client's
+/// startup phase to report. It decides nothing. A reader honors it only while
+/// it names the repository's live runtime owner, the same owner stamp and
+/// process incarnation `daemon.lock` records, so a copied, stale or foreign
+/// record, or one whose PID now names another process, says nothing.
+pub const STARTUP_REQUALIFICATION_FILE_NAME: &str = "daemon-startup-requalification.json";
+
+/// What a starting daemon said it is doing before it opens its store.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StartupRequalification {
+    /// The runtime owner stamp of the daemon that wrote it, which it also
+    /// wrote under `daemon.lock` when it took the repository's runtime
+    /// authority.
+    owner: String,
+    /// Whether it is re-qualifying the store, rather than only reading
+    /// whether the store needs it.
+    pub requalifying: bool,
+    /// The step it is on, in words a reader can print.
+    pub step: String,
+}
+
+/// Record `step` as what this starting daemon, the holder of the runtime
+/// authority for `kin_root`, is doing before it opens the store.
+///
+/// Best effort: a start never fails because it could not say what it is
+/// doing. Written to a temporary file created exclusively under an
+/// unpredictable name and renamed over the record, so a link planted at the
+/// record's name is replaced rather than followed and a reader never sees half
+/// a record.
+pub fn record_startup_requalification(kin_root: &Path, requalifying: bool, step: &str) {
+    let record = StartupRequalification {
+        owner: current_repository_runtime_owner_stamp(),
+        requalifying,
+        step: step.to_string(),
+    };
+    let Ok(body) = serde_json::to_vec(&record) else {
+        return;
+    };
+    let Ok(mut staged) = tempfile::Builder::new()
+        .prefix(".daemon-startup-requalification")
+        .tempfile_in(kin_root)
+    else {
+        return;
+    };
+    if staged.write_all(&body).is_ok() {
+        let _ = staged.persist(kin_root.join(STARTUP_REQUALIFICATION_FILE_NAME));
+    }
+}
+
+/// Withdraw this process's record once its start is past the step it named.
+/// A record another process wrote, or anything at the name that is not a
+/// regular file, is left alone.
+pub fn clear_startup_requalification(kin_root: &Path) {
+    let path = kin_root.join(STARTUP_REQUALIFICATION_FILE_NAME);
+    let mine = read_regular_file_nofollow(&path)
+        .and_then(|raw| serde_json::from_str::<StartupRequalification>(&raw).ok())
+        .is_some_and(|record| record.owner == current_repository_runtime_owner_stamp());
+    if mine {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// What the daemon starting on `kin_root` says it is doing before it opens the
+/// store, while the record names the repository's live runtime owner.
+pub fn read_startup_requalification(kin_root: &Path) -> Option<StartupRequalification> {
+    let record: StartupRequalification = serde_json::from_str(&read_regular_file_nofollow(
+        &kin_root.join(STARTUP_REQUALIFICATION_FILE_NAME),
+    )?)
+    .ok()?;
+    let owner = read_regular_file_nofollow(&kin_root.join("daemon.lock"))?;
+    if owner.trim().is_empty() || owner.trim() != record.owner.trim() {
+        return None;
+    }
+    let identity: ProcessIdentity = serde_json::from_str(
+        record
+            .owner
+            .trim()
+            .strip_prefix(REPOSITORY_RUNTIME_OWNER_STAMP_V2)?
+            .trim(),
+    )
+    .ok()?;
+    process_identity_is_current(&identity)
+        .ok()?
+        .then_some(record)
+}
+
+/// The text of the regular file at `path`, refusing a link or anything else
+/// that is not a regular file rather than following it.
+fn read_regular_file_nofollow(path: &Path) -> Option<String> {
+    let mut file = open_startup_regular_file(path, false, false, false).ok()?;
+    let mut text = String::new();
+    file.read_to_string(&mut text).ok()?;
+    Some(text)
+}
+
+/// The phase a starting daemon is in while it re-qualifies its store, the
+/// work `kin upgrade` does, before it opens it.
+pub const DAEMON_STARTUP_REQUALIFYING_PHASE: &str =
+    "phase: the daemon is re-qualifying this store's binding history before opening it, the work \
+     `kin upgrade` does, run once";
+
+/// How far a starting repo daemon has come: the phase its lifecycle markers put
+/// it in, and what its last complete open of this store cost, as the daemon
+/// recorded it when that open finished.
+///
+/// For the MCP still-starting answer and its progress notifications. The last
+/// open is the only yardstick a client has before the daemon publishes an
+/// endpoint, since the daemon answers nothing until then.
+pub fn daemon_startup_progress(kin_root: &Path) -> kin_mcp::StartupProgress {
+    kin_mcp::StartupProgress {
+        phase: daemon_startup_phase(kin_root),
+        last_open: kin_daemon_spawn::read_boot_cost(kin_root)
+            .map(|cost| Duration::from_millis(cost.total_ms)),
     }
 }
 
@@ -5144,44 +5475,17 @@ fn resolve_idle_timeout_env(
     })
 }
 
-/// The idle window a caller must carry to a daemon it did not start, in
-/// seconds, or `None` when there is nothing to carry.
-///
-/// Injecting an idle timeout only works on the path that spawns the daemon.
-/// Every attach path — a supervisor route, a live repo-local endpoint — hands
-/// back a process whose window was fixed by whoever started it, which on a
-/// developer machine is almost always an ordinary CLI command taking the short
-/// CLI default. An MCP session that attached there inherited 60 seconds and had
-/// the daemon expire underneath it between tool calls. A caller with a stated
-/// need has to say so to the daemon it actually got.
-///
-/// `None` means the caller stated no need of its own and is content with
-/// whatever the daemon is running, which is the pre-existing behavior for every
-/// ordinary CLI command. A user's explicit `KIN_DAEMON_IDLE_TIMEOUT_SECS` is
-/// their decision about this host and is never overridden from here.
-fn idle_timeout_to_carry(caller_override: Option<&str>, user_env_is_set: bool) -> Option<u64> {
-    if user_env_is_set {
-        return None;
-    }
-    caller_override?
-        .trim()
-        .parse::<u64>()
-        .ok()
-        .filter(|secs| *secs > 0)
-}
-
 /// Attach this command to a daemon it did not start.
 ///
-/// Two things are true at exactly this moment and nowhere else: the daemon's
-/// idle window was chosen without this session's needs in mind, and every
-/// behavior lever this command carries was already decided by whichever command
-/// started that daemon. Both are stated here so no caller can take the endpoint
-/// and skip one.
-async fn attach_to_existing_daemon(
-    base_url: &str,
-    idle_timeout_override: Option<&'static str>,
-) -> std::result::Result<(), AutoStartError> {
-    carry_idle_timeout_to_existing_daemon(base_url, idle_timeout_override).await;
+/// Every behavior lever this command carries was already decided by whichever
+/// command started that daemon, so it is stated here and no caller can take the
+/// endpoint and skip it.
+///
+/// The daemon's idle window was chosen without this command's needs in mind
+/// too. An MCP session answers for that itself, with an idle floor it holds
+/// for as long as the session lasts (`kin_mcp::session_idle_floor`), rather
+/// than a one-time raise from here that would outlive the session.
+async fn attach_to_existing_daemon(base_url: &str) -> std::result::Result<(), AutoStartError> {
     report_behavior_env_ignored_by_existing_daemon(base_url).await
 }
 
@@ -5249,68 +5553,6 @@ async fn fetch_daemon_behavior_env(base_url: &str) -> Option<kin_core::behavior_
         .await
         .ok()
         .map(|health| health.behavior_env)
-}
-
-/// Tell a daemon this process did not start what idle window its session needs.
-///
-/// Best-effort by construction: an older daemon has no such route, and a
-/// refusal here must never turn a working attach into a failed one. What it
-/// must not do is fail silently, so a daemon that declines to grow its window
-/// says so on stderr rather than leaving the caller believing its stated need
-/// was honoured.
-async fn carry_idle_timeout_to_existing_daemon(
-    base_url: &str,
-    caller_override: Option<&'static str>,
-) {
-    let user_timeout_set = std::env::var_os("KIN_DAEMON_IDLE_TIMEOUT_SECS").is_some();
-    let Some(at_least_secs) = idle_timeout_to_carry(caller_override, user_timeout_set) else {
-        return;
-    };
-    let mut request = daemon_health_client()
-        .post(format!("{}/idle-timeout", base_url.trim_end_matches('/')))
-        .json(&serde_json::json!({
-            "at_least_secs": at_least_secs,
-            "client": "kin mcp",
-        }));
-    if let Some(token) = resolve_daemon_auth_token() {
-        request = request.bearer_auth(token);
-    }
-    match request.send().await {
-        Ok(response) if response.status().is_success() => {
-            let effective = response
-                .json::<serde_json::Value>()
-                .await
-                .ok()
-                .and_then(|body| body.get("effective_secs")?.as_u64());
-            match effective {
-                Some(effective) if effective >= at_least_secs => {
-                    info!(
-                        requested_secs = at_least_secs,
-                        effective_secs = effective,
-                        "attached daemon idle window covers this session"
-                    );
-                }
-                Some(effective) => eprintln!(
-                    "Kin: this session needs the repo daemon to survive {at_least_secs}s idle, \
-                     but its window is {effective}s; it may exit mid-session. Set \
-                     KIN_DAEMON_IDLE_TIMEOUT_SECS={at_least_secs} and restart the daemon."
-                ),
-                None => eprintln!(
-                    "Kin: the repo daemon accepted a {at_least_secs}s idle window request but \
-                     reported no effective window; it may exit mid-session."
-                ),
-            }
-        }
-        Ok(response) => eprintln!(
-            "Kin: the repo daemon refused a {at_least_secs}s idle window request ({}); it may \
-             exit mid-session. Set KIN_DAEMON_IDLE_TIMEOUT_SECS={at_least_secs} and restart it.",
-            response.status()
-        ),
-        Err(error) => eprintln!(
-            "Kin: could not ask the repo daemon for a {at_least_secs}s idle window ({error}); it \
-             may exit mid-session."
-        ),
-    }
 }
 
 /// How long a daemon that is not warming may answer nothing at all before the
@@ -5628,6 +5870,7 @@ pub(crate) fn validate_health_repo(health: &HealthResponse, working_dir: &Path) 
         warn_on_health_change(
             health.repo_root.as_deref().unwrap_or("<unknown>"),
             "attention",
+            &attention_causes(health),
         );
     } else {
         // Any other serving status clears the memory, so a daemon that returns
@@ -5672,14 +5915,25 @@ fn should_report_health(repo_root: &str, status: &'static str) -> bool {
     }
 }
 
-fn warn_on_health_change(repo_root: &str, status: &'static str) {
+fn warn_on_health_change(repo_root: &str, status: &'static str, causes: &[String]) {
     if should_report_health(repo_root, status) {
-        warn!(
-            repo_root = repo_root,
-            "daemon is up and serving but reports health=attention (degraded); \
-             continuing to use it. Run `kin doctor` for details."
-        );
+        crate::progress::clear_transient();
+        warn!(repo_root = repo_root, "{}", attention_notice(causes));
     }
+}
+
+/// The one line a degraded daemon is announced with: why, and what it means
+/// for the answer.
+fn attention_notice(causes: &[String]) -> String {
+    if causes.is_empty() {
+        return "the kin daemon is serving but needs attention; answers still come from its \
+                graph. `kin doctor` says why."
+            .to_string();
+    }
+    format!(
+        "the kin daemon is serving but needs attention: {}. `kin doctor` says more.",
+        causes.join("; ")
+    )
 }
 
 fn forget_reported_health(repo_root: &str) {
@@ -7116,8 +7370,12 @@ async fn probe_daemon_endpoint_with_warming_signal(
                     Ok(readiness) => {
                         warming = readiness.warming;
                         warming_signal.store(warming, Ordering::Relaxed);
+                        let doing = readiness
+                            .progress
+                            .map(|progress| format!("; {progress}"))
+                            .unwrap_or_default();
                         format!(
-                            "readiness returned HTTP {status} (ready={}, warming={})",
+                            "readiness returned HTTP {status} (ready={}, warming={}){doing}",
                             readiness.ready, readiness.warming
                         )
                     }
@@ -7228,10 +7486,26 @@ struct StartupNotice {
     progress: crate::progress::Progress,
     started: Instant,
     closed: bool,
+    ready_line: ReadyLine,
+}
+
+/// What happens to a cold start's closing line on a terminal.
+///
+/// Off a terminal the line is always printed and kept, because a log cannot be
+/// erased and the cold-start tests read it there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReadyLine {
+    /// Printed and kept, for a caller that prints its own rows after the start,
+    /// such as `kin setup` and `kin init`.
+    Kept,
+    /// Erased once the daemon answers, for a query that started the daemon:
+    /// the line explains the wait while the query runs, and the answer then
+    /// takes its place.
+    Transient,
 }
 
 impl StartupNotice {
-    fn open() -> Self {
+    fn open(ready_line: ReadyLine) -> Self {
         let mut progress = crate::progress::Progress::stderr();
         progress.update(format_args!(
             "starting the kin daemon for this repository; the first query after a start waits \
@@ -7241,12 +7515,19 @@ impl StartupNotice {
             progress,
             started: Instant::now(),
             closed: false,
+            ready_line,
         }
     }
 
     fn tick(&mut self, kin_root: &Path) {
+        // A re-qualification names the step it is on, which the phase alone
+        // cannot carry.
+        let step = read_startup_requalification(kin_root)
+            .filter(|record| record.requalifying)
+            .map(|record| format!(": {}", record.step))
+            .unwrap_or_default();
         self.progress.update(format_args!(
-            "{} ({:.1}s)",
+            "{}{step} ({:.1}s)",
             daemon_startup_phase(kin_root),
             self.started.elapsed().as_secs_f64()
         ));
@@ -7257,12 +7538,21 @@ impl StartupNotice {
     /// The elapsed figure is the point. A reader who has just waited wants to
     /// know whether the wait was the daemon or their query, and a closing line
     /// with no number cannot answer that.
+    ///
+    /// For a query, the line is transient on a terminal: it stays while the
+    /// query runs, so the reader knows the wait was the daemon, and the
+    /// daemon's answer erases it (see [`crate::progress::clear_transient`]).
     fn close(&mut self) {
         self.closed = true;
-        self.progress.finish_with(format_args!(
-            "kin daemon ready in {:.1}s",
-            self.started.elapsed().as_secs_f64()
-        ));
+        let seconds = self.started.elapsed().as_secs_f64();
+        match self.ready_line {
+            ReadyLine::Kept => self
+                .progress
+                .finish_with(format_args!("kin daemon ready in {seconds:.1}s")),
+            ReadyLine::Transient => self
+                .progress
+                .finish_transient(format_args!("kin daemon ready in {seconds:.1}s")),
+        }
     }
 }
 
@@ -8713,13 +9003,21 @@ pub async fn ensure_daemon_running_with_idle_timeout(
     kin_root: &Path,
     idle_timeout_override: Option<&'static str>,
 ) -> std::result::Result<String, AutoStartError> {
+    ensure_daemon_running_inner(kin_root, idle_timeout_override, ReadyLine::Kept).await
+}
+
+async fn ensure_daemon_running_inner(
+    kin_root: &Path,
+    idle_timeout_override: Option<&'static str>,
+    ready_line: ReadyLine,
+) -> std::result::Result<String, AutoStartError> {
     refuse_incompatible_store(kin_root)?;
     install_spawn_registrar();
     let supervisor_url = ensure_supervisor_running()
         .await
         .map_err(map_supervisor_auto_start_error)?;
     if let Some(base_url) = supervisor_route_for_repo(kin_root, &supervisor_url).await {
-        attach_to_existing_daemon(&base_url, idle_timeout_override).await?;
+        attach_to_existing_daemon(&base_url).await?;
         return Ok(base_url);
     }
 
@@ -8728,7 +9026,7 @@ pub async fn ensure_daemon_running_with_idle_timeout(
             register_repo_daemon_with_supervisor(kin_root, &base_url, &supervisor_url, false)
                 .await
                 .map_err(AutoStartError::spawn)?;
-            attach_to_existing_daemon(&base_url, idle_timeout_override).await?;
+            attach_to_existing_daemon(&base_url).await?;
             return Ok(base_url);
         }
         ExistingDaemon::Starting(message) | ExistingDaemon::LiveNotReady(message) => {
@@ -8741,7 +9039,7 @@ pub async fn ensure_daemon_running_with_idle_timeout(
         .await
         .map_err(AutoStartError::spawn)?;
     if let Some(base_url) = supervisor_route_for_repo(kin_root, &supervisor_url).await {
-        attach_to_existing_daemon(&base_url, idle_timeout_override).await?;
+        attach_to_existing_daemon(&base_url).await?;
         return Ok(base_url);
     }
     match wait_for_existing_daemon(kin_root).await {
@@ -8749,7 +9047,7 @@ pub async fn ensure_daemon_running_with_idle_timeout(
             register_repo_daemon_with_supervisor(kin_root, &base_url, &supervisor_url, false)
                 .await
                 .map_err(AutoStartError::spawn)?;
-            attach_to_existing_daemon(&base_url, idle_timeout_override).await?;
+            attach_to_existing_daemon(&base_url).await?;
             return Ok(base_url);
         }
         ExistingDaemon::Starting(message) | ExistingDaemon::LiveNotReady(message) => {
@@ -8764,7 +9062,10 @@ pub async fn ensure_daemon_running_with_idle_timeout(
     // printed nothing for all of it, and silence and a hang are the same thing
     // to read. Announced here rather than at entry so a warm call, which is
     // every call that returned above, stays silent.
-    let mut notice = Some(StartupNotice::open());
+    // Not while `kin clone` or `kin init` draws its own live line, which the
+    // notice would be written through; that phase's row carries the timing.
+    let mut notice =
+        (!crate::first_run::daemon_start_is_quiet()).then(|| StartupNotice::open(ready_line));
     let daemon_bin = find_daemon_binary().map_err(|error| match error {
         DaemonBinaryDiscoveryError::NotFound => AutoStartError::BinaryNotFound,
         DaemonBinaryDiscoveryError::Invalid(detail) => AutoStartError::SpawnFailed(detail),
@@ -8841,7 +9142,11 @@ pub async fn ensure_daemon_running_with_idle_timeout(
     };
     register_repo_daemon_with_supervisor(kin_root, &base_url, &supervisor_url, true)
         .await
-        .map_err(AutoStartError::spawn)?;
+        .map_err(|error| {
+            // The error prints next, on its own line.
+            crate::progress::clear_transient();
+            AutoStartError::spawn(error)
+        })?;
     // A death note explains the outage that made this spawn necessary, and
     // nothing after it. Left in place it would be quoted as the cause of the
     // next unrelated transport failure.
@@ -9016,7 +9321,7 @@ pub async fn running_daemon_reading(layout: &KinLayout) -> RunningDaemonReading 
 }
 
 pub async fn resolve_daemon_url(layout: &KinLayout) -> Result<Option<String>> {
-    resolve_daemon_url_inner(layout, None).await
+    resolve_daemon_url_inner(layout, None, ReadyLine::Transient).await
 }
 
 /// The refusal a command gets when daemon resolution produced no endpoint.
@@ -9094,12 +9399,13 @@ fn unreachable_daemon_sentence(
 /// the same long idle window as the auto-revival path.  An explicit
 /// `KIN_DAEMON_IDLE_TIMEOUT_SECS` env var always overrides this.
 pub async fn resolve_daemon_url_for_mcp(layout: &KinLayout) -> Result<Option<String>> {
-    resolve_daemon_url_inner(layout, Some(MCP_IDLE_TIMEOUT_SECS)).await
+    resolve_daemon_url_inner(layout, Some(MCP_IDLE_TIMEOUT_SECS), ReadyLine::Kept).await
 }
 
 async fn resolve_daemon_url_inner(
     layout: &KinLayout,
     idle_timeout_override: Option<&'static str>,
+    ready_line: ReadyLine,
 ) -> Result<Option<String>> {
     let no_daemon_autostart = is_transient_bool_env("KIN_NO_DAEMON");
     let explicit_daemon_url = std::env::var("KIN_DAEMON_URL")
@@ -9112,7 +9418,7 @@ async fn resolve_daemon_url_inner(
         return Ok(supervisor_route_for_repo_if_running_async(layout.root()).await);
     }
 
-    match ensure_daemon_running_with_idle_timeout(layout.root(), idle_timeout_override).await {
+    match ensure_daemon_running_inner(layout.root(), idle_timeout_override, ready_line).await {
         Ok(url) => Ok(Some(url)),
         // A store this build cannot open is the whole answer, and so is a
         // strict-mode environment divergence: neither is a daemon that failed
@@ -9252,6 +9558,143 @@ mod tests {
     }
 
     use super::*;
+
+    /// A daemon checking or re-qualifying its store's binding history before
+    /// it opens it says so through its startup record, and the phase names it
+    /// while the record names the live runtime owner.
+    #[test]
+    fn a_starting_daemon_s_requalification_record_names_its_phase_while_it_owns_the_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let kin_root = tmp.path();
+        let _runtime = acquire_repository_runtime_authority(kin_root)
+            .unwrap()
+            .expect("take the runtime authority as a starting daemon does");
+        record_startup_requalification(kin_root, false, "checking");
+        assert!(
+            daemon_startup_phase(kin_root).contains("checking this store's binding history"),
+            "{}",
+            daemon_startup_phase(kin_root)
+        );
+        record_startup_requalification(kin_root, true, "re-deriving main");
+        assert_eq!(
+            daemon_startup_phase(kin_root),
+            DAEMON_STARTUP_REQUALIFYING_PHASE
+        );
+        // It outranks the endpoint markers while it lives, and is gone once
+        // its writer is past the step.
+        std::fs::write(kin_root.join(kin_daemon_spawn::PID_FILE_NAME), "12345").unwrap();
+        assert_eq!(
+            daemon_startup_phase(kin_root),
+            DAEMON_STARTUP_REQUALIFYING_PHASE
+        );
+        clear_startup_requalification(kin_root);
+        assert!(daemon_startup_phase(kin_root).contains("loading the repository graph"));
+    }
+
+    /// A record that does not name the live runtime owner says nothing: one a
+    /// live but unrelated process is stamped with, one copied from a daemon
+    /// whose incarnation is gone though its PID is alive, and one beside a
+    /// runtime authority nobody holds.
+    #[cfg(unix)]
+    #[test]
+    fn a_stale_or_foreign_startup_record_is_ignored() {
+        let tmp = tempfile::tempdir().unwrap();
+        let kin_root = tmp.path();
+        let path = kin_root.join(STARTUP_REQUALIFICATION_FILE_NAME);
+        let write = |owner: String| {
+            std::fs::write(
+                &path,
+                serde_json::to_string(&StartupRequalification {
+                    owner,
+                    requalifying: true,
+                    step: "re-deriving main".to_string(),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        };
+
+        // Nobody holds the runtime authority: even this process's own stamp
+        // is not honored.
+        write(current_repository_runtime_owner_stamp());
+        assert_eq!(read_startup_requalification(kin_root), None);
+
+        let _runtime = acquire_repository_runtime_authority(kin_root)
+            .unwrap()
+            .expect("take the runtime authority");
+        // A live process that is not the owner: this process's parent.
+        let parent = process_identity(std::os::unix::process::parent_id())
+            .unwrap()
+            .expect("the parent is alive");
+        write(format!(
+            "{REPOSITORY_RUNTIME_OWNER_STAMP_V2} {}",
+            serde_json::to_string(&parent).unwrap()
+        ));
+        assert_eq!(read_startup_requalification(kin_root), None);
+        assert!(!daemon_startup_phase(kin_root).contains("binding history"));
+
+        // This process's live PID with another incarnation's birth token, the
+        // shape a record copied from a dead daemon takes once its PID is
+        // reused; the lock is stamped with it too, so only the incarnation
+        // check can refuse it.
+        let mut reused = current_process_identity().unwrap();
+        reused.birth_token = format!("{}-earlier", reused.birth_token);
+        let stale = format!(
+            "{REPOSITORY_RUNTIME_OWNER_STAMP_V2} {}",
+            serde_json::to_string(&reused).unwrap()
+        );
+        std::fs::write(kin_root.join("daemon.lock"), &stale).unwrap();
+        write(stale);
+        assert_eq!(read_startup_requalification(kin_root), None);
+    }
+
+    /// A link planted at the record's name is never followed: a read refuses
+    /// it, a clear leaves it and its target alone, and a write replaces the
+    /// link itself while the file it pointed at keeps its bytes.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_at_the_startup_record_is_refused_never_followed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let kin_root = tmp.path();
+        let _runtime = acquire_repository_runtime_authority(kin_root)
+            .unwrap()
+            .expect("take the runtime authority");
+        let victim = tmp.path().join("victim");
+        let path = kin_root.join(STARTUP_REQUALIFICATION_FILE_NAME);
+        std::fs::write(
+            &victim,
+            serde_json::to_string(&StartupRequalification {
+                owner: current_repository_runtime_owner_stamp(),
+                requalifying: true,
+                step: "planted".to_string(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let planted = std::fs::read(&victim).unwrap();
+        std::os::unix::fs::symlink(&victim, &path).unwrap();
+
+        assert_eq!(read_startup_requalification(kin_root), None);
+        clear_startup_requalification(kin_root);
+        assert!(std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read(&victim).unwrap(), planted);
+
+        record_startup_requalification(kin_root, true, "re-deriving main");
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            planted,
+            "the target was written"
+        );
+        let metadata = std::fs::symlink_metadata(&path).unwrap();
+        assert!(metadata.is_file() && !metadata.file_type().is_symlink());
+        assert_eq!(
+            read_startup_requalification(kin_root).map(|record| record.step),
+            Some("re-deriving main".to_string())
+        );
+    }
 
     /// The startup-phase line the MCP answer-early path injects must track the
     /// daemon's lifecycle markers: pid file means the process is up and
@@ -12704,6 +13147,7 @@ mod tests {
             behavior_env: Default::default(),
             build: None,
             reconcile: Default::default(),
+            attention: Default::default(),
         }
     }
 
@@ -13581,6 +14025,53 @@ mod tests {
         assert!(!dir.path().join("daemon.port").exists());
     }
 
+    /// A degraded daemon's notice names why, and what it means for the
+    /// answer, instead of "degraded" alone.
+    #[test]
+    fn an_attention_daemon_says_why_and_what_it_means_for_the_answer() {
+        let health: HealthResponse = serde_json::from_value(serde_json::json!({
+            "status": "attention",
+            "version": "0.8.1",
+            "uptime_seconds": 3,
+            "graph_entity_count": 197,
+            "graph_loaded": true,
+            "reconciliation_status": "idle",
+            "embed_worker_failed": true,
+            "reconcile": {"admission_failure_streak": 4, "admission_failures": 4},
+            "background_passes": [{"name": "embed", "state": "stopped", "progress": 0}]
+        }))
+        .expect("a daemon's health parses with its attention facts");
+        let causes = attention_causes(&health);
+        assert!(
+            causes.iter().any(|c| c.contains("embedding worker stopped")
+                && c.contains("answers by name and from the graph are unaffected")),
+            "{causes:?}"
+        );
+        assert!(causes
+            .iter()
+            .any(|c| c.contains("embed background pass stopped")));
+        let notice = attention_notice(&causes);
+        assert!(
+            notice.contains("needs attention: its embedding worker stopped"),
+            "{notice}"
+        );
+        assert!(!notice.contains("degraded"), "{notice}");
+
+        // An older daemon that reports none of these still parses, and the
+        // notice still says the answer is served.
+        let older: HealthResponse = serde_json::from_value(serde_json::json!({
+            "status": "attention",
+            "version": "0.8.0",
+            "uptime_seconds": 3,
+            "graph_entity_count": 1,
+            "graph_loaded": true,
+            "reconciliation_status": "idle"
+        }))
+        .unwrap();
+        assert!(attention_causes(&older).is_empty());
+        assert!(attention_notice(&[]).contains("answers still come from its graph"));
+    }
+
     #[test]
     fn health_validation_rejects_wrong_repo_root() {
         let dir = tempfile::tempdir().unwrap();
@@ -13599,6 +14090,7 @@ mod tests {
             behavior_env: Default::default(),
             build: None,
             reconcile: Default::default(),
+            attention: Default::default(),
         };
 
         let error = validate_health_repo(&health, dir.path()).unwrap_err();
@@ -13620,6 +14112,7 @@ mod tests {
             behavior_env: Default::default(),
             build: None,
             reconcile: Default::default(),
+            attention: Default::default(),
         }
     }
 
@@ -14286,48 +14779,6 @@ mod tests {
         // Regression guard: the MCP path must inject 1800s (30 min), not the
         // 60-second CLI default.
         assert_eq!(MCP_IDLE_TIMEOUT_SECS, "1800");
-    }
-
-    // ── idle-timeout carried to a daemon this process did not start ────────
-
-    /// Both sides. Injecting at spawn only helps the caller that spawns, and an
-    /// MCP session usually attaches to a daemon an ordinary CLI command already
-    /// started at the 60-second default. A caller with a stated need must carry
-    /// it; a caller with none must leave the daemon alone.
-    #[test]
-    fn an_mcp_session_carries_its_window_to_a_daemon_it_did_not_start() {
-        assert_eq!(
-            idle_timeout_to_carry(Some(MCP_IDLE_TIMEOUT_SECS), false),
-            Some(1800),
-            "an MCP attach must state its 1800s need to the daemon it got"
-        );
-        assert_eq!(
-            idle_timeout_to_carry(None, false),
-            None,
-            "an ordinary CLI attach states no need and must not touch the window"
-        );
-    }
-
-    /// A user who set `KIN_DAEMON_IDLE_TIMEOUT_SECS` decided this host's policy.
-    /// The attach path must respect that exactly as the spawn path does, or the
-    /// two would disagree about whose value wins.
-    #[test]
-    fn an_explicit_user_window_is_never_overridden_from_the_attach_path() {
-        assert_eq!(
-            idle_timeout_to_carry(Some(MCP_IDLE_TIMEOUT_SECS), true),
-            None
-        );
-        assert_eq!(idle_timeout_to_carry(None, true), None);
-    }
-
-    /// Nothing usable is carried rather than carried as a zero, which the
-    /// daemon would have to reject as "a floor of forever".
-    #[test]
-    fn an_unusable_window_value_is_not_carried_at_all() {
-        assert_eq!(idle_timeout_to_carry(Some("0"), false), None);
-        assert_eq!(idle_timeout_to_carry(Some(""), false), None);
-        assert_eq!(idle_timeout_to_carry(Some("later"), false), None);
-        assert_eq!(idle_timeout_to_carry(Some(" 900 "), false), Some(900));
     }
 
     #[test]

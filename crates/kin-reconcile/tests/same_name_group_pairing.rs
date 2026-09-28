@@ -888,3 +888,108 @@ fn a_planner_retained_rename_keeps_identity_with_a_same_signature_sibling() {
         }
     }
 }
+
+/// Flask's `stream_with_context`: two `@overload` stubs, then the
+/// implementation, whose nested wrapper calls the function by name.
+const SELF_CALL: &str = r#"import typing as t
+from functools import update_wrapper
+
+
+def get_debug_flag() -> bool:
+    return True
+
+
+@t.overload
+def stream_with_context(
+    generator_or_function: t.Iterator[t.AnyStr],
+) -> t.Iterator[t.AnyStr]: ...
+
+
+@t.overload
+def stream_with_context(
+    generator_or_function: t.Callable[..., t.Iterator[t.AnyStr]],
+) -> t.Callable[[t.Iterator[t.AnyStr]], t.Iterator[t.AnyStr]]: ...
+
+
+def stream_with_context(generator_or_function):
+    try:
+        gen = iter(generator_or_function)
+    except TypeError:
+
+        def decorator(*args, **kwargs):
+            gen = generator_or_function(*args, **kwargs)
+            return stream_with_context(gen)
+
+        return update_wrapper(decorator, generator_or_function)
+    return gen
+"#;
+
+/// Every `Calls` edge between the file's `stream_with_context` definitions,
+/// each end named by its place in the group: the stubs in source order, then
+/// the implementation.
+fn overload_group_calls(repo: &LiveRepo) -> Vec<(String, String)> {
+    let mut group: Vec<Entity> = repo
+        .graph
+        .list_all_entities()
+        .unwrap()
+        .into_iter()
+        .filter(|entity| entity.name == "stream_with_context")
+        .collect();
+    group.sort_by_key(|entity| entity.span.as_ref().map(|span| span.start_line));
+    assert_eq!(group.len(), 3, "two stubs and the implementation");
+    let label = |id: kin_model::EntityId| -> String {
+        match group.iter().position(|entity| entity.id == id) {
+            Some(0) => "first stub".into(),
+            Some(1) => "second stub".into(),
+            Some(2) => "implementation".into(),
+            _ => "elsewhere".into(),
+        }
+    };
+    let mut calls: Vec<(String, String)> = group
+        .iter()
+        .flat_map(|entity| repo.graph.get_all_relations_for_entity(&entity.id).unwrap())
+        .filter(|edge| edge.kind == RelationKind::Calls)
+        .filter_map(|edge| Some((edge.src.as_entity()?, edge.dst.as_entity()?)))
+        .filter(|(src, dst)| {
+            group.iter().any(|entity| entity.id == *src)
+                && group.iter().any(|entity| entity.id == *dst)
+        })
+        .map(|(src, dst)| (label(src), label(dst)))
+        .collect();
+    calls.sort();
+    calls.dedup();
+    calls
+}
+
+#[test]
+fn an_edit_and_its_revert_leave_an_overload_groups_self_call_on_the_implementation() {
+    for reopen in [false, true] {
+        let mut repo = LiveRepo::new();
+        repo.commit("src/flask/helpers.py", SELF_CALL);
+        let before = overload_group_calls(&repo);
+        assert_eq!(
+            before,
+            vec![("implementation".to_string(), "implementation".to_string())],
+            "reopen={reopen}: the first derivation binds the self-call to the implementation"
+        );
+        if reopen {
+            repo.reopen();
+        }
+        let edited = SELF_CALL.replace(
+            "def get_debug_flag() -> bool:\n",
+            "def get_debug_flag() -> bool:\n    acceptance_edit = True\n",
+        );
+        repo.commit("src/flask/helpers.py", &edited);
+        assert_eq!(
+            overload_group_calls(&repo),
+            before,
+            "reopen={reopen}: an edit above the group must not rebind the self-call"
+        );
+        repo.commit("src/flask/helpers.py", SELF_CALL);
+        assert_eq!(
+            overload_group_calls(&repo),
+            before,
+            "reopen={reopen}: reverting the edit must restore the first derivation's calls"
+        );
+    }
+}

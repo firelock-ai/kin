@@ -3337,9 +3337,14 @@ pub fn record_query_producer_verdict(
 /// first query runs in. Telling them apart needs `index_attached`: the
 /// `indexed` counter reads zero for both, so a reason picked from the counters
 /// alone can neither name the absent case nor fail to name it.
+///
+/// `model_declined` says whether this machine declined the embedding model
+/// download and lacks the model. It is asked only when the index is empty, and
+/// taken as an argument so a test decides it rather than the machine it runs on.
 fn record_vector_index_degradation(
     coverage: &SemanticCoverage,
     index_attached: bool,
+    model_declined: impl FnOnce() -> bool,
     sink: &mut Vec<RetrievalDegradation>,
 ) {
     if coverage.complete {
@@ -3358,6 +3363,10 @@ fn record_vector_index_degradation(
         );
         return;
     }
+    // Read only when the index is empty, since only then can it be the cause.
+    // A decline outranks the opt-out: both mean nothing fills the index on its
+    // own, and the decline is the one whose way back is a single command.
+    let declined = coverage.indexed == 0 && model_declined();
     let (reason, detail, remediation) = if !index_attached {
         let detail = format!(
             "no vector index has been built for this graph, so none of its {} entities \
@@ -3369,7 +3378,16 @@ fn record_vector_index_degradation(
         // variable at its own start to decide the pass. Saying which of the two
         // states holds is the whole difference between "this fills in on its
         // own" and "this stays as it is until someone asks".
-        if kin_daemon_spawn::auto_embed_enabled_from(
+        if declined {
+            (
+                "absent_declined",
+                format!(
+                    "{detail}; this machine declined the embedding model download in `kin \
+                     setup`, so nothing will build the index on its own"
+                ),
+                "run 'kin embed' to download the model and build the index".to_string(),
+            )
+        } else if kin_daemon_spawn::auto_embed_enabled_from(
             std::env::var(kin_daemon_spawn::DAEMON_AUTO_EMBED_ENV)
                 .ok()
                 .as_deref(),
@@ -3404,6 +3422,16 @@ fn record_vector_index_degradation(
                 coverage.indexed, coverage.total, coverage.pending
             ),
             "run 'kin embed' until kin status reports full embedding coverage".to_string(),
+        )
+    } else if declined {
+        (
+            "absent_declined",
+            format!(
+                "vector index empty: 0/{} entities embedded, and this machine declined the \
+                 embedding model download in `kin setup`, so nothing will fill it on its own",
+                coverage.total
+            ),
+            "run 'kin embed' to download the model and build the index".to_string(),
         )
     } else if kin_daemon_spawn::auto_embed_enabled_from(
         std::env::var(kin_daemon_spawn::DAEMON_AUTO_EMBED_ENV)
@@ -3772,6 +3800,21 @@ pub async fn run(
     // `EmbedModelFetch::with_progress_since` for why a CLI process may not
     // simply assert that the daemon's embed pass is at work.
     let model_before = crate::embed_model::EmbedModelFetch::probe(false);
+    // Said while the daemon ranks, from a moment in, so a locate that loads
+    // the model or starts a daemon never leaves a blank terminal.
+    let waiting = (!json)
+        .then(|| {
+            crate::screen::LiveLine::start_after(
+                crate::screen::Style::for_stdout(),
+                "Locating",
+                crate::commands::init::LIVE_LINE_DELAY,
+            )
+        })
+        .flatten();
+    if let Some(live) = &waiting {
+        crate::first_run::quiet_daemon_start();
+        live.note("ranking the graph for your words");
+    }
     let result = capture(
         text,
         queries,
@@ -3786,7 +3829,9 @@ pub async fn run(
         paging,
         scope,
     )
-    .await?;
+    .await;
+    drop(waiting);
+    let result = result?;
     let model_fetch = embedding_model_fetch_note(result.semantic_coverage.as_ref(), || {
         crate::embed_model::EmbedModelFetch::probe(false).with_progress_since(&model_before)
     });
@@ -4240,7 +4285,12 @@ fn run_with_graph_capture_budgeted(
     ensure_lexical_index_queryable(graph, &mut degradations);
     let (semantic_coverage, vector_index_attached) =
         evaluate_embedding_coverage(graph, vector_source)?;
-    record_vector_index_degradation(&semantic_coverage, vector_index_attached, &mut degradations);
+    record_vector_index_degradation(
+        &semantic_coverage,
+        vector_index_attached,
+        || crate::embed_model::declined_and_absent().is_some(),
+        &mut degradations,
+    );
     // Per-stage prune attribution, recorded only under --explain.
     let mut prune_ledger: Vec<PruneEvent> = Vec::new();
 
@@ -20983,10 +21033,20 @@ fn embedding_model_fetch_note(
     coverage: Option<&SemanticCoverage>,
     observe: impl FnOnce() -> crate::embed_model::EmbedModelFetch,
 ) -> Option<String> {
-    if !coverage.is_some_and(embedding_work_is_owed) {
+    let coverage = coverage?;
+    let owed = embedding_work_is_owed(coverage);
+    // A machine that declined the model never attaches an index, so its
+    // substrate reads `Unknown` rather than owed. The decline is still why the
+    // rows are lexical, and it is the one cause a reader can undo with a
+    // single command, so an unread substrate is asked about it too.
+    if !owed && !matches!(coverage.embedding_state, EmbeddingState::Unknown) {
         return None;
     }
-    observe().retrieval_clause()
+    let fetch = observe();
+    if !owed && !fetch.declined {
+        return None;
+    }
+    fetch.retrieval_clause()
 }
 
 /// The stdout lines `output_text` prints for the ranked file list, in order.
@@ -29488,9 +29548,24 @@ mod tests {
             queued: 7,
         };
         let mut sink = Vec::new();
-        record_vector_index_degradation(&coverage_from_status(&unfilled, false), false, &mut sink);
-        record_vector_index_degradation(&coverage_from_status(&unfilled, true), true, &mut sink);
-        record_vector_index_degradation(&coverage_from_status(&partial, true), true, &mut sink);
+        record_vector_index_degradation(
+            &coverage_from_status(&unfilled, false),
+            false,
+            || false,
+            &mut sink,
+        );
+        record_vector_index_degradation(
+            &coverage_from_status(&unfilled, true),
+            true,
+            || false,
+            &mut sink,
+        );
+        record_vector_index_degradation(
+            &coverage_from_status(&partial, true),
+            true,
+            || false,
+            &mut sink,
+        );
 
         let reasons = sink
             .iter()
@@ -29541,6 +29616,7 @@ mod tests {
             record_vector_index_degradation(
                 &coverage_from_status(&unfilled, true),
                 true,
+                || false,
                 &mut filling,
             );
         }
@@ -29569,6 +29645,7 @@ mod tests {
             record_vector_index_degradation(
                 &coverage_from_status(&unfilled, false),
                 false,
+                || false,
                 &mut absent,
             );
         }
@@ -29589,6 +29666,7 @@ mod tests {
             record_vector_index_degradation(
                 &coverage_from_status(&unfilled, true),
                 true,
+                || false,
                 &mut opted_out,
             );
         }
@@ -29627,6 +29705,7 @@ mod tests {
             record_vector_index_degradation(
                 &coverage_from_status(&unfilled, false),
                 false,
+                || false,
                 &mut waiting,
             );
         }
@@ -29644,6 +29723,7 @@ mod tests {
             record_vector_index_degradation(
                 &coverage_from_status(&unfilled, false),
                 false,
+                || false,
                 &mut opted_out,
             );
         }
@@ -29655,6 +29735,67 @@ mod tests {
             "the lever that decided this must be named: {}",
             opted_out[0].detail
         );
+    }
+
+    /// A machine that declined the embedding model download is told that
+    /// nothing will build the index and which command does, never to wait for
+    /// a pass that will not run. That holds with the index unbuilt and with it
+    /// attached but empty.
+    #[cfg(feature = "vector")]
+    #[test]
+    #[serial_test::serial]
+    fn a_declined_model_is_reported_as_its_own_reason_with_the_way_back() {
+        let unfilled = kin_db::EmbeddingStatus {
+            pending: 12,
+            indexed: 0,
+            total: 12,
+            queued: 12,
+        };
+        let _on = kin_core::test_env::EnvVarGuard::unset(kin_daemon_spawn::DAEMON_AUTO_EMBED_ENV);
+        for attached in [false, true] {
+            let mut declined = Vec::new();
+            record_vector_index_degradation(
+                &coverage_from_status(&unfilled, attached),
+                attached,
+                || true,
+                &mut declined,
+            );
+            assert_eq!(declined[0].reason, "absent_declined", "attached={attached}");
+            assert!(
+                declined[0]
+                    .detail
+                    .contains("declined the embedding model download"),
+                "{}",
+                declined[0].detail
+            );
+            assert!(
+                declined[0].remediation.contains("kin embed"),
+                "{}",
+                declined[0].remediation
+            );
+            assert!(
+                !declined[0].remediation.contains("wait"),
+                "{}",
+                declined[0].remediation
+            );
+        }
+
+        // A partly embedded index is not a decline, whatever was recorded,
+        // and the decline is not even read.
+        let partial = kin_db::EmbeddingStatus {
+            pending: 6,
+            indexed: 6,
+            total: 12,
+            queued: 6,
+        };
+        let mut sink = Vec::new();
+        record_vector_index_degradation(
+            &coverage_from_status(&partial, true),
+            true,
+            || panic!("a partly embedded index never asks about the decline"),
+            &mut sink,
+        );
+        assert_eq!(sink[0].reason, "partial");
     }
 
     /// The pipeline itself reports the unbuilt index, not only the helper that
@@ -37222,6 +37363,7 @@ mod tests {
             expected_bytes: Some(crate::embed_model::DEFAULT_EMBED_MODEL_BYTES),
             fetching: false,
             no_fetch_reason: None,
+            declined: false,
             relocated_hf_home: None,
         }
     }
@@ -37316,6 +37458,33 @@ mod tests {
             embedding_model_fetch_note(None, weights_arriving),
             None,
             "a payload carrying no coverage asserts nothing about embeddings"
+        );
+    }
+
+    /// A machine that declined the model download is told once, in plain
+    /// words, that semantic search is off and which command turns it on. Its
+    /// substrate reads `Unknown`, because no index is ever attached, and that
+    /// must not hide the line.
+    #[test]
+    fn a_declined_model_names_the_way_back_even_on_an_unread_substrate() {
+        let declined = || crate::embed_model::EmbedModelFetch {
+            declined: true,
+            no_fetch_reason: Some("declined in kin setup".to_string()),
+            ..partial_weights(0)
+        };
+        for state in [EmbeddingState::Unknown, EmbeddingState::Absent] {
+            let line = embedding_model_fetch_note(Some(&owed_embedding_coverage(state)), declined)
+                .unwrap_or_else(|| panic!("a declined model is reported over {state:?}"));
+            assert!(line.starts_with("semantic search is off"), "{line}");
+            assert!(line.contains("`kin embed`"), "{line}");
+        }
+        assert_eq!(
+            embedding_model_fetch_note(
+                Some(&owed_embedding_coverage(EmbeddingState::Present)),
+                declined
+            ),
+            None,
+            "a whole index is not held back by anything"
         );
     }
 

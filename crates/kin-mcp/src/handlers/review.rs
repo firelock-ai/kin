@@ -7,13 +7,59 @@ use super::repository_authority::RequestRepositoryAuthority;
 use kin_model::graph::GraphStore;
 use kin_model::ids::SemanticChangeId;
 use kin_review::write::{PlannedReviewEvent, ReviewGroup, ReviewWrite};
-use kin_review::{format_review, SemanticReview};
+use kin_review::{ReviewRenderOptions, SemanticReview};
 
 use crate::error::{McpError, Result};
 use crate::session::SessionRegistry;
 use crate::types::ToolCallResult;
 
 use super::common::*;
+
+/// Source capability for one answer's batch containment observation. Exact
+/// bytes and graph records are read by the common selected-authority census;
+/// the review engine receives observations, never a file-reading capability.
+pub struct AnalysisEscapeEvidence<'store, G: GraphStore> {
+    held: HeldSourceAuthority<'store, G>,
+    scope: EntitySourceScope,
+}
+
+impl<'store, G: GraphStore> AnalysisEscapeEvidence<'store, G> {
+    pub fn new(
+        store: &'store G,
+        authority: Option<&RequestRepositoryAuthority>,
+        scope: EntitySourceScope,
+    ) -> Self {
+        Self {
+            held: HeldSourceAuthority::new(store, authority),
+            scope,
+        }
+    }
+
+    pub fn observe(
+        &self,
+        targets: &[kin_model::Entity],
+        at: Option<SemanticChangeId>,
+    ) -> kin_review::enrichment::EscapeEvidenceBatch {
+        let scope = at.map_or(self.scope, EntitySourceScope::At);
+        let selected_change = match scope {
+            EntitySourceScope::WorkspaceHead => None,
+            EntitySourceScope::At(change) => Some(change),
+        };
+        let focals: Vec<_> = targets
+            .iter()
+            .map(|target| (target, kin_model::focal_call_names(target)))
+            .collect();
+        let readings = if focals.is_empty() {
+            Vec::new()
+        } else {
+            self.held.escape_evidence_batch(scope, &focals)
+        };
+        kin_review::enrichment::EscapeEvidenceBatch {
+            selected_change,
+            readings,
+        }
+    }
+}
 
 pub const SEMANTIC_DIFF_DESC: &str = "\
 Compute an entity-level diff — what declarations were added, removed, or changed — \
@@ -38,8 +84,24 @@ pub fn handle_semantic_diff<G: GraphStore>(
         return Ok(refusal);
     }
     let diff = resolve_diff(args, store)?;
-    let formatted = kin_review::format_diff(&diff);
+    let namer = |node: &kin_model::relation::GraphNodeId| kin_review::graph_node_name(store, node);
+    let formatted = kin_review::format_diff_with(&diff, &review_render_options(&namer));
     text_answer(formatted, args, "semantic_diff")
+}
+
+/// The line a review or diff prints under relation changes it only counted,
+/// naming the call that returns every one of them.
+const RELATION_LIST_HINT: &str =
+    "Call semantic_review with format='json' to read every relation change.";
+
+/// How the review tools render text: relation endpoints named from the graph,
+/// and relation changes counted by origin and kind with the hint above.
+fn review_render_options<'a>(namer: &'a kin_review::NodeNamer<'a>) -> ReviewRenderOptions<'a> {
+    ReviewRenderOptions {
+        node_names: Some(namer),
+        relation_list_hint: Some(RELATION_LIST_HINT),
+        ..Default::default()
+    }
 }
 
 /// Whether the call named `files`, the file-path targeting these tools keep
@@ -218,6 +280,23 @@ pub async fn handle_impact_analysis<G: GraphStore>(
     store: &G,
     sessions: &SessionRegistry,
 ) -> Result<ToolCallResult> {
+    handle_impact_analysis_with_source(
+        args,
+        store,
+        sessions,
+        None,
+        EntitySourceScope::WorkspaceHead,
+    )
+    .await
+}
+
+pub async fn handle_impact_analysis_with_source<G: GraphStore>(
+    args: &HashMap<String, serde_json::Value>,
+    store: &G,
+    sessions: &SessionRegistry,
+    repository_authority: Option<&RequestRepositoryAuthority>,
+    source_scope: EntitySourceScope,
+) -> Result<ToolCallResult> {
     // What a change to a symbol outside the repository reaches is its callers
     // here, and find_references lists them with each call's proof. The
     // impact walk and the consumer counts it reports are keyed by repository
@@ -235,8 +314,12 @@ pub async fn handle_impact_analysis<G: GraphStore>(
     let depth = get_optional_u64(args, "depth", 3) as u32;
     let diff = resolve_diff(args, store)?;
 
-    let impact =
-        kin_review::analyze_impact(store, &diff).map_err(|e| McpError::Review(e.to_string()))?;
+    let impact = {
+        let source = AnalysisEscapeEvidence::new(store, repository_authority, source_scope);
+        let evidence = |targets: &[kin_model::Entity], at| source.observe(targets, at);
+        kin_review::impact::analyze_impact_with_source(store, &diff, Some(&evidence))
+            .map_err(|e| McpError::Review(e.to_string()))?
+    };
 
     let mut result = semantic_metadata_json(&impact)?;
     annotate_impact_presentation_lines(&mut result, &impact);
@@ -381,6 +464,22 @@ pub fn handle_semantic_review<G: GraphStore>(
     store: &G,
     sessions: &SessionRegistry,
 ) -> Result<ToolCallResult> {
+    handle_semantic_review_with_source(
+        args,
+        store,
+        sessions,
+        None,
+        EntitySourceScope::WorkspaceHead,
+    )
+}
+
+pub fn handle_semantic_review_with_source<G: GraphStore>(
+    args: &HashMap<String, serde_json::Value>,
+    store: &G,
+    sessions: &SessionRegistry,
+    repository_authority: Option<&RequestRepositoryAuthority>,
+    source_scope: EntitySourceScope,
+) -> Result<ToolCallResult> {
     if let Some(refusal) = external_entity_ids_refusal(
         args,
         store,
@@ -393,10 +492,13 @@ pub fn handle_semantic_review<G: GraphStore>(
     let format = get_optional_string_param(args, "format").unwrap_or_else(|| "text".into());
     let diff = resolve_diff(args, store)?;
 
-    let review = SemanticReview::review_from_diff(diff, store)
+    let source = AnalysisEscapeEvidence::new(store, repository_authority, source_scope);
+    let evidence = |targets: &[kin_model::Entity], at| source.observe(targets, at);
+    let review = SemanticReview::review_from_diff_with_source(diff, store, Some(&evidence))
         .map_err(|e| McpError::Review(e.to_string()))?;
 
-    let formatted = format_review(&review);
+    let namer = |node: &kin_model::relation::GraphNodeId| kin_review::graph_node_name(store, node);
+    let formatted = kin_review::format_review_with(&review, &review_render_options(&namer));
 
     if format.eq_ignore_ascii_case("json") {
         let mut result = semantic_metadata_json(&review)?;
@@ -442,7 +544,17 @@ pub fn handle_semantic_review<G: GraphStore>(
     } else {
         formatted
     };
-    text_answer(text, args, "semantic_review")
+    // Preserve the observation for the canonical verdict in text mode too.
+    // The finalizer already wraps plain text as a message object.
+    let mut result = serde_json::json!({
+        "message": text,
+        "enrichment": review.impact.enrichment,
+    });
+    if names_files(args) {
+        record_files_deprecation(&mut result, "semantic_review");
+    }
+    let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
+    Ok(ToolCallResult::text(json))
 }
 
 fn collect_review_traffic_lines(
@@ -800,7 +912,9 @@ or by raw semantic scopes — and optionally seed a title, description, creator 
 and an initial reviewer list. Reach for it to start a code-review workflow that lives \
 in graph truth (so decisions, notes, and discussions attach to entities, not just \
 files), whether driven by a human, an assistant, or CI. Returns the new review's ID, \
-which the other kin_review_* tools (decide, note_add, discuss, assign, get) operate on.";
+which the other kin_review_* tools (decide, note_add, discuss, assign, get) operate on. \
+A scope or entity id naming a symbol outside the repository is refused with \
+external_symbol_not_served.";
 
 pub fn handle_review_create<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
@@ -958,7 +1072,8 @@ Attach a standalone note to a review, optionally anchored to a specific entity o
 need a back-and-forth thread — \"FYI this also affects X\". Because notes can be scoped \
 to an entity, they travel with that declaration in graph truth rather than being pinned \
 to a line number that drifts. For a comment that expects replies, start a thread with \
-kin_review_discuss instead.";
+kin_review_discuss instead. A scope naming a symbol outside the repository is refused \
+with external_symbol_not_served.";
 
 pub fn handle_review_note_add<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
@@ -976,7 +1091,7 @@ fn plan_review_note_add<G: GraphStore>(
 
     let review_id = parse_review_id(args, "review_id")?;
     let body = get_string_param(args, "body")?;
-    let scope = parse_optional_scope_arg(args, store)?;
+    let scope = parse_optional_scope_arg(args, store, "kin_review_note_add")?;
     let author = parse_identity_arg(args, "author", "author_kind", "mcp-client");
     existing_review(store, &review_id)?;
 
@@ -1017,7 +1132,8 @@ specific entity or file/line. Reach for it when a point needs conversation — a
 or concern others should reply to and eventually resolve — rather than a one-off note. \
 Returns the new discussion's ID; reply with kin_review_discuss_reply and close it out \
 with kin_review_discuss_resolve. Anchoring to an entity keeps the thread attached to \
-the code in graph truth as it evolves.";
+the code in graph truth as it evolves. A scope naming a symbol outside the repository is \
+refused with external_symbol_not_served.";
 
 pub fn handle_review_discuss<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
@@ -1037,7 +1153,7 @@ fn plan_review_discuss<G: GraphStore>(
 
     let review_id = parse_review_id(args, "review_id")?;
     let body = get_string_param(args, "body")?;
-    let scope = parse_optional_scope_arg(args, store)?;
+    let scope = parse_optional_scope_arg(args, store, "kin_review_discuss")?;
     let author = parse_identity_arg(args, "author", "author_kind", "mcp-client");
     existing_review(store, &review_id)?;
 
@@ -1550,10 +1666,31 @@ fn parse_optional_work_scope(
         .transpose()
 }
 
+/// The refusal a review write gives a scope naming a symbol outside the
+/// repository, as the error its plan fails with. The error's text is the
+/// refusal's own JSON, so the in-process tool and the daemon's review writer,
+/// which both answer a failed plan with that text, refuse it in one shape.
+fn external_review_scope_refusal<G: GraphStore>(
+    store: &G,
+    scopes: Option<&serde_json::Value>,
+    tool: &str,
+    argument: &str,
+) -> Result<()> {
+    let Some(scopes) = scopes else {
+        return Ok(());
+    };
+    match super::external_symbols::external_scope_refusal(store, scopes, tool, argument)? {
+        Some(refusal) => Err(McpError::Other(refusal)),
+        None => Ok(()),
+    }
+}
+
 fn parse_optional_scope_arg<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
+    tool: &str,
 ) -> Result<Option<kin_model::WorkScope>> {
+    external_review_scope_refusal(store, args.get("scope"), tool, "scope")?;
     if let Some(scope) = parse_optional_work_scope(args.get("scope"))? {
         return Ok(Some(scope));
     }
@@ -1634,6 +1771,7 @@ fn parse_review_create_scopes<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
 ) -> Result<Vec<kin_model::WorkScope>> {
+    external_review_scope_refusal(store, args.get("scopes"), "kin_review_create", "scopes")?;
     let scopes = parse_work_scopes(args.get("scopes"))?;
     if !scopes.is_empty() {
         return Ok(scopes);
@@ -1652,22 +1790,7 @@ fn parse_review_create_scopes<G: GraphStore>(
             // A symbol outside the repository is no review scope. Its address
             // would otherwise be stored as a file path below, and its bare id
             // as an entity no review reaches.
-            if let Some(node) = super::external_symbols::lookup_external_symbol(store, raw)? {
-                return Err(McpError::InvalidParams(
-                    super::external_symbols::external_not_served_message(
-                        &node,
-                        "kin_review_create",
-                        "scopes a review to repository entities and has nothing of it here to \
-                         review",
-                    ),
-                ));
-            }
-            if super::external_symbols::is_external_address(raw) {
-                return Err(McpError::InvalidParams(format!(
-                    "External symbol not found: {}",
-                    raw.trim()
-                )));
-            }
+            external_review_scope_refusal(store, Some(value), "kin_review_create", "entity_ids")?;
             if raw.starts_with("entity:")
                 || raw.starts_with("artifact:")
                 || raw.starts_with("contract:")
@@ -1805,6 +1928,7 @@ mod tests {
             entity
         };
         let report = kin_review::ImpactReport {
+            enrichment: None,
             affected_callers: vec![direct.clone(), spanless.clone()],
             affected_dependents: vec![],
             affected_contract_consumers: vec![],
@@ -1988,6 +2112,30 @@ mod tests {
                 store.upsert_relation(&relation).unwrap();
             }
 
+            if caller_parsed_call_sites == 1 {
+                // The positive control records the resolver's actual evidence,
+                // so the repository-wide ledger observation agrees with the
+                // parser-to-edge census used by the arrival gate.
+                use crate::call_sites::fixture::{admit, ledger, proof_context};
+                let context = proof_context(kin_model::LanguageId::Python, "test");
+                let records = vec![
+                    ledger(&test_module, "", context.id(), vec![]),
+                    ledger(
+                        &test_fn,
+                        "find_note()",
+                        context.id(),
+                        vec![(
+                            "find_note",
+                            kin_model::CallSiteState::ProvenTarget {
+                                target: find_note.id,
+                            },
+                        )],
+                    ),
+                    context,
+                ];
+                admit(&store, &[], records);
+            }
+
             // A host that resolves Python, stated rather than inherited from
             // whoever runs the suite, so the only gate left to decide is the one
             // this test is about.
@@ -2088,7 +2236,12 @@ mod tests {
             let args: HashMap<String, serde_json::Value> =
                 serde_json::from_value(args).expect("an argument object");
             assert!(
-                parse_optional_scope_arg(&args, &kin_db::InMemoryGraph::new()).is_err(),
+                parse_optional_scope_arg(
+                    &args,
+                    &kin_db::InMemoryGraph::new(),
+                    "kin_review_note_add"
+                )
+                .is_err(),
                 "a misspelled scope must refuse: {args:?}"
             );
         }
@@ -2170,6 +2323,134 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn populated_impact_and_both_review_formats_disclose_recorded_enrichment_debt() {
+        use crate::call_sites::fixture::{admit, ledger, proof_context};
+        use kin_model::{CallSiteState, EntityStore, GraphNodeId, RelationKind, RelationOrigin};
+        let store = kin_db::InMemoryGraph::new();
+        let target = entity_spanning("target", "src/target.rs", 0, 0);
+        let caller = entity_spanning("caller", "src/caller.rs", 0, 0);
+        let unrelated = entity_spanning("unrelated_pending", "src/unrelated.rs", 41, 41);
+        let context = proof_context(kin_model::LanguageId::Rust, "test");
+        admit(
+            &store,
+            &[&target, &caller, &unrelated],
+            vec![
+                ledger(&target, "", context.id(), vec![]),
+                ledger(
+                    &caller,
+                    "x()",
+                    context.id(),
+                    vec![("x", CallSiteState::ProvenTarget { target: target.id })],
+                ),
+                context,
+            ],
+        );
+        store
+            .upsert_relation(&kin_model::Relation {
+                id: kin_model::RelationId::new(),
+                kind: RelationKind::Calls,
+                src: GraphNodeId::Entity(caller.id),
+                dst: GraphNodeId::Entity(target.id),
+                confidence: 1.0,
+                origin: RelationOrigin::Parsed,
+                created_in: None,
+                import_source: None,
+                evidence: vec![],
+            })
+            .unwrap();
+        let args = HashMap::from([
+            (
+                "entity_ids".into(),
+                serde_json::json!([target.id.to_string()]),
+            ),
+            ("include_traffic".into(), serde_json::json!(false)),
+        ]);
+        let sessions = SessionRegistry::empty_for_test();
+        let parse = |result, tool| {
+            let result = crate::envelope::finalize_bounded(
+                result,
+                crate::Envelope::daemon().with_health(&serde_json::json!({
+                    "initialized": true, "graph_loaded": true, "reconciliation_status": "clean",
+                })),
+                tool,
+                &crate::budget::ResponseBudget::default(),
+            );
+            let crate::types::ContentBlock::Text { text } = &result.content[0];
+            serde_json::from_str::<serde_json::Value>(text).unwrap()
+        };
+        let impact = parse(
+            handle_impact_analysis(&args, &store, &sessions)
+                .await
+                .unwrap(),
+            "impact_analysis",
+        );
+        assert!(!impact["affected_callers"].as_array().unwrap().is_empty());
+        let review_json = handle_semantic_review(
+            &HashMap::from([("format".into(), serde_json::json!("json"))])
+                .into_iter()
+                .chain(args.clone())
+                .collect(),
+            &store,
+            &sessions,
+        )
+        .unwrap();
+        let review_text = handle_semantic_review(&args, &store, &sessions).unwrap();
+        for (answer, pointer) in [
+            (impact, "/enrichment"),
+            (parse(review_json, "semantic_review"), "/impact/enrichment"),
+            (parse(review_text, "semantic_review"), "/enrichment"),
+        ] {
+            let observation = answer
+                .pointer(pointer)
+                .expect("the structured observation survives finalization");
+            assert_eq!(observation["status"], "bounded", "{answer}");
+            if let Some(formatted) = answer
+                .get("message")
+                .or_else(|| answer.get("formatted"))
+                .and_then(serde_json::Value::as_str)
+            {
+                assert_eq!(formatted.matches("not settled:").count(), 1, "{formatted}");
+                assert!(
+                    formatted.find("--- Summary ---").unwrap()
+                        < formatted.find("not settled:").unwrap()
+                );
+                assert!(
+                    formatted.contains("unrelated_pending (path: src/unrelated.rs)"),
+                    "{formatted}"
+                );
+                assert!(
+                    !formatted.contains(&unrelated.id.to_string()),
+                    "{formatted}"
+                );
+            }
+            assert_eq!(observation["total_pending_entities"], 1);
+            assert_eq!(
+                observation["pending_entities"][0]["entity_id"],
+                unrelated.id.to_string()
+            );
+            assert_eq!(
+                observation["pending_entities"][0]["projection"]["path"],
+                "src/unrelated.rs"
+            );
+            assert!(observation["pending_entities"][0]["projection"]
+                .get("line")
+                .is_none());
+            assert_eq!(
+                answer["_kin"]["verdict"]["state"], "inconclusive",
+                "{answer}"
+            );
+            assert_eq!(
+                answer["_kin"]["verdict"]["inputs"]["enrichment"],
+                "inconclusive"
+            );
+            assert!(answer["_kin"]["verdict"]["limiting_factor"]
+                .as_str()
+                .unwrap()
+                .contains("enrichment_incomplete"));
+        }
+    }
+
     /// A note anchored by file and line lands on the entity that holds the line,
     /// and on the innermost one when spans nest. A line no entity holds, and a
     /// path with no line at all, fall back to the artifact rather than guessing.
@@ -2196,7 +2477,7 @@ mod tests {
             if let Some(line) = line {
                 args.insert("line".to_string(), serde_json::json!(line));
             }
-            parse_optional_scope_arg(&args, &store)
+            parse_optional_scope_arg(&args, &store, "kin_review_note_add")
                 .expect("an anchor resolves")
                 .expect("a file_path always anchors on something")
                 .to_string()
@@ -2240,7 +2521,9 @@ mod tests {
         let mut args = HashMap::new();
         args.insert("file_path".into(), serde_json::json!("src/main.ts"));
 
-        let scope = parse_optional_scope_arg(&args, &kin_db::InMemoryGraph::new()).unwrap();
+        let scope =
+            parse_optional_scope_arg(&args, &kin_db::InMemoryGraph::new(), "kin_review_note_add")
+                .unwrap();
         assert_eq!(scope.unwrap().to_string(), "artifact:src/main.ts");
     }
 

@@ -367,6 +367,45 @@ pub struct PluginWorkspace {
     pub layout: Option<PathBuf>,
 }
 
+/// What the workspace file tells the plugin, for a proof context: the same
+/// document with every path inside `root` written relative to it, so the
+/// same repository describes itself the same way wherever it is checked out,
+/// and any change to its packages, its map or its dependency layout still
+/// reads as a different configuration. Paths outside `root`, such as Kin's
+/// dependency layout, stay as they are and are normalized with the rest of
+/// the launch.
+fn workspace_identity(workspace: &PluginWorkspace, root: &Path) -> String {
+    let relative = |path: &Path| match path.strip_prefix(root) {
+        Ok(inner) => format!(
+            "${{workspace}}/{}",
+            inner.to_string_lossy().replace('\\', "/")
+        ),
+        Err(_) => path.to_string_lossy().into_owned(),
+    };
+    let packages: Vec<serde_json::Value> = workspace
+        .packages
+        .iter()
+        .map(|package| {
+            serde_json::json!({
+                "name": package.name,
+                "dir": relative(&package.dir),
+                "tsconfig": package.tsconfig.as_deref().map(relative),
+            })
+        })
+        .collect();
+    let map: BTreeMap<&String, String> = workspace
+        .workspace_map
+        .iter()
+        .map(|(name, path)| (name, relative(path)))
+        .collect();
+    serde_json::json!({
+        "packages": packages,
+        "workspaceMap": map,
+        "layout": workspace.layout.as_deref().map(relative),
+    })
+    .to_string()
+}
+
 /// Install the plugin under `cache` and describe the workspace to it: the
 /// directory tsserver probes for the plugin, and the workspace file.
 pub fn install_workspace_plugin(
@@ -828,6 +867,10 @@ fn configure_server(
             ServerLaunch {
                 initialization_options: Some(options),
                 env: vec![(WORKSPACE_ENV.to_string(), file.display().to_string())],
+                env_identity: vec![(
+                    WORKSPACE_ENV.to_string(),
+                    workspace_identity(&workspace, root),
+                )],
                 label: format!(
                     "typescript-language-server with {typescript}, {} workspace package(s) \
                      resolvable from source; {dependencies}",
@@ -1080,6 +1123,54 @@ mod tests {
                 PathBuf::from("lib/tsconfig.json"),
                 PathBuf::from("pnpm-workspace.yaml"),
             ]
+        );
+    }
+
+    /// One repository checked out at two paths gives one proof context,
+    /// although the workspace file each launch names is keyed by its absolute
+    /// path. A different workspace is a different configuration.
+    #[test]
+    fn a_workspace_launch_proves_the_same_wherever_the_repository_is() {
+        let cache = Fixture::new("ts-relocation-cache");
+        let checkout = |name: &str, packages: &[&str]| {
+            let repo = Fixture::new(name);
+            let globs: String = packages.iter().map(|p| format!("  - {p}\n")).collect();
+            repo.write("pnpm-workspace.yaml", &format!("packages:\n{globs}"));
+            for package in packages {
+                repo.write(
+                    &format!("{package}/package.json"),
+                    &format!("{{\"name\": \"{package}\"}}"),
+                );
+                repo.write(&format!("{package}/tsconfig.json"), "{}");
+            }
+            repo
+        };
+        let basis = |repo: &Fixture| {
+            let launch = launch_with(&repo.root, &cache.root);
+            let basis = crate::proof_context::ProofBasis::of(
+                &launch,
+                &repo.root,
+                "typescript-language-server",
+                Some("typescript-language-server"),
+                Some("4.3.3"),
+            );
+            (launch.env[0].1.clone(), basis)
+        };
+
+        let (here_file, here) = basis(&checkout("ts-relocation-here", &["lib"]));
+        let (there_file, there) = basis(&checkout("ts-relocation-there", &["lib"]));
+        assert_ne!(
+            here_file, there_file,
+            "each checkout names its own workspace file"
+        );
+        assert_eq!(here, there, "and both prove under one configuration");
+
+        // One package either way, so the launch label matches and only what
+        // the workspace file says can tell the two apart.
+        let (_, other) = basis(&checkout("ts-relocation-other", &["core"]));
+        assert_ne!(
+            here, other,
+            "a workspace with other packages is another configuration"
         );
     }
 

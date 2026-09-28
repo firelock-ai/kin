@@ -366,6 +366,27 @@ pub(crate) fn parse_work_scope(s: &str) -> Result<WorkScope> {
     Ok(kin_mcp::handlers::common::parse_single_work_scope(s)?)
 }
 
+/// [`parse_work_scope`] after the check every scope argument asks first: a
+/// scope naming a symbol outside the repository is refused by what it names,
+/// in `command`'s words, rather than stored as an entity or refused as a
+/// spelling. `why` finishes the refusal's sentence after the command's name,
+/// the clause the MCP tool refuses the same scope with.
+pub(crate) fn parse_graph_work_scope<G: GraphStore>(
+    graph: &G,
+    scope: &str,
+    command: &str,
+    why: &str,
+) -> Result<WorkScope> {
+    if let Some(lines) = crate::commands::external_symbols::scope_argument_refusal(
+        graph,
+        scope,
+        &format!("`{command}` {why}"),
+    )? {
+        anyhow::bail!(lines.join("\n"));
+    }
+    parse_work_scope(scope)
+}
+
 fn render_work_list(
     graph: &kin_db::InMemoryGraph,
     status: Option<String>,
@@ -387,7 +408,17 @@ fn render_work_list(
                     .map_err(|e| anyhow::anyhow!(e))
             })
             .transpose()?,
-        scope: scope.as_deref().map(parse_work_scope).transpose()?,
+        scope: scope
+            .as_deref()
+            .map(|scope| {
+                parse_graph_work_scope(
+                    graph,
+                    scope,
+                    "kin work list",
+                    crate::commands::external_symbols::WORK_LIST_WHY,
+                )
+            })
+            .transpose()?,
     };
 
     let items = graph.list_work_items(&filter)?;
@@ -659,7 +690,14 @@ pub fn execute_work_request(
                 .parse()
                 .map_err(|e: String| anyhow::anyhow!(e))?;
             let scopes = scope
-                .map(|s| parse_work_scope(&s))
+                .map(|s| {
+                    parse_graph_work_scope(
+                        graph,
+                        &s,
+                        "kin work create",
+                        crate::commands::external_symbols::WORK_SCOPE_WHY,
+                    )
+                })
                 .transpose()?
                 .into_iter()
                 .collect();
@@ -703,7 +741,12 @@ pub fn execute_work_request(
         WorkRequest::Show { work_id } => render_work_show(graph, work_id)?,
         WorkRequest::Link { work_id, scope } => {
             let id = parse_work_id(&work_id)?;
-            let ws = parse_work_scope(&scope)?;
+            let ws = parse_graph_work_scope(
+                graph,
+                &scope,
+                "kin work link",
+                crate::commands::external_symbols::WORK_SCOPE_WHY,
+            )?;
             let mut item = graph
                 .get_work_item(&id)?
                 .ok_or_else(|| anyhow::anyhow!("work item not found: {}", work_id))?;
@@ -758,7 +801,12 @@ pub fn execute_work_request(
         }
         WorkRequest::Implement { work_id, scope } => {
             let id = parse_work_id(&work_id)?;
-            let scope = parse_work_scope(&scope)?;
+            let scope = parse_graph_work_scope(
+                graph,
+                &scope,
+                "kin work implement",
+                crate::commands::external_symbols::WORK_SCOPE_WHY,
+            )?;
             graph
                 .get_work_item(&id)?
                 .ok_or_else(|| anyhow::anyhow!("work item not found: {}", work_id))?;
@@ -956,6 +1004,121 @@ pub fn execute_work_request(
 mod tests {
     use super::*;
     use kin_model::WorkStore;
+
+    /// Work is linked to repository scopes. `kin work create`, `link`,
+    /// `implement` and `list --scope` refuse a scope naming a symbol outside
+    /// the repository, by its address, as an `entity:` scope or by its bare id,
+    /// naming the symbol and the command that lists its callers, as the MCP
+    /// tools refuse it, and nothing is written. An address naming nothing held
+    /// is said to name nothing.
+    #[test]
+    fn work_scopes_refuse_an_external_symbol_by_what_it_is() {
+        let store = crate::commands::external_symbols::fixture::external_store(false);
+        let dir = tempfile::tempdir().unwrap();
+        let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
+        let item = WorkItem {
+            work_id: WorkId::new(),
+            kind: WorkKind::Task,
+            title: "replace the map".into(),
+            description: String::new(),
+            status: WorkStatus::Proposed,
+            priority: Priority::None,
+            scopes: vec![],
+            acceptance_criteria: vec![],
+            external_refs: vec![],
+            created_by: IdentityRef::human("cli-user"),
+            created_at: Timestamp::now(),
+        };
+        store.graph.create_work_item(&item).unwrap();
+        let work_id = item.work_id.to_string();
+        let refused = |request: WorkRequest, command: &str| {
+            let error = match execute_work_request(&layout, &store.graph, request) {
+                Ok(execution) => panic!("{command} answered: {}", execution.response.text),
+                Err(error) => format!("{error:#}"),
+            };
+            assert!(error.contains("Array.map"), "{error}");
+            assert!(error.contains(&format!("`{command}`")), "{error}");
+            assert!(
+                error.contains(&format!("kin refs {}", store.address())),
+                "{error}"
+            );
+            assert!(!error.contains("unrecognized scope"), "{error}");
+        };
+        for scope in [
+            store.address(),
+            format!("entity:{}", store.node.id),
+            store.node.id.to_string(),
+        ] {
+            refused(
+                WorkRequest::Create {
+                    kind: "task".into(),
+                    title: "replace the map".into(),
+                    description: None,
+                    scope: Some(scope.clone()),
+                    priority: None,
+                },
+                "kin work create",
+            );
+            refused(
+                WorkRequest::Link {
+                    work_id: work_id.clone(),
+                    scope: scope.clone(),
+                },
+                "kin work link",
+            );
+            refused(
+                WorkRequest::Implement {
+                    work_id: work_id.clone(),
+                    scope: scope.clone(),
+                },
+                "kin work implement",
+            );
+            refused(
+                WorkRequest::List {
+                    status: None,
+                    kind: None,
+                    scope: Some(scope),
+                },
+                "kin work list",
+            );
+        }
+        let unknown = "external_reference:00000000-0000-8000-8000-000000000000";
+        let error = match execute_work_request(
+            &layout,
+            &store.graph,
+            WorkRequest::Link {
+                work_id: work_id.clone(),
+                scope: unknown.into(),
+            },
+        ) {
+            Ok(execution) => panic!("an unknown address was linked: {}", execution.response.text),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(
+            error.contains("names no symbol outside the repository"),
+            "{error}"
+        );
+
+        let items = store.graph.list_work_items(&WorkFilter::default()).unwrap();
+        assert_eq!(items.len(), 1, "a refused create writes nothing");
+        assert!(items[0].scopes.is_empty(), "a refused link writes nothing");
+        assert!(store
+            .graph
+            .get_implementors(&item.work_id)
+            .unwrap()
+            .is_empty());
+
+        // A held entity is linked as before.
+        execute_work_request(
+            &layout,
+            &store.graph,
+            WorkRequest::Link {
+                work_id,
+                scope: format!("entity:{}", store.caller.id),
+            },
+        )
+        .expect("a held entity is linked");
+    }
 
     /// The CLI reads a scope through the same parser as the MCP tools, so a bare
     /// path is refused here too rather than becoming a path scope.

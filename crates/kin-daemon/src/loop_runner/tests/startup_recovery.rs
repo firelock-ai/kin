@@ -202,7 +202,7 @@ async fn startup_diagnostic_watch_arms_before_marked_repair_is_live() {
         cancel_rx,
         Some(WatchArmed::new(armed_tx)),
     ));
-    let arming = crate::daemon::await_watch_armed(armed_rx, Duration::from_secs(5)).await;
+    let arming = crate::daemon::await_watch_armed(armed_rx, WATCH_ARMING_BOUND).await;
     let live_at_arm = state.graph.entity_count();
     let durable_at_arm = state.durable_entity_count();
     startup_diagnostic_trace("watch_armed_while_startup_gate_held", &state);
@@ -315,7 +315,7 @@ async fn startup_diagnostic_full_loop_must_not_certify_the_missing_function() {
         cancel_rx,
         Some(WatchArmed::new(armed_tx)),
     ));
-    let arming = crate::daemon::await_watch_armed(armed_rx, Duration::from_secs(5)).await;
+    let arming = crate::daemon::await_watch_armed(armed_rx, WATCH_ARMING_BOUND).await;
     let completed = tokio::time::timeout(Duration::from_secs(30), async {
         while state
             .graph

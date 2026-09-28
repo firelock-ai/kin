@@ -1589,25 +1589,14 @@ pub(crate) struct NativeAmend {
     pub message: Option<String>,
 }
 
-/// Check the selected head before filesystem admission can mutate the workspace.
+/// [`validate_native_amend_head_from`] through an open of the test's own.
+#[cfg(test)]
 pub(crate) fn validate_native_amend_head(
     authority_context: &LocalRepositoryAuthorityContext,
     expected_head: SemanticChangeId,
 ) -> Result<()> {
     let authority = authority_context.open()?;
-    let lease = authority.read_authority();
-    let workspace = lease
-        .metadata()
-        .workspaces
-        .iter()
-        .find(|workspace| workspace.workspace_id == authority_context.workspace_id())
-        .ok_or_else(|| invalid("repository authority has no local workspace"))?;
-    let (_, _, head) = resolve_commit_base(
-        lease.metadata(),
-        &workspace.head,
-        workspace.base_target.as_ref(),
-    )?;
-    require_amend_head(head, expected_head)
+    validate_native_amend_head_from(&authority, authority_context.workspace_id(), expected_head)
 }
 
 fn require_amend_head(head: Option<SemanticChangeId>, expected: SemanticChangeId) -> Result<()> {
@@ -1620,6 +1609,9 @@ fn require_amend_head(head: Option<SemanticChangeId>, expected: SemanticChangeId
     }
 }
 
+/// An amend planned through an open of the caller's own. The commit route plans
+/// amends through [`plan_command_commit`] and the authority the daemon holds.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn plan_native_amend(
     graph: &kin_db::InMemoryGraph,
@@ -1646,8 +1638,78 @@ pub(crate) fn plan_native_amend(
     )
 }
 
+/// Plan the transaction `/commands/commit` publishes, reading and then
+/// publishing through `held`, the authority the daemon holds for the current
+/// publication.
+///
+/// The ordinary, amend and declared-carry shapes differ only in what they pass
+/// here, so the route plans all three through one function rather than three
+/// that each open the store for themselves. The declared-carry shape is an
+/// agent toolchain run's: it has no transaction, its admission has just been
+/// published into the live graph, and naming `authored_files` makes the
+/// message declare any other pending content the change carries, exactly as
+/// an MCP commit does. An open decodes the complete
+/// persisted authority and re-verifies every body in repository CAS; the held
+/// authority was verified when the daemon loaded it and is handed out only
+/// while `authority.json` reads as it did before that load. The storage
+/// compare-and-swap at publication still refuses a head that moved after the
+/// plan was read.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn plan_command_commit(
+    graph: &kin_db::InMemoryGraph,
+    blobs: &kin_blobs::BlobStore,
+    authority_context: &LocalRepositoryAuthorityContext,
+    held: Arc<RepositoryAuthorityManager<LocalFileBackend>>,
+    operation_id: OperationId,
+    timestamp: Timestamp,
+    author: AuthorId,
+    authored_files: Option<&BTreeSet<RepoPath>>,
+    message: &dyn Fn(&[RepoPath]) -> String,
+    amend: Option<&NativeAmend>,
+) -> Result<NativeCommitPlan> {
+    plan_native_commit_inner(
+        graph,
+        blobs,
+        authority_context,
+        operation_id,
+        timestamp,
+        author,
+        authored_files,
+        message,
+        None,
+        amend,
+        SemanticCurrency::DaemonMaintained,
+        Some(held),
+    )
+}
+
+/// Check the selected head before filesystem admission can mutate the workspace,
+/// against the authority the caller already holds, so the commit route checks
+/// the head it is asked to amend without an open of its own.
+pub(crate) fn validate_native_amend_head_from(
+    authority: &RepositoryAuthorityManager<LocalFileBackend>,
+    workspace_id: WorkspaceId,
+    expected_head: SemanticChangeId,
+) -> Result<()> {
+    let lease = authority.read_authority();
+    let workspace = lease
+        .metadata()
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.workspace_id == workspace_id)
+        .ok_or_else(|| invalid("repository authority has no local workspace"))?;
+    let (_, _, head) = resolve_commit_base(
+        lease.metadata(),
+        &workspace.head,
+        workspace.base_target.as_ref(),
+    )?;
+    require_amend_head(head, expected_head)
+}
+
 /// Construct one exact native transaction without mutating repository
-/// authority.
+/// authority, through an open of the caller's own. The commit route plans
+/// through [`plan_command_commit`] and the authority the daemon holds.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn plan_native_commit(
     graph: &kin_db::InMemoryGraph,
@@ -1751,41 +1813,6 @@ pub(crate) fn plan_native_commit_from_base_declaring_carry(
         None,
         SemanticCurrency::AuthoritySnapshot,
         held,
-    )
-}
-
-/// Plan one exact native transaction from the daemon's live graph whose
-/// message states which of the files it publishes the caller did not author.
-///
-/// [`plan_native_commit_from_base_declaring_carry`] plans against the base a
-/// transaction captured when it began. An agent's toolchain run has no
-/// transaction: its admission has just been published into the live graph,
-/// and this records that admission as a change, declaring any other pending
-/// content the change carries exactly as an MCP commit does.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn plan_native_commit_declaring_carry(
-    graph: &kin_db::InMemoryGraph,
-    blobs: &kin_blobs::BlobStore,
-    authority_context: &LocalRepositoryAuthorityContext,
-    operation_id: OperationId,
-    timestamp: Timestamp,
-    author: AuthorId,
-    authored_files: &BTreeSet<RepoPath>,
-    message: &dyn Fn(&[RepoPath]) -> String,
-) -> Result<NativeCommitPlan> {
-    plan_native_commit_inner(
-        graph,
-        blobs,
-        authority_context,
-        operation_id,
-        timestamp,
-        author,
-        Some(authored_files),
-        message,
-        None,
-        None,
-        SemanticCurrency::DaemonMaintained,
-        None,
     )
 }
 

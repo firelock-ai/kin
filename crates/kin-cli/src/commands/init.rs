@@ -229,11 +229,28 @@ struct UncommittedPathPayload {
 /// its exit status reports the admission rather than the reader going away. A
 /// progress line is not worth an exit code, let alone a panic, so this drops the
 /// line instead.
+///
+/// Silent while the short form draws its own live line, which a note would be
+/// written through; the rows and the closing block say what the notes would
+/// have. See [`quiet_notes`].
 macro_rules! note {
     ($($arg:tt)*) => {{
-        use std::io::Write as _;
-        let _ = writeln!(std::io::stderr(), $($arg)*);
+        if !NOTES_QUIET.load(std::sync::atomic::Ordering::Relaxed) {
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr(), $($arg)*);
+        }
     }};
+}
+
+/// Whether conversion-phase notes are withheld for the short form.
+static NOTES_QUIET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Withhold every conversion-phase note for the rest of this process.
+///
+/// For the short form only, which says the same things in its rows. The full
+/// form, every pipe and `--json` keep every note on stderr.
+pub(crate) fn quiet_notes() {
+    NOTES_QUIET.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Exit status for a conversion that produced a store whose semantic enrichment
@@ -263,6 +280,7 @@ pub async fn run(
     json: bool,
     no_enrich: bool,
     adopt_repository_id: Option<String>,
+    verbose: bool,
 ) -> Result<i32> {
     let _span = tracing::info_span!("kin.init").entered();
     // Read before any work, so the closing summary can say what this run did
@@ -282,9 +300,57 @@ pub async fn run(
         .unwrap_or_else(|| std::env::current_dir().expect("cannot determine current directory"));
 
     let adopted = parse_adopted_repository_id(adopt_repository_id.as_deref())?;
+    // A person at a terminal gets the short form; `--json`, `--verbose`, a
+    // pipe and CI keep the full record scripts read.
+    let short = !json && crate::screen::short_form(verbose);
 
     ensure_directory(&dir)?;
-    reject_existing_repository(&dir)?;
+    // Reopening a repository reads its authority, starts its daemon and asks
+    // it for the search index, which on a large store is tens of seconds. A
+    // live line says which of those it is on, from a moment in, so a warm
+    // reopen that answers fast never shows it.
+    let style = crate::screen::Style::for_stdout();
+    let reopening = (!json && path_exists(&dir.join(".kin"))?)
+        .then(|| crate::screen::LiveLine::start_after(style, "Reopening", LIVE_LINE_DELAY))
+        .flatten();
+    let step = |label: &str, note: &str| {
+        if let Some(live) = &reopening {
+            live.label(label);
+            live.note(note);
+        }
+    };
+    step("Reopening", "reading the repository");
+    if let Some(existing) = answer_existing_repository(&dir, json, adopted.is_some())? {
+        // A store that is already here may still owe background work, such as
+        // a search index a stopped daemon left half built. Starting its daemon
+        // resumes that work, and the answer says so rather than "nothing to do".
+        crate::first_run::quiet_daemon_start();
+        step("Starting daemon", "it resumes any unfinished work");
+        let index = search_index_standing(&existing.layout).await;
+        step("Next step", "finding a function to ask about");
+        let next = suggest_first_question(&existing.layout).await.map_or_else(
+            || "kin refs <function>".to_string(),
+            |name| format!("kin refs {name}"),
+        );
+        if let Some(live) = reopening {
+            live.finish();
+        }
+        let mut out = String::new();
+        for line in existing_repository_lines(
+            style,
+            &existing,
+            &index,
+            &next,
+            crate::screen::right_edge(),
+            short,
+        ) {
+            out.push_str(&line);
+            out.push('\n');
+        }
+        emit(&out)?;
+        return Ok(0);
+    }
+    drop(reopening);
 
     let boundary = if path_exists(&dir.join(".git"))? {
         InitBoundary::ExactGit
@@ -298,26 +364,120 @@ pub async fn run(
     // error. `--json` output is read by a program and never carries it.
     crate::banner::print_once(!json);
 
+    let view = short.then(|| {
+        let screen = std::sync::Arc::new(crate::first_run::Screen::new(
+            crate::screen::Style::for_stdout(),
+        ));
+        let name = repository_name(&dir);
+        let header = match (boundary, git_commit_count(&dir)) {
+            (InitBoundary::NativeUnborn, _) => {
+                format!("  Starting {name} as a new Kin repository")
+            }
+            (InitBoundary::ExactGit, Some(commits)) => format!(
+                "  Reading {name}: {} {} of Git history",
+                crate::screen::count(commits),
+                if commits == 1 { "commit" } else { "commits" }
+            ),
+            (InitBoundary::ExactGit, None) => format!("  Reading {name}'s Git history"),
+        };
+        screen.lines(&[header, String::new()]);
+        screen
+    });
+
     // Both boundaries honour adoption. A flag that worked on one of them and
     // was silently ignored on the other would produce a store that looks
     // adopted and pushes nowhere, which is the failure this whole path exists
     // to remove.
-    let result = match (boundary, &adopted) {
-        (InitBoundary::ExactGit, None) => kin_core::init_from_git(&dir)
-            .context("admit exact reachable Git repository authority")?,
+    let result = admit_showing_progress(view.as_ref(), || match (boundary, &adopted) {
+        (InitBoundary::ExactGit, None) => {
+            kin_core::init_from_git(&dir).context("admit exact reachable Git repository authority")
+        }
         (InitBoundary::ExactGit, Some(adopted)) => kin_core::init_from_git_adopting(&dir, adopted)
             .with_context(|| {
                 format!("admit exact reachable Git repository authority adopting {adopted}")
-            })?,
+            }),
         (InitBoundary::NativeUnborn, None) => {
-            kin_core::init(&dir).context("initialize unborn Kin-native repository authority")?
+            kin_core::init(&dir).context("initialize unborn Kin-native repository authority")
         }
         (InitBoundary::NativeUnborn, Some(adopted)) => kin_core::init_adopting(&dir, adopted)
             .with_context(|| {
                 format!("initialize unborn Kin-native repository authority adopting {adopted}")
-            })?,
-    };
+            }),
+    })?;
 
+    let after = after_admission(&result, no_enrich, view.clone()).await;
+
+    if json {
+        print_json_result(
+            &result,
+            boundary,
+            &after.reported,
+            after.cross_file.payload(after.enrichment_elapsed),
+            &after.graph_section_materialization,
+            after.daemon_death.as_ref(),
+        )?;
+    } else if let Some(screen) = &view {
+        print_short_result(screen, &result, &after, None);
+    } else {
+        print_human_result(
+            &result,
+            boundary,
+            &after.reported,
+            &after.cross_file,
+            &after.graph_section_materialization,
+            &model_before,
+            after.daemon_death.as_ref(),
+        )?;
+    }
+    Ok(after.exit_code())
+}
+
+/// What the post-admission pipeline did, for whichever command admitted.
+///
+/// `kin init` and `kin clone` over Git both end in an admitted store, and both
+/// owe it the same work after admission: the graph section its first reopen
+/// reads, `.kin/` kept out of `git status`, a registry entry, the language
+/// servers the repository needs, the cross-file linking phase and the first
+/// embedding pass. [`after_admission`] is that work, once, for both.
+pub(crate) struct AfterAdmission {
+    graph_section_materialization: InitGraphSectionMaterialization,
+    cross_file: CrossFileEnrichment,
+    enrichment_elapsed: std::time::Duration,
+    /// The durable values to report, read after the phase where it may have
+    /// published.
+    reported: ReportedAuthority,
+    /// A daemon serving this store that died during the phase, read once so
+    /// the words and the exit status come from one reading.
+    daemon_death: Option<kin_daemon_spawn::DaemonKillRecord>,
+}
+
+impl AfterAdmission {
+    /// The exit status this conversion reports: 0, or 7 and 8 with the
+    /// meanings [`EXIT_ENRICHMENT_UNATTESTED`] and
+    /// [`EXIT_GRAPH_SECTION_UNMATERIALIZED`] give them.
+    pub(crate) fn exit_code(&self) -> i32 {
+        exit_code_for(
+            self.daemon_death.as_ref(),
+            self.graph_section_materialization.is_failed(),
+        )
+    }
+}
+
+/// Run everything a conversion owes an admitted store before it reports.
+///
+/// Never fails: the store is durable before this starts, and each step that
+/// can go wrong reports and carries on, so an admission that succeeded is
+/// never turned into a failure by work that only makes it faster or richer.
+/// `view` is the short form's screen, when a person is watching.
+pub(crate) async fn after_admission(
+    result: &kin_core::InitResult,
+    no_enrich: bool,
+    view: Option<std::sync::Arc<crate::first_run::Screen>>,
+) -> AfterAdmission {
+    if view.is_some() {
+        quiet_notes();
+        crate::first_run::quiet_daemon_start();
+    }
     // Core init has finished publishing and proving semantic authority here.
     // Reopen that exact persisted authority in a short-lived scope and memoize
     // its complete workspace base before enrichment starts a daemon. This
@@ -353,6 +513,11 @@ pub async fn run(
         );
     }
 
+    // Before linking, because linking is what a server is for. Only with the
+    // consent `kin setup` recorded, and only the servers this repository's
+    // own languages need.
+    provision_language_servers(result.layout.working_dir(), no_enrich, view.as_ref()).await;
+
     // Conversion is not finished when the graph exists. Cross-file reference,
     // override and type-use edges are not derivable from a single-file parse:
     // they need a resolved program from a language server, and until this ran
@@ -373,7 +538,8 @@ pub async fn run(
         // forever is a worse guarantee than making the phase structurally unable
         // to matter.
         let kin_root = result.layout.root().to_path_buf();
-        match tokio::spawn(async move { enrich_after_init(&kin_root).await }).await {
+        let phase_view = view.clone();
+        match tokio::spawn(async move { enrich_after_init(&kin_root, phase_view).await }).await {
             Ok(outcome) => outcome,
             Err(error) => {
                 note!("note: the cross-file enrichment phase did not finish cleanly: {error}");
@@ -388,10 +554,23 @@ pub async fn run(
         )
     };
     let enrichment_elapsed = enrichment_started.elapsed();
+    if let Some(screen) = &view {
+        // Whichever rows the phase did not reach, such as a sweep refused
+        // before it started a daemon.
+        show_linked(screen, &cross_file);
+        show_search_index(screen, None);
+    }
+
+    // The AI clients whose Kin entry has to name a repository and lives
+    // outside it (Codex CLI, Grok CLI) could only wait during `kin setup`,
+    // which ran outside one. This is the repository, so they are connected here, with the
+    // consent setup recorded, rather than by a second run of setup. Reported
+    // on stderr off the short form, so `--json` keeps stdout to one document.
+    connect_waiting_clients(result.layout.working_dir(), view.as_ref());
 
     // After the phase, never before it: a sweep publishes as it goes, so what
     // admission published is not what the store holds once the phase ends.
-    let reported = ReportedAuthority::after_enrichment(&result, &cross_file);
+    let reported = ReportedAuthority::after_enrichment(result, &cross_file);
 
     // Read once, here, and handed to whichever surface reports it. The kill
     // happens during the enrichment phase above and leaves nothing in this
@@ -400,30 +579,833 @@ pub async fn run(
     // person reads and the number a script reads disagree about the same run.
     let daemon_death = crate::daemon_death::recorded_for_store(result.layout.root());
 
-    if json {
-        print_json_result(
-            &result,
-            boundary,
-            &reported,
-            cross_file.payload(enrichment_elapsed),
-            &graph_section_materialization,
-            daemon_death.as_ref(),
-        )?;
+    let author_warning =
+        author_warning_lines(&result.layout, crate::screen::right_edge(), view.is_some());
+    if let Some(screen) = &view {
+        screen.lines(&author_warning);
     } else {
-        print_human_result(
-            &result,
-            boundary,
-            &reported,
-            &cross_file,
-            &graph_section_materialization,
-            &model_before,
-            daemon_death.as_ref(),
-        )?;
+        for line in author_warning {
+            eprintln!("{line}");
+        }
     }
-    Ok(exit_code_for(
-        daemon_death.as_ref(),
-        graph_section_materialization.is_failed(),
-    ))
+
+    AfterAdmission {
+        graph_section_materialization,
+        cross_file,
+        enrichment_elapsed,
+        reported,
+        daemon_death,
+    }
+}
+
+/// Connect the clients that were waiting for a repository, and say so.
+fn connect_waiting_clients(
+    working_dir: &Path,
+    view: Option<&std::sync::Arc<crate::first_run::Screen>>,
+) {
+    use crate::screen::Status;
+    for connection in crate::commands::setup::connect_waiting_clients(working_dir, true) {
+        match (&connection.outcome, view) {
+            (Ok(path), Some(screen)) => screen.row(
+                Status::Ok,
+                connection
+                    .client
+                    .strip_prefix("Google ")
+                    .unwrap_or(connection.client),
+                &format!(
+                    "connected to this repository · {}",
+                    crate::screen::fit(&crate::screen::home_relative(path), 22)
+                ),
+                None,
+            ),
+            (Err(reason), Some(screen)) => screen.row(
+                Status::Warn,
+                connection
+                    .client
+                    .strip_prefix("Google ")
+                    .unwrap_or(connection.client),
+                &format!("not connected: {reason}"),
+                None,
+            ),
+            (Ok(path), None) => eprintln!(
+                "Connected {} to this repository ({}).",
+                connection.client,
+                path.display()
+            ),
+            (Err(reason), None) => eprintln!(
+                "warning: {} was not connected to this repository: {reason}",
+                connection.client
+            ),
+        }
+    }
+}
+
+/// Install the language servers this repository's languages need, when
+/// `kin setup` recorded consent, and record which serve it.
+///
+/// Scoped to the repository: its languages come from the same configuration
+/// read `kin doctor` uses before a graph can answer, and only a server one of
+/// them needs is installed. A repository too large to count is not guessed
+/// at, so nothing is installed for it. Installer output stays on stderr, so
+/// `--json` keeps stdout to its one document.
+async fn provision_language_servers(
+    working_dir: &Path,
+    no_enrich: bool,
+    view: Option<&std::sync::Arc<crate::first_run::Screen>>,
+) {
+    use crate::commands::language_servers::{self as servers, LanguageScope};
+    use crate::first_run::ServerInstall;
+
+    let consent = crate::commands::setup::kin_dir()
+        .ok()
+        .and_then(|kin_home| servers::recorded_install_consent(&kin_home));
+    // Off the short form nothing is shown, so without consent there is
+    // nothing to do and the repository's languages are not counted at all.
+    if view.is_none() && (consent != Some(true) || no_enrich) {
+        return;
+    }
+    let languages = match servers::language_scope(working_dir, None) {
+        LanguageScope::Repository(languages) => languages,
+        LanguageScope::Unknown(_) => Vec::new(),
+    };
+    let missing: Vec<kin_model::LanguageId> = servers::missing_enrichable_languages()
+        .into_iter()
+        .filter(|language| languages.contains(language))
+        .collect();
+
+    match crate::first_run::server_install(consent, no_enrich, &missing) {
+        ServerInstall::Nothing => {}
+        // Nothing is installed without a recorded yes. The Linked row names
+        // the language it could not link and the command that adds its
+        // server, so no second row repeats it here.
+        ServerInstall::Offer(_) => {}
+        ServerInstall::Install(missing) => {
+            install_language_servers(missing, view).await;
+        }
+    }
+
+    if let Some(screen) = view {
+        let mut names = Vec::new();
+        for language in &languages {
+            if let Some(binary) = servers::recipe_for(*language).and_then(|recipe| {
+                recipe
+                    .binaries
+                    .iter()
+                    .find(|binary| which::which(binary).is_ok())
+            }) {
+                names.push(crate::first_run::server_name(binary));
+            }
+        }
+        let mut facts = screen.facts();
+        facts.languages = languages
+            .iter()
+            .map(|language| crate::first_run::language_name(*language))
+            .collect();
+        facts.servers = dedup(names);
+    }
+}
+
+fn dedup(items: Vec<String>) -> Vec<String> {
+    let mut seen = Vec::new();
+    for item in items {
+        if !seen.contains(&item) {
+            seen.push(item);
+        }
+    }
+    seen
+}
+
+/// Install `missing` through the routes `kin setup` and `kin doctor` use, one
+/// row per install on the short form, one stderr line per install otherwise.
+async fn install_language_servers(
+    missing: Vec<kin_model::LanguageId>,
+    view: Option<&std::sync::Arc<crate::first_run::Screen>>,
+) {
+    use crate::commands::language_servers::{self as servers, InstallConsent, InstallOutcome};
+    use crate::screen::Status;
+
+    // Each install's route and duration, for its row. One command can serve
+    // two languages, and `provision` runs it once, so a language without an
+    // entry here shared another's install.
+    let runs: std::sync::Arc<
+        std::sync::Mutex<
+            Vec<(
+                kin_model::LanguageId,
+                servers::InstallRoute,
+                std::time::Duration,
+            )>,
+        >,
+    > = std::sync::Arc::default();
+    let recorded = std::sync::Arc::clone(&runs);
+    if let Some(screen) = view {
+        screen.start("Language server");
+    }
+    let live = view.cloned();
+    let reports = servers::provision_async(
+        missing,
+        InstallConsent::Granted,
+        |recipe| recipe.installed(),
+        servers::resolve_route,
+        |_, _| true,
+        move |recipe, route| {
+            match &live {
+                Some(screen) => screen.note(&format!(
+                    "installing {}",
+                    crate::first_run::server_name(recipe.binaries[0])
+                )),
+                None => {
+                    let mut stderr = std::io::stderr();
+                    let _ = writeln!(
+                        stderr,
+                        "Installing the {} language server, as `kin setup` recorded you allow: {}",
+                        recipe.language,
+                        recipe.route_command_line(route)
+                    );
+                }
+            }
+            let started = std::time::Instant::now();
+            let result = servers::run_install(recipe, route);
+            if let Ok(mut runs) = recorded.lock() {
+                runs.push((recipe.language, route, started.elapsed()));
+            }
+            result
+        },
+    )
+    .await;
+    let reports = match reports {
+        Ok(reports) => reports,
+        Err(error) => {
+            match view {
+                Some(screen) => screen.row(
+                    Status::Fail,
+                    "Language server",
+                    "the install did not finish",
+                    None,
+                ),
+                None => note!("note: the language server install did not finish: {error}"),
+            }
+            return;
+        }
+    };
+    let runs = runs.lock().map(|runs| runs.clone()).unwrap_or_default();
+    for report in reports {
+        let Some(recipe) = servers::recipe_for(report.language) else {
+            continue;
+        };
+        let name = crate::first_run::server_name(recipe.binaries[0]);
+        let run = runs
+            .iter()
+            .find(|(language, _, _)| *language == report.language)
+            .map(|(_, route, elapsed)| (*route, *elapsed));
+        let (status, value, detail) = match (&report.outcome, run) {
+            (InstallOutcome::Installed { .. }, Some((route, _))) => (
+                Status::Ok,
+                format!("{name} ({})", install_route_label(recipe, route)),
+                None,
+            ),
+            (InstallOutcome::RanButStillMissing { .. }, Some(_)) => (
+                Status::Warn,
+                format!("{name} installed, but not found on PATH"),
+                Some(servers::RESTART_AFTER_INSTALL.to_string()),
+            ),
+            (InstallOutcome::Failed { reason, .. }, Some(_)) => (
+                Status::Fail,
+                format!("{name} didn't install"),
+                Some(reason.clone()),
+            ),
+            (InstallOutcome::ChecksumRefused { reason, .. }, Some(_)) => (
+                Status::Fail,
+                format!("{name} refused: its download did not match"),
+                Some(reason.clone()),
+            ),
+            (InstallOutcome::NoInstaller { program, .. }, _) => (
+                Status::Warn,
+                format!("{name} needs {program}, which isn't installed"),
+                None,
+            ),
+            // Already present, or served by an install another language ran.
+            _ => continue,
+        };
+        let elapsed = run.map(|(_, elapsed)| elapsed);
+        match view {
+            Some(screen) => {
+                screen.row(status, "Language server", &value, elapsed);
+                if let Some(detail) = &detail {
+                    if status != Status::Ok {
+                        screen.hint(detail);
+                    }
+                }
+            }
+            None => {
+                let mut stderr = std::io::stderr();
+                let _ = writeln!(stderr, "  {}: {value}", recipe.language);
+                if let Some(detail) = detail {
+                    let _ = writeln!(stderr, "    {detail}");
+                }
+            }
+        }
+    }
+    if let Some(screen) = view {
+        screen.finish();
+    }
+}
+
+/// How an install ran, in a row's words: `npm, global`.
+fn install_route_label(
+    recipe: &crate::commands::language_servers::LanguageServerRecipe,
+    route: crate::commands::language_servers::InstallRoute,
+) -> String {
+    use crate::commands::language_servers::InstallRoute;
+    match route {
+        InstallRoute::Installer if recipe.program == "npm" => "npm, global".to_string(),
+        InstallRoute::Installer if recipe.program == "go" => "go install".to_string(),
+        InstallRoute::Installer => recipe.program.to_string(),
+        InstallRoute::ManagedPrefix => format!(
+            "{}, {}",
+            recipe.program,
+            crate::screen::home_relative(&recipe.managed_prefix_bin_dir())
+        ),
+        InstallRoute::PinnedRelease => format!(
+            "release binary, {}",
+            crate::screen::home_relative(&kin_core::tool_prefix::managed_tool_bin_dir())
+        ),
+    }
+}
+
+/// The short form's end: a row for anything that needs the reader, then the
+/// closing block.
+///
+/// `cd` is where a clone's reader goes first.
+pub(crate) fn print_short_result(
+    screen: &crate::first_run::Screen,
+    result: &kin_core::InitResult,
+    after: &AfterAdmission,
+    cd: Option<String>,
+) {
+    use crate::screen::Status;
+    if crate::daemon_death::enrichment_caveat(after.daemon_death.as_ref()).names_a_death() {
+        screen.row(
+            Status::Warn,
+            "Daemon",
+            "stopped while linking · kin doctor says more",
+            None,
+        );
+    }
+    if after.graph_section_materialization.is_failed() {
+        screen.row(
+            Status::Warn,
+            "Graph section",
+            "not saved · kin graph materialize retries it",
+            None,
+        );
+    }
+    let divergence = &result.workspace_divergence;
+    if !divergence.is_empty() {
+        screen.row(
+            Status::Off,
+            "Uncommitted",
+            &format!(
+                "{} {} · the daemon takes them in as workspace state",
+                crate::screen::count(divergence.observed_paths() as u64),
+                if divergence.observed_paths() == 1 {
+                    "path"
+                } else {
+                    "paths"
+                }
+            ),
+            None,
+        );
+    }
+    let facts = screen.facts().clone();
+    let enrichment = &after.reported.semantic_enrichment;
+    let closing = crate::first_run::Closing {
+        name: repository_name(result.layout.working_dir()),
+        languages: facts.languages,
+        entities: enrichment.entity_count as u64,
+        relations: enrichment.relation_count as u64,
+        linking: facts
+            .linking
+            .unwrap_or_else(|| linking_for(&after.cross_file)),
+        servers: facts.servers,
+        cd,
+        suggestion: facts.suggestion,
+    };
+    screen.lines(&crate::first_run::closing_lines(screen.style(), &closing));
+}
+
+/// The lines the full form prints about enrichment: the "Semantic enrichment"
+/// line and the warnings beneath it, exactly as `kin init` words them.
+///
+/// `kin clone` prints these too, in place of the "not run" it used to print
+/// when it ran no enrichment.
+pub(crate) fn enrichment_report_lines(after: &AfterAdmission) -> Vec<String> {
+    let enrichment = &after.reported.semantic_enrichment;
+    let mut lines = vec![format!(
+        "  Semantic enrichment: {}",
+        render_semantic_enrichment(enrichment, after.daemon_death.as_ref(), &after.cross_file)
+    )];
+    lines.extend(enrichment_kill_warning(after.daemon_death.as_ref()));
+    lines.extend(cross_file_pending_notice(enrichment, &after.cross_file));
+    lines.extend(semantic_absence_notice(enrichment));
+    lines
+}
+
+/// The authority generation line, qualified exactly as `kin init` qualifies
+/// it when the value is admission's rather than the store's latest.
+pub(crate) fn authority_generation_line(after: &AfterAdmission) -> String {
+    match after.reported.as_of.human_qualifier() {
+        Some(qualifier) => format!(
+            "  Authority generation: {} ({qualifier})",
+            after.reported.authority_generation
+        ),
+        None => format!(
+            "  Authority generation: {}",
+            after.reported.authority_generation
+        ),
+    }
+}
+
+/// Run an admission, showing it as one "Reading history" line with a step
+/// count on the short form, and leaving its row when it ends.
+///
+/// The admission ladder's sixteen numbered stages and the linker's per-commit
+/// bar are what the full form prints; on the short form both are switched
+/// off for the rest of this process, and the ladder hands its steps here
+/// instead.
+pub(crate) fn admit_showing_progress(
+    view: Option<&std::sync::Arc<crate::first_run::Screen>>,
+    admit: impl FnOnce() -> Result<kin_core::InitResult>,
+) -> Result<kin_core::InitResult> {
+    let Some(screen) = view else {
+        return admit();
+    };
+    screen.start("Reading history");
+    let observer: kin_core::AdmissionStepObserver = {
+        let screen = std::sync::Arc::clone(screen);
+        std::sync::Arc::new(move |step, total| {
+            screen.progress(step as u64, total as u64, "steps");
+        })
+    };
+    kin_core::compact_admission_progress(Some(observer));
+    kin_index::linker::suppress_progress_bar(true);
+    let admitted = admit();
+    // Released here, so the screen is not held by kin-core past admission.
+    kin_core::compact_admission_progress(None);
+    match admitted {
+        Ok(result) => {
+            let summary = &result.authority.semantic_enrichment;
+            if result.authority.initial_change_id.is_some() {
+                screen.finish_row(
+                    crate::screen::Status::Ok,
+                    "Read history",
+                    &crate::first_run::read_history_value(
+                        summary.semantic_change_count as u64,
+                        summary.entity_count as u64,
+                    ),
+                );
+            } else {
+                // An unborn repository has no history to have read.
+                screen.finish_row(
+                    crate::screen::Status::Ok,
+                    "Created",
+                    "an empty Kin repository",
+                );
+            }
+            Ok(result)
+        }
+        Err(error) => {
+            screen.finish();
+            Err(error)
+        }
+    }
+}
+
+/// The repository's name, as its directory is called.
+pub(crate) fn repository_name(dir: &Path) -> String {
+    let resolved = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    resolved
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| resolved.display().to_string())
+}
+
+/// How many commits Git reaches from every ref here, for the short form's
+/// opening line, or `None` when Git cannot say.
+///
+/// Asked of Git because the history is Git's until admission has read it, and
+/// only to word one line: nothing is decided from it.
+fn git_commit_count(dir: &Path) -> Option<u64> {
+    let output = std::process::Command::new("git")
+        .args(["rev-list", "--count", "--all"])
+        .current_dir(dir)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
+}
+
+/// What `kin init` does about a directory that already holds a `.kin`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SecondInit {
+    /// This build opens the store, so there is nothing to do.
+    NothingToDo { entities: usize },
+    /// Refuse, with today's refusal and exit 1.
+    Refuse,
+}
+
+/// Decide a second `kin init` from what the store is and whether this build
+/// opened it.
+///
+/// Only a store this build opens is answered as done. `--json` keeps its
+/// refusal, because its callers parse one result shape and a second init
+/// has none to give them. An adoption request keeps it too: the store already
+/// carries an identity, and saying "nothing to do" to a request for another
+/// one would hide the mismatch the flag exists to prevent.
+fn second_init(
+    json: bool,
+    adopting: bool,
+    installation: bool,
+    opened: Option<usize>,
+) -> SecondInit {
+    match opened {
+        Some(entities) if !json && !adopting && !installation => {
+            SecondInit::NothingToDo { entities }
+        }
+        _ => SecondInit::Refuse,
+    }
+}
+
+/// How long a command waits before a live line says what it is waiting on. A
+/// warm command answers inside it and never shows the line.
+pub(crate) const LIVE_LINE_DELAY: std::time::Duration = std::time::Duration::from_millis(600);
+
+/// A store this build opens, in a directory `kin init` was asked to convert.
+#[derive(Debug)]
+struct ExistingRepository {
+    name: String,
+    entities: usize,
+    layout: kin_core::KinLayout,
+}
+
+/// How far a store's search index has got, as its daemon reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SearchIndexStanding {
+    /// Every entry is indexed.
+    Complete { total: usize },
+    /// The daemon is filling it now.
+    Filling { indexed: usize, total: usize },
+    /// Nothing is filling it, why, and when it resumes, where that is known.
+    Paused {
+        indexed: usize,
+        total: usize,
+        cause: String,
+        resumes: Option<&'static str>,
+    },
+    /// This machine declined the search model.
+    Off,
+    /// The daemon could not be read.
+    Unread,
+}
+
+/// Answer a `kin init` over a directory that already holds a `.kin`, or say
+/// there is none.
+///
+/// `Ok(Some(_))` when this build opens the store, which the caller answers
+/// with exit 0. The refusal, with its backup advice and exit 1, is kept for
+/// what it was written for: a store this build cannot open, and the
+/// installation directory.
+fn answer_existing_repository(
+    dir: &Path,
+    json: bool,
+    adopting: bool,
+) -> Result<Option<ExistingRepository>> {
+    if !path_exists(&dir.join(".kin"))? {
+        return Ok(None);
+    }
+    let installation = kin_core::layout::is_managed_kin_home(&dir.join(".kin"));
+    // The same authority open `kin status` pays when no daemon answers it,
+    // and nothing more: the question is whether this build opens the store.
+    let opened = if json || adopting || installation {
+        None
+    } else {
+        // The store in this directory, never an enclosing one that
+        // discovery would walk up to.
+        let own = dir.join(".kin").canonicalize().ok();
+        kin_core::KinLayout::discover(dir)
+            .filter(|layout| own.is_some() && layout.root().canonicalize().ok() == own)
+            .and_then(|layout| {
+                ReportedAuthority::read(&layout)
+                    .ok()
+                    .map(|reported| (layout, reported.semantic_enrichment.entity_count))
+            })
+    };
+    let entities = opened.as_ref().map(|(_, entities)| *entities);
+    match second_init(json, adopting, installation, entities) {
+        SecondInit::NothingToDo { entities } => Ok(opened.map(|(layout, _)| ExistingRepository {
+            name: repository_name(dir),
+            entities,
+            layout,
+        })),
+        SecondInit::Refuse => bail!(existing_repository_refusal(dir)),
+    }
+}
+
+/// Start the repository's daemon, which resumes whatever background work the
+/// store owes, and read how far its search index has got.
+///
+/// Never an error, because the answer to `kin init` is already settled.
+async fn search_index_standing(layout: &kin_core::KinLayout) -> SearchIndexStanding {
+    match embed_runtime(layout).await {
+        Some(embed) => search_index_from(&embed, embed_refusal_for(layout.root()).as_ref()),
+        None => SearchIndexStanding::Unread,
+    }
+}
+
+/// The repository daemon's embedding facts, starting it if it is not running.
+async fn embed_runtime(
+    layout: &kin_core::KinLayout,
+) -> Option<crate::commands::resources::EmbedRuntimeState> {
+    let url = crate::daemon_client::ensure_daemon_running(layout.root())
+        .await
+        .ok()?;
+    let client = crate::daemon_client::DaemonClient::from_base_url_for_layout(url, layout).ok()?;
+    let response = client
+        .command_resources(&crate::commands::resources::CommandResourcesRequest::default())
+        .await
+        .ok()?;
+    Some(response.embed_runtime)
+}
+
+/// What a semantic search over an unfinished index says before its results:
+/// how far the index has got, why it is not further, when that changes, and
+/// what the rows below were ranked by. `None` when the index is complete or the
+/// daemon could not be read, so the caller keeps its own line.
+pub(crate) async fn semantic_search_note(
+    layout: &kin_core::KinLayout,
+    text_fallback: bool,
+) -> Option<Vec<String>> {
+    let embed = embed_runtime(layout).await?;
+    let standing = search_index_from(&embed, embed_refusal_for(layout.root()).as_ref());
+    semantic_search_note_from(&standing, &embed.model_fetch, text_fallback)
+}
+
+/// [`semantic_search_note`] from facts already read. Pure.
+fn semantic_search_note_from(
+    standing: &SearchIndexStanding,
+    model: &crate::embed_model::EmbedModelFetch,
+    text_fallback: bool,
+) -> Option<Vec<String>> {
+    use crate::screen::count;
+    let index = match standing {
+        SearchIndexStanding::Complete { .. } | SearchIndexStanding::Unread => return None,
+        SearchIndexStanding::Filling { indexed, total } => format!(
+            "Search index {} of {} · filling in the background.",
+            count(*indexed as u64),
+            count(*total as u64)
+        ),
+        SearchIndexStanding::Paused {
+            indexed,
+            total,
+            cause,
+            resumes,
+        } => format!(
+            "Search index {} of {} · paused: {cause}{}.",
+            count(*indexed as u64),
+            count(*total as u64),
+            resumes.map(|when| format!(" · {when}")).unwrap_or_default()
+        ),
+        SearchIndexStanding::Off => {
+            "Search index off · this machine declined the search model; kin embed turns it on."
+                .to_string()
+        }
+    };
+    let mut note = vec![index];
+    if !model.present && !model.declined && model.no_fetch_reason.is_none() {
+        note.push(if model.fetching {
+            format!(
+                "Downloading the search model ({}).",
+                model.render_progress()
+            )
+        } else {
+            "The search model isn't downloaded yet; it downloads when the index builds.".to_string()
+        });
+    }
+    note.push(if text_fallback {
+        "Answering from graph text search meanwhile:".to_string()
+    } else {
+        "Ranked over the part indexed so far:".to_string()
+    });
+    Some(note)
+}
+
+/// The standing a daemon's report and the store's last embedding refusal add
+/// up to.
+///
+/// A pass held back for memory is paused, not filling: the daemon leaves it
+/// unqueued and may idle out, so "finishing in the background" would be false.
+fn search_index_from(
+    embed: &crate::commands::resources::EmbedRuntimeState,
+    refusal: Option<&kin_core::memory_pressure::PressureRefusal>,
+) -> SearchIndexStanding {
+    let (indexed, total) = (embed.embeddings_indexed, embed.embeddings_total);
+    if embed.model_fetch.declined {
+        return SearchIndexStanding::Off;
+    }
+    if indexed >= total {
+        return SearchIndexStanding::Complete { total };
+    }
+    // A memory hold resumes by itself while a daemon stays up for it, and
+    // otherwise with whichever kin command next starts one.
+    let memory_resumes = if embed.embed_held_for_memory {
+        "resumes when memory frees"
+    } else {
+        "resumes on the next kin command"
+    };
+    let cause = if embed.embed_worker_failed {
+        Some((
+            "the embedding worker stopped (kin doctor)".to_string(),
+            None,
+        ))
+    } else if embed.embed_persistence_unavailable {
+        Some(("this store keeps no local vectors".to_string(), None))
+    } else if embed.background_embed_paused && !embed.embedding_work_busy {
+        Some((
+            "automatic indexing is off".to_string(),
+            Some("kin embed runs it"),
+        ))
+    } else {
+        refusal.map(|refusal| {
+            let cause = if refusal.from_budget {
+                "Kin's memory budget"
+            } else {
+                "memory pressure"
+            };
+            (cause.to_string(), Some(memory_resumes))
+        })
+    };
+    match cause {
+        Some((cause, resumes)) => SearchIndexStanding::Paused {
+            indexed,
+            total,
+            cause,
+            resumes,
+        },
+        None => SearchIndexStanding::Filling { indexed, total },
+    }
+}
+
+/// What a second `kin init` answers with: one sentence, short aligned lines
+/// for the repository and its search index, and one next command.
+fn existing_repository_lines(
+    style: crate::screen::Style,
+    existing: &ExistingRepository,
+    index: &SearchIndexStanding,
+    next: &str,
+    right_edge: usize,
+    compact: bool,
+) -> Vec<String> {
+    use crate::screen::count;
+    const INDENT: &str = crate::screen::INDENT;
+    let label = |text: &str| style.faint(&format!("{text:<12}"));
+    let mut lines = vec![
+        format!("{INDENT}{} is already a Kin repository.", existing.name),
+        String::new(),
+        format!(
+            "{INDENT}{}  ready {} {} entities",
+            label("Repository"),
+            style.dot(),
+            count(existing.entities as u64)
+        ),
+    ];
+    let search = match index {
+        SearchIndexStanding::Complete { total } => {
+            Some(format!("{} entries", count(*total as u64)))
+        }
+        SearchIndexStanding::Filling { indexed, total } => Some(format!(
+            "{} of {} {} finishing in the background",
+            count(*indexed as u64),
+            count(*total as u64),
+            style.dot()
+        )),
+        SearchIndexStanding::Paused {
+            indexed,
+            total,
+            cause,
+            resumes,
+        } => Some(format!(
+            "{} of {} {} paused: {cause}{}",
+            count(*indexed as u64),
+            count(*total as u64),
+            style.separator(),
+            resumes
+                .map(|when| format!(" {} {when}", style.separator()))
+                .unwrap_or_default()
+        )),
+        SearchIndexStanding::Off => Some(format!("off {} kin embed turns it on", style.dot())),
+        SearchIndexStanding::Unread => None,
+    };
+    if let Some(search) = search {
+        // Wrapped under its own column, so a long reason never hard-wraps a
+        // narrow terminal.
+        let width = right_edge.saturating_sub(INDENT.len() + 12 + 2).max(24);
+        for (index, part) in crate::screen::wrap(&search, width).into_iter().enumerate() {
+            let name = if index == 0 { "Search index" } else { "" };
+            lines.push(format!("{INDENT}{}  {part}", label(name)));
+        }
+    }
+    lines.extend(author_warning_lines(&existing.layout, right_edge, compact));
+    lines.push(format!(
+        "{INDENT}{}  {}",
+        style.lilac(&format!("{:<12}", "Next")),
+        style.bold(next)
+    ));
+    lines
+}
+
+/// Import preserves its historical authors, but the next workspace admission
+/// still needs this person's identity. The same warning serves init and clone,
+/// including reopening an already imported store; JSON stdout stays unchanged.
+fn author_warning_lines(
+    layout: &kin_core::KinLayout,
+    right_edge: usize,
+    compact: bool,
+) -> Vec<String> {
+    let Err(error) = kin_core::resolve_commit_identity(layout) else {
+        return Vec::new();
+    };
+    render_author_warning(&error, right_edge, compact)
+}
+
+fn render_author_warning(
+    error: &kin_core::KinError,
+    right_edge: usize,
+    compact: bool,
+) -> Vec<String> {
+    let message = if super::is_missing_author_identity(error) {
+        if compact {
+            format!(
+                "{}\n{}",
+                super::COMPACT_AUTHOR_CONSEQUENCE,
+                super::compact_author_commands()
+            )
+        } else {
+            format!(
+                "Author not configured: changes cannot be admitted or committed.\n{}",
+                kin_core::IDENTITY_REMEDIATION
+            )
+        }
+    } else {
+        format!("Author needs attention: {error}")
+    };
+    message
+        .lines()
+        .flat_map(|line| crate::screen::wrap(line.trim(), right_edge.saturating_sub(2).max(24)))
+        .map(|line| format!("  {line}"))
+        .collect()
 }
 
 fn materialize_graph_section_after_init(
@@ -506,16 +1488,17 @@ enum ConversionDaemonExit {
     /// The sweep ended, or never ran, so nothing the daemon is doing belongs
     /// to this conversion. Stop it now.
     StopNow,
-    /// This command stopped waiting on a sweep that is still running. Ask the
-    /// daemon to exit once nothing needs it, which keeps it up until the sweep
-    /// has finished and published.
+    /// This command stopped waiting on work that is still running: a sweep, or
+    /// the first embedding pass. Ask the daemon to exit once nothing needs it,
+    /// which keeps it up until that work has finished and published, since
+    /// retirement waits on a sweep and on embedding alike.
     ///
     /// It used to be stopped here like any other. On a 3,590-file TypeScript
     /// repository whose sweep takes 47 minutes, that stop landed at file 1,603
     /// of every attempt: the sweep never published, the next daemon started it
     /// again from the first file, and the conversion's own summary said it
     /// "resumes on the next daemon start".
-    RetireWhenSweepEnds,
+    RetireWhenWorkEnds,
 }
 
 impl ConversionDaemonExit {
@@ -524,8 +1507,21 @@ impl ConversionDaemonExit {
             CrossFileEnrichment::Withheld {
                 reason: CrossFileShortfall::SweepBudgetSpent,
                 ..
-            } => Self::RetireWhenSweepEnds,
+            } => Self::RetireWhenWorkEnds,
             _ => Self::StopNow,
+        }
+    }
+
+    /// The exit once the first embedding pass has had its wait.
+    ///
+    /// A pass still filling when the wait ran out keeps its daemon, which then
+    /// retires once the pass has drained. Stopping it there killed the pass
+    /// mid-batch while the command reported it "finishing in the background",
+    /// which it could not be: the only process that could finish it was gone.
+    fn after_embedding(self, settled: &FirstEmbedPassOutcome) -> Self {
+        match (self, settled) {
+            (Self::StopNow, FirstEmbedPassOutcome::BudgetSpent { .. }) => Self::RetireWhenWorkEnds,
+            (exit, _) => exit,
         }
     }
 }
@@ -550,7 +1546,7 @@ async fn stop_conversion_daemon(
                 note!("note: the conversion daemon could not be stopped: {error:#}");
             }
         }
-        ConversionDaemonExit::RetireWhenSweepEnds => {
+        ConversionDaemonExit::RetireWhenWorkEnds => {
             if let Some(line) = conversion_daemon_retirement_note(
                 crate::commands::daemon::retire_current_repo_quiet(kin_root).await,
             ) {
@@ -684,6 +1680,18 @@ fn first_embed_pass_standing(
     if embed.embeddings_pending == 0 {
         return FirstEmbedPassStanding::Settled;
     }
+    // Declined in `kin setup`: nothing will download the model, so nothing
+    // drains this queue, and waiting out the budget would only delay the
+    // answer that says so.
+    if embed.model_fetch.declined {
+        return FirstEmbedPassStanding::Stalled(
+            "this machine declined the embedding model download in `kin setup` (`kin embed` \
+             downloads it)",
+        );
+    }
+    if embed.background_embed_paused && !embed.embedding_work_busy {
+        return FirstEmbedPassStanding::Stalled("automatic indexing is off; `kin embed` runs it");
+    }
     // A machine that has not got the model yet cannot index anything until
     // several hundred megabytes have arrived, and holding `kin init` for that
     // helps nobody: the fetch continues in the daemon the next command starts,
@@ -759,9 +1767,9 @@ impl FirstEmbedPassOutcome {
                 waited_secs,
             } => Some(format!(
                 "First embedding pass: {indexed} of {total} indexed in the {waited_secs}s this \
-                 command was willing to wait. The rest is persisted work in progress: the daemon \
-                 your next command starts resumes it from here, and semantic queries answer from \
-                 lexical retrieval until it finishes."
+                 command was willing to wait. The daemon keeps embedding the rest in the \
+                 background and exits when it is done, and semantic queries answer from lexical \
+                 retrieval until it finishes."
             )),
         }
     }
@@ -871,7 +1879,12 @@ where
 
 /// Ask the daemon this conversion started where its first embedding pass has
 /// reached, and wait for it under [`FIRST_EMBED_PASS_BUDGET`].
-async fn settle_first_embed_pass(layout: &kin_core::KinLayout) -> FirstEmbedPassOutcome {
+///
+/// On the short form each reading also moves the Search index line.
+async fn settle_first_embed_pass(
+    layout: &kin_core::KinLayout,
+    view: Option<&crate::first_run::Screen>,
+) -> FirstEmbedPassOutcome {
     let Some(url) = crate::daemon_client::resolve_daemon_url_if_running_async(layout).await else {
         return FirstEmbedPassOutcome::Unread;
     };
@@ -879,19 +1892,74 @@ async fn settle_first_embed_pass(layout: &kin_core::KinLayout) -> FirstEmbedPass
     else {
         return FirstEmbedPassOutcome::Unread;
     };
+    if let Some(screen) = view {
+        screen.start("Search index");
+    }
     settle_first_embed_pass_within(
         FIRST_EMBED_PASS_BUDGET,
         FIRST_EMBED_PASS_POLL,
         FIRST_EMBED_PASS_STALL,
         || async {
-            client
+            let embed = client
                 .command_resources(&crate::commands::resources::CommandResourcesRequest::default())
                 .await
                 .ok()
-                .map(|response| response.embed_runtime)
+                .map(|response| response.embed_runtime);
+            if let (Some(screen), Some(embed)) = (view, embed.as_ref()) {
+                screen.progress(
+                    embed.embeddings_indexed as u64,
+                    embed.embeddings_total as u64,
+                    "entries",
+                );
+            }
+            embed
         },
     )
     .await
+}
+
+/// The Search index row for one wait, or `None` when there is nothing to say.
+///
+/// `fetch` is the model's standing after the wait, which is what separates a
+/// machine that declined the model from one that has not got it yet.
+fn search_index_row(
+    outcome: &FirstEmbedPassOutcome,
+    fetch: &crate::embed_model::EmbedModelFetch,
+) -> Option<(crate::screen::Status, String)> {
+    use crate::screen::Status;
+    if fetch.declined {
+        return Some((Status::Off, "off · kin embed turns it on".to_string()));
+    }
+    match outcome {
+        FirstEmbedPassOutcome::Unread | FirstEmbedPassOutcome::Drained { indexed: 0 } => None,
+        FirstEmbedPassOutcome::Drained { indexed } => Some((
+            Status::Ok,
+            format!("{} entries", crate::screen::count(*indexed as u64)),
+        )),
+        FirstEmbedPassOutcome::Stalled { .. }
+            if !fetch.present && fetch.no_fetch_reason.is_none() =>
+        {
+            Some((
+                Status::Warn,
+                "waits for the search model · kin embed downloads it".to_string(),
+            ))
+        }
+        FirstEmbedPassOutcome::Stalled { pending, .. } => Some((
+            Status::Warn,
+            format!(
+                "{} entries queued · the next daemon fills them",
+                crate::screen::count(*pending as u64)
+            ),
+        )),
+        FirstEmbedPassOutcome::BudgetSpent { indexed, total, .. } => Some((
+            Status::Warn,
+            format!(
+                "{} of {} entries so far · finishing in the background",
+                crate::screen::count(*indexed as u64),
+                crate::screen::count(*total as u64)
+            ),
+        )),
+    }
 }
 
 /// Run the language-server sweep as a phase of conversion, with progress.
@@ -1629,11 +2697,15 @@ pub(crate) fn cross_file_enrichment_outcome(
 ///
 /// The phase runs on its own task and the cleanup runs after the join, so it is
 /// reached on success, on refusal, on timeout and on panic alike.
-async fn enrich_after_init(kin_root: &Path) -> CrossFileEnrichment {
+async fn enrich_after_init(
+    kin_root: &Path,
+    view: Option<std::sync::Arc<crate::first_run::Screen>>,
+) -> CrossFileEnrichment {
     enrich_after_init_with(
         kin_root,
         crate::daemon_client::daemon_spawns_are_disabled(),
         crate::daemon_client::loopback_blocked,
+        view,
     )
     .await
 }
@@ -1646,6 +2718,7 @@ async fn enrich_after_init_with(
     kin_root: &Path,
     spawns_disabled: bool,
     loopback: impl FnOnce() -> Option<crate::daemon_client::LoopbackBlocked>,
+    view: Option<std::sync::Arc<crate::first_run::Screen>>,
 ) -> CrossFileEnrichment {
     let Some(layout) = kin_core::KinLayout::discover(kin_root) else {
         note!("note: cross-file reference enrichment was skipped: no Kin layout at this path");
@@ -1673,7 +2746,11 @@ async fn enrich_after_init_with(
 
     let root = kin_root.to_path_buf();
     let phase_layout = layout.clone();
-    let phase = tokio::spawn(async move { enrich_phase(&root, &phase_layout).await });
+    let phase_view = view.clone();
+    let phase =
+        tokio::spawn(
+            async move { enrich_phase(&root, &phase_layout, phase_view.as_deref()).await },
+        );
     let outcome = match phase.await {
         Ok(outcome) => outcome,
         Err(error) => {
@@ -1681,6 +2758,9 @@ async fn enrich_after_init_with(
             CrossFileEnrichment::unreadable().with_cause(error.to_string())
         }
     };
+    if let Some(screen) = view.as_deref() {
+        show_linked(screen, &outcome);
+    }
 
     // Before the stop, never after it. The daemon this phase started is the
     // only process that can drain the embedding queue its own ingest filled,
@@ -1694,14 +2774,133 @@ async fn enrich_after_init_with(
     //
     // A daemon asked to exit only once nothing needs it keeps draining the
     // embedding queue as well as the sweep, so it is owed no such wait.
-    let exit = ConversionDaemonExit::after(&outcome);
+    let mut exit = ConversionDaemonExit::after(&outcome);
     if !borrowed_existing && exit == ConversionDaemonExit::StopNow {
-        if let Some(line) = settle_first_embed_pass(&layout).await.note() {
+        let settled = settle_first_embed_pass(&layout, view.as_deref()).await;
+        if let Some(line) = settled.note() {
             note!("{line}");
         }
+        if let Some(screen) = view.as_deref() {
+            show_search_index(screen, Some(&settled));
+        }
+        exit = exit.after_embedding(&settled);
+    }
+    // While the daemon this phase used is still up, and only for a person
+    // who will read it: the function to suggest asking about first.
+    if let Some(screen) = view.as_deref() {
+        let suggestion = suggest_first_question(&layout).await;
+        screen.facts().suggestion = suggestion;
     }
     stop_conversion_daemon(borrowed_existing, kin_root, exit).await;
     outcome
+}
+
+/// How long the suggestion's graph read may take before the next action falls
+/// back to `kin refs <function>`. The ranking reads every entity's relations,
+/// so on a very large repository it is skipped rather than waited on.
+const SUGGESTION_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The function most of this repository depends on, from the running daemon's
+/// graph, or `None` when the graph cannot say quickly.
+///
+/// A graph read, never a scan of the files: the daemon ranks entities by the
+/// distinct callers, importers and referrers the reference surface certifies.
+async fn suggest_first_question(layout: &kin_core::KinLayout) -> Option<String> {
+    let url = crate::daemon_client::resolve_daemon_url_if_running_async(layout).await?;
+    let client = crate::daemon_client::DaemonClient::from_base_url_for_layout(url, layout).ok()?;
+    let read = async {
+        let repo_id = client.health().await.ok()?.repo_id?;
+        client.ranked_entities(&repo_id, 50).await.ok()
+    };
+    let ranked = tokio::time::timeout(SUGGESTION_BUDGET, read).await.ok()??;
+    crate::first_run::suggestion(&ranked)
+}
+
+/// What linking came to, read from the phase's outcome when the sweep itself
+/// recorded nothing more exact.
+fn linking_for(outcome: &CrossFileEnrichment) -> crate::first_run::Linking {
+    use crate::first_run::Linking;
+    let reason = match outcome {
+        CrossFileEnrichment::Produced => return Linking::Finished(Default::default()),
+        CrossFileEnrichment::Withheld { reason, .. } => *reason,
+    };
+    let not_run = |cause: &str| Linking::NotRun(cause.to_string());
+    match reason {
+        CrossFileShortfall::NotRequested => Linking::Skipped,
+        CrossFileShortfall::LanguageServerUnavailable => Linking::NoServer,
+        CrossFileShortfall::DaemonSpawnDisabled => not_run("KIN_NO_DAEMON is set"),
+        CrossFileShortfall::LoopbackBlocked => not_run("this process can't reach loopback"),
+        CrossFileShortfall::DaemonUnavailable => not_run("no daemon could start"),
+        CrossFileShortfall::StoreUnreadable => not_run("the store couldn't be opened"),
+        CrossFileShortfall::SweepNotStarted => not_run("the daemon wouldn't start it"),
+        CrossFileShortfall::SweepOutcomeUnreadable => not_run("its progress couldn't be read"),
+        CrossFileShortfall::SweepBudgetSpent
+        | CrossFileShortfall::SweepEnrichedNothing
+        | CrossFileShortfall::SweepLanguagesUnserved
+        | CrossFileShortfall::SweepFilesOwed => not_run("its outcome wasn't recorded"),
+    }
+}
+
+/// Print the Linked row once, from what the sweep recorded or, failing that,
+/// from the phase's outcome.
+fn show_linked(screen: &crate::first_run::Screen, outcome: &CrossFileEnrichment) {
+    let (linking, languages, servers) = {
+        let mut facts = screen.facts();
+        if facts.linked_shown {
+            return;
+        }
+        facts.linked_shown = true;
+        let linking = facts
+            .linking
+            .clone()
+            .unwrap_or_else(|| linking_for(outcome));
+        facts.linking = Some(linking.clone());
+        (linking, facts.languages.clone(), facts.servers.clone())
+    };
+    let (status, value, hint) = crate::first_run::linked_row(&linking, &languages, &servers);
+    screen.finish_row(status, "Linked", &value);
+    if let Some(hint) = hint {
+        screen.hint(&hint);
+    }
+}
+
+/// Print the Search index row once. `settled` is the wait this command made,
+/// when it made one.
+fn show_search_index(screen: &crate::first_run::Screen, settled: Option<&FirstEmbedPassOutcome>) {
+    {
+        let mut facts = screen.facts();
+        if facts.search_shown {
+            return;
+        }
+        facts.search_shown = true;
+    }
+    let fetch = crate::embed_model::EmbedModelFetch::probe(false);
+    let row = match settled {
+        Some(settled) => search_index_row(settled, &fetch),
+        None => Some(unobserved_search_index_row(&fetch)),
+    };
+    match row {
+        Some((status, value)) => screen.finish_row(status, "Search index", &value),
+        None => {
+            screen.finish();
+        }
+    }
+}
+
+/// Without a daemon reading, give an explicit action instead of promising
+/// background work. A skipped phase may never have started a daemon, and a
+/// running daemon can have paused automatic indexing independently of this CLI.
+fn unobserved_search_index_row(
+    fetch: &crate::embed_model::EmbedModelFetch,
+) -> (crate::screen::Status, String) {
+    (
+        crate::screen::Status::Off,
+        if fetch.declined {
+            "off · kin embed turns it on".to_string()
+        } else {
+            "kin embed builds it".to_string()
+        },
+    )
 }
 
 /// The sentence `kin init` prints when a run produced no cross-file edges.
@@ -1768,7 +2967,15 @@ fn enrichment_unavailable_note(reason: &str, detail: Option<&str>) -> String {
     }
 }
 
-async fn enrich_phase(kin_root: &Path, layout: &kin_core::KinLayout) -> CrossFileEnrichment {
+async fn enrich_phase(
+    kin_root: &Path,
+    layout: &kin_core::KinLayout,
+    view: Option<&crate::first_run::Screen>,
+) -> CrossFileEnrichment {
+    if let Some(screen) = view {
+        screen.start("Linking");
+        screen.note("starting the daemon");
+    }
     let url = match crate::daemon_client::ensure_daemon_running(kin_root).await {
         Ok(url) => url,
         Err(error) => {
@@ -1847,6 +3054,9 @@ async fn enrich_phase(kin_root: &Path, layout: &kin_core::KinLayout) -> CrossFil
         .unwrap_or(0);
 
     note!("Enriching cross-file references (language server)...");
+    if let Some(screen) = view {
+        screen.note("asking the language server");
+    }
     let deadline = std::time::Instant::now() + ENRICH_BUDGET;
     let mut last_reported = 0u64;
     loop {
@@ -1873,6 +3083,11 @@ async fn enrich_phase(kin_root: &Path, layout: &kin_core::KinLayout) -> CrossFil
             last_reported = done;
             note!("  enriched {done}/{total} files");
         }
+        if let Some(screen) = view {
+            if total > 0 {
+                screen.progress(done, total, "files");
+            }
+        }
         let completed = status
             .get("sweeps_completed")
             .and_then(|v| v.as_u64())
@@ -1895,11 +3110,20 @@ async fn enrich_phase(kin_root: &Path, layout: &kin_core::KinLayout) -> CrossFil
             let (line, outcome) =
                 cross_file_enrichment_outcome(done, total, blocked, &skipped, &owed);
             note!("{}", line);
+            if let Some(screen) = view {
+                screen.facts().linking = Some(crate::first_run::Linking::Finished(
+                    crate::first_run::SweepTally::from_status(&status),
+                ));
+            }
             return outcome;
         }
         if std::time::Instant::now() >= deadline {
             let (note, outcome) = sweep_budget_spent(ENRICH_BUDGET, done, total);
             note!("{note}");
+            if let Some(screen) = view {
+                screen.facts().linking =
+                    Some(crate::first_run::Linking::BudgetSpent { done, total });
+            }
             return outcome;
         }
     }
@@ -2047,13 +3271,6 @@ fn last_lines(text: &str, count: usize) -> String {
         .filter(|line| !line.is_empty())
         .collect();
     lines[lines.len().saturating_sub(count)..].join(" ")
-}
-
-fn reject_existing_repository(dir: &Path) -> Result<()> {
-    if path_exists(&dir.join(".kin"))? {
-        anyhow::bail!(existing_repository_refusal(dir));
-    }
-    Ok(())
 }
 
 /// The refusal `kin init` raises over a directory that already holds a `.kin`.
@@ -2941,6 +4158,58 @@ fn initialized_raw_git_head(result: &kin_core::InitResult) -> Option<&kin_model:
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn compact_author_guidance_keeps_commands_and_verbose_keeps_alternatives() {
+        let refusal = kin_core::KinError::Config(kin_core::unresolved_identity_message());
+        let compact = super::render_author_warning(&refusal, 58, true);
+        assert_eq!(compact.len(), 3, "{compact:#?}");
+        assert!(compact[0].contains("admission and commits are blocked"));
+        assert_eq!(
+            compact[1].trim(),
+            "git config --global user.name \"Your Name\""
+        );
+        assert_eq!(
+            compact[2].trim(),
+            "git config --global user.email \"you@example.com\""
+        );
+        assert!(compact
+            .iter()
+            .all(|line| console::measure_text_width(line) < 60));
+        let full = super::render_author_warning(&refusal, 58, false).join("\n");
+        assert!(full.contains("default_author"), "{full}");
+        assert!(full.contains(".kin/config.toml"), "{full}");
+        let misplaced = super::render_author_warning(
+            &kin_core::KinError::Config(kin_core::identity::misplaced_identity_message(
+                "resources",
+            )),
+            58,
+            true,
+        )
+        .join("\n");
+        let misplaced = misplaced.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            misplaced.contains("default_author under [resources]"),
+            "{misplaced}"
+        );
+        assert!(
+            misplaced.contains("Move the line to the top level"),
+            "{misplaced}"
+        );
+        assert!(
+            !misplaced.contains(super::super::COMPACT_AUTHOR_CONSEQUENCE),
+            "{misplaced}"
+        );
+        let invalid = super::render_author_warning(
+            &kin_core::KinError::Config(
+                "GIT_AUTHOR_EMAIL is set but unusable; unset it".to_string(),
+            ),
+            58,
+            true,
+        )
+        .join("\n");
+        assert!(invalid.contains("GIT_AUTHOR_EMAIL"), "{invalid}");
+        assert!(!invalid.contains("git config"), "{invalid}");
+    }
     use super::*;
     use crate::commands::status::SemanticEnrichmentView;
 
@@ -3057,6 +4326,23 @@ mod tests {
             FirstEmbedPassStanding::Stalled(_)
         ));
 
+        let paused = crate::commands::resources::EmbedRuntimeState {
+            background_embed_paused: true,
+            ..filling.clone()
+        };
+        assert!(matches!(
+            first_embed_pass_standing(&paused),
+            FirstEmbedPassStanding::Stalled(reason) if reason.contains("`kin embed`")
+        ));
+        assert_eq!(
+            first_embed_pass_standing(&crate::commands::resources::EmbedRuntimeState {
+                embedding_work_busy: true,
+                ..paused
+            }),
+            FirstEmbedPassStanding::Filling,
+            "an explicit pass can be running while automatic indexing stays paused"
+        );
+
         let unpersistable = crate::commands::resources::EmbedRuntimeState {
             embed_persistence_unavailable: true,
             ..filling.clone()
@@ -3065,6 +4351,27 @@ mod tests {
             first_embed_pass_standing(&unpersistable),
             FirstEmbedPassStanding::Stalled(_)
         ));
+
+        // Declined in `kin setup`: the daemon stood its pass down and nothing
+        // will download the model, so waiting out the budget helps nobody.
+        let declined = crate::commands::resources::EmbedRuntimeState {
+            embeddings_indexed: 0,
+            embeddings_pending: 92,
+            embeddings_total: 92,
+            model_fetch: crate::embed_model::EmbedModelFetch {
+                declined: true,
+                no_fetch_reason: Some("declined in kin setup".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        match first_embed_pass_standing(&declined) {
+            FirstEmbedPassStanding::Stalled(reason) => {
+                assert!(reason.contains("declined"), "{reason}");
+                assert!(reason.contains("`kin embed`"), "{reason}");
+            }
+            other => panic!("a declined model is not worth waiting for: {other:?}"),
+        }
 
         let drained = crate::commands::resources::EmbedRuntimeState {
             embeddings_indexed: 92,
@@ -3176,8 +4483,45 @@ mod tests {
         );
         let note = outcome.note().expect("a partial pass is worth a line");
         assert!(
-            note.contains("7 of 40") && note.contains("resumes it from here"),
+            note.contains("7 of 40") && note.contains("keeps embedding the rest"),
             "the reader has to learn where it reached and that nothing is lost: {note}"
+        );
+    }
+
+    /// The conversion daemon is never stopped while the first embedding pass
+    /// is still filling: it is asked to retire, and retirement waits for the
+    /// pass. A pass that drained, stalled or could not be read stops as
+    /// before, and a sweep still running keeps its daemon whatever the pass
+    /// did.
+    #[test]
+    fn the_conversion_daemon_is_not_stopped_while_embedding_is_owed() {
+        let filling = FirstEmbedPassOutcome::BudgetSpent {
+            indexed: 0,
+            total: 429,
+            waited_secs: 20,
+        };
+        assert_eq!(
+            ConversionDaemonExit::StopNow.after_embedding(&filling),
+            ConversionDaemonExit::RetireWhenWorkEnds
+        );
+        for settled in [
+            FirstEmbedPassOutcome::Unread,
+            FirstEmbedPassOutcome::Drained { indexed: 429 },
+            FirstEmbedPassOutcome::Stalled {
+                pending: 429,
+                reason: "nothing drains it",
+            },
+        ] {
+            assert_eq!(
+                ConversionDaemonExit::StopNow.after_embedding(&settled),
+                ConversionDaemonExit::StopNow,
+                "{settled:?}"
+            );
+        }
+        assert_eq!(
+            ConversionDaemonExit::RetireWhenWorkEnds
+                .after_embedding(&FirstEmbedPassOutcome::Unread),
+            ConversionDaemonExit::RetireWhenWorkEnds
         );
     }
 
@@ -3309,7 +4653,7 @@ mod tests {
         let repo = tempfile::tempdir().expect("temp repo");
         let layout = kin_core::init(repo.path()).expect("init").layout;
         let began = std::time::Instant::now();
-        let outcome = settle_first_embed_pass(&layout).await;
+        let outcome = settle_first_embed_pass(&layout, None).await;
         assert_eq!(outcome, FirstEmbedPassOutcome::Unread);
         assert!(
             began.elapsed() < std::time::Duration::from_secs(30),
@@ -4791,6 +6135,7 @@ mod tests {
             expected_bytes: Some(crate::embed_model::DEFAULT_EMBED_MODEL_BYTES),
             fetching: false,
             no_fetch_reason: None,
+            declined: false,
             relocated_hf_home: None,
         };
 
@@ -4912,6 +6257,7 @@ mod tests {
             expected_bytes: Some(crate::embed_model::DEFAULT_EMBED_MODEL_BYTES),
             fetching: false,
             no_fetch_reason: None,
+            declined: false,
             relocated_hf_home: None,
         };
         let partial = |bytes: u64| crate::embed_model::EmbedModelFetch {
@@ -5040,9 +6386,15 @@ mod tests {
         // Enrichment off: this case is about the conversion transaction, and
         // starting a daemon to query a language server would make it depend on
         // what the host has installed.
-        run(Some(repo.to_str().unwrap().to_string()), false, true, None)
-            .await
-            .expect("kin init must succeed under a scratch registry");
+        run(
+            Some(repo.to_str().unwrap().to_string()),
+            false,
+            true,
+            None,
+            false,
+        )
+        .await
+        .expect("kin init must succeed under a scratch registry");
 
         let registry = kin_core::registry::KinRegistry::load_from(&registry_path)
             .expect("registry must be readable after init");
@@ -5179,18 +6531,27 @@ mod tests {
             let _registry =
                 kin_core::test_env::EnvVarGuard::set("KIN_REGISTRY_PATH", &registry_path);
 
-            run(Some(repo.to_str().unwrap().to_string()), false, true, None)
-                .await
-                .expect("kin init admits the fixture");
+            run(
+                Some(repo.to_str().unwrap().to_string()),
+                false,
+                true,
+                None,
+                false,
+            )
+            .await
+            .expect("kin init admits the fixture");
             let store = AdmittedStore {
                 kin_root: repo.join(".kin"),
                 scratch,
             };
 
             let started = Instant::now();
-            let outcome = enrich_after_init_with(&store.kin_root, true, || {
-                panic!("KIN_NO_DAEMON already settled it, so loopback is not asked")
-            })
+            let outcome = enrich_after_init_with(
+                &store.kin_root,
+                true,
+                || panic!("KIN_NO_DAEMON already settled it, so loopback is not asked"),
+                None,
+            )
             .await;
             let waited = started.elapsed();
             assert!(
@@ -5206,12 +6567,17 @@ mod tests {
             #[cfg(unix)]
             {
                 let started = Instant::now();
-                let outcome = enrich_after_init_with(&store.kin_root, false, || {
-                    Some(crate::daemon_client::LoopbackBlocked::new(
-                        "loopback",
-                        std::io::Error::from_raw_os_error(libc::EACCES),
-                    ))
-                })
+                let outcome = enrich_after_init_with(
+                    &store.kin_root,
+                    false,
+                    || {
+                        Some(crate::daemon_client::LoopbackBlocked::new(
+                            "loopback",
+                            std::io::Error::from_raw_os_error(libc::EACCES),
+                        ))
+                    },
+                    None,
+                )
                 .await;
                 let waited = started.elapsed();
                 assert!(
@@ -5391,7 +6757,7 @@ mod tests {
             let (_, outcome) = sweep_budget_spent(Duration::from_secs(900), 1603, 3590);
             assert_eq!(
                 ConversionDaemonExit::after(&outcome),
-                ConversionDaemonExit::RetireWhenSweepEnds
+                ConversionDaemonExit::RetireWhenWorkEnds
             );
         }
 
@@ -5632,6 +6998,380 @@ mod tests {
                 assert!(line.contains("at admission"), "{line}");
                 assert!(line.contains("`kin status`"), "{line}");
             }
+        }
+    }
+
+    /// A second `kin init` over a store this build opens is done, not refused.
+    mod second_init_decision {
+        use super::super::{second_init, SecondInit};
+
+        #[test]
+        fn a_store_this_build_opens_has_nothing_left_to_do() {
+            assert_eq!(
+                second_init(false, false, false, Some(197)),
+                SecondInit::NothingToDo { entities: 197 }
+            );
+        }
+
+        #[test]
+        fn a_store_this_build_cannot_open_keeps_the_refusal() {
+            assert_eq!(second_init(false, false, false, None), SecondInit::Refuse);
+        }
+
+        /// `--json` callers parse one result shape, an adoption names an
+        /// identity the store may not carry, and the installation is not a
+        /// repository: each keeps today's refusal whatever the store is.
+        #[test]
+        fn json_adoption_and_the_installation_keep_the_refusal() {
+            assert_eq!(second_init(true, false, false, Some(1)), SecondInit::Refuse);
+            assert_eq!(second_init(false, true, false, Some(1)), SecondInit::Refuse);
+            assert_eq!(second_init(false, false, true, Some(1)), SecondInit::Refuse);
+        }
+
+        /// The search index reads as filling only while a daemon will fill it:
+        /// a memory hold, a failed worker and a declined model are each said as
+        /// what they are.
+        #[test]
+        fn the_search_index_standing_names_what_holds_it() {
+            use super::super::{search_index_from, SearchIndexStanding};
+            let embed = |indexed, total| crate::commands::resources::EmbedRuntimeState {
+                embeddings_indexed: indexed,
+                embeddings_total: total,
+                ..Default::default()
+            };
+            assert_eq!(
+                search_index_from(&embed(64, 197), None),
+                SearchIndexStanding::Filling {
+                    indexed: 64,
+                    total: 197
+                }
+            );
+            assert_eq!(
+                search_index_from(&embed(197, 197), None),
+                SearchIndexStanding::Complete { total: 197 }
+            );
+            let refusal = kin_core::memory_pressure::PressureRefusal {
+                work: "embed_batch".to_string(),
+                level: "critical".to_string(),
+                reason: "the machine is short of memory".to_string(),
+                at_unix: 0,
+                from_budget: false,
+            };
+            assert_eq!(
+                search_index_from(&embed(0, 429), Some(&refusal)),
+                SearchIndexStanding::Paused {
+                    indexed: 0,
+                    total: 429,
+                    cause: "memory pressure".to_string(),
+                    resumes: Some("resumes on the next kin command"),
+                },
+                "with no daemon staying up for it, the next command resumes it"
+            );
+            let mut held = embed(0, 429);
+            held.embed_held_for_memory = true;
+            assert_eq!(
+                search_index_from(&held, Some(&refusal)),
+                SearchIndexStanding::Paused {
+                    indexed: 0,
+                    total: 429,
+                    cause: "memory pressure".to_string(),
+                    resumes: Some("resumes when memory frees"),
+                },
+                "a daemon holding for memory resumes it by itself"
+            );
+            let mut declined = embed(0, 197);
+            declined.model_fetch.declined = true;
+            assert_eq!(search_index_from(&declined, None), SearchIndexStanding::Off);
+            let mut failed = embed(0, 197);
+            failed.embed_worker_failed = true;
+            assert!(matches!(
+                search_index_from(&failed, None),
+                SearchIndexStanding::Paused { .. }
+            ));
+        }
+
+        #[test]
+        fn automatic_indexing_pause_is_not_reported_as_background_progress() {
+            use super::super::{search_index_from, semantic_search_note_from, SearchIndexStanding};
+            let mut embed = crate::commands::resources::EmbedRuntimeState {
+                embeddings_total: 5,
+                background_embed_paused: true,
+                model_fetch: crate::embed_model::EmbedModelFetch {
+                    present: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let standing = search_index_from(&embed, None);
+            assert_eq!(
+                standing,
+                SearchIndexStanding::Paused {
+                    indexed: 0,
+                    total: 5,
+                    cause: "automatic indexing is off".to_string(),
+                    resumes: Some("kin embed runs it"),
+                }
+            );
+            let note = semantic_search_note_from(&standing, &embed.model_fetch, true)
+                .unwrap()
+                .join("\n");
+            assert!(note.contains("paused: automatic indexing is off"), "{note}");
+            assert!(note.contains("kin embed runs it"), "{note}");
+            assert!(!note.contains("background"), "{note}");
+
+            embed.background_embed_paused = false;
+            assert!(matches!(
+                search_index_from(&embed, None),
+                SearchIndexStanding::Filling { .. }
+            ));
+            embed.background_embed_paused = true;
+            embed.embed_worker_failed = true;
+            assert!(
+                matches!(search_index_from(&embed, None), SearchIndexStanding::Paused { cause, .. } if cause.contains("worker stopped"))
+            );
+            embed.embed_worker_failed = false;
+            embed.embed_persistence_unavailable = true;
+            assert!(
+                matches!(search_index_from(&embed, None), SearchIndexStanding::Paused { cause, .. } if cause.contains("no local vectors"))
+            );
+            embed.model_fetch.declined = true;
+            assert_eq!(search_index_from(&embed, None), SearchIndexStanding::Off);
+            embed.model_fetch.declined = false;
+            embed.embed_persistence_unavailable = false;
+            embed.embeddings_indexed = 5;
+            assert_eq!(
+                search_index_from(&embed, None),
+                SearchIndexStanding::Complete { total: 5 }
+            );
+        }
+
+        /// A semantic search over an unfinished index says how far it got, why,
+        /// when that changes and what ranked the rows, never a bare "no vector
+        /// matches".
+        #[test]
+        fn a_semantic_search_on_an_unready_index_says_why() {
+            use super::super::{semantic_search_note_from, SearchIndexStanding};
+            let absent = crate::embed_model::EmbedModelFetch {
+                model_id: "nomic-ai/nomic-embed-text-v1.5".to_string(),
+                ..Default::default()
+            };
+            let paused = SearchIndexStanding::Paused {
+                indexed: 0,
+                total: 429,
+                cause: "memory pressure".to_string(),
+                resumes: Some("resumes when memory frees"),
+            };
+            assert_eq!(
+                semantic_search_note_from(&paused, &absent, true),
+                Some(vec![
+                    "Search index 0 of 429 · paused: memory pressure · resumes when memory frees."
+                        .to_string(),
+                    "The search model isn't downloaded yet; it downloads when the index builds."
+                        .to_string(),
+                    "Answering from graph text search meanwhile:".to_string(),
+                ])
+            );
+            let present = crate::embed_model::EmbedModelFetch {
+                present: true,
+                ..absent.clone()
+            };
+            assert_eq!(
+                semantic_search_note_from(
+                    &SearchIndexStanding::Filling {
+                        indexed: 64,
+                        total: 197
+                    },
+                    &present,
+                    false
+                ),
+                Some(vec![
+                    "Search index 64 of 197 · filling in the background.".to_string(),
+                    "Ranked over the part indexed so far:".to_string(),
+                ])
+            );
+            assert_eq!(
+                semantic_search_note_from(
+                    &SearchIndexStanding::Complete { total: 197 },
+                    &present,
+                    true
+                ),
+                None
+            );
+        }
+
+        /// End to end over a real store: the answer, exit 0, and a store left
+        /// exactly as it was.
+        #[tokio::test(flavor = "current_thread")]
+        async fn a_second_init_answers_and_leaves_the_store_alone() {
+            let dir = tempfile::tempdir().unwrap();
+            kin_core::init(dir.path()).unwrap();
+            let manifest = std::fs::read(dir.path().join(".kin/manifest.json")).unwrap();
+            let answered = super::super::answer_existing_repository(dir.path(), false, false)
+                .expect("a store this build opens is answered, not refused")
+                .expect("and answered as already a repository");
+            let paused = super::super::SearchIndexStanding::Paused {
+                indexed: 0,
+                total: 429,
+                cause: "memory pressure".to_string(),
+                resumes: Some("resumes when memory frees"),
+            };
+            let lines = super::super::existing_repository_lines(
+                crate::screen::Style::plain(),
+                &answered,
+                &paused,
+                "kin refs want_bytes",
+                58,
+                true,
+            );
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.contains("resumes when memory frees")),
+                "{lines:#?}"
+            );
+            assert!(
+                lines.iter().any(|l| l.contains("Search index")
+                    && l.contains("0 of 429")
+                    && l.contains("paused: memory pressure")),
+                "{lines:#?}"
+            );
+            assert_eq!(
+                lines.last().map(String::as_str),
+                Some("  Next          kin refs want_bytes"),
+                "{lines:#?}"
+            );
+            for line in &lines {
+                assert!(
+                    line.chars().count() < 60,
+                    "short lines, no hard wrap: {line:?}"
+                );
+                assert!(!line.contains("Nothing to do"), "{line}");
+            }
+            assert_eq!(
+                std::fs::read(dir.path().join(".kin/manifest.json")).unwrap(),
+                manifest
+            );
+            let refused = super::super::answer_existing_repository(dir.path(), true, false)
+                .expect_err("--json keeps its refusal");
+            assert!(refused.to_string().contains("already exists"), "{refused}");
+        }
+    }
+
+    /// The Search index row says what the first embedding pass came to.
+    mod search_index_rows {
+        use super::super::{search_index_row, unobserved_search_index_row, FirstEmbedPassOutcome};
+        use crate::embed_model::EmbedModelFetch;
+        use crate::screen::Status;
+
+        fn cached() -> EmbedModelFetch {
+            EmbedModelFetch {
+                present: true,
+                ..EmbedModelFetch::default()
+            }
+        }
+
+        #[test]
+        fn an_unobserved_index_names_an_explicit_action_not_background_work() {
+            for fetch in [cached(), EmbedModelFetch::default()] {
+                assert_eq!(
+                    unobserved_search_index_row(&fetch),
+                    (Status::Off, "kin embed builds it".to_string())
+                );
+            }
+            assert_eq!(
+                unobserved_search_index_row(&EmbedModelFetch {
+                    declined: true,
+                    ..Default::default()
+                }),
+                (Status::Off, "off · kin embed turns it on".to_string())
+            );
+        }
+
+        #[test]
+        fn a_drained_pass_counts_its_entries() {
+            assert_eq!(
+                search_index_row(&FirstEmbedPassOutcome::Drained { indexed: 429 }, &cached()),
+                Some((Status::Ok, "429 entries".to_string()))
+            );
+            assert_eq!(
+                search_index_row(&FirstEmbedPassOutcome::Drained { indexed: 0 }, &cached()),
+                None,
+                "a repository with nothing to embed grows no row"
+            );
+        }
+
+        #[test]
+        fn a_declined_model_is_off_and_names_the_way_back() {
+            let declined = EmbedModelFetch {
+                declined: true,
+                no_fetch_reason: Some("declined".to_string()),
+                ..EmbedModelFetch::default()
+            };
+            assert_eq!(
+                search_index_row(
+                    &FirstEmbedPassOutcome::Stalled {
+                        pending: 429,
+                        reason: "declined",
+                    },
+                    &declined
+                ),
+                Some((Status::Off, "off · kin embed turns it on".to_string()))
+            );
+        }
+
+        #[test]
+        fn a_missing_model_and_a_spent_budget_never_claim_an_index() {
+            let absent = EmbedModelFetch::default();
+            let (status, value) = search_index_row(
+                &FirstEmbedPassOutcome::Stalled {
+                    pending: 429,
+                    reason: "absent",
+                },
+                &absent,
+            )
+            .unwrap();
+            assert_eq!(status, Status::Warn);
+            assert!(value.contains("kin embed"), "{value}");
+            let (status, value) = search_index_row(
+                &FirstEmbedPassOutcome::BudgetSpent {
+                    indexed: 120,
+                    total: 429,
+                    waited_secs: 120,
+                },
+                &cached(),
+            )
+            .unwrap();
+            assert_eq!(status, Status::Warn);
+            assert_eq!(
+                value,
+                "120 of 429 entries so far · finishing in the background"
+            );
+        }
+    }
+
+    /// Every way the phase can end short reaches the Linked row as something a
+    /// reader can act on, never as a finished link.
+    #[test]
+    fn every_shortfall_reaches_the_linked_row_as_what_it_is() {
+        use crate::first_run::Linking;
+        let linking = |reason| linking_for(&CrossFileEnrichment::withheld(reason, "pending"));
+        assert_eq!(linking(CrossFileShortfall::NotRequested), Linking::Skipped);
+        assert_eq!(
+            linking(CrossFileShortfall::LanguageServerUnavailable),
+            Linking::NoServer
+        );
+        for reason in [
+            CrossFileShortfall::DaemonSpawnDisabled,
+            CrossFileShortfall::LoopbackBlocked,
+            CrossFileShortfall::DaemonUnavailable,
+            CrossFileShortfall::StoreUnreadable,
+            CrossFileShortfall::SweepNotStarted,
+            CrossFileShortfall::SweepOutcomeUnreadable,
+        ] {
+            assert!(
+                matches!(linking(reason), Linking::NotRun(_)),
+                "{reason:?} is a phase that did not run"
+            );
         }
     }
 }

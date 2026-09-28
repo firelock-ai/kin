@@ -161,8 +161,9 @@ pub struct EnrichmentMark {
     /// The enrichment version that finished the file. A build that asks more
     /// does not skip a file an older enrichment finished.
     pub version: u32,
-    /// [`enrichment_relations_digest`] of the relations authority holds for
-    /// the file, taken when the mark was committed.
+    /// Versions through seven use [`enrichment_relations_digest`] (identities).
+    /// Version eight uses [`crate::enrichment_proof_inputs_by_file`] (complete
+    /// selected proof payloads). The serialized four-field shape is unchanged.
     pub relations: Hash256,
 }
 
@@ -399,6 +400,20 @@ pub fn settle_enrichment_marks(
     successor_tree: &ResolvedTree,
     mut relations_for: impl FnMut(&str) -> Hash256,
 ) -> Result<(Vec<EnrichmentMark>, Vec<String>)> {
+    settle_enrichment_marks_with_digest(current, delta, successor_tree, |mark| {
+        Some(relations_for(&mark.path))
+    })
+}
+
+/// Version-aware settlement. Unknown or unavailable proof inputs drop the mark
+/// without refusing the semantic publication beside it. Legacy callers retain
+/// their ID-only digest through [`settle_enrichment_marks`].
+pub fn settle_enrichment_marks_with_digest(
+    current: &[EnrichmentMark],
+    delta: &EnrichmentMarksDelta,
+    successor_tree: &ResolvedTree,
+    mut digest_for: impl FnMut(&EnrichmentMark) -> Option<Hash256>,
+) -> Result<(Vec<EnrichmentMark>, Vec<String>)> {
     delta.validate()?;
     let mut settled: BTreeMap<String, EnrichmentMark> = if delta.retire_all {
         BTreeMap::new()
@@ -416,7 +431,7 @@ pub fn settle_enrichment_marks(
     let mut dropped_named = Vec::new();
     for (path, mark) in settled {
         let holds =
-            mark_body_holds(&mark, successor_tree) && relations_for(&path) == mark.relations;
+            mark_body_holds(&mark, successor_tree) && digest_for(&mark) == Some(mark.relations);
         if holds {
             kept.push(mark);
         } else if named.contains(path.as_str()) {
@@ -787,6 +802,242 @@ impl WorkspaceSemanticOverlay {
                 RelationDelta::Removed { .. } => false,
             })
     }
+
+    /// Whether this overlay contains only resolver state, including exact
+    /// source-sealed obligations for bindings the resolver withdrew.
+    ///
+    /// Ordinary removed relations and parser additions remain authored work.
+    /// A withdrawal qualifies when its full prior payload is retained by
+    /// canonical binding debt, or an evidence-bound parser certificate and a
+    /// current source-sealed resolver ledger name its derived input. This classifies
+    /// work ownership; the obligation remains outstanding, not resolved.
+    pub fn is_language_server_enrichment_only_at(&self, tree: &ResolvedTree) -> bool {
+        use crate::binding_debt::{
+            claims_local_binding_debt, decode_local_binding_debt, local_binding_debt_id,
+        };
+        use crate::{GraphNodeId, Relation, RelationKind, RelationOrigin};
+
+        let binding_debt = |relation: &Relation| {
+            claims_local_binding_debt(relation)
+                || matches!(relation.src, GraphNodeId::Artifact(artifact)
+                    if relation.id == local_binding_debt_id(artifact))
+        };
+        let refines_binding = |old: &Relation, new: &Relation| {
+            old.origin != RelationOrigin::Manual
+                && new.origin == RelationOrigin::Lsp
+                && old.kind == new.kind
+                && old.src == new.src
+                && old.dst == new.dst
+        };
+        if self.is_language_server_enrichment_only()
+            && self.relation_deltas().iter().all(|delta| match delta {
+                RelationDelta::Modified { old, new } => refines_binding(old, new),
+                _ => true,
+            })
+            && !self.relation_deltas().iter().any(|delta| {
+                delta.old_state().is_some_and(binding_debt)
+                    || delta.new_state().is_some_and(binding_debt)
+            })
+        {
+            return true;
+        }
+        if self.is_empty()
+            || !self.entity_deltas().is_empty()
+            || !self.external_reference_deltas().iter().all(|delta| {
+                matches!(delta, ExternalReferenceDelta::Added { new }
+                    if new.resolution_namespace == crate::EXTERNAL_SYMBOL_NAMESPACE)
+            })
+        {
+            return false;
+        }
+        let records: BTreeMap<_, _> = self
+            .resolution_record_deltas()
+            .iter()
+            .filter_map(ResolutionRecordDelta::new_state)
+            .map(|record| (record.id(), record))
+            .collect();
+        let parser_withdrawals: BTreeSet<_> = self
+            .relation_deltas()
+            .iter()
+            .filter_map(|delta| match delta {
+                RelationDelta::Removed { old }
+                    if current_parser_withdrawal(old, tree, &records) =>
+                {
+                    Some(old.id)
+                }
+                _ => None,
+            })
+            .collect();
+        let decode_current = |relation: &Relation| {
+            let GraphNodeId::Artifact(artifact) = relation.src else {
+                return None;
+            };
+            let held = tree.get(&artifact)?;
+            let path = crate::FilePathId(held.path.as_utf8()?.to_owned());
+            let crate::TreeEntry::Blob { hash, .. } = held.entry else {
+                return None;
+            };
+            let debt = decode_local_binding_debt(&path, artifact, relation).ok()??;
+            (debt.observed_source_digest == hash).then_some(debt)
+        };
+        let prior_payloads: std::collections::HashMap<_, _> = self
+            .relation_deltas()
+            .iter()
+            .filter_map(|delta| delta.old_state().map(|old| (old.id, old)))
+            .collect();
+        let mut debts = std::collections::HashSet::new();
+        let mut recorded = std::collections::HashMap::new();
+        for delta in self.relation_deltas() {
+            let Some(new) = delta.new_state() else {
+                continue;
+            };
+            if new.origin == RelationOrigin::Lsp
+                && !binding_debt(new)
+                && !delta.old_state().is_some_and(binding_debt)
+            {
+                continue;
+            }
+            let Some(debt) = decode_current(new) else {
+                return false;
+            };
+            let prior = match delta.old_state() {
+                Some(old) => {
+                    let Some(prior) = decode_current(old) else {
+                        return false;
+                    };
+                    if !prior
+                        .obligations
+                        .iter()
+                        .all(|old| debt.obligations.contains(old))
+                    {
+                        return false;
+                    }
+                    Some(prior)
+                }
+                None => None,
+            };
+            for obligation in &debt.obligations {
+                if prior
+                    .as_ref()
+                    .is_some_and(|prior| prior.obligations.contains(obligation))
+                {
+                    continue;
+                }
+                let old = &obligation.retired_relation;
+                let resolver_owned = old.origin == RelationOrigin::Lsp
+                    || (old.kind == RelationKind::Calls
+                        && matches!(
+                            old.origin,
+                            RelationOrigin::Parsed | RelationOrigin::Inferred
+                        ));
+                if !resolver_owned
+                    || prior_payloads.get(&old.id).copied() != Some(old)
+                    || obligation.source_digest != debt.observed_source_digest
+                    || obligation
+                        .prior_source_file
+                        .as_ref()
+                        .is_some_and(|path| path != &debt.source_file)
+                {
+                    return false;
+                }
+                recorded.insert(old.id, old.clone());
+            }
+            debts.insert(new.id);
+        }
+        (!debts.is_empty() || !parser_withdrawals.is_empty())
+            && self.relation_deltas().iter().all(|delta| match delta {
+                RelationDelta::Added { new } => {
+                    new.origin == RelationOrigin::Lsp || debts.contains(&new.id)
+                }
+                RelationDelta::Modified { old, new } => {
+                    debts.contains(&new.id)
+                        || (new.origin == RelationOrigin::Lsp
+                            && (refines_binding(old, new) || recorded.get(&old.id) == Some(old)))
+                }
+                RelationDelta::Removed { old } => {
+                    recorded.get(&old.id) == Some(old) || parser_withdrawals.contains(&old.id)
+                }
+            })
+    }
+}
+
+/// Recognize a resolver's withdrawal of its own parser-inferred input. This
+/// is an ownership check, not a proof that the old call was absent or that an
+/// obligation was discharged. History admission still checks those separately.
+fn current_parser_withdrawal(
+    old: &crate::Relation,
+    tree: &ResolvedTree,
+    records: &BTreeMap<crate::ResolutionRecordId, &crate::ResolutionRecord>,
+) -> bool {
+    use crate::parser_occurrence::{evidence_digest, reserved, validated_proofs};
+    use crate::{GraphNodeId, RelationKind, RelationOrigin, ResolutionRecord, ResolutionRecordId};
+    if old.kind != RelationKind::Calls || old.origin != RelationOrigin::Inferred {
+        return false;
+    }
+    let (GraphNodeId::Entity(caller), GraphNodeId::Entity(_)) = (old.src, old.dst) else {
+        return false;
+    };
+    let Ok(proofs) = validated_proofs(old) else {
+        return false;
+    };
+    if proofs.is_empty() {
+        return false;
+    }
+    let Some(ResolutionRecord::CallSites(ledger)) = records
+        .get(&ResolutionRecordId::call_sites(caller))
+        .copied()
+    else {
+        return false;
+    };
+    if ResolutionRecord::CallSites(ledger.clone())
+        .validate()
+        .is_err()
+    {
+        return false;
+    }
+    let mut sites = 0;
+    old.evidence.iter().all(|evidence| {
+        if reserved(evidence) {
+            return true;
+        }
+        let Some(span) = evidence.source_span.as_ref() else {
+            return false;
+        };
+        if span.start_byte >= span.end_byte
+            || evidence.occurrence_count == 0
+            || !proofs.contains_key(&evidence_digest(evidence))
+        {
+            return false;
+        }
+        let Ok(path) = crate::RepoPath::from_utf8(span.file.0.clone()) else {
+            return false;
+        };
+        let Some(held) = tree.artifact_at_path(&path) else {
+            return false;
+        };
+        let crate::TreeEntry::Blob { hash, .. } = held.entry else {
+            return false;
+        };
+        let Some(language) = crate::language_of_path(&span.file.0) else {
+            return false;
+        };
+        let Some(ResolutionRecord::ContextValidation(validation)) = records
+            .get(&ResolutionRecordId::context_validation(language))
+            .copied()
+        else {
+            return false;
+        };
+        let Some(ResolutionRecord::ProofContext(context)) = records.get(&ledger.context).copied()
+        else {
+            return false;
+        };
+        sites += 1;
+        hash == ledger.body_hash
+            && context.language == language
+            && validation.validate().is_ok()
+            && ResolutionRecordId::proof_context(context) == ledger.context
+            && validation.current_context() == Some(ledger.context)
+    }) && sites > 0
 }
 
 /// One versioned digest in the repository authority root bundle.
@@ -1114,7 +1365,9 @@ impl WorkspaceState {
     /// unborn head, or an overlay holding anything else still does.
     pub fn holds_uncommitted_work(&self) -> bool {
         (!self.semantic_overlay.is_empty()
-            && !self.semantic_overlay.is_language_server_enrichment_only())
+            && !self
+                .semantic_overlay
+                .is_language_server_enrichment_only_at(&self.tree))
             || self
                 .base_tree_hash
                 .map_or(!self.tree.is_empty(), |base| base != self.tree_hash)
@@ -2566,7 +2819,7 @@ impl RepositoryTransaction {
 
     /// Hash metadata with externally stored changes in strictly increasing identity order.
     ///
-    /// `self.changes` must be empty. The factory is opened three times and must
+    /// `self.changes` must be empty. The factory is opened twice and must
     /// return the same fallible sequence each time. Every change is validated,
     /// and canonical change digests are compared across passes before returning
     /// a hash. Memory holds one change body and compact identity indexes.
@@ -2595,20 +2848,27 @@ impl RepositoryTransaction {
                 Ok(change)
             }),
         )?;
+        let change_bytes = validated.written();
         let digest = validated.finish();
         let view = CanonicalTransaction::new(self);
         let mut counter = CountingSink::default();
         view.write_preimage_with_changes(&mut counter, |out| {
-            write_streamed_changes(out, change_count, open()?, digest)
+            write_streamed_change_header(out, change_count)
+        })?;
+        // Validation already encoded every change. Count only metadata and the
+        // array header here, then add their exact byte count without reading
+        // or encoding the external history a third time.
+        let payload_len = counter.len().checked_add(change_bytes).ok_or_else(|| {
+            ModelError::InvalidOperation("canonical preimage length exceeds u64".into())
         })?;
         let mut sink = HashingSink::new();
         sink.write_bytes(REPOSITORY_TRANSACTION_HASH_DOMAIN);
-        sink.write_bytes(&counter.len().to_le_bytes());
+        sink.write_bytes(&payload_len.to_le_bytes());
         let header_len = sink.written();
         view.write_preimage_with_changes(&mut sink, |out| {
             write_streamed_changes(out, change_count, open()?, digest)
         })?;
-        if sink.written() - header_len != counter.len() {
+        if sink.written() - header_len != payload_len {
             return Err(ModelError::InvalidOperation(
                 "canonical preimage length differs between counting and hashing passes".into(),
             ));
@@ -2668,18 +2928,23 @@ fn check_stream_order(previous: &mut Option<SemanticChangeId>, id: SemanticChang
     Ok(())
 }
 
-fn write_streamed_changes<S: CanonicalSink>(
-    out: &mut S,
-    expected: usize,
-    changes: impl IntoIterator<Item = Result<SemanticChange>>,
-    validated_digest: [u8; 32],
-) -> Result<()> {
+fn write_streamed_change_header<S: CanonicalSink>(out: &mut S, expected: usize) -> Result<()> {
     out.push_byte(4);
     out.write_bytes(
         &u64::try_from(expected)
             .map_err(|_| ModelError::InvalidOperation("canonical array exceeds u64".into()))?
             .to_le_bytes(),
     );
+    Ok(())
+}
+
+fn write_streamed_changes<S: CanonicalSink>(
+    out: &mut S,
+    expected: usize,
+    changes: impl IntoIterator<Item = Result<SemanticChange>>,
+    validated_digest: [u8; 32],
+) -> Result<()> {
+    write_streamed_change_header(out, expected)?;
     let mut digest = HashingSink::new();
     let mut previous = None;
     let mut count = 0;
@@ -4493,6 +4758,713 @@ mod tests {
         assert!(workspace(Hash256::from_bytes([0x9a; 32]), enrichment).holds_uncommitted_work());
     }
 
+    fn workspace_with_recorded_guess_withdrawal(
+    ) -> (WorkspaceState, crate::Relation, crate::Relation) {
+        use crate::binding_debt::{
+            build_local_binding_debt, LocalBindingDebt, LocalBindingObligation,
+        };
+        let repository_id = RepositoryId::new("repo").unwrap();
+        let workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(0x94));
+        let (shared_policy, policy, _) = admission_policy(workspace_id);
+        let artifact = ArtifactId(Uuid::from_u128(0x95));
+        let target_artifact = ArtifactId(Uuid::from_u128(0x96));
+        let tree = ResolvedTree::default()
+            .apply(&[
+                add_artifact(artifact, b"src/source.rs".to_vec(), 0x42, false),
+                add_artifact(target_artifact, b"src/target.rs".to_vec(), 0x43, false),
+            ])
+            .unwrap();
+        let tree_hash = compute_resolved_tree_hash(&tree).unwrap();
+        let old = crate::Relation {
+            id: crate::RelationId(Uuid::from_u128(0x99)),
+            kind: crate::RelationKind::Calls,
+            src: crate::GraphNodeId::Entity(EntityId(Uuid::from_u128(0x97))),
+            dst: crate::GraphNodeId::Entity(EntityId(Uuid::from_u128(0x98))),
+            confidence: 0.5,
+            origin: crate::RelationOrigin::Inferred,
+            created_in: None,
+            import_source: None,
+            evidence: vec![crate::RelationEvidence {
+                source_span: Some(crate::SourceSpan {
+                    file: crate::FilePathId("src/source.rs".into()),
+                    start_byte: 1,
+                    end_byte: 7,
+                    start_line: 1,
+                    start_col: 1,
+                    end_line: 1,
+                    end_col: 7,
+                }),
+                parser_rule: Some("call_expression".into()),
+                token: Some("callee".into()),
+                ..Default::default()
+            }],
+        };
+        let debt = build_local_binding_debt(
+            artifact,
+            LocalBindingDebt {
+                source_file: crate::FilePathId("src/source.rs".into()),
+                observed_source_digest: Hash256::from_bytes([0x42; 32]),
+                obligations: vec![LocalBindingObligation {
+                    retired_relation: old.clone(),
+                    source_name: "caller".into(),
+                    source_digest: Hash256::from_bytes([0x42; 32]),
+                    prior_source_file: None,
+                    target_artifact,
+                    target_file: crate::FilePathId("src/target.rs".into()),
+                    target_name: "callee".into(),
+                }],
+            },
+        )
+        .unwrap();
+        let overlay = WorkspaceSemanticOverlay::new(
+            Vec::new(),
+            vec![
+                RelationDelta::Removed { old: old.clone() },
+                RelationDelta::Added { new: debt.clone() },
+            ],
+        )
+        .unwrap();
+        let workspace = WorkspaceState::new(
+            repository_id,
+            workspace_id,
+            1,
+            WorkspaceHead::Symbolic {
+                target: RefName::branch(b"main").unwrap(),
+            },
+            Some(RefTarget::change(SemanticChangeId::from_hash(
+                Hash256::from_bytes([0x97; 32]),
+            ))),
+            Some(tree_hash),
+            tree,
+            overlay,
+            shared_policy,
+            policy,
+        )
+        .unwrap();
+        (workspace, old, debt)
+    }
+
+    #[test]
+    fn exact_source_sealed_binding_withdrawals_are_derived_workspace_state() {
+        use crate::binding_debt::{build_local_binding_debt, decode_local_binding_debt};
+        let (workspace, old, debt) = workspace_with_recorded_guess_withdrawal();
+        assert!(
+            workspace.is_dirty(),
+            "the persisted semantic overlay still exists"
+        );
+        assert!(
+            !workspace.holds_uncommitted_work(),
+            "exact outstanding debt is derived state"
+        );
+        let crate::GraphNodeId::Artifact(artifact) = debt.src else {
+            panic!("fixture is artifact-owned");
+        };
+        let file = crate::FilePathId("src/source.rs".into());
+        let prior = decode_local_binding_debt(&file, artifact, &debt)
+            .unwrap()
+            .unwrap();
+        assert_eq!(prior.obligations[0].retired_relation, old);
+        let mut retargeted = old.clone();
+        retargeted.origin = crate::RelationOrigin::Lsp;
+        retargeted.dst = crate::GraphNodeId::Entity(EntityId(Uuid::from_u128(0xb0)));
+        let mut refined = workspace.clone();
+        refined.semantic_overlay = WorkspaceSemanticOverlay::new(
+            Vec::new(),
+            vec![RelationDelta::Modified {
+                old: old.clone(),
+                new: retargeted.clone(),
+            }],
+        )
+        .unwrap();
+        assert!(
+            refined.holds_uncommitted_work(),
+            "another target requires exact prior accounting"
+        );
+        refined.semantic_overlay = WorkspaceSemanticOverlay::new(
+            Vec::new(),
+            vec![
+                RelationDelta::Modified {
+                    old: old.clone(),
+                    new: retargeted,
+                },
+                RelationDelta::Added { new: debt.clone() },
+            ],
+        )
+        .unwrap();
+        assert!(
+            !refined.holds_uncommitted_work(),
+            "retargeted resolver binding retains the exact old obligation"
+        );
+        for origin in [crate::RelationOrigin::Parsed, crate::RelationOrigin::Lsp] {
+            let mut retired = old.clone();
+            retired.origin = origin;
+            let mut retained = prior.clone();
+            retained.obligations[0].retired_relation = retired.clone();
+            let mut observed = workspace.clone();
+            observed.semantic_overlay = WorkspaceSemanticOverlay::new(
+                Vec::new(),
+                vec![
+                    RelationDelta::Removed {
+                        old: retired.clone(),
+                    },
+                    RelationDelta::Added {
+                        new: build_local_binding_debt(artifact, retained).unwrap(),
+                    },
+                ],
+            )
+            .unwrap();
+            assert!(
+                !observed.holds_uncommitted_work(),
+                "exact paired {origin:?} withdrawal"
+            );
+            observed.semantic_overlay = WorkspaceSemanticOverlay::new(
+                Vec::new(),
+                vec![RelationDelta::Removed { old: retired }],
+            )
+            .unwrap();
+            assert!(
+                observed.holds_uncommitted_work(),
+                "unpaired {origin:?} withdrawal"
+            );
+        }
+        assert_eq!(
+            build_local_binding_debt(artifact, prior.clone()).unwrap(),
+            debt
+        );
+        assert_eq!(
+            debt.evidence[0].parser_rule.as_deref(),
+            Some("local_binding_debt_v1")
+        );
+        assert!(!debt.evidence[0]
+            .token
+            .as_ref()
+            .unwrap()
+            .contains("prior_source_file"));
+        let mut located = prior.clone();
+        located.obligations[0].prior_source_file = Some(file.clone());
+        let located = build_local_binding_debt(artifact, located).unwrap();
+        assert_eq!(
+            located.evidence[0].parser_rule.as_deref(),
+            Some("local_binding_debt_v2")
+        );
+        assert_eq!(
+            decode_local_binding_debt(&file, artifact, &located)
+                .unwrap()
+                .unwrap()
+                .obligations[0]
+                .prior_source_file,
+            Some(file)
+        );
+        let mut with_location = workspace.clone();
+        with_location.semantic_overlay = WorkspaceSemanticOverlay::new(
+            Vec::new(),
+            vec![
+                RelationDelta::Removed { old: old.clone() },
+                RelationDelta::Added { new: located },
+            ],
+        )
+        .unwrap();
+        assert!(!with_location.holds_uncommitted_work());
+
+        // Existing debt can be extended without treating its already-held
+        // obligations as withdrawals newly made by this overlay.
+        let mut second = old.clone();
+        second.id = crate::RelationId(Uuid::from_u128(0xaa));
+        second.evidence[0].source_span.as_mut().unwrap().start_byte = 2;
+        let mut merged = prior.clone();
+        let mut obligation = prior.obligations[0].clone();
+        obligation.retired_relation = second.clone();
+        merged.obligations.push(obligation.clone());
+        let merged = build_local_binding_debt(artifact, merged).unwrap();
+        let mut extended = workspace.clone();
+        extended.semantic_overlay = WorkspaceSemanticOverlay::new(
+            Vec::new(),
+            vec![
+                RelationDelta::Removed {
+                    old: second.clone(),
+                },
+                RelationDelta::Modified {
+                    old: debt.clone(),
+                    new: merged,
+                },
+            ],
+        )
+        .unwrap();
+        assert!(!extended.holds_uncommitted_work());
+        let mut dropped = prior;
+        dropped.obligations = vec![obligation];
+        extended.semantic_overlay = WorkspaceSemanticOverlay::new(
+            Vec::new(),
+            vec![
+                RelationDelta::Removed { old: second },
+                RelationDelta::Modified {
+                    old: debt,
+                    new: build_local_binding_debt(artifact, dropped).unwrap(),
+                },
+            ],
+        )
+        .unwrap();
+        assert!(
+            extended.holds_uncommitted_work(),
+            "derived refinement cannot discard an old obligation"
+        );
+    }
+
+    fn workspace_with_current_parser_withdrawal() -> (WorkspaceState, crate::Relation) {
+        use crate::parser_occurrence::{evidence_digest, Proof, OCCURRENCE_RULE};
+        use crate::{
+            CallSiteLedger, ContextValidation, ContextValidationState, LanguageId, ProofContext,
+            ResolutionRecord, ResolutionRecordId,
+        };
+        let (mut workspace, mut old, _) = workspace_with_recorded_guess_withdrawal();
+        old.confidence = 0.3;
+        old.evidence[0].parser_rule = Some("call_shape_incomplete_extraction_v1".into());
+        let certificate = Proof {
+            relation_id: old.id,
+            src: old.src,
+            dst: old.dst,
+            kind: old.kind,
+            evidence_sha256: evidence_digest(&old.evidence[0]),
+            confidence: old.confidence,
+            origin: old.origin,
+        };
+        old.evidence.push(crate::RelationEvidence {
+            parser_rule: Some(OCCURRENCE_RULE.into()),
+            token: Some(serde_json::to_string(&certificate).unwrap()),
+            occurrence_count: 0,
+            ..Default::default()
+        });
+        let context = ProofContext {
+            language: LanguageId::Rust,
+            resolver: "lsp:rust-analyzer".into(),
+            resolver_version: "1".into(),
+            configuration_hash: Hash256::from_bytes([0x71; 32]),
+            environment_hash: Hash256::from_bytes([0x72; 32]),
+            environment_summary: "pinned".into(),
+        };
+        let records = vec![
+            ResolutionRecord::CallSites(CallSiteLedger {
+                caller: old.src.as_entity().unwrap(),
+                behavior_hash: Hash256::from_bytes([0x73; 32]),
+                body_hash: Hash256::from_bytes([0x42; 32]),
+                context: ResolutionRecordId::proof_context(&context),
+                census: 0,
+                sites: vec![],
+            }),
+            ResolutionRecord::ProofContext(context.clone()),
+            ResolutionRecord::ContextValidation(ContextValidation {
+                language: LanguageId::Rust,
+                state: ContextValidationState::Validated { context },
+            }),
+        ]
+        .into_iter()
+        .map(|new| ResolutionRecordDelta::Added { new })
+        .collect();
+        workspace.semantic_overlay = WorkspaceSemanticOverlay::new(
+            vec![],
+            vec![RelationDelta::Removed { old: old.clone() }],
+        )
+        .unwrap()
+        .with_resolution_records(records)
+        .unwrap();
+        (workspace, old)
+    }
+
+    #[test]
+    fn current_parser_withdrawal_is_derived_with_or_without_remaining_debt() {
+        let (mut workspace, old) = workspace_with_current_parser_withdrawal();
+        assert!(workspace.is_dirty());
+        assert!(!workspace.holds_uncommitted_work());
+        let (_, mut another, mut debt) = workspace_with_recorded_guess_withdrawal();
+        another.id = crate::RelationId(Uuid::from_u128(0xb5));
+        let crate::GraphNodeId::Artifact(artifact) = debt.src else {
+            panic!("artifact")
+        };
+        let mut owed = crate::binding_debt::decode_local_binding_debt(
+            &crate::FilePathId("src/source.rs".into()),
+            artifact,
+            &debt,
+        )
+        .unwrap()
+        .unwrap();
+        owed.obligations[0].retired_relation = another.clone();
+        debt = crate::binding_debt::build_local_binding_debt(artifact, owed).unwrap();
+        workspace.semantic_overlay = WorkspaceSemanticOverlay::new(
+            vec![],
+            vec![
+                RelationDelta::Removed { old },
+                RelationDelta::Removed { old: another },
+                RelationDelta::Added { new: debt.clone() },
+            ],
+        )
+        .unwrap()
+        .with_resolution_records(
+            workspace
+                .semantic_overlay
+                .resolution_record_deltas()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(!workspace.holds_uncommitted_work());
+        assert_eq!(
+            workspace
+                .semantic_overlay
+                .relation_deltas()
+                .iter()
+                .find_map(|delta| delta.new_state().filter(|new| new.id == debt.id)),
+            Some(&debt),
+            "classifying ownership never discharges the remaining obligation"
+        );
+    }
+
+    #[test]
+    fn parser_withdrawal_ownership_requires_exact_current_source_and_context() {
+        use crate::{ContextValidationState, ResolutionRecord};
+        let (workspace, _) = workspace_with_current_parser_withdrawal();
+        for case in 0..6 {
+            let mut candidate = workspace.clone();
+            let mut records = candidate
+                .semantic_overlay
+                .resolution_record_deltas()
+                .to_vec();
+            match case {
+                0 => records.retain(|delta| {
+                    !matches!(
+                        delta.new_state(),
+                        Some(ResolutionRecord::ContextValidation(_))
+                    )
+                }),
+                1 => {
+                    if let ResolutionRecordDelta::Added {
+                        new: ResolutionRecord::ContextValidation(validation),
+                    } = records
+                        .iter_mut()
+                        .find(|delta| {
+                            matches!(
+                                delta.new_state(),
+                                Some(ResolutionRecord::ContextValidation(_))
+                            )
+                        })
+                        .unwrap()
+                    {
+                        validation.state = ContextValidationState::Unverified {
+                            reason: "not validated".into(),
+                        };
+                    }
+                }
+                2 => {
+                    if let ResolutionRecordDelta::Added {
+                        new: ResolutionRecord::CallSites(ledger),
+                    } = records
+                        .iter_mut()
+                        .find(|delta| {
+                            matches!(delta.new_state(), Some(ResolutionRecord::CallSites(_)))
+                        })
+                        .unwrap()
+                    {
+                        ledger.body_hash = Hash256::from_bytes([0x74; 32]);
+                    }
+                }
+                3 => records.retain(|delta| {
+                    !matches!(delta.new_state(), Some(ResolutionRecord::ProofContext(_)))
+                }),
+                4 => {
+                    if let ResolutionRecordDelta::Added {
+                        new: ResolutionRecord::ContextValidation(validation),
+                    } = records
+                        .iter_mut()
+                        .find(|delta| {
+                            matches!(
+                                delta.new_state(),
+                                Some(ResolutionRecord::ContextValidation(_))
+                            )
+                        })
+                        .unwrap()
+                    {
+                        if let ContextValidationState::Validated { context } = &mut validation.state
+                        {
+                            context.resolver_version = "different".into();
+                        }
+                    }
+                }
+                _ => records.retain(|delta| {
+                    !matches!(delta.new_state(), Some(ResolutionRecord::CallSites(_)))
+                }),
+            }
+            candidate.semantic_overlay = WorkspaceSemanticOverlay::new(
+                vec![],
+                candidate.semantic_overlay.relation_deltas().to_vec(),
+            )
+            .unwrap()
+            .with_resolution_records(records)
+            .unwrap();
+            assert!(
+                candidate.holds_uncommitted_work(),
+                "missing or stale proof case {case}"
+            );
+        }
+        let mut candidate = workspace;
+        candidate.tree = ResolvedTree::default();
+        assert!(!candidate
+            .semantic_overlay
+            .is_language_server_enrichment_only_at(&candidate.tree));
+    }
+
+    #[test]
+    fn parser_withdrawal_ownership_never_hides_uncertified_or_authored_changes() {
+        let (workspace, old) = workspace_with_current_parser_withdrawal();
+        for case in 0..9 {
+            let mut changed = old.clone();
+            match case {
+                0 => changed.origin = crate::RelationOrigin::Manual,
+                1 => changed.origin = crate::RelationOrigin::Lsp,
+                2 => changed.evidence.pop().map(|_| ()).unwrap(),
+                3 => changed.evidence[1].token = Some("{}".into()),
+                4 => {
+                    changed.evidence[1].parser_rule =
+                        Some("parser_occurrence_resolution_v99".into())
+                }
+                5 => changed.evidence[0].source_span.as_mut().unwrap().end_byte += 1,
+                6 => changed.dst = crate::GraphNodeId::Entity(EntityId(Uuid::from_u128(0xb6))),
+                7 => changed.evidence.push(crate::RelationEvidence {
+                    token: Some("unattributed".into()),
+                    ..Default::default()
+                }),
+                _ => {
+                    changed.evidence[0].source_span.as_mut().unwrap().file =
+                        crate::FilePathId("src/elsewhere.rs".into())
+                }
+            }
+            let mut candidate = workspace.clone();
+            candidate.semantic_overlay = WorkspaceSemanticOverlay::new(
+                vec![],
+                vec![RelationDelta::Removed { old: changed }],
+            )
+            .unwrap()
+            .with_resolution_records(
+                workspace
+                    .semantic_overlay
+                    .resolution_record_deltas()
+                    .to_vec(),
+            )
+            .unwrap();
+            assert!(
+                candidate.holds_uncommitted_work(),
+                "bad prior payload case {case}"
+            );
+        }
+        let mut candidate = workspace.clone();
+        candidate.semantic_overlay = WorkspaceSemanticOverlay::new(
+            vec![EntityDelta::Added {
+                new: semantic_entity(0xb7, "authored"),
+            }],
+            workspace.semantic_overlay.relation_deltas().to_vec(),
+        )
+        .unwrap()
+        .with_resolution_records(
+            workspace
+                .semantic_overlay
+                .resolution_record_deltas()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(candidate.holds_uncommitted_work());
+        candidate = workspace;
+        candidate.base_tree_hash = Some(Hash256::from_bytes([0x75; 32]));
+        assert!(
+            candidate.holds_uncommitted_work(),
+            "derived withdrawals never excuse source edits"
+        );
+    }
+
+    #[test]
+    fn binding_debt_never_hides_authored_or_unpaired_workspace_changes() {
+        use crate::binding_debt::{build_local_binding_debt, decode_local_binding_debt};
+        let (workspace, old, debt) = workspace_with_recorded_guess_withdrawal();
+        let crate::GraphNodeId::Artifact(artifact) = debt.src else {
+            panic!("fixture is artifact-owned");
+        };
+        let file = crate::FilePathId("src/source.rs".into());
+        let payload = decode_local_binding_debt(&file, artifact, &debt)
+            .unwrap()
+            .unwrap();
+        let mut cases = Vec::new();
+        let mut wrong = debt.clone();
+        wrong.id = crate::RelationId(Uuid::from_u128(0xab));
+        cases.push(("wrong reserved identity", wrong));
+        let mut wrong = debt.clone();
+        wrong.dst = old.dst;
+        cases.push(("not an artifact self relation", wrong));
+        let mut wrong = debt.clone();
+        wrong.evidence[0].parser_rule = None;
+        cases.push(("missing canonical marker", wrong));
+        let mut wrong = debt.clone();
+        wrong.evidence[0].parser_rule = Some("local_binding_debt_v99".into());
+        cases.push(("unknown canonical version", wrong));
+        let mut wrong = debt.clone();
+        wrong.evidence[0].token = Some("{}".into());
+        cases.push(("malformed payload", wrong));
+        let mut wrong = payload.clone();
+        wrong.observed_source_digest = Hash256::from_bytes([0x44; 32]);
+        cases.push((
+            "stale current source seal",
+            build_local_binding_debt(artifact, wrong).unwrap(),
+        ));
+        let mut wrong = payload.clone();
+        wrong.obligations[0].source_digest = Hash256::from_bytes([0x44; 32]);
+        cases.push((
+            "another prior body",
+            build_local_binding_debt(artifact, wrong).unwrap(),
+        ));
+        let mut wrong = payload.clone();
+        wrong.obligations[0].retired_relation.confidence = 0.75;
+        cases.push((
+            "same ID but another prior payload",
+            build_local_binding_debt(artifact, wrong).unwrap(),
+        ));
+        let mut wrong = payload.clone();
+        wrong.source_file = crate::FilePathId("src/other.rs".into());
+        wrong.obligations[0].retired_relation.evidence[0]
+            .source_span
+            .as_mut()
+            .unwrap()
+            .file = wrong.source_file.clone();
+        cases.push((
+            "wrong source path",
+            build_local_binding_debt(artifact, wrong).unwrap(),
+        ));
+        for (label, candidate) in cases {
+            let mut observed = workspace.clone();
+            observed.semantic_overlay = WorkspaceSemanticOverlay::new(
+                Vec::new(),
+                vec![
+                    RelationDelta::Removed { old: old.clone() },
+                    RelationDelta::Added { new: candidate },
+                ],
+            )
+            .unwrap();
+            assert!(observed.holds_uncommitted_work(), "{label}");
+        }
+        // Neither removing the marker nor changing origin may turn a
+        // reserved debt identity into an ordinary Lsp addition/refinement.
+        let mut markerless = debt.clone();
+        markerless.origin = crate::RelationOrigin::Lsp;
+        markerless.evidence.clear();
+        let mut disguised = workspace.clone();
+        disguised.semantic_overlay = WorkspaceSemanticOverlay::new(
+            Vec::new(),
+            vec![RelationDelta::Added { new: markerless }],
+        )
+        .unwrap();
+        assert!(
+            disguised.holds_uncommitted_work(),
+            "reserved debt identity cannot take the Lsp fast path"
+        );
+        let other_artifact = payload.obligations[0].target_artifact;
+        let mut other_payload = payload.clone();
+        other_payload.source_file = crate::FilePathId("src/target.rs".into());
+        other_payload.observed_source_digest = Hash256::from_bytes([0x43; 32]);
+        let obligation = &mut other_payload.obligations[0];
+        obligation.source_digest = other_payload.observed_source_digest;
+        obligation.target_artifact = artifact;
+        obligation.target_file = file.clone();
+        obligation.retired_relation.id = crate::RelationId(Uuid::from_u128(0xaf));
+        obligation.retired_relation.evidence[0]
+            .source_span
+            .as_mut()
+            .unwrap()
+            .file = other_payload.source_file.clone();
+        let other_debt = build_local_binding_debt(other_artifact, other_payload).unwrap();
+        let mut replacement = other_debt.clone();
+        replacement.origin = crate::RelationOrigin::Lsp;
+        replacement.evidence.clear();
+        let mut relations = workspace.semantic_overlay.relation_deltas().to_vec();
+        relations.push(RelationDelta::Modified {
+            old: other_debt,
+            new: replacement,
+        });
+        disguised.semantic_overlay = WorkspaceSemanticOverlay::new(Vec::new(), relations).unwrap();
+        assert!(
+            disguised.holds_uncommitted_work(),
+            "old debt cannot disappear beside another valid derived pair"
+        );
+        let mut manual = old.clone();
+        manual.origin = crate::RelationOrigin::Manual;
+        let mut replacement = manual.clone();
+        replacement.id = crate::RelationId(Uuid::from_u128(0xb1));
+        replacement.origin = crate::RelationOrigin::Lsp;
+        let mut prior_manual = manual.clone();
+        prior_manual.id = replacement.id;
+        let rewrite = RelationDelta::Modified {
+            old: prior_manual,
+            new: replacement,
+        };
+        let mut disguised = workspace.clone();
+        disguised.semantic_overlay =
+            WorkspaceSemanticOverlay::new(Vec::new(), vec![rewrite.clone()]).unwrap();
+        assert!(
+            disguised.holds_uncommitted_work(),
+            "a Manual-to-Lsp rewrite is still authored work"
+        );
+        let mut relations = workspace.semantic_overlay.relation_deltas().to_vec();
+        relations.push(rewrite);
+        disguised.semantic_overlay = WorkspaceSemanticOverlay::new(Vec::new(), relations).unwrap();
+        assert!(
+            disguised.holds_uncommitted_work(),
+            "exact debt beside a manual rewrite cannot hide it"
+        );
+        let mut manual_debt = payload;
+        manual_debt.obligations[0].retired_relation = manual.clone();
+        let mut observed = workspace.clone();
+        observed.semantic_overlay = WorkspaceSemanticOverlay::new(
+            Vec::new(),
+            vec![
+                RelationDelta::Removed { old: manual },
+                RelationDelta::Added {
+                    new: build_local_binding_debt(artifact, manual_debt).unwrap(),
+                },
+            ],
+        )
+        .unwrap();
+        assert!(
+            observed.holds_uncommitted_work(),
+            "even exact debt cannot hide a manual withdrawal"
+        );
+        let mut unrelated = old.clone();
+        unrelated.id = crate::RelationId(Uuid::from_u128(0xac));
+        observed.semantic_overlay = WorkspaceSemanticOverlay::new(
+            Vec::new(),
+            vec![
+                RelationDelta::Removed { old },
+                RelationDelta::Added { new: debt },
+                RelationDelta::Removed { old: unrelated },
+            ],
+        )
+        .unwrap();
+        assert!(
+            observed.holds_uncommitted_work(),
+            "an unpaired removal remains work beside exact debt"
+        );
+        observed = workspace.clone();
+        observed.base_tree_hash = Some(Hash256::from_bytes([0x45; 32]));
+        assert!(
+            observed.holds_uncommitted_work(),
+            "debt never excuses authored source changes"
+        );
+        observed = workspace;
+        observed.semantic_overlay = WorkspaceSemanticOverlay::new(
+            vec![EntityDelta::Added {
+                new: semantic_entity(0xad, "authored"),
+            }],
+            observed.semantic_overlay.relation_deltas().to_vec(),
+        )
+        .unwrap();
+        assert!(
+            observed.holds_uncommitted_work(),
+            "debt never excuses authored semantic entities"
+        );
+    }
+
     #[test]
     fn workspace_snapshot_binding_requires_complete_base_authority() {
         let mut binding = WorkspaceSnapshotBinding {
@@ -5358,6 +6330,30 @@ mod tests {
     }
 
     #[test]
+    fn external_change_stream_opens_and_reads_history_only_twice() {
+        let transaction = canonicalizable_transaction();
+        let expected = transaction.transaction_hash().unwrap();
+        let mut metadata = transaction;
+        let mut changes = std::mem::take(&mut metadata.changes);
+        changes.sort_by_key(|change| change.id);
+        let mut opens = 0;
+        let reads = std::cell::Cell::new(0);
+        let read_count = &reads;
+        let actual = metadata
+            .transaction_hash_with_changes(changes.len(), || {
+                opens += 1;
+                assert!(opens <= 2, "counting must reuse the validated byte count");
+                Ok(changes.clone().into_iter().map(Ok).inspect(move |_| {
+                    read_count.set(read_count.get() + 1);
+                }))
+            })
+            .unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(opens, 2);
+        assert_eq!(reads.get(), changes.len() * 2);
+    }
+
+    #[test]
     fn external_change_stream_rejects_bad_sources() {
         let mut metadata = canonicalizable_transaction();
         let mut changes = std::mem::take(&mut metadata.changes);
@@ -5386,7 +6382,7 @@ mod tests {
         assert!(metadata
             .transaction_hash_with_changes(2, || Ok(duplicate.clone().into_iter().map(Ok)))
             .is_err());
-        for failing_pass in 1..=3 {
+        for failing_pass in 1..=2 {
             let mut pass = 0;
             assert!(metadata
                 .transaction_hash_with_changes(changes.len(), || {
@@ -5398,24 +6394,40 @@ mod tests {
                     Ok(items)
                 })
                 .is_err());
+            assert_eq!(pass, failing_pass);
         }
-        for changed_pass in [2, 3] {
+        for changed_source in ["short", "long", "reversed", "duplicate", "body"] {
             let mut pass = 0;
-            assert!(metadata
-                .transaction_hash_with_changes(changes.len(), || {
-                    pass += 1;
-                    let mut items = changes.clone();
-                    if pass == changed_pass {
-                        let replacement = if items[0].message.starts_with('x') {
-                            "y"
-                        } else {
-                            "x"
-                        };
-                        items[0].message = replacement.repeat(items[0].message.len());
-                    }
-                    Ok(items.into_iter().map(Ok))
-                })
-                .is_err());
+            assert!(
+                metadata
+                    .transaction_hash_with_changes(changes.len(), || {
+                        pass += 1;
+                        let mut items = changes.clone();
+                        if pass == 2 {
+                            match changed_source {
+                                "short" => {
+                                    items.pop();
+                                }
+                                "long" => items.push(items.last().unwrap().clone()),
+                                "reversed" => items.reverse(),
+                                "duplicate" => items[1] = items[0].clone(),
+                                "body" => {
+                                    let replacement = if items[0].message.starts_with('x') {
+                                        "y"
+                                    } else {
+                                        "x"
+                                    };
+                                    items[0].message = replacement.repeat(items[0].message.len());
+                                }
+                                _ => unreachable!(),
+                            }
+                        }
+                        Ok(items.into_iter().map(Ok))
+                    })
+                    .is_err(),
+                "the final hash pass must reject a changed {changed_source} source"
+            );
+            assert_eq!(pass, 2);
         }
     }
 
@@ -7182,6 +8194,183 @@ mod tests {
                 ..Default::default()
             }],
         }
+    }
+
+    #[test]
+    fn enrichment_proof_digest_binds_payloads_and_preserves_legacy_marker_encoding() {
+        use crate::{
+            CallSite, CallSiteLedger, CallSiteState, ContextValidation, ContextValidationState,
+            ProofContext, ResolutionRecord, ResolutionRecordId,
+        };
+        let path = "src/a.rs";
+        let mut caller = semantic_entity(1, "caller");
+        caller.file_origin = Some(crate::FilePathId::new(path));
+        let proof = ProofContext {
+            language: LanguageId::Rust,
+            resolver: "lsp:test".into(),
+            resolver_version: "1".into(),
+            configuration_hash: Hash256::from_bytes([1; 32]),
+            environment_hash: Hash256::from_bytes([2; 32]),
+            environment_summary: "fixture".into(),
+        };
+        let context = ResolutionRecord::ProofContext(proof.clone());
+        let validation = ResolutionRecord::ContextValidation(ContextValidation {
+            language: LanguageId::Rust,
+            state: ContextValidationState::Validated { context: proof },
+        });
+        let ledger = ResolutionRecord::CallSites(CallSiteLedger {
+            caller: caller.id,
+            behavior_hash: caller.fingerprint.behavior_hash,
+            body_hash: Hash256::from_bytes([3; 32]),
+            context: context.id(),
+            census: 1,
+            sites: vec![CallSite {
+                offset: 3,
+                length: 4,
+                state: CallSiteState::ProvenTarget { target: caller.id },
+            }],
+        });
+        let relation = lsp_relation(100, path);
+        let records = vec![context, validation, ledger];
+        let digest = |entity: &Entity, relation: &crate::Relation, records: &[ResolutionRecord]| {
+            crate::enrichment_proof_inputs_by_file([path], [entity], [relation], records).unwrap()
+                [path]
+        };
+        let original = digest(&caller, &relation, &records);
+        assert_eq!(
+            original,
+            digest(
+                &caller,
+                &relation,
+                &records.iter().cloned().rev().collect::<Vec<_>>()
+            )
+        );
+        let mut changed = records.clone();
+        let ResolutionRecord::CallSites(ledger) = &mut changed[2] else {
+            panic!()
+        };
+        ledger.sites[0].state = CallSiteState::Binding { may_call: None };
+        assert_eq!(changed[2].id(), records[2].id());
+        assert_ne!(
+            original,
+            digest(&caller, &relation, &changed),
+            "same-ID ledger payload must move completion"
+        );
+        let mut changed = records.clone();
+        changed[1] = ResolutionRecord::ContextValidation(ContextValidation {
+            language: LanguageId::Rust,
+            state: ContextValidationState::Unverified {
+                reason: "environment changed".into(),
+            },
+        });
+        assert_eq!(changed[1].id(), records[1].id());
+        assert_ne!(original, digest(&caller, &relation, &changed));
+        assert_ne!(
+            original,
+            digest(
+                &caller,
+                &relation,
+                &[records[0].clone(), records[2].clone()]
+            ),
+            "missing validation is explicit"
+        );
+        assert_ne!(
+            original,
+            digest(&caller, &relation, &records[1..]),
+            "missing recorded proof context is explicit"
+        );
+        let mut changed_relation = relation.clone();
+        changed_relation.evidence[0].parser_rule = Some("another accepted method".into());
+        assert_ne!(original, digest(&caller, &changed_relation, &records));
+        let mut changed_entity = caller.clone();
+        changed_entity.fingerprint.behavior_hash = Hash256::from_bytes([8; 32]);
+        assert_ne!(original, digest(&changed_entity, &relation, &records));
+        let legacy = EnrichmentMark {
+            path: path.into(),
+            body: Hash256::from_bytes([4; 32]),
+            version: 7,
+            relations: enrichment_relations_digest(
+                path,
+                [&relation],
+                |_| Some(path),
+                [ResolutionRecordId::call_sites(caller.id)],
+            ),
+        };
+        assert_eq!(
+            legacy.relations,
+            enrichment_relations_digest(
+                path,
+                [&changed_relation],
+                |_| Some(path),
+                [records[2].id()]
+            )
+        );
+        let bytes = rmp_serde::to_vec(&legacy).unwrap();
+        assert_eq!(
+            bytes[0], 0x94,
+            "the persisted marker remains a four-element tuple"
+        );
+        assert_eq!(
+            rmp_serde::from_slice::<EnrichmentMark>(&bytes).unwrap(),
+            legacy
+        );
+        assert_eq!(legacy.version, 7, "reading never promotes an old marker");
+    }
+
+    #[test]
+    fn enrichment_proof_settlement_drops_changed_inputs_and_never_promotes_legacy() {
+        let tree = ResolvedTree::default()
+            .apply(&[add_artifact(
+                ArtifactId(Uuid::from_u128(10)),
+                "src/a.rs",
+                1,
+                false,
+            )])
+            .unwrap();
+        let legacy = mark("src/a.rs", 1, &[]);
+        let full = EnrichmentMark {
+            version: crate::ENRICHMENT_PROOF_MARK_VERSION,
+            relations: Hash256::from_bytes([8; 32]),
+            ..legacy.clone()
+        };
+        let current = [legacy.clone()];
+        let (kept, _) = settle_enrichment_marks_with_digest(
+            &current,
+            &EnrichmentMarksDelta::default(),
+            &tree,
+            |held| Some(held.relations),
+        )
+        .unwrap();
+        assert_eq!(
+            kept, current,
+            "an unrelated successful mutation must not invent a new completion"
+        );
+        let delta = EnrichmentMarksDelta {
+            retire_all: false,
+            marks: vec![full.clone()],
+        };
+        let (kept, dropped) =
+            settle_enrichment_marks_with_digest(&current, &delta, &tree, |_| Some(full.relations))
+                .unwrap();
+        assert_eq!(kept, vec![full.clone()]);
+        assert!(dropped.is_empty());
+        let (kept, dropped) = settle_enrichment_marks_with_digest(&current, &delta, &tree, |_| {
+            Some(Hash256::from_bytes([9; 32]))
+        })
+        .unwrap();
+        assert!(kept.is_empty());
+        assert_eq!(dropped, ["src/a.rs"]);
+        let (kept, _) = settle_enrichment_marks_with_digest(
+            &[full],
+            &EnrichmentMarksDelta::default(),
+            &tree,
+            |_| None,
+        )
+        .unwrap();
+        assert!(
+            kept.is_empty(),
+            "unknown proof inputs cannot preserve completion"
+        );
     }
 
     fn no_entity_files(_: &EntityId) -> Option<&'static str> {

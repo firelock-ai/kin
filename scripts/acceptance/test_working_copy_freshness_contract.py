@@ -21,15 +21,18 @@ def fixture():
     source_text = freshness.LINKGRAPH_SRC
     path, repo, repo_id = "linkgraph/predicates.py", "/fixture/repo", "fixture-repository"
     focal_id, caller_id = "fixture-focal", "fixture-caller"
-    use_line = next(i for i, line in enumerate(source_text.splitlines(), 1)
-                    if freshness.SYMBOL in line and line.lstrip().startswith("return "))
+    # The use sits one line below the first line of `dangling_links`, and Kin
+    # quotes the constant's name there.
     payload = {
-        "focal_entity": {"id": focal_id, "name": freshness.SYMBOL, "kind": "constant", "file_path": path},
+        "focal_entity": {"id": focal_id, "name": freshness.SYMBOL, "kind": "constant",
+                         "projection": {"path": path}},
         "references": [{"entity_id": caller_id, "name": freshness.ADMITTED_FUNCTION_NAME,
-                        "kind": "Function", "file_path": path, "resolution": "type_resolved",
-                        "relation_kinds": ["references"], "reference_lines": [use_line],
-                        "reference_line_count": 1, "reference_lines_absent_reason": None,
-                        "reference_lines_partial_reason": None}],
+                        "kind": "Function", "role": "source", "projection": {"path": path},
+                        "resolution": "type_resolved", "relation_kinds": ["references"],
+                        "site_count": 1,
+                        "sites": [{"line_in_entity": 1, "callee": freshness.SYMBOL}],
+                        "sites_absent_reason": None, "sites_partial_reason": None,
+                        "via_override_of": None}],
         "total_upstream": 1, "candidates": [], "unconfirmed_candidates": 0,
         "negative": {"kind": "qualified_answer", "interpretation": "qualified_answer",
                      "result_count": 1, "safe_to_conclude_absent": False, "trust": "authoritative",
@@ -55,6 +58,41 @@ def fixture():
             path, repo)
 
 
+def call_domain_fixture():
+    """The positive answer bounded by an unsettled call-site reading, as served."""
+    args = list(fixture())
+    payload = args[0]
+    codes = "call_sites_owed; call_sites_unresolved"
+    payload["negative"]["trust"] = "inconclusive"
+    payload["negative"]["advice"] = (
+        "this answer returned rows, so it asserts no absence ... Limiting factor: "
+        "call_sites_owed: 4 of the 9 callers ...; call_sites_unresolved: 2 of the 3 call sites ...")
+    payload["_kin"]["verdict"] = {
+        "state": "inconclusive", "absence_claim": "not_applicable", "safe_to_conclude_absent": False,
+        "limiting_factor": codes,
+        "inputs": {"absence_gate": "inconclusive", "call_sites": "inconclusive",
+                   "caller_arrival": "not_applicable", "completeness": "certified",
+                   "cross_repo": "certified", "edge_coverage": "certified",
+                   "graph_freshness": "not_applicable", "withheld_candidates": "certified"}}
+    payload["call_sites"] = {
+        "by_state": {"proven_target": 1, "unresolved": 2}, "call_names": [freshness.SYMBOL],
+        "callers": 9, "callers_owed_enrichment": 4, "candidate_count": 2,
+        "candidates": [
+            {"callee": "split", "caller": "parse-key-id", "caller_name": "parse_key",
+             "line_in_entity": 1, "projection": {"path": "notekeeper/parsing.py"},
+             "reason": "focal escapes as a value", "state": "unresolved", "state_reason": "no_answer"},
+            {"callee": "append", "caller": "store-id", "caller_name": "store",
+             "line_in_entity": 1, "projection": {"path": "notekeeper/storage.py"},
+             "reason": "focal escapes as a value", "state": "unresolved", "state_reason": "no_answer"}],
+        "clauses": ["call_sites_owed: 4 of the 9 callers in the store's callers that could call "
+                    "the focal have call sites the graph has not settled yet",
+                    "call_sites_unresolved: 2 of the 3 call sites in the store's callers that "
+                    "could call the focal got an answer that proves no target"],
+        "focal_escape": {"escape": "unknown", "reason": "dynamic reflective access in the domain"},
+        "settled": False, "sites": 3}
+    return tuple(args)
+
+
 class PositiveReference(unittest.TestCase):
     def test_exact_graph_sources_prove_the_use_without_claiming_absence(self):
         args = fixture()
@@ -65,17 +103,41 @@ class PositiveReference(unittest.TestCase):
         mutations = [
             (0, ["focal_entity", "id"], "other"),
             (0, ["focal_entity", "name"], "other"),
-            (0, ["focal_entity", "file_path"], "other.py"),
+            (0, ["focal_entity", "projection", "path"], "other.py"),
+            (0, ["focal_entity", "projection"], None),
+            (0, ["focal_entity", "projection"], "linkgraph/predicates.py"),
+            # A focal that still carries a bare file path is the retired shape.
+            (0, ["focal_entity", "file_path"], "linkgraph/predicates.py"),
             (0, ["cross_repo", "authority_anchor", "repo_id"], "foreign"),
             (0, ["references", 0, "entity_id"], "other"),
             (0, ["references", 0, "name"], "other"),
-            (0, ["references", 0, "file_path"], "other.py"),
-            (0, ["references", 0, "reference_lines"], [1]),
-            (0, ["references", 0, "reference_lines"], [6]),
-            (0, ["references", 0, "reference_lines"], [5.0]),
-            (0, ["references", 0, "reference_line_count"], True),
+            (0, ["references", 0, "projection", "path"], "other.py"),
+            (0, ["references", 0, "projection"], None),
+            (0, ["references", 0, "projection"], "linkgraph/predicates.py"),
+            # A row that still carries a file line is the retired shape.
+            (0, ["references", 0, "file_path"], "linkgraph/predicates.py"),
+            (0, ["references", 0, "start_line"], 4),
+            (0, ["references", 0, "reference_lines"], [5]),
+            (0, ["references", 0, "sites", 0, "line_in_entity"], 0),
+            (0, ["references", 0, "sites", 0, "line_in_entity"], 2),
+            (0, ["references", 0, "sites", 0, "line_in_entity"], 4),
+            (0, ["references", 0, "sites", 0, "line_in_entity"], 1.0),
+            (0, ["references", 0, "sites", 0, "line_in_entity"], True),
+            (0, ["references", 0, "sites", 0, "line_in_entity"], None),
+            (0, ["references", 0, "sites", 0, "callee"], None),
+            (0, ["references", 0, "sites", 0, "callee"], "conn.execute"),
+            (0, ["references", 0, "sites", 0, "callee"], "RESOLVE"),
+            # Names the constant, and is not text the use line holds.
+            (0, ["references", 0, "sites", 0, "callee"], "links." + freshness.SYMBOL),
+            (0, ["references", 0, "sites", 0, "callee_unavailable"], "caller_source_unavailable"),
+            (0, ["references", 0, "sites"], []),
+            (0, ["references", 0, "sites"], [{"line_in_entity": 1, "callee": freshness.SYMBOL}] * 2),
+            (0, ["references", 0, "sites"], [1]),
+            (0, ["references", 0, "site_count"], True),
+            (0, ["references", 0, "site_count"], 2),
             (0, ["references", 0, "resolution"], "name_only"),
-            (0, ["references", 0, "reference_lines_partial_reason"], "unproven"),
+            (0, ["references", 0, "sites_absent_reason"], "no_evidence_span"),
+            (0, ["references", 0, "sites_partial_reason"], "unproven"),
             (0, ["references"], []),
             (0, ["total_upstream"], True),
             (0, ["total_upstream"], "1"),
@@ -115,12 +177,94 @@ class PositiveReference(unittest.TestCase):
                 obj[path[-1]] = value
                 self.assertEqual(freshness.grade_admitted_reference(*args)[0], freshness.FAIL)
 
+    def test_a_call_domain_bound_on_proven_rows_passes_and_every_weakening_fails(self):
+        # The shape 0.8.2 serves while the callers of a just-admitted module
+        # still owe enrichment: the rows are proven, and the reading names the
+        # call sites it could not settle instead of certifying the whole set.
+        args = call_domain_fixture()
+        status, detail = freshness.grade_admitted_reference(*args)
+        self.assertEqual(status, freshness.PASS, detail)
+        self.assertIn("call_sites_owed, call_sites_unresolved", detail)
+        mutations = [
+            (["negative", "trust"], "authoritative"),
+            (["_kin", "verdict", "state"], "certified"),
+            (["_kin", "verdict", "inputs", "call_sites"], "certified"),
+            (["_kin", "verdict", "inputs", "edge_coverage"], "inconclusive"),
+            (["_kin", "verdict", "inputs", "graph_freshness"], "inconclusive"),
+            (["_kin", "verdict", "inputs"], None),
+            (["_kin", "verdict", "limiting_factor"], None),
+            (["_kin", "verdict", "limiting_factor"], "call_sites_owed; graph_behind_working_tree"),
+            (["_kin", "verdict", "limiting_factor"], "call_sites_owed"),
+            (["negative", "advice"], "treat these rows as a lower bound"),
+            (["call_sites"], None),
+            (["call_sites", "settled"], True),
+            (["call_sites", "clauses"], []),
+            (["call_sites", "clauses"], ["call_sites_owed: 4 of the 9 callers are owed"]),
+            (["call_sites", "clauses"], ["some callers are owed"]),
+            (["call_sites", "candidate_count"], 3),
+            (["call_sites", "candidate_count"], True),
+            # A negative withheld count cannot balance the ledger: 1 = 2 + -1.
+            (["call_sites", "candidate_count"], 1),
+            (["call_sites", "candidates_withheld"], -1),
+            (["call_sites", "candidates_withheld"], True),
+            (["call_sites", "candidates", 0, "line_in_entity"], None),
+            (["call_sites", "candidates", 0, "caller"], ""),
+            (["call_sites", "candidates", 0, "reason"], None),
+            (["call_sites", "candidates", 0, "projection"], "notekeeper/parsing.py"),
+            (["call_sites", "candidates", 0, "file_path"], "notekeeper/parsing.py"),
+            (["call_sites", "candidates", 0, "start_line"], 4),
+            (["_kin", "verdict", "safe_to_conclude_absent"], True),
+            (["negative", "safe_to_conclude_absent"], True),
+            (["_kin", "verdict", "absence_claim"], "authoritative"),
+        ]
+        for path, value in mutations:
+            with self.subTest(path=path, value=value):
+                args = list(call_domain_fixture()); obj = args[0]
+                for key in path[:-1]: obj = obj[key]
+                if value is None and path[-1] in ("call_sites", "inputs", "limiting_factor"):
+                    del obj[path[-1]]
+                else:
+                    obj[path[-1]] = value
+                self.assertEqual(freshness.grade_admitted_reference(*args)[0], freshness.FAIL)
+        # The two counts together, each individually well typed.
+        args = list(call_domain_fixture())
+        args[0]["call_sites"].update(candidate_count=1, candidates_withheld=-1)
+        self.assertEqual(freshness.grade_admitted_reference(*args)[0], freshness.FAIL)
+        args = list(call_domain_fixture())
+        args[0]["call_sites"].update(candidate_count=-1)
+        args[0]["call_sites"]["candidates"] = []
+        args[0]["call_sites"]["candidates_withheld"] = -1
+        self.assertEqual(freshness.grade_admitted_reference(*args)[0], freshness.FAIL)
+        # A real withheld remainder still balances.
+        args = list(call_domain_fixture())
+        args[0]["call_sites"].update(candidate_count=5, candidates_withheld=3)
+        self.assertEqual(freshness.grade_admitted_reference(*args)[0], freshness.PASS)
+
+    def test_kin_refs_must_agree_with_find_references(self):
+        payload = call_domain_fixture()[0]
+        agreeing = {"lines": ["dangling_links  function  linkgraph/predicates.py"],
+                    "call_sites": copy.deepcopy(payload["call_sites"])}
+        self.assertEqual(freshness.grade_cli_agrees(payload, 0, json.dumps(agreeing))[0], freshness.PASS)
+        for mutate in (
+            lambda cli: cli["call_sites"].update(callers=8),
+            lambda cli: cli["call_sites"].update(clauses=[]),
+            lambda cli: cli["call_sites"].update(settled=True),
+            lambda cli: cli.pop("call_sites"),
+            lambda cli: cli.update(lines=["no references"]),
+            lambda cli: cli.update(error="no entity named RESOLVE_PREDICATE"),
+            lambda cli: cli.update(negative={"safe_to_conclude_absent": True}),
+        ):
+            cli = copy.deepcopy(agreeing); mutate(cli)
+            self.assertEqual(freshness.grade_cli_agrees(payload, 0, json.dumps(cli))[0], freshness.FAIL)
+        self.assertEqual(freshness.grade_cli_agrees(payload, 1, json.dumps(agreeing))[0], freshness.FAIL)
+        self.assertEqual(freshness.grade_cli_agrees(payload, 0, "not json")[0], freshness.UNREADABLE)
+
     def test_candidates_do_not_substitute_for_proven_rows(self):
         args = list(fixture()); args[0]["candidates"] = args[0]["references"]; args[0]["references"] = []
         self.assertEqual(freshness.grade_admitted_reference(*args)[0], freshness.FAIL)
 
     def test_bad_positive_cannot_fall_through_to_named_gap(self):
-        args = list(fixture()); args[0]["references"][0]["reference_lines"] = [1]
+        args = list(fixture()); args[0]["references"][0]["sites"][0]["line_in_entity"] = 0
         args[0]["negative"]["trust_reason"] = "graph_behind_working_tree"
         class Suite:
             unadmitted_path = args[3]

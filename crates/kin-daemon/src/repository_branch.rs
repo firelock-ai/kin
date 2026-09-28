@@ -400,6 +400,14 @@ where
             return Ok(response);
         }
     };
+    // The transition committed through the daemon's held authority, which now
+    // holds the successor it wrote. While `authority.json` is still exactly the
+    // record that commit installed, the label moves with it, so the finalize
+    // below and every reader after it keep this authority instead of reopening
+    // the store to load the state it already holds. Any other record, including
+    // one another writer landed in between, is left for the next reader to load
+    // and judge.
+    crate::api::relabel_held_authority_after_own_commit(state);
 
     #[cfg(test)]
     if state
@@ -485,6 +493,9 @@ where
         authority.workspace_id,
         "workspace transition",
     );
+    // A refresh that wrote a section installed a record of its own, through the
+    // same held authority, so the label follows it on the same terms as above.
+    crate::api::relabel_held_authority_after_own_commit(state);
 
     drop(persistence);
     drop(graph_mutation);
@@ -1011,7 +1022,9 @@ fn switch(
     // what to do with graph-owned state the caller never committed. Moving the
     // tree out from under it would discard work the compare-and-swap already
     // owns, so the transition stops here and the transfer reports it.
-    if policy == TransitionPolicy::FollowMovedRef && workspace.is_dirty() {
+    // Derived language-server enrichment is not work the caller owns, so it
+    // does not stop a follow.
+    if policy == TransitionPolicy::FollowMovedRef && workspace.holds_uncommitted_work() {
         return Err(graph_owned_changes(&workspace, policy));
     }
     let transaction = RepositoryTransaction {
@@ -1162,7 +1175,10 @@ fn plan_switch_carry(
     name: &RefName,
     policy: TransitionPolicy,
 ) -> Result<Option<Box<kin_core::WorkspaceCarryPlan>>> {
-    if policy != TransitionPolicy::Switch || !workspace.is_dirty() {
+    // Only work the author owns is carried across a switch. Language-server
+    // enrichment was derived from the tree being left, so carrying it would
+    // pin edges the target's own sweep has to re-derive.
+    if policy != TransitionPolicy::Switch || !workspace.holds_uncommitted_work() {
         return Ok(None);
     }
     let base_tree = match base_change_id {
@@ -1499,14 +1515,25 @@ fn ref_transaction(
     }
 }
 
+/// Commit a branch ref transaction and hold its successor frozen.
+///
+/// Through the local binding-history verifier, as every projection commit is:
+/// a ref-only transition leaves each workspace's selected graph as it was, so
+/// the verifier extends a checked lineage across it rather than ending it. An
+/// ordinary commit here ended the lineage on every branch create or delete,
+/// and the next daemon start then re-derived every head to check it again.
 fn commit_and_freeze_exact(
     manager: &RepositoryAuthorityManager<LocalFileBackend>,
     transaction: RepositoryTransaction,
 ) -> Result<(RepositoryCommitReceipt, LocalRepositoryAuthorityFreeze)> {
-    match manager.commit_repository_transaction_and_freeze(transaction.clone()) {
+    let verifier = &kin_index::binding_history::LocalBindingHistoryVerifier;
+    match manager.commit_repository_transaction_with_binding_history_and_freeze(
+        transaction.clone(),
+        verifier,
+    ) {
         Ok(committed) => Ok(committed),
         Err(first_error) => manager
-            .commit_repository_transaction_and_freeze(transaction)
+            .commit_repository_transaction_with_binding_history_and_freeze(transaction, verifier)
             .map_err(|second_error| {
                 anyhow::Error::new(second_error).context(format!(
                     "commit and freeze repository branch authority after first attempt failed: \

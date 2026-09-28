@@ -134,15 +134,52 @@ def check_product_wiring() -> None:
     # hash to the archive's own name is what lets install.ps1 refuse a checksum
     # file that names a different archive, so a second published container that
     # skipped this line would ship a sidecar nothing could match.
+    #
+    # The sidecar is also the one LF-terminated line sha256sum writes. A plain
+    # Set-Content ends it in CRLF on Windows, and sha256sum -c on Linux or macOS
+    # then reads a file name ending in CR. rc-build.yml copies the same step.
     release_requirements = (
         'foreach ($ArchivePath in @("$env:ARTIFACT.zip", "$env:ARTIFACT.tar.gz")) {',
         "$Hash = (Get-FileHash -Algorithm SHA256 $ArchivePath).Hash.ToLowerInvariant()",
-        '"$Hash  $ArchivePath" | Set-Content -Encoding ascii "$ArchivePath.sha256"',
+        '$Sidecar = "$Hash  $ArchivePath`n"',
+        'Set-Content -NoNewline -Encoding ascii -Path "$ArchivePath.sha256" -Value $Sidecar',
+        'if ((Get-Content -Raw -Encoding ascii "$ArchivePath.sha256") -cne $Sidecar) {',
     )
-    for requirement in release_requirements:
+    rc_workflow = (ROOT / ".github/workflows/rc-build.yml").read_text(encoding="utf-8")
+    for name, text in (("release.yml", release_workflow), ("rc-build.yml", rc_workflow)):
+        for requirement in release_requirements:
+            if requirement not in text:
+                raise AssertionError(
+                    f"{name} is missing filename-bound LF checksum output: {requirement}"
+                )
+        if re.search(r"\|\s*(?:Set-Content|Out-File|Add-Content)\b[^\n]*\.sha256", text):
+            raise AssertionError(
+                f"{name} pipes a checksum line into a cmdlet that ends it in CRLF on Windows"
+            )
+
+    # The publisher refuses a sidecar carrying a carriage return, since the
+    # sidecars are published as they are, and holds every one to the bytes
+    # sha256sum writes.
+    publisher_requirements = (
+        """if LC_ALL=C grep -q $'\\r' "$f"; then""",
+        "| cmp -s - \"$asset.sha256\"",
+    )
+    for requirement in publisher_requirements:
         if requirement not in release_workflow:
             raise AssertionError(
-                f"release.yml is missing filename-bound checksum output: {requirement}"
+                f"release.yml publishes a sidecar it has not held to LF bytes: {requirement}"
+            )
+
+    # The PowerShell harness runs the writer it reads out of release.yml on
+    # Windows and checks the bytes, so the pins above cannot pass on text alone.
+    for requirement in (
+        "Invoke-Expression $Writer",
+        "if ($Bytes -contains 13) {",
+        'PASS: the release workflow writes each Windows sidecar as one LF-terminated line',
+    ):
+        if requirement not in powershell_harness:
+            raise AssertionError(
+                f"test-install-checksum.ps1 no longer proves the sidecar bytes: {requirement}"
             )
 
     ci_requirements = (

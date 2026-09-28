@@ -240,6 +240,14 @@ pub const CLAUSE_CODES: &[ClauseCode] = &[
         meaning: "The answer did not report whether the graph holds the cross-file edges it depends on.",
     },
     ClauseCode {
+        code: "enrichment_incomplete",
+        meaning: "Persisted call-site evidence in the selected repository graph is unsettled, so impact counts are a lower bound and review risk may change; the listed entities are not proven dependencies of the change.",
+    },
+    ClauseCode {
+        code: "enrichment_metadata_unavailable",
+        meaning: "Selected graph enrichment detail exceeded its bounded metadata scan. Aggregate counters remain observations, but the unavailable file inventory cannot attest dependency completion or absence.",
+    },
+    ClauseCode {
         code: "entity_index_unresolved",
         meaning: "Nothing resolves the program behind the parsed declarations, so an empty name or kind filter cannot separate a missing declaration from one the extractor did not admit.",
     },
@@ -356,6 +364,10 @@ pub const CLAUSE_CODES: &[ClauseCode] = &[
         meaning: "A call site in the answer's scope was proven under a proof context its resolver no longer runs under, so the proof may not hold for the code as it builds now.",
     },
     ClauseCode {
+        code: "proof_context_unverified",
+        meaning: "The selected graph has not validated the proof context of recorded call-site evidence, so that evidence does not establish current validity.",
+    },
+    ClauseCode {
         code: "ranking_is_bounded",
         meaning: "A ranking is a bounded candidate set, so a name absent from it may belong to an entity the query never ranked.",
     },
@@ -364,8 +376,20 @@ pub const CLAUSE_CODES: &[ClauseCode] = &[
         meaning: "An adapter is wired for the language but no language server for it is installed on this host.",
     },
     ClauseCode {
+        code: "reference_enrichment_unknown",
+        meaning: "No completed language-server readiness observation is recorded for the selected language, so reference-enrichment availability is unestablished.",
+    },
+    ClauseCode {
         code: "reference_enrichment_unsupported",
         meaning: "This build cannot link cross-file references for the language, so an unused symbol cannot be told from an unlinked one.",
+    },
+    ClauseCode {
+        code: "reference_enrichment_unusable",
+        meaning: "A language server for the selected language failed to initialize, so reference-enrichment capability is unavailable.",
+    },
+    ClauseCode {
+        code: "reference_page_partial",
+        meaning: "This page contains only part of a reference answer; reconstruct every page and retain the original safety readings before assessing the complete result.",
     },
     ClauseCode {
         code: "relevance_floor_unmeasured",
@@ -425,6 +449,10 @@ pub const CLAUSE_CODES: &[ClauseCode] = &[
         meaning: "The coverage classes the answer depended on were not all observed present; `_kin.completeness.classes` names them.",
     },
     ClauseCode {
+        code: "trace_page_partial",
+        meaning: "This page contains only part of a trace; reconstruct every page and retain the original safety readings before assessing the complete result.",
+    },
+    ClauseCode {
         code: "trace_spine_clipped",
         meaning: "The per-step cap cut the walk's fan-out, so the chain is one route among those the cap kept and a missing hop was not looked for.",
     },
@@ -458,7 +486,7 @@ pub const CLAUSE_CODES: &[ClauseCode] = &[
     },
     ClauseCode {
         code: "watcher_events_lost",
-        meaning: "The filesystem watcher lost events no admission has covered; `kin admit` clears it.",
+        meaning: "The filesystem watcher lost events no admission has covered; a running daemon retries a full admission, and `kin admit` runs it now.",
     },
     ClauseCode {
         code: "watcher_loss_unreadable",
@@ -727,6 +755,7 @@ impl Verdict {
             // site whose call no resolver settled bounds the rows an answer did
             // return as much as the absence it did not.
             ("call_sites", call_sites_reading(payload)),
+            ("enrichment", enrichment_reading(payload)),
             ("edge_coverage", edge_coverage_reading(tool, payload)),
             ("withheld_candidates", withheld_candidates_reading(payload)),
             ("degradations", degradations_reading(payload)),
@@ -1057,6 +1086,27 @@ fn caller_arrival_reading(tool: &str, payload: &Value, makes_absence_claim: bool
 /// unsettled. A block that says it is unsettled and names no clause is one no
 /// producer here writes, and it still refuses rather than certifying on no
 /// evidence.
+/// The report observes the selected graph's persisted ledgers. A settled
+/// call-site observation is deliberately silent about all other relation types.
+pub(crate) fn enrichment_gap(payload: &Value) -> Option<String> {
+    let observation = payload
+        .get("enrichment")
+        .or_else(|| payload.pointer("/impact/enrichment"))?;
+    if observation.get("status").and_then(Value::as_str) != Some("bounded") {
+        return None;
+    }
+    Some(observation.get("limitation").and_then(Value::as_str)
+        .unwrap_or("enrichment_incomplete: recorded call-site evidence is unsettled, so impact counts are a lower bound and review risk may change")
+        .to_string())
+}
+
+fn enrichment_reading(payload: &Value) -> Reading {
+    match enrichment_gap(payload) {
+        Some(gap) => Reading::Inconclusive(vec![gap]),
+        None => Reading::Silent,
+    }
+}
+
 fn call_sites_reading(payload: &Value) -> Reading {
     let Some(block) = payload.get(crate::call_sites::CALL_SITES_KEY) else {
         return Reading::Silent;
@@ -1112,6 +1162,10 @@ fn edge_coverage_reading(tool: &str, payload: &Value) -> Reading {
         .and_then(Value::as_str)
         .filter(|language| !language.trim().is_empty())
         .unwrap_or("an unreported language");
+
+    if let Some(gap) = crate::negative::reference_readiness_gap(coverage) {
+        return Reading::Inconclusive(vec![gap]);
+    }
 
     // The same reading [`crate::negative::absence_coverage_gap`] takes, on
     // purpose. `available` is the only enrichment state that licenses a
@@ -1169,8 +1223,13 @@ fn edge_coverage_reading(tool: &str, payload: &Value) -> Reading {
         // sharper reason. Read from the gate's own function so the input's
         // reading and the refusal can never disagree about one observation.
         if crate::negative::coverage_classes_unmeasured(coverage, &requested) {
+            let code = if crate::negative::answer_claims_absence(tool, payload) {
+                "absence_coverage_unmeasured"
+            } else {
+                "answer_coverage_unmeasured"
+            };
             return Reading::Inconclusive(vec![format!(
-                "absence_coverage_unmeasured: this answer measured no coverage class for \
+                "{code}: this answer measured no coverage class for \
                  {language}, so nothing established what the extractor admitted for it"
             )]);
         }
@@ -1952,6 +2011,60 @@ mod clause_codes_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enrichment_bounds_populated_and_empty_answers_without_certifying_other_relations() {
+        use kin_model::EntityStore as _;
+        let graph = kin_db::InMemoryGraph::new();
+        let focal = crate::call_sites::fixture::spanned_entity(
+            "pending",
+            "pending.py",
+            kin_model::LanguageId::Python,
+            0,
+            "def pending():\n    return unresolved()\n",
+        );
+        graph.upsert_entity(&focal).unwrap();
+        // Exercise the producer's prose through the negative block's joined
+        // clauses. A separator inside one explanation would mint an unknown
+        // second clause when that block is read back into the verdict.
+        let observation =
+            kin_review::enrichment::observe_selected_impact(&graph, &[focal], false).unwrap();
+        let limitation = observation.limitation.as_deref().unwrap();
+        assert!(!limitation.contains(CLAUSE_SEPARATOR), "{limitation}");
+        assert!(limitation.contains("does not prove"));
+        let observation = serde_json::to_value(observation).unwrap();
+        let envelope = Envelope::daemon().with_health(&json!({
+            "initialized": true, "graph_loaded": true, "reconciliation_status": "clean",
+        }));
+        for payload in [
+            json!({"entity_impacts": [], "enrichment": observation}),
+            json!({"entity_impacts": [{"consumer_count": 1}], "enrichment": observation}),
+        ] {
+            let negative =
+                crate::negative::negative_for("impact_analysis", &payload, &envelope, &[]).unwrap();
+            assert_eq!(negative["trust"], "inconclusive");
+            assert!(negative["trust_reason"]
+                .as_str()
+                .unwrap()
+                .contains("enrichment_incomplete"));
+            let verdict = Verdict::compute("impact_analysis", &payload, &envelope, Some(&negative))
+                .unwrap()
+                .to_value();
+            assert_eq!(verdict["state"], "inconclusive");
+            assert_eq!(verdict["inputs"]["enrichment"], "inconclusive");
+            let factor = verdict["limiting_factor"].as_str().unwrap();
+            assert!(factor
+                .split(CLAUSE_SEPARATOR)
+                .any(|code| code == "enrichment_incomplete"));
+            assert!(!factor.contains(UNLISTED_CLAUSE_CODE), "{verdict}");
+            assert_eq!(verdict["safe_to_conclude_absent"], false);
+        }
+        let observation = json!({"enrichment": {"status": "no_recorded_call_site_debt"}});
+        assert!(matches!(enrichment_reading(&observation), Reading::Silent));
+        assert!(
+            Verdict::compute("semantic_review", &observation, &Envelope::daemon(), None).is_none()
+        );
+    }
 
     /// The freshness field carries two readings and they are graded apart.
     ///
@@ -4252,6 +4365,13 @@ mod tests {
                         CallSiteState::ProvenOutside,
                     ]))),
                     "proof_context_stale",
+                ),
+                (
+                    tally_of(CallerSites::Unverified {
+                        ledger: ledger_of(vec![CallSiteState::ProvenOutside]),
+                        reason: "resolver failed; validation never completed".into(),
+                    }),
+                    "proof_context_unverified",
                 ),
                 (tally_of(CallerSites::OwedEnrichment), "call_sites_owed"),
                 (tally_of(CallerSites::OwedDerivation), "call_sites_owed"),

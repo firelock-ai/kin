@@ -59,6 +59,19 @@ kin init [path] [options]
 | --- | --- | --- |
 | `--json` |  | Output machine-readable JSON status instead of human text |
 | `--no-enrich` |  | Skip the cross-file enrichment phase |
+| `--verbose` |  | Print the full record: every admission stage, the ids and the enrichment detail |
+
+On a terminal, `kin init` prints one live line per phase and a short result: rows for reading
+history, linking and the search index, what is not linked yet and why, and a `kin refs` command
+on a function from the graph. A pipe, CI and `--verbose` print the full record instead, unchanged,
+and `--json` prints its one document.
+
+When `kin setup` recorded that Kin may install language servers, `kin init` installs the ones this
+repository's languages need before it links. Without that answer it installs nothing, and names
+`kin doctor --fix --install-language-servers`.
+
+A second `kin init` in a repository this build can open says so and exits 0. Over a store this
+build cannot open it still refuses and exits 1, as does `--json`.
 
 `kin init` stages its conversion beside the repository and publishes `.kin` into the repository
 root, so it first checks that it can create entries in both. When either directory is not writable
@@ -150,6 +163,13 @@ kin clone <url> [path] [options]
 | Flag | Default | Description |
 | --- | --- | --- |
 | `--repository <repository>` |  | Native repository identity when URL is a peer daemon HTTP endpoint |
+| `--verbose` |  | Print the full record: Git's own progress, every admission stage, the ids and the enrichment detail |
+
+Over Git transport, `kin clone` runs everything `kin init` runs after admission: `.kin/` goes into
+`.git/info/exclude`, the repository joins the registry, the language servers it needs are installed
+when `kin setup` recorded consent, and the cross-file linking phase and the first embedding pass run
+within `kin init`'s budget. It exits 7 and 8 for what `kin init` exits them for, and it prints the
+same short form on a terminal.
 
 ### `kin status`
 
@@ -163,6 +183,12 @@ kin status [options]
 | --- | --- | --- |
 | `--json` |  | Output machine-readable JSON for editor integrations |
 | `--wait-quiesce <seconds>` | `0` | Seconds to keep re-reading while embedding coverage is only momentarily unobservable, such as an embedding pass or a graph mutation batch spanning the sample. Never waits on a coverage that was observed, nor on an absence a re-read cannot clear. 0 reads once |
+| `--verbose` |  | Print the full record: ids, generations, the working copy's basis, the store and the daemon |
+
+On a terminal `kin status` prints a short page: the graph, whether the working copy matches it, the
+search index, every warning the full record raises, and `kin status --verbose` for the rest. A pipe,
+CI, `--json` and `--verbose` print the full record, unchanged, and the exit code is the same either
+way.
 
 Exit 9 means nothing admitted the working copy, so no count in the report describes the files on disk. It is not a failure: every line is still true about durable authority, and the reading is printed either way. It happens when no daemon is holding the repository, because neither command starts one, and `kin admit` is what takes the working copy. The banner at the top of the output says the same thing, and the exit code is the only place the `--json` form can carry it.
 
@@ -441,6 +467,22 @@ kin refs [entity] [options]
 | `--entities <entities>` |  | Comma-separated entity UUIDs for --bulk-json. Required when --bulk-json is set. |
 | `--compact` |  | If true (default) emit compact bulk-mode rows ({entity_id, has_references, reference_count, receiver_name_candidate_count, unconfirmed_candidate_count}). A row holding an unconfirmed candidate caller reads `reference_count` null beside `known_reference_count`, and `has_references` null unless a caller is confirmed. Set --no-compact for verbose rows with name/kind/file_path/matched_kinds. |
 | `--no-compact` |  | Force verbose bulk-mode rows (overrides --compact). Required for clap to accept `--no-compact`. |
+| `--all` |  | List every caller in full, each with its id and projection, instead of the first 20 sized to the terminal. Output that is not a terminal is always complete |
+| `--json` |  | Print the complete answer as JSON: its lines, the absence verdict and the call-site block |
+| `--max-chars <n>` |  | With `--json`, return a frozen semantic page bounded to 2000–60000 bytes; incompatible with `--all` and `--bulk-json` |
+| `--cursor <cursor>` |  | With `--json`, continue the prior bounded answer using its `next_cursor` and the same entity and relation filters |
+
+For a bounded response, run `kin refs <entity> --json --max-chars 12000`, then repeat
+with `--cursor '<next_cursor>'` until `next_cursor` is null. These JSON pages use the
+same transport as MCP `find_references`: collect `readings` by their keys, then
+attach the accumulated collection rows at their dotted addresses (for example
+`call_sites.candidates`). Concatenate `record_fragment` UTF-8 fragments before
+interpreting that semantic record. The byte budget can change between pages. A
+page's absence reading remains qualified until the complete answer is reconstructed;
+finishing the pages does not clear any semantic uncertainty in that answer. A changed
+graph, source scope or writer epoch, or an expired/evicted cursor, requires a fresh
+query. Normal `kin refs --json` retains its complete CLI answer shape.
+
 
 A bare name that several entities share resolves through the ranking every read
 command shares, and the answer lists the others and says it chose. `--file` and
@@ -453,6 +495,14 @@ the filter compares.
 ```
 kin refs render --file src/panel.rs --entity-kind function
 ```
+
+A name no entity in the repository carries can name a symbol outside it, and
+`kin refs` reads it the way `find_references` reads its `query`: exactly, by the
+name a reader writes (`Array.map`), by its SCIP descriptor chain, or by its whole
+SCIP symbol. The answer is the one its `external_reference:<uuid>` address gets,
+led by a line saying what the name named and which spelling matched. A name
+several such symbols share, one per package version the resolver loaded, lists
+each by its address and answers about none of them.
 
 A pinned answer says so on the line under the header, naming the pin, the
 definition it selected and how many entities the name reaches, because the
@@ -479,16 +529,71 @@ and nothing at the site settles the destination. A reader working through an
 agent has no grep to check a row against, so the tier is the whole of what it
 has.
 
+A row names its caller by the caller's id, then the file the caller is
+projected into, labelled `projection:` because it is a projection and not an
+address. Each site is written `+N`, N lines below the caller's first line, the
+offset a numbered body shows, followed by the text at the site cut from the
+caller's own body. A call's argument list is left out of that text, so it names
+what is called. A site whose text cannot be read is written `+N` alone, and one
+that cannot be placed inside its caller is written `+?` with the reason. No row carries a file line, and
+the header names the entity the same way. The rows and their sites are the ones
+the `find_references` MCP tool returns, and the answer says once what a site's
+`+N` means.
+
+```
+kin refs get_dependant --kind calls --all
+References to 'get_dependant' -> get_dependant (Function) [<id>] (projection: fastapi/dependencies/utils.py)
+Call sites in files that import utils.py: 957 across 73 callers.
+  Every one of them is accounted for.
+referenced by 4 entities:
+  solve_dependencies [<id>] (projection: fastapi/dependencies/utils.py) [Calls] (type_resolved) sites +43 `get_dependant`
+```
+
+Every answer leads with what qualifies it: the header, then the call-site
+summary, every clause that leaves it unsettled, and the unproven call sites
+that could still be calls to the entity, the ones that name it listed first,
+before any caller. That holds for `--all`, for `--json`'s `lines` and for
+output that is not a terminal, as well as at a terminal.
+
+At a terminal the answer is laid out for a person reading it. After that
+disclosure, the callers follow, grouped under the
+file each is projected into, one row each with the name first and then each
+site as `+N` and the text there. A row shows a tag only when it is not a
+proven call, such as its resolution tier, `imports` or `references`. The
+terminal rows leave out each caller's id; `--all` prints it. At most 20
+callers are listed, and a line such as `and 49 more; --all or --json for the
+full list` counts the rest. Every line fits the terminal's width, 80 columns
+when the width cannot be read: a name or a site's text too long for its room
+is cut with an ellipsis, and prose wraps between words. `--all`, `--json` and
+output that is not a terminal get the complete answer, with every caller's id
+and projection.
+
+```
+kin refs get_dependant --kind calls
+References to 'get_dependant' -> get_dependant (Function)
+  [<id>] (projection: fastapi/dependencies/utils.py)
+Call sites in files that import utils.py: 957 across 73 callers.
+  Every one of them is accounted for.
+referenced by 4 entities:
+  (projection: fastapi/dependencies/utils.py)
+    get_parameterless_sub_dependant  +7 get_dependant
+    solve_dependencies               +43 get_dependant
+  (projection: fastapi/routing.py)
+    APIRoute.__init__                +137 get_dependant
+    APIWebSocketRoute.__init__       +14 get_dependant
+```
+
 A symbol outside the repository, such as `Array.map` in TypeScript's own
 library, is named by the `external_reference:<uuid>` id that `kin context`,
 `kin trace` and the MCP tools print for it, or by its bare uuid. `kin refs`
 then lists the entities in this repository that call it. The first line names
 the symbol, its package and version, and whether it is a standard library.
-Each row is one caller: where it is declared, the relation, its resolution
-tier, its sites and the proof, which names the language server and version
-that proved the call. A site is written `+N`, N lines below the caller's first
-line, the offset a numbered body shows. The graph records no location for the
-external declaration, so none is printed for it. Only calls a language server
+Each row is one caller, named by its id and the file it is projected into: the
+relation, its resolution tier, its sites and the proof, which names the language
+server and version that proved the call. A site is written `+N`, N lines below
+the caller's first line, the offset a numbered body shows, with the text at it.
+The graph records no location for the external declaration, so none is printed
+for it. Only calls a language server
 proved are recorded, so the list is a floor, and the answer says so. The rows
 are the ones `find_references` returns for the same id.
 
@@ -496,7 +601,7 @@ are the ones `find_references` returns for the same id.
 kin refs external_reference:<uuid>
 References to 'external_reference:<uuid>' -> Array.map (external symbol, npm typescript 5.6.3, standard library)
 referenced by 1 entity:
-  render @ src/app.ts:11 [Calls] (type_resolved) sites +2, +5 proven_external by lsp:tsserver 5.6.3 (lsp_definition)
+  render [<id>] (projection: src/app.ts) [Calls] (type_resolved) sites +2 `map`, +5 `map` proven_external by lsp:tsserver 5.6.3 (lsp_definition)
 ```
 
 An `external_reference` id this repository's graph holds no symbol under is
@@ -511,24 +616,29 @@ repository are listed by `kin context` and `kin trace` instead.
 
 Every answer about a repository entity ends with the call sites of the callers
 in the files that import the entity's file, the block the `find_references`
-MCP tool serves as `call_sites` over the same files. It counts the callers read,
-the callers still owed a call-site ledger, and the sites their ledgers hold,
-then prints one `not settled:` line per unsettled kind in the words the verdict
-reads, or says every site in scope is settled. A caller no ledger describes yet
-is owed enrichment while a resolver for its language can still prove its sites,
-and a site the resolver left unresolved, failed at, found outside any build or
-read as a value binding is not settled; either way a caller of the entity may be
-among those sites. When no resolver can prove a caller's sites on this host now,
-because the daemon runs with language-server enrichment switched off, no
-language server serves the language, or the one that does cannot start, the
-caller is not owed: the header counts it as one no resolver can prove, and its
-`not settled: call_sites_unproven_no_resolver:` line names why for each
-language. Waiting does not settle those; installing the server does, once the
-next sweep runs. The daemon's JSON carries the block under `call_sites`.
+MCP tool serves as `call_sites` over the same files, said in plain words. It
+counts the callers read and the sites their ledgers hold, then says what is
+still open, one line for each kind, or that every site is accounted for. A
+caller still being linked whose whole body never spells the entity's name
+cannot call it by name, so it is left out of the count and a line says how
+many were. A
+caller no ledger describes yet is still being linked while a resolver for its
+language can still prove its sites, and the answer names `kin daemon sweep`,
+which finishes that now. A site the resolver left unresolved, failed at, found
+outside any build or read as a value binding keeps its own count, because a
+caller of the entity may be among those sites. When no resolver can prove a
+caller's sites on this host now, because the daemon runs with language-server
+enrichment switched off, no language server serves the language, or the one
+that does cannot start, the caller is counted as one that can't be linked on
+this machine, with why for each language. Waiting does not settle those;
+installing the server does, once the next sweep runs. The daemon's JSON carries
+the block under `call_sites`, with the verdict codes, such as
+`call_sites_owed`, that a program reads.
 
 ```
-Call sites in the files that import the focal's file: 12 across 5 caller(s), 1 caller(s) owed
-  not settled: call_sites_owed: 1 of the 5 callers in the files that import the focal's file have call sites the graph has not settled yet because their derivation or enrichment is owed, so a call there is not accounted for
+Call sites in files that import storage.py: 12 across 5 callers.
+  Still linking 1 of the 5 callers, so this answer may be missing calls from it.
+  Run `kin daemon sweep` to finish linking now.
 ```
 
 ### `kin context`
@@ -768,9 +878,10 @@ kin trace-data-flow [options]
 | `--depth <n>` |  | Maximum traversal depth from the focal (default 3, capped at 8). |
 | `--direction <dir>` |  | Traversal direction: `calls`, `callers`, or `both` (default both). |
 | `--limit-per-step <m>` |  | Max relations expanded per step (default 5, capped at 25). |
+| `--target <entity>` |  | A symbol you are trying to reach. Neighbors from which it is still reachable inside the requested depth survive the per-step cap ahead of ones that are not. |
 | `--max-response-chars <c>` |  | UTF-8 bytes the printed JSON may occupy (default 45,000; a value below 2,000 or above 60,000 is served as 2,000 or 60,000). Bodies go first, then whole branches, and at least one step is kept. A walk whose smallest retained form still does not fit is refused with an error naming that floor, rather than printed over the limit. The MCP `trace_data_flow` tool answers the same walk with a disclosed overrun instead. |
 
-A symbol outside the repository is where a walk stops, never where one starts. A focal naming one, by its `external_reference:<uuid>` id or its bare uuid, is refused with the JSON error the `trace_data_flow` MCP tool gives, code `external_symbol_not_served`, which names the symbol and carries its record. A walk from one of its callers reaches it as a leaf step.
+A symbol outside the repository is where a walk stops, never where one starts. A focal naming one, by its `external_reference:<uuid>` id or its bare uuid, is refused with the JSON error the `trace_data_flow` MCP tool gives, code `external_symbol_not_served`, which names the symbol and carries its record. A walk from one of its callers reaches it as a leaf step. A `--target` naming one is refused the same way, with `argument` `target`, because a target ranks steps through its own edges and the graph holds none of the symbol's own; name one of its callers as the target instead. A target given as an `external_reference` id the graph holds no symbol under is refused as `External symbol not found`.
 
 ### `kin security`
 
@@ -1208,6 +1319,16 @@ kin review [<subcommand>] [change] [options]
 | `--entities <entities>` |  | Comma-separated entity IDs to review |
 | `--files <files>` |  | Comma-separated file paths to review |
 | `--changes <changes>` |  | Comma-separated change IDs to combine into one review |
+| `--relations` |  | List every relation change by name instead of counting them by origin and kind |
+
+The review opens with a summary: the overall risk, how many entities and
+relations changed, how many entities the change reaches, and the breaking
+changes and other findings. Entity changes, relation changes, inline comments
+and the impact analysis follow. Relation changes are counted by origin and
+kind, with edges from language-server enrichment counted apart from the ones
+parsed from the change, and a group of ten or fewer is listed by name.
+`--relations` lists every one. `--json` keeps its own shape and does not carry
+the relation list, so the two flags cannot be combined.
 
 `--entities` reviews repository entities, and reads an id no entity carries as
 a removed entity. A symbol outside the repository, named by its
@@ -1304,6 +1425,14 @@ kin review discuss <review-id> [options]
 | --- | --- | --- |
 | `--body <body>` |  | Discussion body |
 | `--scope <scope>` |  | Optional scope (entity:&lt;uuid&gt; or artifact:&lt;path&gt;) |
+
+A note or discussion is anchored to a repository entity. A `--scope` naming a
+symbol outside the repository, by its `external_reference:<uuid>` id, as
+`entity:<uuid>` or by its bare uuid, is refused by `kin review note` and `kin
+review discuss` with the symbol named and `kin refs <id>` given as the command
+that lists its callers, and nothing is written. The `kin_review_note_add`,
+`kin_review_discuss` and `kin_review_create` MCP tools refuse the same scopes
+with `external_symbol_not_served`.
 
 #### `kin review reply`
 
@@ -2077,6 +2206,15 @@ kin intent register <scope> [options]
 | `-t, --task <task>` |  | Task description |
 | `-s, --session <session>` |  | Session ID (defaults to a new CLI session) |
 
+An intent locks repository scopes. A scope naming a symbol outside the
+repository, by its `external_reference:<uuid>` id, as `entity:<uuid>` or by
+its bare uuid, is refused with the symbol named and `kin refs <id>` given as
+the command that lists its callers, and nothing is locked. An
+`external_reference` id the graph holds no symbol under is refused as naming
+nothing. `kin traffic show` refuses the same scopes, since no intent can be
+declared on one, and the `kin_register_intent` and `kin_check_traffic` MCP
+tools refuse them with `external_symbol_not_served`.
+
 #### `kin intent release`
 
 Release a specific intent
@@ -2156,6 +2294,15 @@ kin work create [options]
 | `-d, --description <description>` |  | Optional description |
 | `-s, --scope <scope>` |  | Scope to link (entity:&lt;uuid&gt;, contract:&lt;uuid&gt;, artifact:&lt;path&gt;, change:&lt;id&gt;, or an entity UUID) |
 | `-p, --priority <priority>` |  | Priority: critical, high, medium, low, none |
+
+Work is linked to repository scopes. A scope naming a symbol outside the
+repository, by its `external_reference:<uuid>` id, as `entity:<uuid>` or by
+its bare uuid, is refused with the symbol named and `kin refs <id>` given as
+the command that lists its callers, and nothing is written. `kin work link`,
+`kin work implement` and the `--scope` filter of `kin work list` refuse the
+same scopes, and so do the `kin_work_*` MCP tools, with
+`external_symbol_not_served`. An `external_reference` id the graph holds no
+symbol under is refused as naming nothing.
 
 #### `kin work list`
 
@@ -2306,7 +2453,8 @@ symbol outside the repository, named by its `external_reference:<uuid>` id,
 as an `entity:` target or by its bare uuid, is refused with the symbol named
 and `kin refs <id>` given as the command that lists its callers, since a note
 belongs on one of them. The `kin_annotation_add` MCP tool refuses the same
-targets.
+targets. `kin note list` refuses a target naming such a symbol too, since no
+note can be anchored to one, rather than answering that it has none.
 
 #### `kin note list`
 
@@ -3226,12 +3374,13 @@ The record of finished files lives in the store's repository authority, and a st
 
 When the language server answers that a call names a declaration outside the repository, in a standard library or an installed dependency, the sweep records the call as a proven call into that symbol. The symbol is named by the package that holds it, at the version the server loaded, and by the chain of declarations the server's own symbols give it, the way SCIP names symbols: `Array.map` in TypeScript 5.6.3 is `npm typescript 5.6.3` and `` `lib.es5.d.ts`/Array#map(). ``, and it is the same symbol in every repository on that version. Each such proof names the proof context it was made under: the language server, its version, and hashes of its configuration and of the environment it answered against. A later sweep under another context records each site it proves again under that context. A declaration outside the repository that the server's symbols do not name still retires the in-repository guesses at the call, and records no symbol. A store that holds these symbols or proof contexts is written at authority snapshot format version 23 (24 when it carries a graph section) and journal frame version 7, which a Kin build that reads at most snapshot version 22 and frame version 6 refuses at the header. Every store is swept once more after upgrading to this build, because files an earlier sweep finished recorded no such proofs.
 
-Every entity with source text in a file the sweep finishes gets a call-site ledger: how many call expressions Kin's parser reads in its body, and one state for each of them, keyed by where its callee sits inside the entity. A site is proven (to a repository declaration, to a named external symbol, or outside the repository with no symbol to name), a call through a value binding that proves no target, in a file no build compiles, a site where the language server timed out, crashed or broke protocol, or unresolved, with the reason. An entity with no call gets a ledger that counts none, so an entity without a ledger is one whose enrichment is still owed. A file is recorded as finished only once every entity in it has a ledger, and an edit that changes an entity drops its ledger and the file's record together. A proven site is carried by a call edge whose evidence names the proof context. When a file is proven again after every pass over it finished, a proof its ledgers no longer hold, including one made under another context or under none, leaves its edge, and an edge left with no site is removed; a file whose passes failed keeps its proofs. A file whose language server keeps failing on the same bytes under the same proof context is recorded on its third attempt with the sites the server failed at, so the sweep stops asking about it. A store that holds call-site ledgers is written at authority snapshot format version 25 (26 when it carries a graph section), journal frame version 8 and graph delta version 7, which a Kin build that reads at most snapshot version 24, frame version 7 and delta version 6 refuses at the header. Every store is swept once more after upgrading to this build, because files an earlier sweep finished have no ledgers.
+Every entity with source text in a file the sweep finishes gets a call-site ledger: how many call expressions Kin's parser reads in its body, and one state for each of them, keyed by where its callee sits inside the entity. A site is proven (to a repository declaration, to a named external symbol, or outside the repository with no symbol to name), a call through a value binding that proves no target, in a file no build compiles, a site where the language server timed out, crashed or broke protocol, or unresolved, with the reason. An entity with no call gets a ledger that counts none, so an entity without a ledger is one whose enrichment is still owed. A file is recorded as finished only once every entity in it has a ledger, and an edit that changes an entity drops its ledger and the file's record together. A proven site is carried by a call edge whose evidence names the proof context. When a file is proven again after every pass over it finished, a proof its ledgers no longer hold, including one made under another context or under none, leaves its edge, and an edge left with no site is removed; a file whose passes failed keeps its proofs. A file whose language server repeatedly returns non-transient errors on the same bytes under the same proof context is recorded on its third attempt with the sites the server failed at, so the sweep stops asking about it. Timeouts and crashed server sessions remain owed. The sweep retries an interrupted file once within the pass, restarting a dead server, and the idle daemon queues another pass when persisted retry backoff expires. Repeated crashes without completing a file stop that language for the pass; completed files preserve progress and renew its restart allowance. A store that holds call-site ledgers is written at authority snapshot format version 25 (26 when it carries a graph section), journal frame version 8 and graph delta version 7, which a Kin build that reads at most snapshot version 24, frame version 7 and delta version 6 refuses at the header. Every store is swept once more after upgrading to this build, because files an earlier sweep finished have no ledgers.
 
 | Flag | Default | Description |
 | --- | --- | --- |
 | `--no-wait` |  | Return as soon as the sweep is queued, instead of waiting for it |
 | `--json` |  | Emit machine-readable JSON |
+| `--verbose` |  | Print the daemon's answer and a line per file, not one live line |
 
 ### `kin registry`
 
@@ -3456,6 +3605,10 @@ kin setup status [options]
 | Flag | Default | Description |
 | --- | --- | --- |
 | `--json` |  | Emit the machine-readable health report as JSON |
+| `--verbose` |  | Print every check, including the ones that pass or do not apply |
+
+On a terminal it prints only the checks that need something, and one line for the rest. A pipe, CI
+and `--verbose` print the full table, unchanged.
 
 #### `kin setup doctor`
 

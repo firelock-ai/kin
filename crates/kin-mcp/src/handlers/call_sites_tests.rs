@@ -301,6 +301,11 @@ fn a_focal_no_resolver_can_prove_reads_unproven_not_owed_on_every_focal_tool() {
         ),
         (
             false,
+            LanguageServerReadiness::Disabled,
+            Some(kin_model::NoResolver::EnrichmentOff),
+        ),
+        (
+            false,
             LanguageServerReadiness::Absent,
             Some(kin_model::NoResolver::NoLanguageServer),
         ),
@@ -455,7 +460,7 @@ fn a_multi_focal_pack_tallies_every_focal_without_rows() {
 }
 
 #[tokio::test]
-async fn find_references_counts_a_ledgered_family_exactly_and_tallies_it() {
+async fn find_references_counts_a_ledgered_family_without_certifying_unread_callers() {
     let store = store();
     ledger_the_callers(&store);
     let value = finalized(
@@ -469,11 +474,13 @@ async fn find_references_counts_a_ledgered_family_exactly_and_tallies_it() {
     assert_eq!(arrival["count_exact"], true, "{arrival}");
     assert_eq!(arrival["files_counted_from_site_ledgers"], 1, "{arrival}");
     let block = &value[crate::call_sites::CALL_SITES_KEY];
-    assert_eq!(block["scope"], crate::call_sites::FAMILY_SCOPE, "{value}");
-    assert_eq!(block["callers"], 2, "{block}");
-    assert_eq!(block["settled"], true, "{block}");
+    assert_eq!(block["scope"], crate::call_sites::NAMED_SCOPE, "{value}");
+    assert_eq!(block["callers"], 3, "{block}");
+    assert_eq!(block["callers_owed_enrichment"], 1, "{block}");
+    assert_eq!(block["focal_escape"]["escape"], "unknown", "{block}");
+    assert_eq!(block["settled"], false, "{block}");
     assert_eq!(
-        value["_kin"]["verdict"]["inputs"]["call_sites"], "certified",
+        value["_kin"]["verdict"]["inputs"]["call_sites"], "inconclusive",
         "{value}"
     );
     assert!(value["_kin"].get("self_check").is_none(), "{value}");
@@ -525,20 +532,22 @@ async fn find_references_reads_an_owed_caller_outside_the_family_as_unsettled() 
     let block = &value[crate::call_sites::CALL_SITES_KEY];
     assert_eq!(block["settled"], false, "{block}");
     assert_eq!(clause_codes(block), ["call_sites_owed"], "{block}");
+    assert_eq!(block["scope"], crate::call_sites::NAMED_SCOPE, "{block}");
+    assert_eq!(block["callers_owed_enrichment"], 2, "{block}");
     assert_eq!(
-        block["owed_outside_scope"]["files"][0]["file"], PROXY_FILE,
-        "{block}"
+        arrival["owed_outside_scope"]["files"][0]["file"], PROXY_FILE,
+        "{arrival}"
     );
     let text = crate::call_sites::text_lines(block).join("\n");
     assert!(!text.contains("every site in scope is settled"), "{text}");
     assert!(text.contains("  not settled: call_sites_owed: "), "{text}");
-    assert!(text.contains(PROXY_FILE), "{text}");
     let verdict = &value["_kin"]["verdict"];
     assert_eq!(verdict["state"], "inconclusive", "{verdict}");
     assert_eq!(verdict["inputs"]["call_sites"], "inconclusive", "{verdict}");
 }
 
-/// Once the sweep settles the outside caller, the same answer certifies again.
+/// Once the sweep settles every potential caller, the call-site component
+/// certifies. Other missing graph evidence still bounds the overall answer.
 #[tokio::test]
 async fn find_references_certifies_once_the_caller_outside_the_family_is_ledgered() {
     let store = store();
@@ -556,6 +565,16 @@ async fn find_references_certifies_once_the_caller_outside_the_family_is_ledgere
                 PROXY_BODY,
                 context_id,
                 vec![("current_app.ensure_sync", CallSiteState::ProvenOutside)],
+            ),
+            ledger(
+                &store.focal,
+                FOCAL_BODY,
+                context_id,
+                vec![
+                    ("fetch", CallSiteState::ProvenOutside),
+                    ("get", CallSiteState::ProvenOutside),
+                    ("render", CallSiteState::ProvenOutside),
+                ],
             ),
         ],
     );
@@ -576,6 +595,10 @@ async fn find_references_certifies_once_the_caller_outside_the_family_is_ledgere
     );
     assert_eq!(
         value["_kin"]["verdict"]["inputs"]["call_sites"], "certified",
+        "{value}"
+    );
+    assert_eq!(
+        value["negative"]["safe_to_conclude_absent"], false,
         "{value}"
     );
 }
@@ -622,13 +645,11 @@ fn previewed(store: &Store, entity: &Entity, body: &str) {
     store.graph.upsert_entity(&entity).unwrap();
 }
 
-/// An owed caller in the family whose whole body never spells the name a call
-/// to the focal uses cannot call it by that name, so settling its sites cannot
-/// add a caller: `call_sites` leaves it out and says how many it left out.
-/// It is still owed, so `caller_arrival` still names it and its file keeps the
-/// parse-against-edge count.
+/// Name-only previews cannot rule out a call through an alias while the
+/// selected source tree is unavailable. Family arrival may still report its
+/// narrower name count, but the call proof must preserve the broader debt.
 #[tokio::test]
-async fn find_references_leaves_out_owed_family_callers_that_never_spell_the_focal() {
+async fn find_references_keeps_owed_callers_without_selected_escape_evidence() {
     let store = store();
     previewed(&store, &store.caller, CALLER_BODY);
     previewed(&store, &store.caller_module, MODULE_BODY);
@@ -642,17 +663,13 @@ async fn find_references_leaves_out_owed_family_callers_that_never_spell_the_foc
     assert_eq!(arrival["owed_caller_count"], 2, "{arrival}");
     assert_eq!(arrival["owed_callers_cannot_name_focal"], 2, "{arrival}");
     let block = &value[crate::call_sites::CALL_SITES_KEY];
-    assert_eq!(block["settled"], true, "{block}");
-    assert_eq!(block["callers"], 0, "{block}");
-    assert_eq!(block["owed_callers_cannot_name_focal"], 2, "{block}");
-    assert!(
-        crate::call_sites::text_lines(block)
-            .iter()
-            .any(|line| line.contains("2 more owed caller(s) there never spell")),
-        "{block}"
-    );
+    assert_eq!(block["settled"], false, "{block}");
+    assert_eq!(block["callers"], 3, "{block}");
+    assert_eq!(block["callers_owed_enrichment"], 3, "{block}");
+    assert_eq!(block["focal_escape"]["escape"], "unknown", "{block}");
+    assert_eq!(clause_codes(block), ["call_sites_owed"], "{block}");
     assert_eq!(
-        value["_kin"]["verdict"]["inputs"]["call_sites"], "certified",
+        value["_kin"]["verdict"]["inputs"]["call_sites"], "inconclusive",
         "{value}"
     );
 }
@@ -676,8 +693,8 @@ async fn an_owed_module_that_imports_the_focal_under_another_name_still_counts()
         "find_references",
     );
     let block = &value[crate::call_sites::CALL_SITES_KEY];
-    assert_eq!(block["callers_owed_enrichment"], 1, "{block}");
-    assert_eq!(block["owed_callers_cannot_name_focal"], 1, "{block}");
+    assert_eq!(block["callers_owed_enrichment"], 3, "{block}");
+    assert_eq!(block["focal_escape"]["escape"], "unknown", "{block}");
     assert_eq!(clause_codes(block), ["call_sites_owed"], "{block}");
     assert_eq!(
         value["_kin"]["verdict"]["inputs"]["call_sites"], "inconclusive",
@@ -719,6 +736,7 @@ fn graph_status_carries_the_store_s_site_shares_and_its_owed_callers() {
     let status = handle_daemon_graph_status_observation(
         GraphStatusScope::Head,
         GraphStatusObservation {
+            details: None,
             authority_epoch: 1,
             entity_count: 5,
             relation_count: 1,

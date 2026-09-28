@@ -671,7 +671,7 @@ async fn unchanged_importer_cold_watcher_target_arrival_recovers_without_admit()
         receiver,
         Some(crate::loop_runner::WatchArmed::new(armed)),
     ));
-    let outcome = crate::daemon::await_watch_armed(ready, Duration::from_secs(10)).await;
+    let outcome = crate::daemon::await_watch_armed(ready, crate::daemon::WATCH_ARMING_BOUND).await;
     let mut recovered = false;
     if outcome == crate::daemon::WatchArming::Armed {
         std::fs::write(repo.path().join("local.py"), WAITING_TARGET).unwrap();

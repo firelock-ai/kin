@@ -200,9 +200,19 @@ fn codes_past_unswept_call_sites<'f>(answer: &Value, factor: &'f str) -> Vec<&'f
                 .keys()
                 .all(|reason| reason.ends_with("language-server enrichment is switched off"))
     });
+    // The block counts every caller in the store that could call the focal,
+    // and a caller whose body holds no call has no site for a resolver to
+    // prove, so it is not among the unproven. The excuse holds while no site
+    // exists and no caller is owed, stale or unverified: every caller left is
+    // either one with no call or one only switched-off enrichment leaves
+    // unproven.
+    let count = |key: &str| block[key].as_u64().unwrap_or(0);
     let unswept = block["sites"] == 0
         && callers > 0
-        && block["callers_unproven_no_resolver"] == block["callers"]
+        && count("callers_owed_derivation") == 0
+        && count("callers_owed_enrichment") == 0
+        && count("callers_stale") == 0
+        && count("callers_unverified") == 0
         && switched_off;
     factor
         .split("; ")

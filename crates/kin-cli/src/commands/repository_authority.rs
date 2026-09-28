@@ -249,6 +249,20 @@ impl RequestRepositoryAuthority {
         self.shared.is_some()
     }
 
+    /// Serve scoped source through the common projector without reopening or
+    /// revalidating the repository this request already holds.
+    pub(crate) fn source_authority(&self) -> Result<kin_mcp::handlers::RequestRepositoryAuthority> {
+        let authority = self.open()?;
+        Ok(kin_mcp::handlers::RequestRepositoryAuthority::already_open(
+            self.binding.clone(),
+            std::sync::Arc::new(kin_mcp::handlers::ActiveRepositoryAuthority::from_shared(
+                std::sync::Arc::clone(&authority.manager),
+                authority.repository_id.clone(),
+                authority.workspace_id,
+            )),
+        ))
+    }
+
     /// The open authority to read this command from.
     ///
     /// Reuses the caller's open when there is one, and otherwise performs the

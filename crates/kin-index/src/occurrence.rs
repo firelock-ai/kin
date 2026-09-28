@@ -8,43 +8,11 @@ use crate::resolution::{RelationResolution, RECEIVER_NAME_FANOUT_CONFIDENCE};
 use kin_model::{
     GraphNodeId, Relation, RelationEvidence, RelationId, RelationKind, RelationOrigin, SourceSpan,
 };
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const OCCURRENCE_RULE: &str = "parser_occurrence_resolution_v1";
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-struct Proof {
-    relation_id: RelationId,
-    src: GraphNodeId,
-    dst: GraphNodeId,
-    kind: RelationKind,
-    evidence_sha256: String,
-    confidence: f32,
-    origin: RelationOrigin,
-}
-
-pub(crate) fn reserved(record: &RelationEvidence) -> bool {
-    record
-        .parser_rule
-        .as_deref()
-        .is_some_and(|rule| rule.starts_with("parser_occurrence_resolution_"))
-}
-
-fn evidence_digest(record: &RelationEvidence) -> String {
-    let mut record = record.clone();
-    // Multiplicity is merged separately. Normalize exactly as the linker does.
-    record.occurrence_count = 1;
-    if let Some(shape) = &mut record.call_shape {
-        shape.keywords.sort();
-        shape.keywords.dedup();
-    }
-    hex::encode(Sha256::digest(
-        serde_json::to_vec(&record).expect("evidence serializes"),
-    ))
-}
+pub(crate) use kin_model::parser_occurrence::reserved;
+pub use kin_model::parser_occurrence::OCCURRENCE_RULE;
+use kin_model::parser_occurrence::{evidence_digest, validated_proofs, Proof};
 
 /// Called only by the fresh single-occurrence parser relation factory, never by
 /// the accumulator: an accumulator also accepts already merged per-file edges.
@@ -179,59 +147,6 @@ pub fn remove_proofs_of_trimmed_sites(relation: &mut Relation, trimmed: &[Relati
         probe.evidence = vec![RelationEvidence::clone(site), record.clone()];
         validated_proofs(&probe).is_err()
     });
-}
-
-fn validated_proofs(relation: &Relation) -> Result<BTreeMap<String, Proof>, ()> {
-    let originals: BTreeSet<_> = relation
-        .evidence
-        .iter()
-        .filter(|record| record.source_span.is_some() && !reserved(record))
-        .map(evidence_digest)
-        .collect();
-    let mut proofs = BTreeMap::new();
-    for record in relation.evidence.iter().filter(|record| reserved(record)) {
-        if record.parser_rule.as_deref() != Some(OCCURRENCE_RULE)
-            || record.source_span.is_some()
-            || record.source_path.is_some()
-            || record.resolved_path.is_some()
-            || record.call_shape.is_some()
-            || record.occurrence_count != 0
-        {
-            return Err(());
-        }
-        let proof: Proof =
-            serde_json::from_str(record.token.as_deref().ok_or(())?).map_err(|_| ())?;
-        if relation.kind != RelationKind::Calls
-            || !matches!(
-                relation.origin,
-                RelationOrigin::Parsed | RelationOrigin::Inferred
-            )
-            || proof.relation_id != relation.id
-            || proof.src != relation.src
-            || proof.dst != relation.dst
-            || proof.kind != relation.kind
-            || !proof.confidence.is_finite()
-            || !(0.0..=1.0).contains(&proof.confidence)
-            || !crate::resolution::RESOLUTION_TIER_LADDER
-                .iter()
-                .any(|(tier, _)| tier.to_bits() == proof.confidence.to_bits())
-            || proof.origin
-                != if proof.confidence >= 1.0 {
-                    RelationOrigin::Parsed
-                } else {
-                    RelationOrigin::Inferred
-                }
-            || !originals.contains(&proof.evidence_sha256)
-        {
-            return Err(());
-        }
-        if let Some(previous) = proofs.insert(proof.evidence_sha256.clone(), proof.clone()) {
-            if previous != proof {
-                return Err(());
-            }
-        }
-    }
-    Ok(proofs)
 }
 
 /// Retain per-site authority when admission maps freshly resolved endpoints to
@@ -574,6 +489,20 @@ mod span_rebinding_tests {
             .into_iter()
             .find(|relation| relation.kind == RelationKind::Calls)
             .unwrap()
+    }
+
+    #[test]
+    fn shared_parser_certificate_tiers_match_the_resolution_ladder() {
+        assert_eq!(
+            kin_model::parser_occurrence::PARSER_CONFIDENCES
+                .iter()
+                .map(|tier| tier.to_bits())
+                .collect::<Vec<_>>(),
+            crate::resolution::RESOLUTION_TIER_LADDER
+                .iter()
+                .map(|(tier, _)| tier.to_bits())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

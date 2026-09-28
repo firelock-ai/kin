@@ -64,8 +64,24 @@ impl SemanticReview {
         head: &SemanticChangeId,
         store: &G,
     ) -> Result<Review, ReviewError> {
+        Self::create_review_with_source(base, head, store, None)
+    }
+
+    pub fn create_review_with_source<G: GraphStore>(
+        base: &SemanticChangeId,
+        head: &SemanticChangeId,
+        store: &G,
+        escape_evidence: Option<&crate::enrichment::EscapeEvidence<'_>>,
+    ) -> Result<Review, ReviewError> {
         let at_head = GraphAtRef::materialize(store, head)?;
-        Self::create_review_at(base, head, store, &at_head)
+        Self::create_review_scoped_with_source(
+            base,
+            head,
+            store,
+            &at_head,
+            |_| true,
+            escape_evidence,
+        )
     }
 
     /// Create a full semantic review between a base and head change, with
@@ -92,8 +108,20 @@ impl SemanticReview {
         at_head: &GraphAtRef<'_, G>,
         in_range: impl Fn(&SemanticChangeId) -> bool,
     ) -> Result<Review, ReviewError> {
+        Self::create_review_scoped_with_source(base, head, store, at_head, in_range, None)
+    }
+
+    pub fn create_review_scoped_with_source<G: GraphStore>(
+        base: &SemanticChangeId,
+        head: &SemanticChangeId,
+        store: &G,
+        at_head: &GraphAtRef<'_, G>,
+        in_range: impl Fn(&SemanticChangeId) -> bool,
+        escape_evidence: Option<&crate::enrichment::EscapeEvidence<'_>>,
+    ) -> Result<Review, ReviewError> {
         let semantic_diff = diff::compute_diff_scoped(store, base, head, in_range)?;
-        let impact_report = impact::analyze_impact_at(at_head, &semantic_diff)?;
+        let impact_report =
+            impact::analyze_impact_at_with_source(at_head, &semantic_diff, escape_evidence)?;
         let risk_summary = risk::assess_risk(&semantic_diff, &impact_report);
         let inline_comments = inline::collect_inline_comments(&semantic_diff, &impact_report);
 
@@ -186,7 +214,16 @@ impl SemanticReview {
         semantic_diff: SemanticDiff,
         store: &G,
     ) -> Result<Review, ReviewError> {
-        let impact_report = impact::analyze_impact(store, &semantic_diff)?;
+        Self::review_from_diff_with_source(semantic_diff, store, None)
+    }
+
+    pub fn review_from_diff_with_source<G: GraphStore>(
+        semantic_diff: SemanticDiff,
+        store: &G,
+        escape_evidence: Option<&crate::enrichment::EscapeEvidence<'_>>,
+    ) -> Result<Review, ReviewError> {
+        let impact_report =
+            impact::analyze_impact_with_source(store, &semantic_diff, escape_evidence)?;
         let risk_summary = risk::assess_risk(&semantic_diff, &impact_report);
         let inline_comments = inline::collect_inline_comments(&semantic_diff, &impact_report);
 

@@ -2731,6 +2731,35 @@ impl Reconciler {
             )?);
         }
 
+        let mut withdrawn_guesses = HashMap::new();
+        for source in std::iter::once(indexed).chain(cross_file.dependent_sources.iter()) {
+            for relation in crate::binding_debt::withdrawn_guesses(graph, source)? {
+                if crate::named_imports::independently_reproves(
+                    graph,
+                    source,
+                    &relation,
+                    &cross_file.named_import_observations,
+                    &delta,
+                )? {
+                    continue;
+                }
+                withdrawn_guesses.insert(relation.id, relation);
+            }
+        }
+        let repeats_withdrawal = |relation: &Relation| {
+            withdrawn_guesses
+                .get(&relation.id)
+                .is_some_and(|old| crate::binding_debt::repeats_withdrawn_guess(relation, old))
+        };
+        // Never reinstall the same withdrawn guess, or let that guess discharge
+        // its own debt. A modification refused here leaves the held row intact.
+        delta.relation_deltas.retain(|change| match change {
+            RelationDelta::Added { new } | RelationDelta::Modified { new, .. } => {
+                !repeats_withdrawal(new)
+            }
+            RelationDelta::Removed { .. } => true,
+        });
+
         // Only relations actually accepted by the staging loops can discharge
         // debt. Raw linker candidates may have failed endpoint admission.
         let mut produced_by_id: HashMap<_, _> = existing_relations
@@ -2758,6 +2787,7 @@ impl Reconciler {
         }
         let produced: Vec<_> = produced_by_id
             .into_values()
+            .filter(|relation| !repeats_withdrawal(relation))
             .filter(|relation| {
                 // Entity proof still requires admitted surviving endpoints.
                 // Artifact import proof comes only from this exact held/staged

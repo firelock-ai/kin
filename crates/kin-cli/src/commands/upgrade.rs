@@ -67,6 +67,33 @@
 //! the moved head would be refused, so it is named first), a source body the
 //! store does not hold, a tree this build cannot derive, and authority that
 //! moved while the upgrade was planned.
+//!
+//! ## When a daemon starts
+//!
+//! Nobody has to run the re-qualification by hand. A daemon starting on a store
+//! that records this build's semantics and whose workspace graph carries no
+//! checked binding history, such as one an earlier build of the same semantics
+//! wrote before binding history existed, runs it through
+//! [`requalify_at_daemon_start`]: the same plan, the same verifier, the same
+//! compare-and-swap and the same payment, while it holds the repository's
+//! runtime authority and before it opens any state, which is exactly where
+//! `kin upgrade` runs it. It runs to completion, however long the store takes,
+//! while the daemon answers readiness as warming and reports the progress this
+//! module reports. Three things differ from the command. The start moves no
+//! head and records no change: it re-qualifies only a store whose every head
+//! and workspace already hold exactly this build's derivation, and starts the
+//! lineage there with a commit that records only an audit event, so a store
+//! that pulled from a peer is never left ahead of it for a change nobody made.
+//! A store that serves anything else, such as history another build derived,
+//! is left for `kin upgrade`. The start commits only a re-derivation the
+//! verifier proves, so it writes a checked lineage or nothing. And it never
+//! upgrades a store whose recorded semantics are behind: that store keeps the
+//! remedy every surface names, because moving it is a claim a person asks for.
+//!
+//! It cannot run twice at once, or beside `kin upgrade`. Both run only while
+//! holding the repository's runtime authority, which one process holds at a
+//! time: a second daemon cannot start while the first holds it, and the
+//! command stops the daemon before it takes it.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write as _;
@@ -74,6 +101,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use kin_core::hydration_semantics::{self, HydrationStanding};
+use kin_db::storage::binding_history::RederivationVerifier;
 use kin_model::{
     compute_semantic_change_id, AuthorId, ChangeOrigin, ChangeStore, Entity, EntityId, GraphNodeId,
     Hash256, OperationId, RefExpectation, RefMutation, RefName, RefTarget, RefUpdatePolicy,
@@ -90,6 +118,84 @@ pub const UPGRADE_REPORT_SCHEMA: &str = "kin.store-upgrade.v1";
 
 /// How often a long derivation says it is still working.
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Who the audit record names when a daemon's start begins a lineage without
+/// recording a change.
+const DAEMON_START_AUDIT_ACTOR: &str = "kin-daemon-startup-requalification";
+
+/// How long a daemon's start waits for the repository authority lock another
+/// process holds while it reads whether the store's lineage is checked.
+const DAEMON_START_AUTHORITY_WAIT: Duration = Duration::from_secs(10);
+
+/// What a daemon's start did about the store's binding history.
+#[derive(Debug)]
+pub enum DaemonStartRequalification {
+    /// The store's workspace graph already carries checked binding history.
+    AlreadyChecked,
+    /// The served state was re-derived and the verifier started a lineage at
+    /// it, exactly as `kin upgrade` re-qualifies a store.
+    Requalified(Box<UpgradeReport>),
+    /// Nothing was attempted and nothing was written, for the reason given.
+    /// `kin upgrade` is the remedy wherever one is needed.
+    NotAttempted(String),
+    /// The attempt did not finish, for the reason given. One that stopped
+    /// before its commit wrote nothing, and a refused commit writes nothing.
+    /// `kin upgrade` is the remedy.
+    Unfinished(String),
+}
+
+/// What asked for an upgrade. The two paths share every step and differ only
+/// where [`Trigger`] is consulted.
+#[derive(Debug, Clone, Copy)]
+enum Trigger {
+    /// `kin upgrade`, which a person ran.
+    Command,
+    /// A daemon starting on this store, holding its runtime authority, before
+    /// it opens any state. See [`requalify_at_daemon_start`].
+    DaemonStart,
+}
+
+impl Trigger {
+    /// Who a checkpoint change says recorded it.
+    fn recorded_by(self) -> &'static str {
+        match self {
+            Self::Command => "kin upgrade recorded this change",
+            Self::DaemonStart => {
+                "The Kin daemon recorded this change when it started on this store"
+            }
+        }
+    }
+}
+
+/// The verifier a daemon's start commits through: the re-derivation verifier
+/// itself, except that a graph it does not prove aborts the commit.
+///
+/// `kin upgrade` commits its re-derivation whether or not the verifier proves
+/// it and reports which, because a person asked for the upgrade and reads the
+/// report. A start nobody asked for must not record a change that checked
+/// nothing, and on the next start record another, so it writes a checked
+/// lineage or nothing.
+struct ProvenOnly<'a>(&'a kin_index::binding_history::RederivationBindingHistoryVerifier);
+
+impl RederivationVerifier for ProvenOnly<'_> {
+    fn verify_rederived_graph(
+        &self,
+        after: &kin_db::GraphSnapshot,
+        load_body: &dyn Fn(Hash256) -> std::result::Result<Option<Vec<u8>>, kin_db::KinDbError>,
+    ) -> std::result::Result<bool, kin_db::KinDbError> {
+        if self.0.verify_rederived_graph(after, load_body)? {
+            return Ok(true);
+        }
+        Err(kin_db::KinDbError::StorageError(format!(
+            "the re-derivation verifier did not prove the re-derived graph ({}), so a daemon's \
+             start commits nothing",
+            self.0
+                .refusals()
+                .pop()
+                .unwrap_or_else(|| "no reason was recorded".to_string())
+        )))
+    }
+}
 
 /// Where an upgrade that ran stood when it finished.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -355,11 +461,146 @@ pub fn upgrade_store(
     hooks: &UpgradeHooks,
     progress: &dyn Fn(&str),
 ) -> Result<UpgradeReport> {
+    upgrade_with(layout, author, hooks, progress, Trigger::Command)
+}
+
+/// Re-qualify the store at `layout` as a daemon starts on it, when its
+/// workspace graph carries no checked binding history and it records this
+/// build's semantics.
+///
+/// The caller holds the repository's runtime authority and has opened no
+/// state, which is where `kin upgrade` runs the same re-qualification, so no
+/// daemon serves the authority this replaces. The work shares
+/// [`upgrade_store`]'s plan, verifier and compare-and-swap, and differs as the
+/// module documentation says: no head moves, a checked lineage or nothing, and
+/// never on a store whose semantics are behind. It runs to completion and says
+/// what it is doing through `progress` as it goes.
+///
+/// Which store needs it is read from the persisted authority envelope first,
+/// so a start over a store that already carries checked binding history pays
+/// for no second open of the whole store.
+pub fn requalify_at_daemon_start(
+    layout: &kin_core::KinLayout,
+    progress: &dyn Fn(&str),
+) -> DaemonStartRequalification {
+    let standing = hydration_semantics::standing(layout);
+    if standing.is_gap() {
+        return DaemonStartRequalification::NotAttempted(format!(
+            "{}; a daemon's start never re-derives a store whose semantics are behind",
+            standing.sentence()
+        ));
+    }
+    if let Err(error) = refuse_unupgradable(&standing) {
+        return DaemonStartRequalification::NotAttempted(format!("{error:#}"));
+    }
+    match lineage_in_envelope(layout) {
+        Ok(Some(EnvelopeLineage::Checked)) => return DaemonStartRequalification::AlreadyChecked,
+        Ok(Some(EnvelopeLineage::Refused(reason))) => {
+            return DaemonStartRequalification::NotAttempted(reason)
+        }
+        Ok(Some(EnvelopeLineage::Unchecked)) | Ok(None) => {}
+        Err(error) => {
+            return DaemonStartRequalification::NotAttempted(format!(
+                "could not read whether this store's binding history is checked ({error:#})"
+            ))
+        }
+    }
+    // The change the re-qualification records names an author, as the
+    // command's does, and a start with none refuses rather than inventing one.
+    let author = match crate::commands::require_commit_author_for(layout) {
+        Ok(author) => author,
+        Err(error) => {
+            return DaemonStartRequalification::NotAttempted(format!(
+                "no commit author resolves for this repository ({error:#}), and the \
+                 re-qualification records a change"
+            ))
+        }
+    };
+    match upgrade_with(
+        layout,
+        author,
+        &UpgradeHooks::default(),
+        progress,
+        Trigger::DaemonStart,
+    ) {
+        Ok(report) if report.state == UpgradeState::AlreadyCurrent => {
+            DaemonStartRequalification::AlreadyChecked
+        }
+        Ok(report) => DaemonStartRequalification::Requalified(Box::new(report)),
+        Err(error) => DaemonStartRequalification::Unfinished(format!("{error:#}")),
+    }
+}
+
+/// What the persisted authority envelope says of this store's lineage.
+enum EnvelopeLineage {
+    /// The one workspace's graph carries checked binding history.
+    Checked,
+    /// It carries none.
+    Unchecked,
+    /// The plan would refuse this store, for the reason given, so a start
+    /// does not pay for the open that would find that out.
+    Refused(String),
+}
+
+/// Read what the persisted authority envelope says of this store's lineage,
+/// without opening the store.
+///
+/// `None` when the envelope-only read cannot answer this store; the full open
+/// the re-qualification takes then decides. A witness names a workspace the
+/// authority holds and is kept only while that workspace's selected graph is
+/// the one it proved, so on a store holding exactly this repository's
+/// workspace, any witness is exactly that workspace graph carrying checked
+/// binding history.
+fn lineage_in_envelope(layout: &kin_core::KinLayout) -> Result<Option<EnvelopeLineage>> {
+    let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(layout)
+        .context("bind this store's local repository authority")?;
+    let workspace = binding.workspace_id();
+    let Some(envelope) = binding
+        .read_authority_metadata_read_only(DAEMON_START_AUTHORITY_WAIT)
+        .context("read the repository authority envelope")?
+    else {
+        return Ok(None);
+    };
+    let metadata = envelope.metadata();
+    // The same two refusals the plan makes first, so a store it would refuse
+    // costs a start nothing more than this read.
+    if !matches!(metadata.workspaces.as_slice(), [only] if only.workspace_id == workspace) {
+        return Ok(Some(EnvelopeLineage::Refused(format!(
+            "this store's authority holds {} workspace(s), and a re-qualification moves exactly \
+             one, this repository's own",
+            metadata.workspaces.len()
+        ))));
+    }
+    if !metadata.merge_transactions.is_empty() {
+        return Ok(Some(EnvelopeLineage::Refused(
+            "a merge is open on this workspace".to_string(),
+        )));
+    }
+    Ok(Some(if metadata.binding_history.is_empty() {
+        EnvelopeLineage::Unchecked
+    } else {
+        EnvelopeLineage::Checked
+    }))
+}
+
+fn upgrade_with(
+    layout: &kin_core::KinLayout,
+    author: AuthorId,
+    hooks: &UpgradeHooks,
+    progress: &dyn Fn(&str),
+    trigger: Trigger,
+) -> Result<UpgradeReport> {
     let started = Instant::now();
     let derives = hydration_semantics::binary_version();
     let before = hydration_semantics::read(layout);
     let standing = hydration_semantics::standing_of(&before, derives);
     refuse_unupgradable(&standing)?;
+    if matches!(trigger, Trigger::DaemonStart) && standing.is_gap() {
+        bail!(
+            "{}; a daemon's start never re-derives a store whose semantics are behind",
+            standing.sentence()
+        );
+    }
     let from = before
         .upgrade()
         .map(|upgrade| upgrade.under)
@@ -400,12 +641,26 @@ pub fn upgrade_store(
         !requalify,
         retire_python,
         progress,
+        trigger,
     )?;
 
     if let Some(hook) = &hooks.before_commit {
         hook()?;
     }
     let verifier = kin_index::binding_history::RederivationBindingHistoryVerifier::default();
+    let proven_only = ProvenOnly(&verifier);
+    let committing_verifier: &dyn RederivationVerifier = match trigger {
+        Trigger::Command => &verifier,
+        Trigger::DaemonStart => {
+            if plan.transaction.is_none() {
+                bail!(
+                    "the re-qualification planned no commit, and a lineage starts only at \
+                         one, so a daemon's start wrote nothing"
+                );
+            }
+            &proven_only
+        }
+    };
     // The same compare-and-swap pays the workspace's owed derivation work,
     // recorded against the exact predecessor it was planned from, where the
     // verifier proves the re-derivation it pays for. A record a later
@@ -418,13 +673,20 @@ pub fn upgrade_store(
         Some(transaction) => Some(
             authority
                 .manager()
-                .commit_rederived_repository_transaction(transaction.clone(), &verifier, payment)
-                .map_err(|error| {
-                    anyhow!(
+                .commit_rederived_repository_transaction(
+                    transaction.clone(),
+                    committing_verifier,
+                    payment,
+                )
+                .map_err(|error| match trigger {
+                    Trigger::Command => anyhow!(
                         "kin upgrade refused to commit: {error}. Nothing was changed; if another \
                          command moved this store while the upgrade was planned, run `kin \
                          upgrade` again"
-                    )
+                    ),
+                    Trigger::DaemonStart => anyhow!(
+                        "the re-qualification's commit was refused: {error}. Nothing was changed"
+                    ),
                 })?,
         ),
         None => None,
@@ -691,6 +953,7 @@ struct Head {
 
 /// `fresh_anchors` is set when the plan's anchors will be recorded as the
 /// upgrade's claim, and cleared for a re-qualification, which records none.
+/// `trigger` names who records the checkpoint changes.
 fn plan_upgrade(
     layout: &kin_core::KinLayout,
     authority: &ActiveRepositoryAuthority,
@@ -700,6 +963,7 @@ fn plan_upgrade(
     fresh_anchors: bool,
     retire_python: bool,
     progress: &dyn Fn(&str),
+    trigger: Trigger,
 ) -> Result<UpgradePlan> {
     let lease = authority.manager().read_authority();
     let roots = lease.roots().clone();
@@ -938,7 +1202,29 @@ fn plan_upgrade(
             }
         })
         .collect();
-    if unproven && !overlay_changes && reasons.iter().all(Option::is_none) {
+    // A daemon's start moves no head and records no change. Where this build
+    // derives something other than what the store serves, which is what a
+    // store holds once another build derived it, here or on a peer it pulled
+    // from, a change on a head would leave this store ahead of every peer for a
+    // commit nobody made, so the start leaves it to `kin upgrade`. Where the
+    // two agree exactly, the lineage starts at a commit that records only
+    // that it did, below, and every head stays where it is.
+    let daemon_start = matches!(trigger, Trigger::DaemonStart);
+    if daemon_start && (overlay_changes || reasons.iter().any(Option::is_some)) {
+        let differing = reasons.iter().filter(|reason| reason.is_some()).count();
+        bail!(
+            "this build derives different state than the store serves ({differing} of {} \
+             head(s){}), and a daemon's start moves no head, so it wrote nothing; `kin upgrade` \
+             re-derives it",
+            reasons.len(),
+            if overlay_changes {
+                " and the workspace's uncommitted work"
+            } else {
+                ""
+            }
+        );
+    }
+    if unproven && !daemon_start && !overlay_changes && reasons.iter().all(Option::is_none) {
         if let Some(index) = workspace_base.and_then(|base| {
             derivations
                 .iter()
@@ -965,7 +1251,7 @@ fn plan_upgrade(
                     parents: vec![head.change],
                     timestamp: timestamp.clone(),
                     author: author.clone(),
-                    message: checkpoint_message(from, derives, *reason),
+                    message: checkpoint_message(from, derives, *reason, trigger),
                     entity_deltas: derivation.entity_deltas.clone(),
                     relation_deltas: derivation.relation_deltas.clone(),
                     tree_deltas: Vec::new(),
@@ -1047,29 +1333,61 @@ fn plan_upgrade(
         })
         .transpose()?;
 
-    let transaction =
-        (!changes.is_empty() || workspace_mutation.is_some()).then(|| RepositoryTransaction {
-            schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
-            operation_id: OperationId::new(),
-            repository_id: authority.repository_id.clone(),
-            expected_generation: roots.generation,
-            expected_roots: roots.clone(),
-            actor: author.clone(),
-            reason: format!(
-                "re-derive the served state under hydration semantics version {derives}"
-            ),
-            external_objects: Vec::new(),
-            git_authority_delta: None,
-            changes,
-            aliases: Vec::new(),
-            ref_mutations,
-            default_ref_mutation: None,
-            workspace_mutation,
-            local_overlay_delta: None,
-            merge_transaction_delta: None,
-            sealed_observation: None,
-            collaboration_delta: None,
-        });
+    // A daemon's start that found every head and the workspace already this
+    // build's derivation commits no change and no ref: only an audit record
+    // saying the lineage starts here, which gives the re-derivation verifier a
+    // commit to prove without moving anything a peer could see.
+    let lineage_record = (daemon_start && unproven && changes.is_empty())
+        .then(|| {
+            let (actor, event) = crate::provenance::plan_audit_event(
+                &history,
+                DAEMON_START_AUDIT_ACTOR,
+                "binding_history_requalified",
+                None,
+                Some(
+                    serde_json::json!({
+                        "repository_id": authority.repository_id,
+                        "workspace_id": authority.workspace_id,
+                        "hydration_version": derives,
+                        "intent": "start a checked binding-history lineage over served state \
+                                   this build derives exactly",
+                    })
+                    .to_string(),
+                ),
+            )?;
+            Ok::<_, anyhow::Error>(kin_model::CollaborationDelta {
+                actors: actor
+                    .into_iter()
+                    .map(|actor| kin_model::Keyed::new(actor.actor_id, actor))
+                    .collect(),
+                audit_events: vec![event],
+                ..Default::default()
+            })
+        })
+        .transpose()?;
+    let transaction = (!changes.is_empty()
+        || workspace_mutation.is_some()
+        || lineage_record.is_some())
+    .then(|| RepositoryTransaction {
+        schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+        operation_id: OperationId::new(),
+        repository_id: authority.repository_id.clone(),
+        expected_generation: roots.generation,
+        expected_roots: roots.clone(),
+        actor: author.clone(),
+        reason: format!("re-derive the served state under hydration semantics version {derives}"),
+        external_objects: Vec::new(),
+        git_authority_delta: None,
+        changes,
+        aliases: Vec::new(),
+        ref_mutations,
+        default_ref_mutation: None,
+        workspace_mutation,
+        local_overlay_delta: None,
+        merge_transaction_delta: None,
+        sealed_observation: None,
+        collaboration_delta: lineage_record,
+    });
     if let Some(transaction) = &transaction {
         transaction
             .validate()
@@ -1237,7 +1555,13 @@ fn names_of(head: &Head) -> Vec<String> {
     names
 }
 
-fn checkpoint_message(from: Option<u32>, to: u32, reason: CheckpointReason) -> String {
+fn checkpoint_message(
+    from: Option<u32>,
+    to: u32,
+    reason: CheckpointReason,
+    trigger: Trigger,
+) -> String {
+    let recorded = trigger.recorded_by();
     let title = match from {
         Some(from) if from != to => {
             format!("Re-derive semantics under hydration semantics version {to} (was {from})")
@@ -1247,32 +1571,30 @@ fn checkpoint_message(from: Option<u32>, to: u32, reason: CheckpointReason) -> S
     let body = match reason {
         CheckpointReason::Rederived => match from {
             Some(from) if from != to => format!(
-                "kin upgrade recorded this change. It carries no file change: it moves the entity \
-                 and relation state this head serves from what replay version {from} derived to \
-                 what version {to} derives from the same tree."
+                "{recorded}. It carries no file change: it moves the entity and relation state \
+                 this head serves from what replay version {from} derived to what version {to} \
+                 derives from the same tree."
             ),
             Some(_) => format!(
-                "kin upgrade recorded this change. It carries no file change: it moves the entity \
-                 and relation state this head serves to what replay version {to} derives from the \
-                 same tree."
+                "{recorded}. It carries no file change: it moves the entity and relation state \
+                 this head serves to what replay version {to} derives from the same tree."
             ),
             None => format!(
-                "kin upgrade recorded this change. It carries no file change: it moves the entity \
-                 and relation state this head serves to what replay version {to} derives from the \
-                 same tree. The store recorded no version before it."
+                "{recorded}. It carries no file change: it moves the entity and relation state \
+                 this head serves to what replay version {to} derives from the same tree. The \
+                 store recorded no version before it."
             ),
         },
         CheckpointReason::BuiltOn => format!(
-            "kin upgrade recorded this change. It carries no file, entity or relation change: \
-             this head already served what replay version {to} derives from its tree, and later \
-             changes an earlier build recorded build on it, so this change marks where the \
-             upgraded state begins."
+            "{recorded}. It carries no file, entity or relation change: this head already served \
+             what replay version {to} derives from its tree, and later changes an earlier build \
+             recorded build on it, so this change marks where the upgraded state begins."
         ),
         CheckpointReason::LineageStart => format!(
-            "kin upgrade recorded this change. It carries no file, entity or relation change: \
-             this head already served what replay version {to} derives from its tree and nothing \
-             else needed to change, but the workspace carried no checked binding history, and a \
-             checked lineage can start only at a recorded change, so it starts here."
+            "{recorded}. It carries no file, entity or relation change: this head already served \
+             what replay version {to} derives from its tree and nothing else needed to change, \
+             but the workspace carried no checked binding history, and a checked lineage can \
+             start only at a recorded change, so it starts here."
         ),
     };
     format!("{title}\n\n{body}")
@@ -1362,4 +1684,71 @@ fn rebaseline_relation_census(
     .with_entities(entities);
     kin_core::relation_census::rebaseline(layout, &census)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The command's checkpoints read exactly as they did before a daemon's
+    /// start could record one, word for word, for every reason and version.
+    #[test]
+    fn a_command_checkpoint_reads_as_it_always_has() {
+        let command = |from, reason| checkpoint_message(from, 31, reason, Trigger::Command);
+        assert_eq!(
+            command(Some(11), CheckpointReason::Rederived),
+            "Re-derive semantics under hydration semantics version 31 (was 11)\n\nkin upgrade \
+             recorded this change. It carries no file change: it moves the entity and relation \
+             state this head serves from what replay version 11 derived to what version 31 \
+             derives from the same tree."
+        );
+        assert_eq!(
+            command(Some(31), CheckpointReason::Rederived),
+            "Re-derive semantics under hydration semantics version 31\n\nkin upgrade recorded \
+             this change. It carries no file change: it moves the entity and relation state this \
+             head serves to what replay version 31 derives from the same tree."
+        );
+        assert_eq!(
+            command(None, CheckpointReason::Rederived),
+            "Re-derive semantics under hydration semantics version 31\n\nkin upgrade recorded \
+             this change. It carries no file change: it moves the entity and relation state this \
+             head serves to what replay version 31 derives from the same tree. The store \
+             recorded no version before it."
+        );
+        assert_eq!(
+            command(Some(11), CheckpointReason::BuiltOn),
+            "Re-derive semantics under hydration semantics version 31 (was 11)\n\nkin upgrade \
+             recorded this change. It carries no file, entity or relation change: this head \
+             already served what replay version 31 derives from its tree, and later changes an \
+             earlier build recorded build on it, so this change marks where the upgraded state \
+             begins."
+        );
+        assert_eq!(
+            command(Some(31), CheckpointReason::LineageStart),
+            "Re-derive semantics under hydration semantics version 31\n\nkin upgrade recorded \
+             this change. It carries no file, entity or relation change: this head already served \
+             what replay version 31 derives from its tree and nothing else needed to change, but \
+             the workspace carried no checked binding history, and a checked lineage can start \
+             only at a recorded change, so it starts here."
+        );
+    }
+
+    /// A daemon's start names itself, not a command nobody ran.
+    #[test]
+    fn a_daemon_start_checkpoint_names_the_daemon() {
+        let message = checkpoint_message(
+            Some(31),
+            31,
+            CheckpointReason::LineageStart,
+            Trigger::DaemonStart,
+        );
+        assert!(
+            message.contains(
+                "\n\nThe Kin daemon recorded this change when it started on this store. It \
+                 carries no file, entity or relation change"
+            ),
+            "{message}"
+        );
+        assert!(!message.contains("kin upgrade recorded"), "{message}");
+    }
 }

@@ -500,6 +500,10 @@ fn main() {
     }
 
     kin_buildinfo::retain_update_build_identity(&KIN_UPDATE_BUILD_IDENTITY);
+    // Before the embedder can be built: a machine whose `kin setup` declined
+    // the embedding model download never fetches it, whether the background
+    // pass, a query or an explicit embed request reaches the embedder.
+    kin_cli::embed_model::install_model_fetch_gate();
     // Raise this process's open-file soft limit before the runtime exists and
     // before anything opens a store. A daemon inherits the limit of whatever
     // started it, which on a stock Mac is 256, and it does the same storage
@@ -741,21 +745,55 @@ async fn async_main() -> i32 {
     let storage = args.storage.clone();
     let runtime = tokio::runtime::Handle::current();
     let opened = tokio::task::spawn_blocking(move || {
+        // Captured before the authority is taken, so the window in which this
+        // daemon holds the repository without a record naming it lasts only as
+        // long as the write below.
+        let starting_owner = kin_cli::daemon_client::capture_starting_daemon_owner();
+        let starting_root = kin_root.clone();
         acquire_before_state(&kin_root, acquire_daemon_authority, move || {
+            // `kin daemon stop` finds a daemon that has not published an
+            // endpoint through this record, beside the lock it now holds. A
+            // start without it is still a start: stop then reports the
+            // repository busy rather than signalling what it cannot attribute.
+            let startup_owner = match starting_owner.map(|owner| {
+                kin_cli::daemon_client::publish_starting_daemon_owner(&starting_root, owner)
+            }) {
+                Some(Ok(publication)) => Some(publication),
+                Some(Err(error)) => {
+                    tracing::warn!(%error, "could not record this daemon's startup ownership");
+                    None
+                }
+                None => {
+                    tracing::warn!("could not identify this daemon's own process to record it");
+                    None
+                }
+            };
             let (warming_listener, api_listener, bound_port) =
                 kin_daemon::api::bind_api_listener_pair(&bind_layout, bind_port)?;
             let (ready_tx, ready_rx) = tokio::sync::watch::channel(false);
             // The readiness surface runs on the async runtime while this thread
             // blocks in the open. That split is the whole mechanism: a warming
             // answer is only possible because the load is not on the reactor.
-            runtime.spawn(kin_daemon::api::serve_warming_until(
+            let progress = kin_daemon::api::WarmingProgress::default();
+            runtime.spawn(kin_daemon::api::serve_warming_with_progress_until(
                 warming_listener,
                 ready_rx,
+                progress.clone(),
             ));
+            kin_daemon::daemon::wait_at_startup_gate();
+            // Before the open, while this process holds the runtime authority
+            // acquired above: a local store whose workspace carries no checked
+            // binding history is re-qualified here, where `kin upgrade` would
+            // re-qualify it, so the state opened below is the checked one. It
+            // runs to completion while readiness answers warming with its
+            // progress.
+            if matches!(storage, StorageMode::Local) {
+                kin_daemon::startup_requalification::before_open(&bind_layout, &progress);
+            }
             // A failed open drops both handles here, which closes the socket. No
             // endpoint was published for it, so nothing outlives the failure.
             let state = create_state(bind_layout, &storage, &repo_id, &runtime, allowed_repo_ids)?;
-            Ok((state, api_listener, bound_port, ready_tx))
+            Ok((state, api_listener, bound_port, ready_tx, startup_owner))
         })
         // The boxed startup error is not `Send`, and this result crosses back
         // off the blocking thread. Its text is the whole of what the caller
@@ -770,7 +808,10 @@ async fn async_main() -> i32 {
                 format!("failed to acquire daemon authority or open state: {error}")
             })
         });
-    let ((state, api_listener, bound_port, ready_tx), authority) = match opened {
+    // The startup record stays for the life of the process, since a stop may
+    // still be attributing it when the endpoint lands, and it is withdrawn on
+    // a normal exit.
+    let ((state, api_listener, bound_port, ready_tx, _startup_owner), authority) = match opened {
         Ok(opened) => opened,
         Err(message) => {
             eprintln!("kin-daemon: {message}");

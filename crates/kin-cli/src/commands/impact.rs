@@ -60,6 +60,9 @@ pub struct ImpactResponse {
     /// opinion about it (FIR-2478, FIR-2524).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub negative: Option<serde_json::Value>,
+    /// Recorded repository-wide call-site limits, including on populated answers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enrichment: Option<kin_review::enrichment::EnrichmentObservation>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -172,6 +175,25 @@ pub async fn build_impact_response(
     request: &ImpactRequest,
     envelope: &kin_mcp::Envelope,
 ) -> Result<ImpactResponse> {
+    build_impact_response_with_source(
+        _layout,
+        graph,
+        request,
+        envelope,
+        None,
+        kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead,
+    )
+    .await
+}
+
+pub async fn build_impact_response_with_source(
+    _layout: &kin_core::KinLayout,
+    graph: &kin_db::InMemoryGraph,
+    request: &ImpactRequest,
+    envelope: &kin_mcp::Envelope,
+    repository_authority: Option<&kin_mcp::handlers::RequestRepositoryAuthority>,
+    source_scope: kin_mcp::handlers::common::EntitySourceScope,
+) -> Result<ImpactResponse> {
     // A symbol outside the repository has no dependents of its own to walk
     // here. What a change to it reaches is its callers, which `kin refs` lists,
     // so it is refused by what it is rather than reported missing.
@@ -199,6 +221,7 @@ pub async fn build_impact_response(
             },
             ranked: None,
             negative: None,
+            enrichment: None,
         });
     }
     // One resolver for every read command (FIR-3505): the typed qualifiers and
@@ -276,6 +299,7 @@ pub async fn build_impact_response(
             query,
             ranked: None,
             negative: None,
+            enrichment: None,
         });
     }
 
@@ -301,6 +325,7 @@ pub async fn build_impact_response(
             query,
             ranked: None,
             negative: None,
+            enrichment: None,
         });
     }
 
@@ -315,6 +340,7 @@ pub async fn build_impact_response(
             query,
             ranked: None,
             negative: None,
+            enrichment: None,
         });
     }
 
@@ -351,11 +377,33 @@ pub async fn build_impact_response(
     // at which each entity is first reached, so the count and every group are
     // read off one traversal of one graph state.
     let local_impacted = downstream_impact_by_hop(graph, &target.id, depth)?;
+    let enrichment_targets = std::iter::once(target.clone())
+        .chain(local_impacted.iter().map(|(_, entity)| entity.clone()))
+        .collect::<Vec<_>>();
+    let source = kin_mcp::handlers::review::AnalysisEscapeEvidence::new(
+        graph,
+        repository_authority,
+        source_scope,
+    );
+    let escape_evidence = |targets: &[kin_model::Entity], at| source.observe(targets, at);
+    let enrichment = kin_review::enrichment::observe_selected_impact_with_source(
+        graph,
+        &enrichment_targets,
+        false,
+        Some(&escape_evidence),
+    )?;
     let mut negative = None;
     if local_impacted.is_empty() {
         lines.push("  No local downstream impact found.".to_string());
-        negative = impact_absence_verdict(graph, target, envelope);
-        lines.extend(impact_absence_qualifier(graph, target, envelope));
+        let mut payload = impact_absence_payload(graph, target);
+        payload["enrichment"] = serde_json::to_value(&enrichment)?;
+        negative = kin_mcp::negative::negative_for("impact_analysis", &payload, envelope, &[]);
+        lines.extend(crate::commands::absence_qualifier::qualify(
+            "impact_analysis",
+            &payload,
+            envelope,
+            "  ",
+        ));
         lines.extend(empty_impact_context(graph, target)?);
     } else {
         lines.push(format!(
@@ -378,6 +426,34 @@ pub async fn build_impact_response(
                 .map(|loc| format!(" @ {loc}"))
                 .unwrap_or_default();
             lines.push(format!("    - {} ({:?}){}", entity.name, entity.kind, at));
+        }
+    }
+
+    if enrichment.bounds_answer() {
+        if !local_impacted.is_empty() {
+            lines.push(format!(
+                "  Limit: {}",
+                enrichment
+                    .limitation
+                    .as_deref()
+                    .unwrap_or("Call-site enrichment is incomplete.")
+            ));
+        }
+        for pending in enrichment.pending_entities.iter().take(3) {
+            let projection = pending.projection.path.as_deref().unwrap_or("unavailable");
+            lines.push(format!(
+                "    Pending: {} [{}] (projection: {}; {})",
+                pending.name,
+                pending.entity_id,
+                projection,
+                pending.states.join(", ")
+            ));
+        }
+        let withheld = enrichment.total_pending_entities.saturating_sub(3);
+        if withheld > 0 {
+            lines.push(format!(
+                "    {withheld} more pending entities; use --json for the bounded list."
+            ));
         }
     }
 
@@ -407,6 +483,7 @@ pub async fn build_impact_response(
         query,
         ranked,
         negative,
+        enrichment: Some(enrichment),
     })
 }
 
@@ -508,29 +585,6 @@ const IMPACT_MEMBER_RELATION_KINDS: &[kin_model::RelationKind] = &[
     kin_model::RelationKind::References,
 ];
 
-/// The absence verdict for an empty impact answer, as a structured object.
-///
-/// The same one gate the rendered sentence goes through, called with the same
-/// tool name and the same observation, so the field a machine reads and the
-/// line a person reads cannot disagree about one store. It is deliberately a
-/// second call to a pure function rather than a shared intermediate: the
-/// rendering is shared across CLI surfaces now (FIR-2524,
-/// [`crate::commands::absence_qualifier`]), and a renderer that also owned the
-/// machine field would put a wording change one edit away from changing what an
-/// agent is told.
-///
-/// Emitted whether or not the verdict refuses, unlike the sentence. Silence is
-/// a fine answer for a person and a missing field for a caller parsing the
-/// payload, and a missing field is the shape that reads as a clean bill.
-fn impact_absence_verdict(
-    graph: &kin_db::InMemoryGraph,
-    target: &kin_model::Entity,
-    envelope: &kin_mcp::Envelope,
-) -> Option<serde_json::Value> {
-    let payload = impact_absence_payload(graph, target);
-    kin_mcp::negative::negative_for("impact_analysis", &payload, envelope, &[])
-}
-
 /// The observations an empty impact answer's verdict is computed from: the
 /// cross-file classes `impact_analysis` declares, and the caller-arrival
 /// reading for the target, which is the one entity this answer reports with no
@@ -555,21 +609,6 @@ fn impact_absence_payload(
         kin_mcp::caller_arrival::CALLER_ARRIVAL_KEY:
             kin_mcp::caller_arrival::observe_impact_arrival(graph, &[target.id]),
     })
-}
-
-/// The absence qualifier for an empty impact answer.
-///
-/// Thin on purpose: the observation is impact-specific (the cross-file classes
-/// `impact_analysis` declares) and the rendering is shared, because three CLI
-/// surfaces answering absence questions differently is the defect, not the
-/// implementation detail. See [`crate::commands::absence_qualifier`].
-fn impact_absence_qualifier(
-    graph: &kin_db::InMemoryGraph,
-    target: &kin_model::Entity,
-    envelope: &kin_mcp::Envelope,
-) -> Vec<String> {
-    let payload = impact_absence_payload(graph, target);
-    crate::commands::absence_qualifier::qualify("impact_analysis", &payload, envelope, "  ")
 }
 
 /// What the graph still says about a target with no downstream impact of its
@@ -903,6 +942,10 @@ mod tests {
     /// verdict disclosed rather than inventing a cause.
     #[tokio::test]
     async fn a_degraded_daemon_makes_the_cli_inherit_the_mcp_verdict() {
+        // This fixture isolates other verdict inputs on a measured usable host.
+        let _readiness = kin_mcp::edge_coverage::test_support::scoped_language_servers(&[
+            kin_model::LanguageId::Rust,
+        ]);
         let graph = kin_db::InMemoryGraph::new();
         let target = entity("orphan", "src/orphan.rs");
         graph.upsert_entity(&target).unwrap();
@@ -1297,6 +1340,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn populated_impact_names_repository_debt_without_claiming_a_dependency() {
+        let graph = kin_db::InMemoryGraph::new();
+        let target = entity("target", "src/target.rs");
+        let caller = entity("caller", "src/caller.rs");
+        let pending = entity_at("unrelated_pending", "src/pending.rs", 41);
+        for entity in [&target, &caller, &pending] {
+            graph.upsert_entity(entity).unwrap();
+        }
+        calls(&graph, &caller, &target);
+        let dir = tempfile::tempdir().unwrap();
+        let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
+        let request = ImpactRequest {
+            entity: target.id.to_string(),
+            depth: 1,
+            file: None,
+            kind: None,
+            signature: None,
+            require_unique: true,
+            dispatch_candidates: false,
+        };
+        let response = build_impact_response(&layout, &graph, &request, &healthy_test_envelope())
+            .await
+            .unwrap();
+        assert_eq!(response.ranked.as_ref().unwrap().candidates.len(), 1);
+        let observation = response.enrichment.as_ref().unwrap();
+        assert!(observation.bounds_answer());
+        assert_eq!(observation.total_pending_entities, 1);
+        assert_eq!(observation.pending_entities[0].entity_id, pending.id);
+        let rendered = response.lines.join("\n");
+        assert!(rendered.contains("lower bound"), "{rendered}");
+        assert!(rendered.contains("unrelated_pending"));
+        assert!(rendered.contains("projection: src/pending.rs"));
+        assert!(rendered.contains("does not prove"));
+        let json = serde_json::to_value(response).unwrap();
+        assert!(json["enrichment"]["pending_entities"][0]["projection"]
+            .get("line")
+            .is_none());
+    }
+
+    #[tokio::test]
     async fn exact_name_query_is_not_forced_ambiguous_by_substring_cousins() {
         let graph = kin_db::InMemoryGraph::new();
         graph
@@ -1345,8 +1428,8 @@ mod tests {
     }
 
     /// FIR-2672, second finding, at the surface a person reads. Coverage short
-    /// on purpose (calls only) beside a failed embedding worker: the class gap
-    /// decides the state and the worker's death stays in the rendering, after
+    /// on purpose (calls only) beside a blocked mass deletion: the class gap
+    /// decides the state and the independent flag stays in the rendering, after
     /// it. Drop either sentence from the qualifier and this goes red.
     #[tokio::test]
     async fn a_short_graph_on_a_degraded_daemon_renders_both_reasons() {
@@ -1369,7 +1452,7 @@ mod tests {
             "graph_loaded": true,
             "graph_entity_count": 3,
             "graph_generation": 1,
-            "embed_worker_failed": true,
+            "mass_deletion_blocked": true,
         }));
 
         let response = build_impact_response(
@@ -1396,8 +1479,8 @@ mod tests {
         let class_gap = rendered
             .find("holds no cross-file reference edges")
             .unwrap_or_else(|| panic!("the short classes decide and must be named: {rendered}"));
-        let worker = rendered.find("embed_worker_failed").unwrap_or_else(|| {
-            panic!("the failed worker must stay named beside the class gap: {rendered}")
+        let worker = rendered.find("mass_deletion_blocked").unwrap_or_else(|| {
+            panic!("the blocked mass deletion must stay named beside the class gap: {rendered}")
         });
         assert!(
             build_gap < class_gap && class_gap < worker,
@@ -2040,6 +2123,24 @@ mod tests {
                 "    - direct_caller (Function) @ src/direct.rs:21".to_string(),
                 "  2 hops:".to_string(),
                 "    - indirect_caller (Function) @ src/indirect.rs:31".to_string(),
+                // The fixture's graph holds parsed edges and no call-site
+                // ledger, so every entity in reach is owed enrichment, and the
+                // listing says so after the hops it leaves byte for byte.
+                "  Limit: enrichment_incomplete: 3 entities in this impact's reach or among its \
+                 possible inbound callers across the selected graph have unsettled call-site \
+                 evidence. Impact counts are a lower bound and review risk may change. This \
+                 conservatively bounds the answer. It does not prove that every listed entity \
+                 reaches the changed code."
+                    .to_string(),
+                "    Pending: direct_caller [69bde98b-ea48-5a6a-97d2-7ba614bb0969] (projection: \
+                 src/direct.rs; owed_enrichment)"
+                    .to_string(),
+                "    Pending: indirect_caller [c291aeca-2e7c-5bce-afa4-b2f99292b564] (projection: \
+                 src/indirect.rs; owed_enrichment)"
+                    .to_string(),
+                "    Pending: changed [995c2f5d-1d19-5eeb-8cbe-7d595b98a1d9] (projection: \
+                 src/lib.rs; owed_enrichment)"
+                    .to_string(),
             ]
         );
     }
@@ -2611,6 +2712,10 @@ mod tests {
     /// arm alone while stamping every empty result uncertain.
     #[tokio::test]
     async fn an_empty_answer_carries_the_same_verdict_in_prose_and_in_the_payload() {
+        // This fixture isolates other verdict inputs on a measured usable host.
+        let _readiness = kin_mcp::edge_coverage::test_support::scoped_language_servers(&[
+            kin_model::LanguageId::Rust,
+        ]);
         let graph = kin_db::InMemoryGraph::new();
         let target = entity("orphan", "src/orphan.rs");
         let caller = entity("caller", "src/a.rs");
@@ -2738,6 +2843,10 @@ mod tests {
     /// gate cannot pass by refusing every empty answer.
     #[tokio::test]
     async fn an_empty_answer_a_caller_may_not_have_reached_refuses_in_prose_and_payload() {
+        // This fixture isolates other verdict inputs on a measured usable host.
+        let _readiness = kin_mcp::edge_coverage::test_support::scoped_language_servers(&[
+            kin_model::LanguageId::Rust,
+        ]);
         for (parsed_call_sites, refuses) in [(2u64, true), (1u64, false)] {
             let graph = kin_db::InMemoryGraph::new();
             let target = entity("orphan", "src/orphan.rs");

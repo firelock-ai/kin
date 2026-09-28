@@ -44,7 +44,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.8.1"
+version = "0.8.2"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["Troy Fortin <troy@firelock.ai>"]
@@ -201,6 +201,16 @@ kin-vfs-core = { path = "crates/kin-vfs-core", version = "=0.4.25", registry = "
 # here naming it. It still needs an entry, because a workspace member can only
 # say `{ workspace = true }` for a name this table carries.
 kin-vector = { path = "crates/kin-vector", version = "=0.2.1", registry = "kin" }
+
+# Every daemon start on Linux records its owner by hashing its own executing
+# image, and a stop hashes it again before it signals. Unoptimized, sha2 hashes
+# about twelve times slower (43 against 508 MiB/s measured), which on a debug
+# daemon image of hundreds of megabytes put tens of seconds on every test
+# daemon's start and pushed the test shards past their budget. Only this one
+# hashing crate is compiled optimized in dev and test builds; release is
+# unchanged.
+[profile.dev.package.sha2]
+opt-level = 3
 
 [profile.release]
 opt-level = 3

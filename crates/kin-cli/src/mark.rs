@@ -56,6 +56,10 @@ const MARK_COLUMNS: usize = 5;
 /// Blank columns between the mark and the text beside it.
 const GUTTER_COLUMNS: usize = 2;
 
+/// The column [`beside`] starts every text line at, counted from the mark's
+/// first column.
+pub(crate) const TEXT_COLUMN: usize = MARK_COLUMNS + GUTTER_COLUMNS;
+
 /// Below this terminal width the mark is not drawn at all.
 ///
 /// The mark plus its gutter takes [`MARK_COLUMNS`] + [`GUTTER_COLUMNS`] columns
@@ -183,7 +187,7 @@ impl MarkStyle {
 /// every snapshot, and every terminal that highlights them.
 pub fn beside(style: MarkStyle, text: &[&str]) -> Vec<String> {
     let rows = style.rows();
-    let indent = MARK_COLUMNS + GUTTER_COLUMNS;
+    let indent = TEXT_COLUMN;
     let height = rows.len().max(text.len());
     let mut out = Vec::with_capacity(height);
     for index in 0..height {

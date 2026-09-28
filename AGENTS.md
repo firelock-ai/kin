@@ -67,6 +67,12 @@ neither is 1.
 working directory, then the client's workspace roots. A bare `kin` resolves against the caller's
 PATH, which inside a container carries neither `~/.kin/bin` nor an npm prefix.
 
+**Trace response limits page the answer.** Repeat the same `trace_data_flow` query with its
+`next_cursor` as `cursor`, or pass `kin trace --cursor`. Preserve absolute hop/parent ids across
+pages. An oversized semantic field uses `record_fragment`; concatenate its UTF-8 fragments
+before reading that field. A partial page never proves absence, and a stale/evicted cursor
+requires a fresh query. Source bodies and safety readings remain semantic records, never files.
+
 **The release version lives in several files at once.** `scripts/release-intent.mjs` and
 `scripts/check-release-version.mjs` keep them in lockstep. The `Release version gate` job runs
 them on pull requests from `automation/release-next` or labelled `release:automated`, and an

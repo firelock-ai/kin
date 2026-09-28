@@ -4,6 +4,7 @@
 use anyhow::{Context, Result};
 use kin_index::RelationResolution;
 use kin_mcp::handlers::common::{ReferenceEdge, ReferenceLinesAbsent};
+use kin_mcp::handlers::external_symbols::SiteText;
 use kin_model::{Entity, EntityId, EntityStore, GraphNodeId, GraphStore, RelationKind};
 use kin_ranking::entity_ranking;
 use serde::{Deserialize, Serialize};
@@ -55,6 +56,36 @@ async fn announce_active_scope(
 pub struct RefsRequest {
     pub entity: String,
     pub kind: String,
+}
+
+/// How `kin refs` lays an answer out for a person at a terminal: every line
+/// fits in `width` columns, and the first `callers` callers are listed with the
+/// rest counted and left to `--all`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefsView {
+    pub width: usize,
+    pub callers: usize,
+}
+
+impl RefsView {
+    /// The narrowest layout a view is drawn at, whatever the terminal says.
+    pub const MIN_WIDTH: usize = 40;
+    /// Callers a terminal answer lists before it counts the rest.
+    pub const CALLERS: usize = 20;
+    /// The width a terminal whose size cannot be read is drawn at.
+    pub const FALLBACK_WIDTH: usize = 80;
+}
+
+/// What the CLI sends the daemon for `kin refs`: the request, and the view it
+/// wants the answer laid out in. With no view the answer is the complete
+/// listing, which `--all`, `--json` and a caller that is not a terminal read,
+/// and which a daemon that predates views returns for any request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RefsCommandRequest {
+    #[serde(flatten)]
+    pub request: RefsRequest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view: Option<RefsView>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -121,10 +152,33 @@ pub struct BulkRefsResponse {
     pub results: Vec<serde_json::Value>,
 }
 
-pub async fn run(entity: String, kind: String) -> Result<()> {
+/// `kin refs`. At a terminal the answer is laid out for a person: sized to the
+/// terminal's width and listing the first [`RefsView::CALLERS`] callers.
+/// `--all`, `--json` and output that is not a terminal get the complete answer.
+pub async fn run(entity: String, kind: String, all: bool, json: bool) -> Result<()> {
     let layout = crate::commands::require_repository_layout()?;
     let _scope = announce_active_scope(&layout, "refs").await?;
-    let response = run_daemon_refs(&layout, &RefsRequest { entity, kind }).await?;
+    let view = (!all && !json && console::Term::stdout().is_term()).then(|| RefsView {
+        width: crate::mark::terminal_columns()
+            .unwrap_or(RefsView::FALLBACK_WIDTH)
+            .max(RefsView::MIN_WIDTH),
+        callers: RefsView::CALLERS,
+    });
+    let response = run_daemon_refs(
+        &layout,
+        &RefsCommandRequest {
+            request: RefsRequest { entity, kind },
+            view,
+        },
+    )
+    .await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&response)?);
+        if let Some(error) = response.error {
+            anyhow::bail!(error);
+        }
+        return Ok(());
+    }
     // Refuse before printing, so a miss leaves stdout empty.
     if let Some(error) = response.error {
         anyhow::bail!(error);
@@ -132,6 +186,58 @@ pub async fn run(entity: String, kind: String) -> Result<()> {
     for line in response.lines {
         println!("{}", crate::output_style::paint_refs_line(&line));
     }
+    Ok(())
+}
+
+/// An explicitly bounded JSON view shares MCP's frozen continuation contract.
+pub async fn run_page(
+    entity: String,
+    kind: String,
+    cursor: Option<String>,
+    max_chars: Option<usize>,
+) -> Result<()> {
+    let max_chars = max_chars.unwrap_or(12_000);
+    if !(kin_mcp::budget::RESPONSE_MIN_MAX_CHARS..=kin_mcp::budget::RESPONSE_MAX_MAX_CHARS)
+        .contains(&max_chars)
+    {
+        anyhow::bail!("--max-chars must be between 2000 and 60000");
+    }
+    let kinds = parse_relation_kinds(&kind)?
+        .into_iter()
+        .map(|kind| match kind {
+            RelationKind::Calls => "calls",
+            RelationKind::Imports => "imports",
+            _ => "references",
+        })
+        .collect::<Vec<_>>();
+    let mut arguments = HashMap::from([
+        ("query".into(), serde_json::json!(entity)),
+        ("relation_kinds".into(), serde_json::json!(kinds)),
+        ("max_chars".into(), serde_json::json!(max_chars)),
+    ]);
+    if let Some(cursor) = cursor {
+        arguments.insert("cursor".into(), serde_json::json!(cursor));
+    }
+    let layout = crate::commands::require_repository_layout()?;
+    let url = match std::env::var("KIN_DAEMON_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        Some(url) => Some(url),
+        None => crate::daemon_client::resolve_daemon_url(&layout).await?,
+    }
+    .ok_or_else(|| crate::daemon_client::daemon_required_error("refs", &layout))?;
+    let response = crate::daemon_client::DaemonClient::from_base_url(url)?
+        .reference_page(arguments)
+        .await?;
+    let Some(kin_mcp::ContentBlock::Text { text }) = response.content.first() else {
+        anyhow::bail!("reference page contains no semantic payload");
+    };
+    if response.is_error == Some(true) {
+        anyhow::bail!("{text}");
+    }
+    // Preserve the already measured compact page, including its trust reading.
+    println!("{text}");
     Ok(())
 }
 
@@ -161,7 +267,7 @@ pub async fn run_bulk(entities: String, kind: String, compact: bool) -> Result<(
 
 async fn run_daemon_refs(
     layout: &kin_core::KinLayout,
-    request: &RefsRequest,
+    request: &RefsCommandRequest,
 ) -> Result<RefsResponse> {
     let daemon_url = std::env::var("KIN_DAEMON_URL")
         .ok()
@@ -202,6 +308,14 @@ async fn run_daemon_bulk_refs(
 pub struct RefsSpine<'a> {
     pub repo_id: &'a str,
     pub spine: ::kin_spine::DaemonSpine<'a>,
+    /// The authority and source scope the daemon holds for this read, which
+    /// the store-wide reading of the focal's possible callers reads caller text
+    /// and takes its escape census through, as `find_references` does. `None`
+    /// reads the callers in the files that import the focal's file alone.
+    pub call_site_sources: Option<(
+        &'a kin_mcp::handlers::RequestRepositoryAuthority,
+        kin_mcp::handlers::common::EntitySourceScope,
+    )>,
 }
 
 impl RefsSpine<'static> {
@@ -211,6 +325,7 @@ impl RefsSpine<'static> {
         Self {
             repo_id: "",
             spine: ::kin_spine::DaemonSpine::Absent,
+            call_site_sources: None,
         }
     }
 }
@@ -225,12 +340,56 @@ pub fn build_refs_response(
     build_refs_response_with_spine(layout, graph, request, envelope, RefsSpine::absent())
 }
 
+/// [`build_refs_response_quoted`] for a caller that holds no body reader:
+/// every site keeps its line inside its caller and says its text is
+/// unavailable.
 pub fn build_refs_response_with_spine(
     layout: &kin_core::KinLayout,
     graph: &kin_db::InMemoryGraph,
     request: &RefsRequest,
     envelope: &kin_mcp::Envelope,
     spine: RefsSpine<'_>,
+) -> Result<RefsResponse> {
+    build_refs_response_quoted(
+        layout,
+        graph,
+        request,
+        envelope,
+        spine,
+        &kin_mcp::handlers::common::NoCallerText,
+        None,
+    )
+}
+
+/// `kin refs`, with the text at each site cut from its caller's own body
+/// through `site_text`, the reader `find_references` quotes a site through.
+///
+/// With a `view` the answer is laid out for a person at a terminal (see
+/// [`RefsView`]); without one it is the complete listing.
+pub fn build_refs_response_quoted(
+    layout: &kin_core::KinLayout,
+    graph: &kin_db::InMemoryGraph,
+    request: &RefsRequest,
+    envelope: &kin_mcp::Envelope,
+    spine: RefsSpine<'_>,
+    site_text: &dyn SiteText,
+    view: Option<RefsView>,
+) -> Result<RefsResponse> {
+    let mut response = build_refs_lines(layout, graph, request, envelope, spine, site_text, view)?;
+    if let Some(view) = view {
+        response.lines = fit_lines(&response.lines, view.width);
+    }
+    Ok(response)
+}
+
+fn build_refs_lines(
+    layout: &kin_core::KinLayout,
+    graph: &kin_db::InMemoryGraph,
+    request: &RefsRequest,
+    envelope: &kin_mcp::Envelope,
+    spine: RefsSpine<'_>,
+    site_text: &dyn SiteText,
+    view: Option<RefsView>,
 ) -> Result<RefsResponse> {
     let relation_kinds = parse_relation_kinds(&request.kind)?;
     let want_dispatch = strip_dispatch_modifier(&request.kind).1;
@@ -247,6 +406,7 @@ pub fn build_refs_response_with_spine(
             &relation_kinds,
             want_dispatch,
             envelope,
+            site_text,
         );
     }
     if crate::commands::external_symbols::is_address(&request.entity) {
@@ -266,6 +426,52 @@ pub fn build_refs_response_with_spine(
         &request.entity,
         &crate::entity_identity::IdentityQualifiers::default(),
     )?;
+    // A name no repository entity carries may name a symbol outside the
+    // repository, `Array.map` or its SCIP symbol. It is matched the way
+    // `find_references` matches it, so the two surfaces answer one name alike.
+    if resolution.name_matches.is_empty() {
+        let (named, matched) =
+            kin_mcp::handlers::external_symbols::external_symbols_named(graph, &request.entity)
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "read the symbols outside the repository named '{}': {error}",
+                        request.entity.trim()
+                    )
+                })?;
+        match named.as_slice() {
+            [] => {}
+            [node] => {
+                let mut response = build_external_refs_response(
+                    layout,
+                    graph,
+                    request,
+                    node,
+                    &relation_kinds,
+                    want_dispatch,
+                    envelope,
+                    site_text,
+                )?;
+                response.lines.insert(
+                    0,
+                    crate::commands::external_symbols::named_line(&request.entity, node, matched),
+                );
+                return Ok(response);
+            }
+            candidates => {
+                let lines = crate::commands::external_symbols::name_candidate_lines(
+                    "kin refs",
+                    &request.entity,
+                    candidates,
+                );
+                return Ok(RefsResponse {
+                    error: Some(lines.join("\n")),
+                    lines,
+                    negative: None,
+                    call_sites: None,
+                });
+            }
+        }
+    }
     // A member name several owners share is answered for each of them, the way
     // `find_references` sections the same name under `candidates_by_owner`,
     // rather than refused or answered for one.
@@ -277,6 +483,8 @@ pub fn build_refs_response_with_spine(
             &resolution,
             envelope,
             spine,
+            site_text,
+            view,
         );
     }
     let refusal = if resolution.name_matches.is_empty() {
@@ -329,18 +537,34 @@ pub fn build_refs_response_with_spine(
     // established, which the arrival reading says on its own.
     // Qualified by the owed callers outside those files, since a caller can
     // reach the focal without importing its file.
-    let arrival = kin_mcp::caller_arrival::observe_caller_arrival(graph, target);
+    let arrival = match spine.call_site_sources {
+        Some((authority, scope)) => kin_mcp::handlers::entities::reference_caller_arrival(
+            graph,
+            target,
+            Some(authority),
+            scope,
+        ),
+        None => kin_mcp::caller_arrival::observe_caller_arrival(graph, target),
+    };
     let call_sites = arrival.call_sites_block();
+    // Said in plain words for the person at the terminal. The block above is
+    // what the daemon's JSON carries, verdict codes included, unchanged.
     let call_site_lines = |lines: &mut Vec<String>| {
-        if let Some(block) = call_sites.as_ref() {
-            lines.extend(kin_mcp::call_sites::text_lines(block));
+        if let Some(tally) = arrival.call_sites.as_ref() {
+            lines.extend(call_site_words(
+                tally,
+                arrival.owed_outside.as_deref(),
+                arrival.owed_callers_cannot_name_focal,
+                target,
+            ));
+        }
+        if let Some(scan) = arrival.scan.as_deref() {
+            lines.extend(kin_mcp::call_sites::candidate_lines(scan, &target.name));
         }
     };
 
     let refs = collect_references(graph, target, &relation_kinds)?;
-    let target_path = declaration_neighbors::entity_location(graph, target)
-        .map(|location| display_read_path(layout, &location))
-        .unwrap_or_else(|| "unknown".to_string());
+    let target_path = entity_address(layout, graph, target);
 
     let mut lines = Vec::new();
     // First, and on every answer, when a missing language server leaves out
@@ -349,7 +573,7 @@ pub fn build_refs_response_with_spine(
     // the whole set.
     lines.extend(language_server_gap_line(target.language));
     lines.push(format!(
-        "References to '{}' -> {} ({:?}) @ {}",
+        "References to '{}' -> {} ({:?}) {}",
         resolution.reference.name, target.name, target.kind, target_path
     ));
     lines.extend(pinned_note(&resolution, target, &target_path));
@@ -387,6 +611,10 @@ pub fn build_refs_response_with_spine(
             envelope,
             spine,
         ));
+        // What leaves the answer unsettled, and the unproven call sites that
+        // could still be calls to the focal, are read right under the verdict,
+        // before the listing of what the graph holds nearby, in every layout.
+        call_site_lines(&mut lines);
         let neighbors = declaration_neighbors::collect(graph, target, &relation_kinds)?;
         // The candidate note above already named every same-name identity, so
         // the sibling listing would only repeat it.
@@ -400,7 +628,6 @@ pub fn build_refs_response_with_spine(
         if want_dispatch {
             lines.extend(dispatch_candidate_lines(layout, graph, target));
         }
-        call_site_lines(&mut lines);
         if let Some(note) = crate::entity_identity::stale_span_note(&lines) {
             lines.push(note);
         }
@@ -447,16 +674,13 @@ pub fn build_refs_response_with_spine(
     }
     let unconfirmed_count = receiver_candidates.len() + name_matches.len();
 
+    // A row names its caller by id, with the file only as the projection it
+    // is, and each site inside the caller, never by a file line.
     let render = |lines: &mut Vec<String>, entry: &ReferenceEntry| {
-        let file_path = entry
-            .file_path
-            .as_deref()
-            .map(|path| display_read_path(layout, path))
-            .unwrap_or_else(|| "unknown".to_string());
-        let location = match (entry.start_line, entry.span_stale) {
-            (_, true) => format!("{file_path} {}", crate::entity_identity::STALE_SPAN_MARK),
-            (Some(line), false) => format!("{file_path}:{line}"),
-            (None, false) => file_path,
+        let caller = graph.get_entity(&entry.entity_id).ok().flatten();
+        let address = match caller.as_ref() {
+            Some(caller) => entity_address(layout, graph, caller),
+            None => format!("[{}]", entry.entity_id),
         };
         let held_note = if entry.held_sites_of_counted_caller {
             " (its proven sites are counted above)"
@@ -464,12 +688,12 @@ pub fn build_refs_response_with_spine(
             ""
         };
         lines.push(format!(
-            "  {} @ {} [{}] ({}) {}{held_note}",
+            "  {} {} [{}] ({}) {}{held_note}",
             entry.name,
-            location,
+            address,
             relation_kinds_label(&entry.relation_kinds),
             entry.resolution.as_str(),
-            reference_sites_label(&entry),
+            reference_sites_label(entry, caller.as_ref(), site_text),
         ));
     };
 
@@ -488,23 +712,16 @@ pub fn build_refs_response_with_spine(
             if unconfirmed_count == 1 { "" } else { "s" }
         )
     };
-    if resolved.is_empty() {
-        lines.push(format!(
+    let count_line = if resolved.is_empty() {
+        format!(
             "No resolved incoming {} relations{unconfirmed}.",
             relation_kinds_label(&relation_kinds)
-        ));
+        )
     } else {
-        lines.push(format!(
-            "referenced by {} entities{unconfirmed}:",
-            resolved.len()
-        ));
-        for entry in &resolved {
-            render(&mut lines, entry);
-        }
-    }
-
-    if !receiver_candidates.is_empty() {
-        lines.push(format!(
+        format!("referenced by {} entities{unconfirmed}:", resolved.len())
+    };
+    let receiver_heading = (!receiver_candidates.is_empty()).then(|| {
+        format!(
             "{} receiver-name candidate{} not counted above; each is a call through a \
              receiver whose type nothing at the reference site settles:",
             receiver_candidates.len(),
@@ -513,21 +730,71 @@ pub fn build_refs_response_with_spine(
             } else {
                 "s"
             }
-        ));
-        for entry in &receiver_candidates {
-            render(&mut lines, entry);
-        }
-    }
-
-    if !name_matches.is_empty() {
-        lines.push(format!(
+        )
+    });
+    let name_heading = (!name_matches.is_empty()).then(|| {
+        format!(
             "{} name-only match{} not counted above; each is an identifier that carries this \
              name with nothing at the site proving it is this entity, which is what a local \
              variable or a parameter of the same name looks like:",
             name_matches.len(),
             if name_matches.len() == 1 { "" } else { "es" }
-        ));
-        for entry in &name_matches {
+        )
+    });
+    let sections: [(Option<String>, &[ReferenceEntry]); 3] = [
+        (None, &resolved),
+        (receiver_heading, &receiver_candidates),
+        (name_heading, &name_matches),
+    ];
+    let weak_tier = sections
+        .iter()
+        .flat_map(|(_, entries)| entries.iter())
+        .any(|entry| !entry.resolution.is_proven());
+
+    // Laid out for a person at a terminal: what qualifies the answer first,
+    // then the callers, name first, sized to the terminal.
+    if let Some(view) = view {
+        let mut notes = Vec::new();
+        if weak_tier {
+            notes.push(TIER_NOTE.to_string());
+        }
+        if want_dispatch {
+            notes.extend(dispatch_candidate_lines(layout, graph, target));
+        }
+        let mut call_site_disclosure = Vec::new();
+        call_site_lines(&mut call_site_disclosure);
+        let lines = compact_refs_lines(
+            view,
+            CompactListing {
+                layout,
+                graph,
+                site_text,
+                lead: lines,
+                call_site_lines: call_site_disclosure,
+                count_line,
+                sections: &sections,
+                notes,
+            },
+        );
+        return Ok(RefsResponse {
+            lines,
+            negative: None,
+            error: None,
+            call_sites,
+        });
+    }
+
+    // The complete listing, which `--all`, `--json` and a pipe read, leads
+    // with the same disclosure the terminal layout does: what leaves the
+    // answer unsettled and the unproven call sites that could still be calls
+    // to the focal, before any row.
+    call_site_lines(&mut lines);
+    lines.push(count_line);
+    for (heading, entries) in &sections {
+        if let Some(heading) = heading {
+            lines.push(heading.clone());
+        }
+        for entry in entries.iter() {
             render(&mut lines, entry);
         }
     }
@@ -536,25 +803,22 @@ pub fn build_refs_response_with_spine(
     // tier weaker than proven. The tags were already printed and nothing said
     // what they meant, and the reader this answer is written for has no grep to
     // check a row against, so the tier is the whole of what it has.
+    if weak_tier {
+        lines.push(TIER_NOTE.to_string());
+    }
+    // How a site is addressed, said once, whenever a row printed one.
     if resolved
         .iter()
         .chain(&receiver_candidates)
         .chain(&name_matches)
-        .any(|entry| !entry.resolution.is_proven())
+        .any(|entry| !entry.reference_lines.is_empty())
     {
-        lines.push(
-            "note: the tag after each row is its resolution tier. type_resolved means the \
-             destination entity itself is proven, import_scoped means an import singled out the \
-             scope the name was selected in, and name_only means the name matched and nothing \
-             at the site settles the destination."
-                .to_string(),
-        );
+        lines.push(REFS_SITE_NOTE.to_string());
     }
 
     if want_dispatch {
         lines.extend(dispatch_candidate_lines(layout, graph, target));
     }
-    call_site_lines(&mut lines);
 
     // No verdict on this path, and that is decided rather than skipped. The walk
     // returned rows, so there is no absence to qualify. That includes the
@@ -575,6 +839,185 @@ pub fn build_refs_response_with_spine(
     })
 }
 
+/// Files with callers still being linked outside the importing files that a
+/// `kin refs` answer names before it says how many more there are.
+const OWED_OUTSIDE_FILES_NAMED: usize = 5;
+
+/// The call sites of the callers in the files that import the focal's file,
+/// in plain words for a person reading a terminal.
+///
+/// It states the facts [`kin_mcp::call_sites::text_lines`] states for the
+/// `call_sites` block `find_references` serves over the same files: every
+/// count, the files it names, and the command that finishes work still owed.
+/// It leaves out the verdict codes, which stay in that block for a program to
+/// read. This is a completeness disclosure, so it never says an answer is
+/// complete while a count says otherwise: every caller still owed, every
+/// caller nothing can link on this machine and every call site whose target
+/// is unproven is counted, and each says what it may cost this answer.
+fn call_site_words(
+    tally: &kin_model::CallSiteTally,
+    owed_outside: Option<&[kin_mcp::call_sites::OwedFile]>,
+    cannot_name: u64,
+    focal: &kin_model::Entity,
+) -> Vec<String> {
+    use kin_model::call_site_reading::{
+        BINDING_UNPROVEN, CALL_SITES_NOT_IN_BUILD, CALL_SITES_SERVER_FAILED, CALL_SITES_UNRESOLVED,
+        PROOF_CONTEXT_STALE,
+    };
+
+    let file = focal
+        .file_origin
+        .as_ref()
+        .map(|file| {
+            std::path::Path::new(&file.0)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| file.0.clone())
+        })
+        .unwrap_or_else(|| "its file".to_string());
+    let name = focal.name.as_str();
+    let callers = tally.callers;
+    let sites = tally.sites;
+    let mut lines = vec![format!(
+        "Call sites in files that import {file}: {sites} across {callers} {}.",
+        plural(callers, "caller", "callers")
+    )];
+    // Left out of the count above, and said so, as the block counts them.
+    if cannot_name > 0 {
+        lines.push(format!(
+            "  {cannot_name} more {} there {} still linking, but never {} {name}, so {} \
+             can't call it by name and {} counted.",
+            plural(cannot_name, "caller", "callers"),
+            plural(cannot_name, "is", "are"),
+            plural(cannot_name, "spells", "spell"),
+            plural(cannot_name, "it", "they"),
+            plural(cannot_name, "isn't", "aren't"),
+        ));
+    }
+    let mut still_linking = false;
+
+    let owed = tally.callers_owed();
+    if owed > 0 {
+        still_linking = true;
+        lines.push(format!(
+            "  Still linking {owed} of the {callers} {}, so this answer may be missing calls \
+             from {}.",
+            plural(callers, "caller", "callers"),
+            plural(owed, "it", "them")
+        ));
+    }
+
+    let unlinkable = tally.callers_unproven_no_resolver;
+    if unlinkable > 0 {
+        let why: Vec<&str> = tally.no_resolver.keys().map(String::as_str).collect();
+        lines.push(format!(
+            "  {unlinkable} of the {callers} {} can't be linked on this machine ({}), so this \
+             answer may be missing calls from {}, and waiting won't change that.",
+            plural(callers, "caller", "callers"),
+            why.join("; "),
+            plural(unlinkable, "it", "them")
+        ));
+    }
+
+    // One sentence per reason a call site's target is unproven, in the order
+    // the verdict codes sort, as the block lists its clauses.
+    let mut unproven: std::collections::BTreeMap<&'static str, u64> =
+        std::collections::BTreeMap::new();
+    for (kind, count) in &tally.by_state {
+        if let Some(code) = kind.verdict_code() {
+            *unproven.entry(code).or_insert(0) += count;
+        }
+    }
+    for (code, count) in unproven {
+        if count == 0 {
+            continue;
+        }
+        let one = count == 1;
+        let what = match code {
+            BINDING_UNPROVEN if one => {
+                "calls through a variable or other value, which doesn't prove what it calls"
+            }
+            BINDING_UNPROVEN => {
+                "call through a variable or other value, which doesn't prove what they call"
+            }
+            CALL_SITES_UNRESOLVED if one => "was checked, but its target couldn't be proven",
+            CALL_SITES_UNRESOLVED => "were checked, but their targets couldn't be proven",
+            CALL_SITES_SERVER_FAILED => {
+                "got no answer because the language server timed out, crashed or failed"
+            }
+            CALL_SITES_NOT_IN_BUILD if one => "is in a file no build of the repository compiles",
+            CALL_SITES_NOT_IN_BUILD => "are in files no build of the repository compiles",
+            PROOF_CONTEXT_STALE if one => {
+                "was linked under a language-server setup that has since changed"
+            }
+            PROOF_CONTEXT_STALE => {
+                "were linked under a language-server setup that has since changed"
+            }
+            _ if one => "is not settled",
+            _ => "are not settled",
+        };
+        lines.push(format!(
+            "  {count} of the {sites} call {} {what}, so {} may call {name}.",
+            plural(sites, "site", "sites"),
+            if one { "it" } else { "one of them" }
+        ));
+    }
+
+    match owed_outside {
+        None => lines.push(format!(
+            "  Kin couldn't read its index of {} code, so callers in files that don't import \
+             {file} weren't checked, and one that reaches {name} without importing {file} may \
+             be missing from this answer.",
+            focal.language
+        )),
+        Some([]) => {}
+        Some(files) => {
+            still_linking = true;
+            let owed_callers: u64 = files.iter().map(|file| file.callers).sum();
+            lines.push(format!(
+                "  Still linking {owed_callers} {} in {} {} that {} import {file}. A caller \
+                 can reach {name} without importing {file}, so this answer may be missing one \
+                 of them.",
+                plural(owed_callers, "caller", "callers"),
+                files.len(),
+                plural(files.len() as u64, "file", "files"),
+                plural(files.len() as u64, "doesn't", "don't"),
+            ));
+            for owed_file in files.iter().take(OWED_OUTSIDE_FILES_NAMED) {
+                lines.push(format!(
+                    "    {} ({} {})",
+                    owed_file.file,
+                    owed_file.callers,
+                    plural(owed_file.callers, "caller", "callers")
+                ));
+            }
+            let more = files.len().saturating_sub(OWED_OUTSIDE_FILES_NAMED);
+            if more > 0 {
+                lines.push(format!(
+                    "    and {more} more {}",
+                    plural(more as u64, "file", "files")
+                ));
+            }
+        }
+    }
+
+    if still_linking {
+        lines.push("  Run `kin daemon sweep` to finish linking now.".to_string());
+    } else if lines.len() == 1 && sites > 0 {
+        lines.push("  Every one of them is accounted for.".to_string());
+    }
+    lines
+}
+
+/// `one` for a count of one, `many` for any other.
+fn plural(count: u64, one: &'static str, many: &'static str) -> &'static str {
+    if count == 1 {
+        one
+    } else {
+        many
+    }
+}
+
 /// `kin refs` for a member name several owners share: a full answer for each
 /// owner's member, each addressed by its id, under one lead that says why.
 ///
@@ -591,6 +1034,8 @@ fn build_shared_member_refs_response(
     resolution: &crate::entity_identity::EntityResolution,
     envelope: &kin_mcp::Envelope,
     spine: RefsSpine<'_>,
+    site_text: &dyn SiteText,
+    view: Option<RefsView>,
 ) -> Result<RefsResponse> {
     let mut candidates = resolution.candidates.clone();
     kin_ranking::entity_ranking::sort_name_candidates(&mut candidates);
@@ -612,7 +1057,7 @@ fn build_shared_member_refs_response(
         ),
     )];
     for candidate in candidates.iter().take(sectioned) {
-        let section = build_refs_response_with_spine(
+        let section = build_refs_response_quoted(
             layout,
             graph,
             &RefsRequest {
@@ -621,6 +1066,8 @@ fn build_shared_member_refs_response(
             },
             envelope,
             spine,
+            site_text,
+            view,
         )?;
         lines.push(String::new());
         lines.push(format!(
@@ -667,9 +1114,9 @@ fn build_shared_member_refs_response(
 /// Rendered from the answer `find_references` gives for the same symbol, built
 /// by the same function over the same edges, so the two surfaces list the same
 /// callers with the same sites and proof. That answer's own floor note is
-/// printed as it stands. The text at each site is not quoted here: this
-/// command holds no body reader, and a site's `+N` already places it inside a
-/// caller whose body `kin context` or `kin graph source` prints.
+/// printed as it stands. The text at each site is cut through `site_text`, the
+/// body reader the daemon hands this command, and a site keeps its `+N` inside
+/// its caller when there is none.
 fn build_external_refs_response(
     layout: &kin_core::KinLayout,
     graph: &kin_db::InMemoryGraph,
@@ -678,17 +1125,18 @@ fn build_external_refs_response(
     relation_kinds: &[RelationKind],
     want_dispatch: bool,
     envelope: &kin_mcp::Envelope,
+    site_text: &dyn SiteText,
 ) -> Result<RefsResponse> {
     use crate::commands::external_symbols as external;
     // The floor `find_references` applies by default, so a caller held there
-    // is held here.
-    let payload = kin_mcp::handlers::external_symbols::external_references_reply(
+    // is held here, and each site's text is cut through the same reader.
+    let payload = kin_mcp::handlers::external_symbols::external_references_reply_quoted(
         graph,
         node,
         relation_kinds,
         false,
         RelationResolution::ImportScoped,
-        None,
+        site_text,
     )
     .map_err(|error| anyhow::anyhow!("read the callers of {}: {error}", node.address()))?;
     let references = payload["references"]
@@ -705,11 +1153,7 @@ fn build_external_refs_response(
             .as_str()
             .and_then(|id| uuid::Uuid::parse_str(id).ok())
             .and_then(|uuid| graph.get_entity(&EntityId(uuid)).ok().flatten())
-            .map(|caller| {
-                let mut pointer = crate::entity_identity::entity_pointer(graph, &caller);
-                pointer.path = pointer.path.map(|path| display_read_path(layout, &path));
-                pointer.render()
-            })
+            .map(|caller| entity_address(layout, graph, &caller))
             .unwrap_or_else(|| "unknown".to_string());
         let kinds = row["relation_kinds"]
             .as_array()
@@ -723,7 +1167,7 @@ fn build_external_refs_response(
             })
             .unwrap_or_default();
         format!(
-            "  {} @ {} [{}] ({}) {} {}",
+            "  {} {} [{}] ({}) {} {}",
             row["name"].as_str().unwrap_or("?"),
             location,
             kinds,
@@ -862,7 +1306,7 @@ fn pinned_note(
     }
     let reached = resolution.name_matches.len();
     vec![format!(
-        "note: pinned by {} to the {} at {}, of {} entit{} the name reaches.",
+        "note: pinned by {} to the {} {}, of {} entit{} the name reaches.",
         pins.join(" "),
         kin_review::StableEntityIdentity::from_entity(target).kind,
         target_path,
@@ -871,17 +1315,6 @@ fn pinned_note(
     )]
 }
 
-/// The reference sites of one entry, or the named reason it has none.
-///
-/// `start_line` locates the caller's definition and says nothing about where
-/// inside it the reference is, which is what sent readers to grep for the line
-/// they actually wanted (FIR-1825). These are the sites themselves, 1-based, in
-/// the caller's own file.
-///
-/// An entry with no sites says which absence it is rather than printing an empty
-/// list, using the same three names the MCP row carries under
-/// `reference_lines_absent_reason`, so the two surfaces can be compared word for
-/// word.
 /// The machine-readable absence verdict for an empty `kin refs` answer.
 ///
 /// A second call to the same pure gate the rendered sentence goes through, for
@@ -1110,7 +1543,365 @@ fn refs_cross_repo(
     (block, counted)
 }
 
-fn reference_sites_label(entry: &ReferenceEntry) -> String {
+/// How `kin refs` names an entity: its id, which is its address, then the
+/// file it is projected into, labelled as the projection it is. A caller
+/// whose span the graph can no longer vouch for carries the stale mark.
+fn entity_address(
+    layout: &kin_core::KinLayout,
+    graph: &kin_db::InMemoryGraph,
+    entity: &Entity,
+) -> String {
+    let pointer = crate::entity_identity::entity_pointer(graph, entity);
+    let mut address = match pointer.path {
+        Some(path) => format!(
+            "[{}] (projection: {})",
+            entity.id,
+            display_read_path(layout, &path)
+        ),
+        None => format!("[{}]", entity.id),
+    };
+    if pointer.stale {
+        address.push(' ');
+        address.push_str(crate::entity_identity::STALE_SPAN_MARK);
+    }
+    address
+}
+
+/// What a `kin refs` answer says once about how its rows address a site.
+pub const REFS_SITE_NOTE: &str = "note: a site is +N, N lines below the first line of the \
+     entity that holds it, the offset a numbered body shows, with the text at it. A row names \
+     its entity by id; the path after `projection:` is the file that entity is projected into, \
+     not an address.";
+
+/// What the tag after each row means, said once whenever a row carries a tier
+/// weaker than proven.
+const TIER_NOTE: &str = "note: the tag after each row is its resolution tier. type_resolved \
+     means the destination entity itself is proven, import_scoped means an import singled out \
+     the scope the name was selected in, and name_only means the name matched and nothing at \
+     the site settles the destination.";
+
+/// The site note a terminal answer carries, whose rows name callers without
+/// their ids.
+const COMPACT_SITE_NOTE: &str = "note: a site is +N, N lines below the first line of the \
+     caller that holds it, with the text there. --all adds each caller's id; --json gives \
+     the whole answer.";
+
+/// What a terminal answer is drawn from.
+struct CompactListing<'a> {
+    layout: &'a kin_core::KinLayout,
+    graph: &'a kin_db::InMemoryGraph,
+    site_text: &'a dyn SiteText,
+    /// The header and the notes about how the focal was chosen.
+    lead: Vec<String>,
+    /// The call-site disclosure in plain words, read before any row.
+    call_site_lines: Vec<String>,
+    /// How many callers the answer counts, and how many it holds apart.
+    count_line: String,
+    /// The counted callers, then each held group under its heading.
+    sections: &'a [(Option<String>, &'a [ReferenceEntry])],
+    /// What follows the rows: the tier note and the dispatch listing.
+    notes: Vec<String>,
+}
+
+/// A `kin refs` answer laid out for a person at a terminal.
+///
+/// What qualifies the answer comes first: the header, then the call-site
+/// summary and every clause that leaves it unsettled, in the plain words the
+/// complete listing uses, so a reader who stops at the first screen has read
+/// them. Then the callers, grouped under
+/// the file each is projected into, each one row with its name first and its
+/// sites inside it, `+N` and the text there. At most `view.callers` callers are
+/// listed, and a count of the rest points at `--all` and `--json`. Every line
+/// fits in `view.width` columns: a site's text is cut with an ellipsis, and
+/// prose wraps between words.
+fn compact_refs_lines(view: RefsView, listing: CompactListing<'_>) -> Vec<String> {
+    let width = view.width.max(RefsView::MIN_WIDTH);
+    let mut lines = fit_lines(&listing.lead, width);
+    // Every clause of the disclosure is kept: it is already bounded, naming at
+    // most a handful of files, and a clause left to `--all` would be a gap the
+    // first screen does not show.
+    lines.extend(fit_lines(&listing.call_site_lines, width));
+    lines.extend(fit_lines(std::slice::from_ref(&listing.count_line), width));
+
+    // Only the callers listed are read, so a symbol with hundreds of callers
+    // costs a screen's worth of bodies, and the rest are counted.
+    let entries: Vec<(usize, &ReferenceEntry)> = listing
+        .sections
+        .iter()
+        .enumerate()
+        .flat_map(|(section, (_, entries))| entries.iter().map(move |entry| (section, entry)))
+        .collect();
+    let shown = entries.len().min(view.callers);
+    let rows: Vec<(usize, CompactRow)> = entries[..shown]
+        .iter()
+        .map(|(section, entry)| {
+            (
+                *section,
+                compact_row(listing.layout, listing.graph, listing.site_text, entry),
+            )
+        })
+        .collect();
+    let name_width = rows
+        .iter()
+        .map(|(_, row)| console::measure_text_width(&row.name))
+        .max()
+        .unwrap_or(0)
+        .min(width * 2 / 5);
+    let mut section_open = None;
+    let mut projection_open: Option<Option<String>> = None;
+    for (section, row) in &rows {
+        if section_open != Some(*section) {
+            section_open = Some(*section);
+            projection_open = None;
+            if let Some(heading) = &listing.sections[*section].0 {
+                lines.extend(fit_lines(std::slice::from_ref(heading), width));
+            }
+        }
+        if projection_open.as_ref() != Some(&row.projection) {
+            projection_open = Some(row.projection.clone());
+            let heading = match &row.projection {
+                Some(path) => {
+                    let room = width.saturating_sub("  (projection: )".len());
+                    format!("  (projection: {})", truncate_left(path, room))
+                }
+                None => "  (no projection)".to_string(),
+            };
+            lines.push(heading);
+        }
+        lines.extend(row.render(name_width, width));
+    }
+    let more = entries.len() - shown;
+    if more > 0 {
+        lines.extend(fit_lines(
+            &[format!(
+                "  and {more} more; --all or --json for the full list"
+            )],
+            width,
+        ));
+    }
+    let mut notes = listing.notes;
+    if rows.iter().any(|(_, row)| row.has_sites) {
+        notes.push(COMPACT_SITE_NOTE.to_string());
+    }
+    if rows.iter().any(|(_, row)| row.stale) {
+        notes.extend(crate::entity_identity::stale_span_note(&[
+            crate::entity_identity::STALE_SPAN_MARK.to_string(),
+        ]));
+    }
+    lines.extend(fit_lines(&notes, width));
+    lines
+}
+
+/// One caller as a terminal answer lists it.
+struct CompactRow {
+    name: String,
+    projection: Option<String>,
+    /// Each site, `+N` and the text there, or why the row has none.
+    sites: Vec<String>,
+    has_sites: bool,
+    /// The graph can no longer vouch for the caller's span.
+    stale: bool,
+    /// What sets the row apart from a proven call: a weaker tier, another
+    /// relation kind, a held part of a counted caller, a stale span.
+    tags: Vec<String>,
+}
+
+impl CompactRow {
+    /// The row in lines of at most `width` columns: the name padded to
+    /// `name_width`, then the sites, wrapping between sites under the first.
+    fn render(&self, name_width: usize, width: usize) -> Vec<String> {
+        const INDENT: &str = "    ";
+        let name_room = width.saturating_sub(INDENT.len() + 2 + 12).max(8);
+        let name = truncate_right(&self.name, name_room);
+        let pad = name_width.saturating_sub(console::measure_text_width(&name));
+        let head = format!("{INDENT}{name}{}  ", " ".repeat(pad));
+        let head_width = console::measure_text_width(&head);
+        // One column is kept back for the comma a wrapped site ends on.
+        let room = width.saturating_sub(head_width + 1).max(1);
+        let continuation = " ".repeat(head_width);
+        let mut items: Vec<(String, &str)> = self
+            .sites
+            .iter()
+            .map(|site| (truncate_right(site, room), ", "))
+            .collect();
+        if !self.tags.is_empty() {
+            let tags = format!("({})", self.tags.join(", "));
+            items.push((truncate_right(&tags, room), " "));
+        }
+        let mut lines = Vec::new();
+        let mut current = head;
+        let mut used = 0usize;
+        for (item, separator) in items {
+            let item_width = console::measure_text_width(&item);
+            if used == 0 {
+                current.push_str(&item);
+                used = item_width;
+            } else if used + separator.len() + item_width <= room {
+                current.push_str(separator);
+                current.push_str(&item);
+                used += separator.len() + item_width;
+            } else {
+                if separator == ", " {
+                    current.push(',');
+                }
+                lines.push(current);
+                current = format!("{continuation}{item}");
+                used = item_width;
+            }
+        }
+        lines.push(current);
+        lines
+    }
+}
+
+fn compact_row(
+    layout: &kin_core::KinLayout,
+    graph: &kin_db::InMemoryGraph,
+    site_text: &dyn SiteText,
+    entry: &ReferenceEntry,
+) -> CompactRow {
+    let caller = graph.get_entity(&entry.entity_id).ok().flatten();
+    let pointer = caller
+        .as_ref()
+        .map(|caller| crate::entity_identity::entity_pointer(graph, caller));
+    let projection = pointer
+        .as_ref()
+        .and_then(|pointer| pointer.path.as_deref())
+        .map(|path| display_read_path(layout, path));
+    let sites_json = reference_sites_json(entry, caller.as_ref(), site_text);
+    let has_sites = !sites_json.is_empty();
+    let sites = if has_sites {
+        sites_json.iter().map(compact_site).collect()
+    } else {
+        vec![format!(
+            "no sites ({})",
+            entry
+                .reference_lines_absent
+                .map(ReferenceLinesAbsent::as_str)
+                .unwrap_or("unknown")
+        )]
+    };
+    let mut tags = Vec::new();
+    if entry.resolution != RelationResolution::TypeResolved {
+        tags.push(entry.resolution.as_str().to_string());
+    }
+    if entry.relation_kinds != [RelationKind::Calls] {
+        tags.push(relation_kinds_label(&entry.relation_kinds).to_lowercase());
+    }
+    if entry.held_sites_of_counted_caller {
+        tags.push("also counted above".to_string());
+    }
+    let stale = pointer.as_ref().is_some_and(|pointer| pointer.stale);
+    if stale {
+        tags.push("span stale".to_string());
+    }
+    CompactRow {
+        name: entry.name.clone(),
+        projection,
+        sites,
+        has_sites,
+        stale,
+        tags,
+    }
+}
+
+/// `+N text`, `+N` when the text cannot be read, or `+?` when the site cannot
+/// be placed inside its caller.
+fn compact_site(site: &serde_json::Value) -> String {
+    let offset = match site["line_in_entity"].as_u64() {
+        Some(line) => format!("+{line}"),
+        None => "+?".to_string(),
+    };
+    match site["callee"]
+        .as_str()
+        .map(crate::commands::external_symbols::callee_text)
+    {
+        Some(text) if !text.is_empty() => format!("{offset} {text}"),
+        _ => offset,
+    }
+}
+
+/// `text` cut to `width` columns from the right, with an ellipsis for what
+/// was cut.
+fn truncate_right(text: &str, width: usize) -> String {
+    console::truncate_str(text, width, "\u{2026}").into_owned()
+}
+
+/// `text` cut to `width` columns from the left, so a path keeps the file it
+/// names.
+fn truncate_left(text: &str, width: usize) -> String {
+    if console::measure_text_width(text) <= width || width == 0 {
+        return text.to_string();
+    }
+    let mut kept: Vec<char> = Vec::new();
+    let mut used = 1usize;
+    for ch in text.chars().rev() {
+        let ch_width = console::measure_text_width(ch.encode_utf8(&mut [0u8; 4]));
+        if used + ch_width > width {
+            break;
+        }
+        used += ch_width;
+        kept.push(ch);
+    }
+    kept.reverse();
+    format!("\u{2026}{}", kept.into_iter().collect::<String>())
+}
+
+/// Every line in at most `width` columns, wrapped between words and never
+/// inside one. A continuation keeps the line's indent and adds two spaces, and
+/// a single word wider than the room left is cut with an ellipsis.
+pub(crate) fn fit_lines(lines: &[String], width: usize) -> Vec<String> {
+    let mut fitted = Vec::new();
+    for line in lines {
+        if console::measure_text_width(line) <= width {
+            fitted.push(line.clone());
+            continue;
+        }
+        let indent = (line.len() - line.trim_start_matches(' ').len()).min(width / 2);
+        let continuation = (indent + 2).min(width / 2);
+        let mut line_indent = indent;
+        let mut current = String::new();
+        let mut current_width = 0usize;
+        for word in line.split(' ').filter(|word| !word.is_empty()) {
+            let word_width = console::measure_text_width(word);
+            if !current.is_empty() && current_width + 1 + word_width <= width {
+                current.push(' ');
+                current.push_str(word);
+                current_width += 1 + word_width;
+                continue;
+            }
+            if !current.is_empty() {
+                fitted.push(std::mem::take(&mut current));
+                line_indent = continuation;
+            }
+            let word = truncate_right(word, width.saturating_sub(line_indent).max(1));
+            current = format!("{}{word}", " ".repeat(line_indent));
+            current_width = line_indent + console::measure_text_width(&word);
+        }
+        if !current.is_empty() {
+            fitted.push(current);
+        }
+    }
+    fitted
+}
+
+/// The reference sites of one entry, each addressed inside its caller, or the
+/// named reason it has none.
+///
+/// A site is `+N` below the caller's first line with the text at it, cut from
+/// the caller's own body through `site_text`: the address `find_references`
+/// serves under `sites`, rendered by the renderer an external symbol's
+/// callers use, so the two surfaces can be compared site for site. Never a
+/// file line.
+///
+/// An entry with no sites says which absence it is rather than printing an
+/// empty list, using the names the MCP row carries under
+/// `sites_absent_reason`, so the two surfaces can be compared word for word.
+fn reference_sites_label(
+    entry: &ReferenceEntry,
+    caller: Option<&Entity>,
+    site_text: &dyn SiteText,
+) -> String {
     if entry.reference_lines.is_empty() {
         let reason = entry
             .reference_lines_absent
@@ -1118,13 +1909,37 @@ fn reference_sites_label(entry: &ReferenceEntry) -> String {
             .unwrap_or("unknown");
         return format!("sites none ({reason})");
     }
-    let sites = entry
+    let sites = reference_sites_json(entry, caller, site_text);
+    crate::commands::external_symbols::sites_label(&serde_json::Value::Array(sites))
+}
+
+/// Each site of one entry as `find_references` serves it, addressed inside
+/// the caller through `site_text`.
+fn reference_sites_json(
+    entry: &ReferenceEntry,
+    caller: Option<&Entity>,
+    site_text: &dyn SiteText,
+) -> Vec<serde_json::Value> {
+    let spans: Vec<(RelationKind, kin_model::SourceSpan)> = entry
+        .edges
+        .iter()
+        .flat_map(|edge| edge.spans.iter().map(|span| (edge.kind, span.clone())))
+        .collect();
+    let addresses = match caller {
+        Some(caller) => kin_mcp::handlers::common::address_reference_sites(
+            caller,
+            &entry.reference_lines,
+            &spans,
+            site_text,
+        ),
+        None => Default::default(),
+    };
+    let unaddressed = kin_mcp::handlers::common::ReferenceSite::unaddressed();
+    entry
         .reference_lines
         .iter()
-        .map(u32::to_string)
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("sites {sites}")
+        .map(|line| addresses.get(line).unwrap_or(&unaddressed).to_json())
+        .collect()
 }
 
 /// What the graph still says about a target whose incoming relations are empty.
@@ -1534,18 +2349,12 @@ pub(crate) struct ReferenceEntry {
     pub(crate) entity_id: EntityId,
     pub(crate) name: String,
     pub(crate) file_path: Option<String>,
-    /// 1-based, as every `file:line` an agent pastes into an editor is.
-    /// `None` for an entity the graph carries no span for, because reporting a
-    /// line for one would be a fabricated position, and `None` when the span
-    /// is stale, for the same reason.
-    start_line: Option<u32>,
-    /// The caller's span was measured against an older version of its file
-    /// than the graph holds, so the row prints the path marked stale.
-    span_stale: bool,
-    /// 1-based lines of the reference sites inside this caller, ascending and
-    /// deduplicated. Read from the same relation evidence and through the same
-    /// helper `find_references` uses, because two surfaces answering "where"
-    /// from two rules is how they came to disagree about "how many" (FIR-2398).
+    /// The reference sites inside this caller, keyed by their 1-based line in
+    /// the caller's file, ascending and deduplicated. Read from the same
+    /// relation evidence and through the same helper `find_references` uses,
+    /// because two surfaces answering "where" from two rules is how they came
+    /// to disagree about "how many". The key is internal: a row prints each
+    /// site inside its caller, never this line.
     reference_lines: Vec<u32>,
     /// Why this entry has no sites, and `None` when it has some. Same three
     /// conditions the MCP row names, so a reader comparing the surfaces sees
@@ -1811,13 +2620,10 @@ pub(crate) fn collect_graph_references(
         } else {
             Some(ReferenceLinesAbsent::NoEvidenceSpan)
         };
-        let pointer = crate::entity_identity::entity_pointer(graph, &entity);
         references.push(ReferenceEntry {
             entity_id: source_id,
             name: entity.name.clone(),
             file_path: entity.file_origin.as_ref().map(|f| f.0.clone()),
-            start_line: pointer.line,
-            span_stale: pointer.stale,
             reference_lines,
             reference_lines_absent,
             relation_kinds: source_kinds,
@@ -1978,21 +2784,10 @@ fn dispatch_candidate_lines(
         let Ok(Some(caller)) = graph.get_entity(caller_id) else {
             continue;
         };
-        let file_path = caller
-            .file_origin
-            .as_ref()
-            .map(|origin| display_read_path(layout, &origin.0))
-            .unwrap_or_else(|| "unknown".to_string());
-        let pointer = crate::entity_identity::entity_pointer(graph, &caller);
-        let location = match (pointer.line, pointer.stale) {
-            (_, true) => format!("{file_path} {}", crate::entity_identity::STALE_SPAN_MARK),
-            (Some(line), false) => format!("{file_path}:{line}"),
-            (None, false) => file_path,
-        };
         lines.push(format!(
-            "  {} @ {} [Calls] (dispatch_candidate) via {}",
+            "  {} {} [Calls] (dispatch_candidate) via {}",
             caller.name,
-            location,
+            entity_address(layout, graph, &caller),
             via.join(", ")
         ));
     }
@@ -2008,9 +2803,11 @@ fn dispatch_candidate_lines(
 /// method's receiver type satisfies the contract and holds nothing that says the
 /// author wrote it to.
 ///
-/// Each row carries a LINE. A reader handed only the file still has to search
-/// it, and the measurement that found this gap scored a file-granularity answer
-/// at zero on the site axis for exactly that reason.
+/// Each row names the declaration by its entity id. A reader handed only the
+/// file still has to search it, and the measurement that found this gap scored
+/// a file-granularity answer at zero on the site axis for exactly that reason;
+/// the id is the declaration's own address, and the file follows it only as
+/// the projection it is, never with a file line.
 fn implementation_candidate_lines(
     layout: &kin_core::KinLayout,
     graph: &kin_db::InMemoryGraph,
@@ -2041,20 +2838,11 @@ fn implementation_candidate_lines(
         let Ok(Some(method)) = graph.get_entity(&candidate.method_id) else {
             continue;
         };
-        let file_path = method
-            .file_origin
-            .as_ref()
-            .map(|origin| display_read_path(layout, &origin.0))
-            .unwrap_or_else(|| "unknown".to_string());
-        let pointer = crate::entity_identity::entity_pointer(graph, &method);
-        let location = match (pointer.line, pointer.stale) {
-            (_, true) => format!("{file_path} {}", crate::entity_identity::STALE_SPAN_MARK),
-            (Some(line), false) => format!("{file_path}:{line}"),
-            (None, false) => file_path,
-        };
         lines.push(format!(
-            "  {} @ {} [Implements] (implementation_candidate) on {}",
-            candidate.method_name, location, candidate.receiver_name
+            "  {} {} [Implements] (implementation_candidate) on {}",
+            candidate.method_name,
+            entity_address(layout, graph, &method),
+            candidate.receiver_name
         ));
     }
     lines
@@ -2084,10 +2872,11 @@ fn display_read_path(_layout: &kin_core::KinLayout, rel_path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_bulk_refs_response, build_refs_response, collect_graph_references,
-        dispatch_candidate_lines, parse_relation_kinds, refs_not_found_guidance,
-        strip_dispatch_modifier, BulkRefsRequest, BulkRefsResponse, ReferenceLinesAbsent,
-        RefsRequest, RelationResolution,
+        build_bulk_refs_response, build_refs_response, build_refs_response_quoted, call_site_words,
+        collect_graph_references, dispatch_candidate_lines, parse_relation_kinds,
+        refs_not_found_guidance, strip_dispatch_modifier, BulkRefsRequest, BulkRefsResponse,
+        Entity, EntityId, ReferenceLinesAbsent, RefsRequest, RefsResponse, RefsSpine, RefsView,
+        RelationResolution, SiteText,
     };
 
     /// MEASUREMENT, not an assertion. Prints which of a C prototype and its
@@ -2421,6 +3210,10 @@ mod tests {
     /// satisfied and an unconfigured spine is the only thing left to object to.
     #[test]
     fn a_dead_focal_on_a_coverage_complete_store_reads_plainly() {
+        // This fixture isolates other verdict inputs on a measured usable host.
+        let _readiness = kin_mcp::edge_coverage::test_support::scoped_language_servers(&[
+            kin_model::LanguageId::Rust,
+        ]);
         use kin_model::relation::{Relation, RelationOrigin};
         use kin_model::{EntityStore, GraphNodeId};
 
@@ -2483,6 +3276,105 @@ mod tests {
             "a dead focal on a coverage-complete store reads plainly; an unconfigured spine is \
              not a gap in this repository: {rendered}"
         );
+    }
+
+    #[test]
+    fn refs_absence_inherits_local_binding_qualification() {
+        // This fixture isolates other verdict inputs on a measured usable host.
+        let _readiness = kin_mcp::edge_coverage::test_support::scoped_language_servers(&[
+            kin_model::LanguageId::Rust,
+        ]);
+        use kin_mcp::source_derivation::{SourceDerivationObservation, SourceObservationScope};
+        use kin_model::relation::{Relation, RelationOrigin};
+        use kin_model::{EntityStore, GraphNodeId};
+        use kin_review::source_derivation::{
+            PriorLocalBindingStatus, SourceBinding, SourceDerivationReport,
+        };
+
+        let (graph, layout, _dir) = orphan_fixture();
+        let entities = graph.query_entities(&Default::default()).unwrap();
+        let caller = entities
+            .iter()
+            .find(|entity| entity.name == "caller")
+            .unwrap();
+        let callee = entities
+            .iter()
+            .find(|entity| entity.name == "callee")
+            .unwrap();
+        // Imports establish the language's importer observation too; without
+        // one, caller arrival independently refuses before this test can
+        // discriminate the local-binding states.
+        for kind in [RelationKind::Calls, RelationKind::Imports] {
+            graph
+                .upsert_relation(&Relation {
+                    id: kin_model::RelationId::new(),
+                    kind,
+                    src: GraphNodeId::Entity(caller.id),
+                    dst: GraphNodeId::Entity(callee.id),
+                    confidence: 1.0,
+                    origin: RelationOrigin::Parsed,
+                    created_in: None,
+                    import_source: None,
+                    evidence: Vec::new(),
+                })
+                .unwrap();
+        }
+        for (binding, outstanding, reason) in [
+            (PriorLocalBindingStatus::NoRecordedDebt, Some(0), None),
+            (
+                PriorLocalBindingStatus::Unproven,
+                None,
+                Some("local_binding_unproven"),
+            ),
+            (
+                PriorLocalBindingStatus::Outstanding,
+                Some(1),
+                Some("local_binding_outstanding"),
+            ),
+        ] {
+            let mut report = SourceDerivationReport::unproven("fixture");
+            report.body_binding = SourceBinding::Current;
+            report.prior_local_binding = binding;
+            report.outstanding_local_binding_obligations = outstanding;
+            let mut envelope = refs_test_envelope();
+            envelope.source_derivation = Some(SourceDerivationObservation {
+                scope: SourceObservationScope::LiveHead,
+                checked_scope: "admitted_inventory".into(),
+                sampled: "selected_graph_before_query".into(),
+                report: Some(report),
+                admission_failure: None,
+                local_binding_requirement:
+                    kin_mcp::source_derivation::LocalBindingRequirement::Required,
+            });
+            let response = build_refs_response(
+                &layout,
+                &graph,
+                &RefsRequest {
+                    entity: "orphan".into(),
+                    kind: "calls".into(),
+                },
+                &envelope,
+            )
+            .unwrap();
+            let negative = response.negative.expect("empty references carry a verdict");
+            assert_eq!(
+                negative["safe_to_conclude_absent"],
+                reason.is_none(),
+                "{negative}"
+            );
+            assert_eq!(
+                response.lines.join("\n").contains("Kin cannot rule out"),
+                reason.is_some(),
+                "{:?}",
+                response.lines
+            );
+            if let Some(reason) = reason {
+                assert!(
+                    negative["trust_reason"].as_str().unwrap().contains(reason),
+                    "{negative}"
+                );
+            }
+        }
     }
 
     /// The federation guard must not swallow a REAL gap, and this is the state
@@ -2592,6 +3484,10 @@ mod tests {
     /// path cannot fire and the degraded signal is the only thing left to say.
     #[test]
     fn a_degraded_daemon_still_speaks_when_coverage_is_complete() {
+        // This fixture isolates other verdict inputs on a measured usable host.
+        let _readiness = kin_mcp::edge_coverage::test_support::scoped_language_servers(&[
+            kin_model::LanguageId::Rust,
+        ]);
         use kin_model::relation::{Relation, RelationOrigin};
         use kin_model::{EntityStore, GraphNodeId};
 
@@ -2879,9 +3775,11 @@ mod tests {
     /// as if it were a failed implementation. It now answers the question a
     /// reader is actually asking there: where is this implemented.
     ///
-    /// The LINE is the assertion. A compiler-graded measurement on `cli/cli` at
-    /// `14d339d9` put Kin at zero correct implementation sites out of 142
-    /// because the file was the most it could name.
+    /// The declaration's id is the assertion. A compiler-graded measurement on
+    /// `cli/cli` at `14d339d9` put Kin at zero correct implementation sites out
+    /// of 142 because the file was the most it could name; the id is the
+    /// declaration's own address, and its file follows only as the projection
+    /// it is, with no file line.
     #[test]
     fn refs_dispatch_on_a_contract_names_where_it_is_implemented() {
         let (graph, layout, _dir, spec) = go_contract_fixture();
@@ -2891,9 +3789,22 @@ mod tests {
             printed.contains("1 implementation candidate not counted above"),
             "{printed}"
         );
+        let buffer_write =
+            kin_model::EntityStore::query_entities(&graph, &kin_model::EntityFilter::default())
+                .unwrap()
+                .into_iter()
+                .find(|entity| entity.name == "Buffer.Write")
+                .expect("the fixture holds Buffer.Write");
         assert!(
-            printed.contains("Buffer.Write @ internal/buf/buffer.go:8"),
-            "the row must carry the declaration line, not only the file: {printed}"
+            printed.contains(&format!(
+                "Buffer.Write [{}] (projection: internal/buf/buffer.go) [Implements]",
+                buffer_write.id
+            )),
+            "the row must name the declaration by its id, not only the file: {printed}"
+        );
+        assert!(
+            !printed.contains("buffer.go:"),
+            "no file line on a reference answer's row: {printed}"
         );
         assert!(printed.contains("(implementation_candidate)"), "{printed}");
         assert!(
@@ -3860,9 +4771,22 @@ mod tests {
             joined.contains("referenced by 2 entities:"),
             "count line must count entities: {joined}"
         );
-        assert!(
-            joined.matches("shared_caller @ callers.rs [").count() == 2,
+        let shared_rows: Vec<&str> = response
+            .lines
+            .iter()
+            .map(String::as_str)
+            .filter(|line| {
+                line.starts_with("  shared_caller [") && line.contains("(projection: callers.rs) [")
+            })
+            .collect();
+        assert_eq!(
+            shared_rows.len(),
+            2,
             "both same-metadata entity ids must be listed separately: {joined}"
+        );
+        assert_ne!(
+            shared_rows[0], shared_rows[1],
+            "each row names its own entity id: {joined}"
         );
 
         let compact = build_bulk_refs_response(
@@ -4152,15 +5076,716 @@ mod tests {
             .expect("refs carries the block");
         assert_eq!(block["scope"], kin_mcp::call_sites::FAMILY_SCOPE, "{block}");
         assert_eq!(block["callers_owed_enrichment"], 1, "{block}");
+        // The block keeps its verdict code for a program to read.
+        assert!(
+            block["clauses"]
+                .as_array()
+                .is_some_and(|clauses| clauses.iter().any(|clause| clause
+                    .as_str()
+                    .is_some_and(|clause| clause.starts_with("call_sites_owed: ")))),
+            "{block}"
+        );
+        // The terminal says the same thing in plain words, naming the file.
         let text = response.lines.join("\n");
         assert!(
+            text.contains("Call sites in files that import storage.py: 1 across 2 callers."),
+            "{text}"
+        );
+        assert!(
             text.contains(
-                "Call sites in the files that import the focal's file: 1 across 2 caller(s), \
-                 1 caller(s) owed"
+                "  Still linking 1 of the 2 callers, so this answer may be missing calls from it."
             ),
             "{text}"
         );
-        assert!(text.contains("  not settled: call_sites_owed: "), "{text}");
+        assert!(
+            text.contains("  Run `kin daemon sweep` to finish linking now."),
+            "{text}"
+        );
+        assert!(
+            !text.contains("call_sites_owed") && !text.contains("the focal's file"),
+            "the codes and the internal wording stay out of the text: {text}"
+        );
+    }
+
+    fn words_focal() -> kin_model::Entity {
+        let mut focal = crate::commands::call_site_fixture::spanned(
+            "want_bytes",
+            "src/itsdangerous/encoding.py",
+            0,
+            "def want_bytes():\n",
+        );
+        focal.file_origin = Some(kin_model::FilePathId::new("src/itsdangerous/encoding.py"));
+        focal
+    }
+
+    fn words(
+        tally: &kin_model::CallSiteTally,
+        owed_outside: Option<&[kin_mcp::call_sites::OwedFile]>,
+    ) -> Vec<String> {
+        call_site_words(tally, owed_outside, 0, &words_focal())
+    }
+
+    /// Owed callers that never spell the function's name are left out of the
+    /// count, and the answer says how many, as the daemon's block does.
+    #[test]
+    fn owed_callers_that_cannot_name_the_focal_are_counted_out_loud() {
+        let tally = kin_model::CallSiteTally {
+            callers: 3,
+            sites: 5,
+            ..Default::default()
+        };
+        let lines = call_site_words(&tally, Some(&[]), 2, &words_focal());
+        assert_eq!(
+            lines[1],
+            "  2 more callers there are still linking, but never spell want_bytes, so they \
+             can't call it by name and aren't counted."
+        );
+        let lines = call_site_words(&tally, Some(&[]), 1, &words_focal());
+        assert_eq!(
+            lines[1],
+            "  1 more caller there is still linking, but never spells want_bytes, so it can't \
+             call it by name and isn't counted."
+        );
+        let lines = call_site_words(&tally, Some(&[]), 0, &words_focal());
+        assert!(
+            !lines.iter().any(|line| line.contains("never spell")),
+            "{lines:?}"
+        );
+    }
+
+    /// A clone whose linking is still owed says so, with every count and the
+    /// command that finishes it, in the words a person reads.
+    #[test]
+    fn owed_callers_are_disclosed_in_plain_words() {
+        let tally = kin_model::CallSiteTally {
+            callers: 69,
+            callers_owed_enrichment: 60,
+            callers_owed_derivation: 8,
+            ..Default::default()
+        };
+        assert_eq!(
+            words(&tally, Some(&[])),
+            vec![
+                "Call sites in files that import encoding.py: 0 across 69 callers.",
+                "  Still linking 68 of the 69 callers, so this answer may be missing calls from \
+                 them.",
+                "  Run `kin daemon sweep` to finish linking now.",
+            ]
+        );
+    }
+
+    /// After linking, each unproven kind of call site keeps its own count, and
+    /// a single site reads in the singular.
+    #[test]
+    fn unproven_call_sites_keep_their_counts() {
+        let mut tally = kin_model::CallSiteTally {
+            callers: 69,
+            sites: 155,
+            ..Default::default()
+        };
+        tally
+            .by_state
+            .insert(kin_model::SiteStateKind::ProvenTarget, 146);
+        tally.by_state.insert(kin_model::SiteStateKind::Binding, 1);
+        tally
+            .by_state
+            .insert(kin_model::SiteStateKind::Unresolved, 8);
+        assert_eq!(
+            words(&tally, Some(&[])),
+            vec![
+                "Call sites in files that import encoding.py: 155 across 69 callers.",
+                "  1 of the 155 call sites calls through a variable or other value, which \
+                 doesn't prove what it calls, so it may call want_bytes.",
+                "  8 of the 155 call sites were checked, but their targets couldn't be proven, \
+                 so one of them may call want_bytes.",
+            ]
+        );
+        // The same counts the verdict clauses carry, so the two cannot drift.
+        let clauses = tally.clauses(kin_mcp::call_sites::FAMILY_SCOPE);
+        assert!(clauses
+            .iter()
+            .any(|clause| clause.starts_with("binding_unproven: 1 of the 155")));
+        assert!(clauses
+            .iter()
+            .any(|clause| clause.starts_with("call_sites_unresolved: 8 of the 155")));
+    }
+
+    /// Every other unproven kind has its own sentence, and none falls back to
+    /// a code.
+    #[test]
+    fn every_unproven_kind_has_its_own_sentence() {
+        for (kind, words_for_it) in [
+            (
+                kin_model::SiteStateKind::ServerFailed,
+                "got no answer because the language server timed out, crashed or failed",
+            ),
+            (
+                kin_model::SiteStateKind::NotInBuild,
+                "are in files no build of the repository compiles",
+            ),
+            (
+                kin_model::SiteStateKind::ProofContextStale,
+                "were linked under a language-server setup that has since changed",
+            ),
+        ] {
+            let mut tally = kin_model::CallSiteTally {
+                callers: 3,
+                sites: 10,
+                ..Default::default()
+            };
+            tally.by_state.insert(kind, 2);
+            let text = words(&tally, Some(&[])).join("\n");
+            assert!(
+                text.contains(&format!(
+                    "  2 of the 10 call sites {words_for_it}, so one of them may call want_bytes."
+                )),
+                "{kind:?}: {text}"
+            );
+            assert!(!text.contains("not settled"), "{kind:?}: {text}");
+        }
+    }
+
+    /// Callers no resolver can link on this machine are counted, with why,
+    /// and the answer does not tell the reader to wait for them.
+    #[test]
+    fn unlinkable_callers_say_why_and_that_waiting_wont_help() {
+        let mut tally = kin_model::CallSiteTally {
+            callers: 4,
+            sites: 2,
+            callers_unproven_no_resolver: 3,
+            ..Default::default()
+        };
+        tally.no_resolver.insert(
+            "python: no language server for it is installed or wired".to_string(),
+            3,
+        );
+        tally
+            .by_state
+            .insert(kin_model::SiteStateKind::ProvenTarget, 2);
+        let text = words(&tally, Some(&[]));
+        assert_eq!(
+            text[1],
+            "  3 of the 4 callers can't be linked on this machine (python: no language server \
+             for it is installed or wired), so this answer may be missing calls from them, and \
+             waiting won't change that."
+        );
+        assert!(
+            !text.iter().any(|line| line.contains("kin daemon sweep")),
+            "a sweep does not settle these: {text:?}"
+        );
+    }
+
+    /// Callers still owed outside the importing files are counted and named,
+    /// and the command is said once however much is owed.
+    #[test]
+    fn owed_callers_outside_the_importing_files_are_named() {
+        let tally = kin_model::CallSiteTally {
+            callers: 5,
+            sites: 9,
+            callers_owed_enrichment: 1,
+            by_state: [(kin_model::SiteStateKind::ProvenTarget, 9)]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        let outside: Vec<kin_mcp::call_sites::OwedFile> = (0..7)
+            .map(|index| kin_mcp::call_sites::OwedFile {
+                file: format!("src/app/view_{index}.py"),
+                callers: if index == 0 { 1 } else { 2 },
+            })
+            .collect();
+        let text = words(&tally, Some(&outside));
+        assert_eq!(
+            text,
+            vec![
+                "Call sites in files that import encoding.py: 9 across 5 callers.",
+                "  Still linking 1 of the 5 callers, so this answer may be missing calls from it.",
+                "  Still linking 13 callers in 7 files that don't import encoding.py. A caller \
+                 can reach want_bytes without importing encoding.py, so this answer may be \
+                 missing one of them.",
+                "    src/app/view_0.py (1 caller)",
+                "    src/app/view_1.py (2 callers)",
+                "    src/app/view_2.py (2 callers)",
+                "    src/app/view_3.py (2 callers)",
+                "    src/app/view_4.py (2 callers)",
+                "    and 2 more files",
+                "  Run `kin daemon sweep` to finish linking now.",
+            ]
+        );
+    }
+
+    /// An index that could not be read is a gap, said as one, and never
+    /// reads as a settled answer.
+    #[test]
+    fn an_unreadable_index_is_disclosed() {
+        let tally = kin_model::CallSiteTally {
+            callers: 2,
+            sites: 3,
+            by_state: [(kin_model::SiteStateKind::ProvenTarget, 3)]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        let text = words(&tally, None);
+        assert_eq!(
+            text[1],
+            "  Kin couldn't read its index of python code, so callers in files that don't \
+             import encoding.py weren't checked, and one that reaches want_bytes without \
+             importing encoding.py may be missing from this answer."
+        );
+        assert!(
+            !text.iter().any(|line| line.contains("accounted for")),
+            "{text:?}"
+        );
+    }
+
+    /// Only an answer with nothing owed, nothing unlinkable and no unproven
+    /// site says it is accounted for.
+    #[test]
+    fn a_settled_answer_says_so() {
+        let tally = kin_model::CallSiteTally {
+            callers: 2,
+            sites: 3,
+            by_state: [(kin_model::SiteStateKind::ProvenTarget, 3)]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        assert!(tally.is_settled());
+        assert_eq!(
+            words(&tally, Some(&[])),
+            vec![
+                "Call sites in files that import encoding.py: 3 across 2 callers.",
+                "  Every one of them is accounted for.",
+            ]
+        );
+    }
+
+    /// A store where `count` callers in one test file each call `find_note`
+    /// once, and that file imports the focal's, so the call-site block is
+    /// taken over it and reads as owed. Each caller's call sits two lines
+    /// below its first line, and `call` is the text written there.
+    fn many_callers_fixture(
+        count: usize,
+        name: impl Fn(usize) -> String,
+        call: &str,
+    ) -> (
+        kin_db::InMemoryGraph,
+        kin_model::Entity,
+        std::collections::HashMap<EntityId, String>,
+    ) {
+        many_callers_fixture_with(count, name, call, false)
+    }
+
+    /// [`many_callers_fixture`], and with `stray` one more caller, `reindex`
+    /// in a file that imports nothing of the focal's, whose one call no
+    /// resolver settled. A store-wide reading that cannot rule out the focal
+    /// being held as a value keeps that call as a candidate.
+    fn many_callers_fixture_with(
+        count: usize,
+        name: impl Fn(usize) -> String,
+        call: &str,
+        stray: bool,
+    ) -> (
+        kin_db::InMemoryGraph,
+        kin_model::Entity,
+        std::collections::HashMap<EntityId, String>,
+    ) {
+        use crate::commands::call_site_fixture::{admit, spanned};
+        use kin_model::EntityStore as _;
+        let graph = kin_db::InMemoryGraph::new();
+        let mut target = spanned("find_note", "pkg/storage.py", 200, "def find_note():\n");
+        target.file_origin = Some(kin_model::FilePathId::new("pkg/storage.py"));
+        target.span = None;
+        let mut target_module = spanned("storage", "pkg/storage.py", 0, "import db\n");
+        target_module.kind = kin_model::EntityKind::Module;
+        target_module.file_origin = Some(kin_model::FilePathId::new("pkg/storage.py"));
+        target_module.span = None;
+        let mut caller_module = spanned(
+            "test_storage",
+            "tests/test_storage.py",
+            0,
+            "import storage\n",
+        );
+        caller_module.kind = kin_model::EntityKind::Module;
+        caller_module.file_origin = Some(kin_model::FilePathId::new("tests/test_storage.py"));
+        caller_module.span = None;
+        let mut callers = Vec::new();
+        let mut bodies = std::collections::HashMap::new();
+        for index in 0..count {
+            let name = name(index);
+            let body = format!("def {name}(db):\n    db.open()\n    {call}\n");
+            let start = 1_000 * (index + 1);
+            let mut caller = spanned(&name, "tests/test_storage.py", start, &body);
+            caller.file_origin = Some(kin_model::FilePathId::new("tests/test_storage.py"));
+            let span = caller.span.as_mut().unwrap();
+            span.start_line = 10 * (index as u32 + 1);
+            span.end_line = span.start_line + 3;
+            let site_start = start + body.find(call).unwrap();
+            let site = kin_model::SourceSpan {
+                file: kin_model::FilePathId::new("tests/test_storage.py"),
+                start_byte: site_start,
+                end_byte: site_start + call.len(),
+                start_line: span.start_line + 2,
+                start_col: 4,
+                end_line: span.start_line + 2,
+                end_col: 4,
+            };
+            bodies.insert(caller.id, body);
+            callers.push((caller, site));
+        }
+        let mut entities: Vec<&kin_model::Entity> = vec![&target, &target_module, &caller_module];
+        entities.extend(callers.iter().map(|(caller, _)| caller));
+        const STRAY_BODY: &str = "def reindex(db):\n    db.rebuild()\n";
+        let mut reindex = spanned("reindex", "pkg/maintenance.py", 90_000, STRAY_BODY);
+        reindex.file_origin = Some(kin_model::FilePathId::new("pkg/maintenance.py"));
+        let mut ledgers = Vec::new();
+        if stray {
+            entities.push(&reindex);
+            ledgers.push((
+                &reindex,
+                STRAY_BODY,
+                vec![(
+                    "db.rebuild()",
+                    kin_model::CallSiteState::Unresolved {
+                        reason: kin_model::UnresolvedReason::NoAnswer,
+                    },
+                )],
+            ));
+        }
+        admit(&graph, &entities, ledgers);
+        let relation = |kind, src: &kin_model::Entity, dst: &kin_model::Entity, evidence| {
+            kin_model::Relation {
+                id: kin_model::RelationId::new(),
+                kind,
+                src: kin_model::GraphNodeId::Entity(src.id),
+                dst: kin_model::GraphNodeId::Entity(dst.id),
+                confidence: 1.0,
+                origin: kin_model::relation::RelationOrigin::Parsed,
+                created_in: None,
+                import_source: None,
+                evidence,
+            }
+        };
+        graph
+            .upsert_relation(&relation(
+                RelationKind::Imports,
+                &caller_module,
+                &target_module,
+                Vec::new(),
+            ))
+            .unwrap();
+        for (caller, site) in &callers {
+            graph
+                .upsert_relation(&relation(
+                    RelationKind::Calls,
+                    caller,
+                    &target,
+                    vec![kin_model::relation::RelationEvidence {
+                        source_span: Some(site.clone()),
+                        ..Default::default()
+                    }],
+                ))
+                .unwrap();
+        }
+        (graph, target, bodies)
+    }
+
+    /// Each caller's body as the fixture wrote it, starting at its span.
+    fn fixture_bodies(
+        bodies: std::collections::HashMap<EntityId, String>,
+    ) -> crate::commands::external_symbols::BodySiteText<impl FnMut(&Entity) -> Option<String>>
+    {
+        crate::commands::external_symbols::BodySiteText::new(move |caller: &Entity| {
+            bodies.get(&caller.id).cloned()
+        })
+    }
+
+    fn view_response(
+        graph: &kin_db::InMemoryGraph,
+        target: &kin_model::Entity,
+        site_text: &dyn SiteText,
+        view: Option<RefsView>,
+    ) -> RefsResponse {
+        let layout = kin_core::KinLayout::new(tempfile::tempdir().unwrap().path().join(".kin"));
+        build_refs_response_quoted(
+            &layout,
+            graph,
+            &RefsRequest {
+                entity: target.id.to_string(),
+                kind: "all".to_string(),
+            },
+            &refs_test_envelope(),
+            RefsSpine::absent(),
+            site_text,
+            view,
+        )
+        .unwrap()
+    }
+
+    /// A terminal answer about a symbol with more callers than a screen holds
+    /// leads with what qualifies it, the call-site summary and every clause
+    /// that leaves it unsettled, then lists the first twenty callers, name
+    /// first with each site inside the caller, then counts the rest and says
+    /// where to read them. The complete listing keeps every caller.
+    #[test]
+    fn a_terminal_answer_lists_twenty_callers_after_what_qualifies_it() {
+        let (graph, target, bodies) = many_callers_fixture(
+            25,
+            |index| format!("test_find_note_case_{index:02}"),
+            "find_note(db, 'x')",
+        );
+        let text = fixture_bodies(bodies);
+        let view = RefsView {
+            width: 80,
+            callers: RefsView::CALLERS,
+        };
+        let lines = view_response(&graph, &target, &text, Some(view)).lines;
+        let joined = lines.join("\n");
+
+        let rows: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.starts_with("    test_find_note_case_"))
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(rows.len(), 20, "the first twenty callers: {joined}");
+        for index in &rows {
+            let row = &lines[*index];
+            assert!(
+                row.ends_with("+2 find_note"),
+                "name first, then the site inside the caller and its text: {row:?}"
+            );
+            assert!(!row.contains("test_storage.py:"), "no file line: {row:?}");
+        }
+        assert!(
+            lines.contains(&"  and 5 more; --all or --json for the full list".to_string()),
+            "{joined}"
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| *line == "  (projection: tests/test_storage.py)")
+                .count(),
+            1,
+            "the callers are grouped under the file they are projected into: {joined}"
+        );
+
+        // What qualifies the answer is read before any row.
+        let count_line = lines
+            .iter()
+            .position(|line| line.starts_with("referenced by 25 entities"))
+            .unwrap_or_else(|| panic!("no count line: {joined}"));
+        let summary = lines
+            .iter()
+            .position(|line| line.starts_with("Call sites in"))
+            .unwrap_or_else(|| panic!("no call-site summary: {joined}"));
+        // The plain words the complete listing uses, every clause of them: the
+        // owed callers, and the command that finishes the linking.
+        let unsettled: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| {
+                line.starts_with("  Still linking") || line.starts_with("  Run `kin daemon sweep`")
+            })
+            .map(|(index, _)| index)
+            .collect();
+        assert!(
+            unsettled.len() >= 2,
+            "the owed callers leave it unsettled, and the answer says how to finish: {joined}"
+        );
+        let full_disclosure: Vec<String> = view_response(&graph, &target, &text, None)
+            .lines
+            .into_iter()
+            .skip_while(|line| !line.starts_with("Call sites in"))
+            .take_while(|line| line.starts_with("Call sites in") || line.starts_with("  "))
+            .collect();
+        // Width-fitting wraps a long clause between words, so the two are
+        // compared word for word.
+        let words = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let terminal_words = words(&joined);
+        assert!(!full_disclosure.is_empty(), "{joined}");
+        for clause in &full_disclosure {
+            assert!(
+                terminal_words.contains(&words(clause)),
+                "the terminal answer drops no clause of the disclosure: {clause:?} \
+                 against {joined}"
+            );
+        }
+        assert!(summary < count_line, "{joined}");
+        assert!(
+            unsettled.iter().all(|index| *index < count_line),
+            "{joined}"
+        );
+        assert!(count_line < rows[0], "{joined}");
+
+        // The complete listing, which `--all`, `--json` and a pipe read, keeps
+        // every caller with its id and projection.
+        let full = view_response(&graph, &target, &text, None);
+        let full_rows = full
+            .lines
+            .iter()
+            .filter(|line| {
+                line.starts_with("  test_find_note_case_")
+                    && line.contains("(projection: tests/test_storage.py) [Calls]")
+            })
+            .count();
+        assert_eq!(full_rows, 25, "{:#?}", full.lines);
+        assert!(!full.lines.iter().any(|line| line.contains("more; --all")));
+    }
+
+    /// The call-site disclosure leads every layout, and the unproven call
+    /// sites a store-wide reading keeps are part of it: the terminal view and
+    /// the complete listing `--all`, `--json` and a pipe read both give the
+    /// summary, what leaves it unsettled and the candidate lines before the
+    /// count and any row.
+    #[test]
+    fn the_call_site_disclosure_and_its_candidates_lead_every_layout() {
+        let (graph, target, bodies) = many_callers_fixture_with(
+            3,
+            |index| format!("test_find_note_case_{index:02}"),
+            "find_note(db, 'x')",
+            true,
+        );
+        let text = fixture_bodies(bodies);
+        let temp = tempfile::tempdir().unwrap();
+        let kin_root = temp.path().join(".kin");
+        std::fs::create_dir_all(kin_root.join("objects")).unwrap();
+        let layout = kin_core::KinLayout::new(kin_root);
+        let authority = kin_mcp::handlers::RequestRepositoryAuthority::pinned(
+            kin_core::LocalRepositoryAuthorityBinding::from_parts(
+                kin_model::RepositoryId::new("refs-disclosure-test").unwrap(),
+                kin_model::WorkspaceId::new(),
+                std::sync::Arc::new(kin_db::LocalFileBackend::new(layout.kindb_dir())),
+            ),
+        );
+        let spine = RefsSpine {
+            repo_id: "",
+            spine: ::kin_spine::DaemonSpine::Absent,
+            call_site_sources: Some((
+                &authority,
+                kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead,
+            )),
+        };
+        for view in [
+            Some(RefsView {
+                width: 100,
+                callers: RefsView::CALLERS,
+            }),
+            None,
+        ] {
+            let lines = build_refs_response_quoted(
+                &layout,
+                &graph,
+                &RefsRequest {
+                    entity: target.id.to_string(),
+                    kind: "all".to_string(),
+                },
+                &refs_test_envelope(),
+                spine,
+                &text,
+                view,
+            )
+            .unwrap()
+            .lines;
+            let joined = lines.join("\n");
+            let at = |prefix: &str| {
+                lines
+                    .iter()
+                    .position(|line| line.starts_with(prefix))
+                    .unwrap_or_else(|| panic!("{view:?}: no line starting {prefix:?}: {joined}"))
+            };
+            let summary = at("Call sites in");
+            let candidates = at("Unproven call sites that could call find_note");
+            let count = at("referenced by 3 entities");
+            let first_row = lines
+                .iter()
+                .position(|line| line.contains("test_find_note_case_"))
+                .unwrap_or_else(|| panic!("{view:?}: no caller row: {joined}"));
+            assert!(
+                summary < candidates && candidates < count && count < first_row,
+                "{view:?}: the disclosure, candidates included, leads the rows: {joined}"
+            );
+            // The candidate block is whole before the count: its heading, then
+            // the kept call counted by why it is kept, and nothing of it after.
+            let kept = at("  1 more are kept because of");
+            assert!(candidates < kept && kept < count, "{view:?}: {joined}");
+            assert!(
+                !lines[count..]
+                    .iter()
+                    .any(|line| line.contains("Unproven call sites")
+                        || line.contains("are kept because of")),
+                "{view:?}: no candidate line follows the rows: {joined}"
+            );
+        }
+    }
+
+    /// No line of a terminal answer is wider than the terminal, and none is
+    /// broken inside a word: a name or a site's text too long for the room
+    /// left is cut with an ellipsis, and prose wraps between words.
+    #[test]
+    fn no_line_of_a_terminal_answer_is_wider_than_the_terminal() {
+        let (graph, target, bodies) = many_callers_fixture(
+            23,
+            |index| {
+                format!(
+                    "TestStorageRoundTripsEveryNoteKindThroughTheLongestHelperChain.case_{index}"
+                )
+            },
+            "result = storage_helpers.with_a_rather_long_attribute_chain.find_note(db, 'x')",
+        );
+        let text = fixture_bodies(bodies);
+        let words = |lines: &[String]| -> std::collections::HashSet<String> {
+            lines
+                .iter()
+                .flat_map(|line| line.split(' '))
+                .filter(|word| !word.is_empty())
+                .map(str::to_string)
+                .collect()
+        };
+        // Every word an unconstrained layout prints, so a word the fitted
+        // layout prints must be one of them or be cut with an ellipsis.
+        let unconstrained = view_response(
+            &graph,
+            &target,
+            &text,
+            Some(RefsView {
+                width: 10_000,
+                callers: RefsView::CALLERS,
+            }),
+        );
+        let known = words(&unconstrained.lines);
+        for width in [40, 57, 80, 120] {
+            let lines = view_response(
+                &graph,
+                &target,
+                &text,
+                Some(RefsView {
+                    width,
+                    callers: RefsView::CALLERS,
+                }),
+            )
+            .lines;
+            for line in &lines {
+                assert!(
+                    console::measure_text_width(line) <= width,
+                    "{width} columns: {line:?} is {} wide",
+                    console::measure_text_width(line)
+                );
+            }
+            for word in words(&lines) {
+                assert!(
+                    known.contains(&word) || word.ends_with('\u{2026}'),
+                    "{width} columns: {word:?} is part of a word: {lines:#?}"
+                );
+            }
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.contains("and 3 more; --all or --json")),
+                "{width} columns: {lines:#?}"
+            );
+        }
     }
 
     #[test]
@@ -4208,18 +5833,16 @@ mod tests {
         );
     }
 
-    /// A reference must report the line a human editor shows.
+    /// A reference row names its caller by entity id and the file it is
+    /// projected into, and carries no file line, whether or not the caller has
+    /// a span.
     ///
-    /// Graph spans carry tree-sitter rows, which are 0-based, and this listing
-    /// emitted them raw. An agent that read `kin refs` and jumped to the
-    /// reported `file:line` landed one line above every reference it was given,
-    /// on every reference, while `find_references` over MCP answered the same
-    /// question one line lower.
-    ///
-    /// The fixture puts the caller on graph row 41, which is line 42 of the
-    /// file, so an off-by-one cannot pass by coincidence.
+    /// This listing once printed `file:line` from raw 0-based graph rows, one
+    /// line above every reference. It now prints no file line at all, so the
+    /// fixture keeps the caller on graph row 41 to show neither row 41 nor line
+    /// 42 reaches the listing.
     #[test]
-    fn a_reference_reports_the_line_a_human_editor_shows() {
+    fn a_reference_row_names_its_caller_by_id_and_projection_and_no_file_line() {
         use kin_db::InMemoryGraph;
         use kin_model::relation::{Relation, RelationOrigin};
         use kin_model::{
@@ -4303,21 +5926,29 @@ mod tests {
         .unwrap();
         let joined = response.lines.join("\n");
 
+        // A row names its caller by id and the file it is projected into,
+        // never by a file line, whether or not the caller carries a span.
+        for (caller, file) in [
+            (&spanned_caller, "spanned.rs"),
+            (&spanless_caller, "spanless.rs"),
+        ] {
+            let address = format!(" [{}] (projection: {file}) [", caller.id);
+            assert!(
+                joined.contains(&format!("  {}{address}", caller.name)),
+                "{} must be addressed by id and projection: {joined}",
+                caller.name
+            );
+            assert!(
+                !joined.contains(&format!("{file}:")),
+                "no file line may reach the listing: {joined}"
+            );
+        }
         assert!(
-            joined.contains("spanned.rs:42"),
-            "graph row 41 is line 42 to a reader: {joined}"
-        );
-        assert!(
-            !joined.contains("spanned.rs:41"),
-            "the raw graph row must never reach the listing: {joined}"
-        );
-        assert!(
-            joined.contains("spanless_caller @ spanless.rs "),
-            "an entity with no span reports its path and no fabricated line: {joined}"
-        );
-        assert!(
-            !joined.contains("spanless.rs:0"),
-            "line 0 exists in no editor: {joined}"
+            response.lines[0].ends_with(&format!(
+                "-> probe_symbol (Function) [{}] (projection: target_mod.rs)",
+                target.id
+            )),
+            "the header names the focal the same way: {joined}"
         );
     }
 
@@ -4358,12 +5989,15 @@ mod tests {
             let row = response
                 .lines
                 .iter()
-                .find(|line| line.trim_start().starts_with("render @"))
+                .find(|line| line.trim_start().starts_with("render ["))
                 .unwrap_or_else(|| panic!("no caller row: {text}"));
             assert_eq!(
                 row.trim(),
-                "render @ src/app.ts:11 [Calls] (type_resolved) sites +2, +5 proven_external \
-                 by lsp:tsserver 5.6.3 (lsp_definition)",
+                format!(
+                    "render [{}] (projection: src/app.ts) [Calls] (type_resolved) sites +2, +5 \
+                     proven_external by lsp:tsserver 5.6.3 (lsp_definition)",
+                    store.caller.id
+                ),
                 "{text}"
             );
             assert!(text.contains("a site is +N"), "{text}");
@@ -4371,6 +6005,130 @@ mod tests {
             assert!(!text.contains("not found"), "{text}");
             assert!(!text.contains("kin xref"), "{text}");
         }
+    }
+
+    /// A name no repository entity carries reaches the symbol outside the
+    /// repository it names, by each spelling `find_references` accepts, and
+    /// the answer is the one its address gets, led by what the name named.
+    #[test]
+    fn refs_reaches_an_external_symbol_by_its_name() {
+        let store = crate::commands::external_symbols::fixture::external_store(true);
+        let dir = tempfile::tempdir().unwrap();
+        let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
+        let refs = |entity: &str| {
+            build_refs_response(
+                &layout,
+                &store.graph,
+                &RefsRequest {
+                    entity: entity.to_string(),
+                    kind: "all".to_string(),
+                },
+                &refs_test_envelope(),
+            )
+            .expect("refs response")
+        };
+        let by_address = refs(&store.address());
+        let descriptors = store.node.symbol.clone();
+        let whole = format!("{} {}", store.node.canonical_source, store.node.symbol);
+        for (name, matched) in [
+            ("Array.map", "name"),
+            (descriptors.as_str(), "SCIP descriptor chain"),
+            (whole.as_str(), "whole SCIP symbol"),
+        ] {
+            let response = refs(name);
+            assert!(response.error.is_none(), "{name}: {:?}", response.error);
+            assert_eq!(
+                response.lines[0],
+                format!(
+                    "{name} names no entity in this repository; it names Array.map (external \
+                     symbol, npm typescript 5.6.3, standard library), matched by its {matched}."
+                )
+            );
+            // The header quotes what was asked; everything under it is the
+            // answer the address gets.
+            assert_eq!(
+                response.lines[1],
+                by_address.lines[0].replace(&store.address(), name),
+                "{name}"
+            );
+            assert_eq!(response.lines[2..], by_address.lines[1..], "{name}");
+            assert_eq!(response.negative, by_address.negative, "{name}");
+            assert_eq!(response.call_sites, by_address.call_sites, "{name}");
+        }
+    }
+
+    /// A name several symbols outside the repository share lists each by its
+    /// address and answers about none of them, the candidates `find_references`
+    /// lists for the same name.
+    #[test]
+    fn refs_lists_every_external_symbol_a_shared_name_names() {
+        use kin_model::{EntityStore as _, ScipDescriptor, ScipPackage};
+        let store = crate::commands::external_symbols::fixture::external_store(true);
+        let other = kin_model::ExternalSymbol::new(
+            ScipPackage::new("npm", "typescript", "5.7.2").unwrap(),
+            vec![
+                ScipDescriptor::namespace("lib.es5.d.ts"),
+                ScipDescriptor::type_("Array"),
+                ScipDescriptor::method("map"),
+            ],
+        )
+        .unwrap()
+        .to_reference()
+        .unwrap();
+        store
+            .graph
+            .apply_transaction_delta(&kin_model::TransactionDelta {
+                external_reference_deltas: vec![kin_model::ExternalReferenceDelta::Added {
+                    new: other.clone(),
+                }],
+                ..kin_model::TransactionDelta::default()
+            })
+            .expect("hold a second Array.map");
+        let dir = tempfile::tempdir().unwrap();
+        let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
+        let response = build_refs_response(
+            &layout,
+            &store.graph,
+            &RefsRequest {
+                entity: "Array.map".to_string(),
+                kind: "all".to_string(),
+            },
+            &refs_test_envelope(),
+        )
+        .expect("refs response");
+        let text = response.lines.join("\n");
+        assert_eq!(response.error.as_deref(), Some(text.as_str()));
+        assert!(
+            response.lines[0]
+                .starts_with("Array.map names 2 symbols declared outside this repository"),
+            "{text}"
+        );
+        assert!(text.contains(&store.address()), "{text}");
+        assert!(
+            text.contains(&format!("external_reference:{}", other.id)),
+            "{text}"
+        );
+        assert!(!text.contains("referenced by"), "{text}");
+        assert!(response.negative.is_none() && response.call_sites.is_none());
+
+        let (named, matched) =
+            kin_mcp::handlers::external_symbols::external_symbols_named(&store.graph, "Array.map")
+                .unwrap();
+        assert_eq!(
+            matched,
+            kin_mcp::handlers::external_symbols::MATCHED_DISPLAY_NAME
+        );
+        let mut addresses: Vec<String> = named.iter().map(|node| node.address()).collect();
+        addresses.sort();
+        let mut listed: Vec<String> = response.lines[1..]
+            .iter()
+            .filter_map(|line| line.split_whitespace().next().map(str::to_string))
+            .collect();
+        listed.sort();
+        assert_eq!(
+            listed, addresses,
+            "the CLI lists what find_references lists"
+        );
     }
 
     /// With no caller of the asked kind, the answer says so about the symbol

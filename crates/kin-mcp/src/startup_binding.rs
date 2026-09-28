@@ -12,10 +12,11 @@
 //!
 //! This type is the seam between the two: the launcher starts the stdio loop
 //! immediately, runs the binding on a background task, and publishes its
-//! progress here. The server consults it on `tools/call`, giving a
-//! fast-settling bind a bounded moment, then answering honestly that the
-//! daemon is still starting instead of hanging or failing as if no daemon
-//! could ever exist.
+//! progress here. The server consults it on `tools/call`, waiting for the bind
+//! within the call's own readiness budget and reporting how far the daemon has
+//! come while it waits. Only a budget that runs out gets the honest answer
+//! that the daemon is still starting, never a hang and never a failure as if
+//! no daemon could ever exist.
 //!
 //! The handle carries a second gate for the same reason it carries the first.
 //! Moving the bind behind the loop made the handshake fast; it did not make it
@@ -57,11 +58,36 @@ pub enum StartupBindingState {
     },
 }
 
+/// How far a starting daemon has come, as the launcher can observe it.
+///
+/// Two facts, both the daemon's own: the phase its lifecycle markers put it
+/// in, and what its last complete open of this store cost, which it recorded
+/// itself when that open finished. The second is the only measure of "how
+/// far" there is before the daemon publishes an endpoint, because a daemon
+/// answers nothing until it does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StartupProgress {
+    /// What the daemon's startup is doing now.
+    pub phase: &'static str,
+    /// What the last complete open of this store cost, when one is recorded.
+    pub last_open: Option<Duration>,
+}
+
+impl StartupProgress {
+    /// Progress for a phase alone, with no recorded open to compare against.
+    pub const fn phase(phase: &'static str) -> Self {
+        Self {
+            phase,
+            last_open: None,
+        }
+    }
+}
+
 /// How the launcher answers "how far has the starting daemon come" for the
 /// still-starting report. Injected rather than computed here: the phase is
 /// read from the daemon's lifecycle markers, and that filesystem IO belongs to
 /// the launcher's daemon-lifecycle boundary, not to this crate.
-pub type StartupPhaseProbe = Box<dyn Fn() -> &'static str + Send + Sync>;
+pub type StartupPhaseProbe = Box<dyn Fn() -> StartupProgress + Send + Sync>;
 
 /// Handle shared between the launcher's background binding task and the stdio
 /// server loop.
@@ -83,6 +109,9 @@ pub struct StartupDaemonBinding {
     /// starting a daemon for this repository. A watch channel rather than a
     /// flag because the launcher's binding task waits on it.
     spawn_admitted: tokio::sync::watch::Sender<bool>,
+    /// When a caller first asked for a graph answer, which is when the daemon
+    /// this server waits on was asked for.
+    admitted_at: Mutex<Option<Instant>>,
     began: Instant,
 }
 
@@ -104,6 +133,7 @@ impl StartupDaemonBinding {
             phase_probe: Mutex::new(None),
             pinned_by_operator: AtomicBool::new(false),
             spawn_admitted: tokio::sync::watch::channel(false).0,
+            admitted_at: Mutex::new(None),
             began: Instant::now(),
         })
     }
@@ -170,7 +200,13 @@ impl StartupDaemonBinding {
     /// cold open rather than on a daemon somebody else already paid for, and
     /// the caller sizes its wait against the answer.
     pub fn admit_daemon_spawn(&self) -> bool {
-        !self.spawn_admitted.send_replace(true)
+        let first = !self.spawn_admitted.send_replace(true);
+        if first {
+            if let Ok(mut admitted_at) = self.admitted_at.lock() {
+                admitted_at.get_or_insert_with(Instant::now);
+            }
+        }
+        first
     }
 
     /// Whether a `tools/call` has admitted starting a daemon.
@@ -216,10 +252,10 @@ impl StartupDaemonBinding {
 
     /// Wait up to `grace` for the binding to settle. Returns whether it did.
     ///
-    /// The grace exists for the warm case: a daemon that is already serving
-    /// binds in well under a second, and a `tools/call` racing that bind must
-    /// get its real answer, not a spurious "still starting". A cold start does
-    /// not fit any reasonable grace and is reported honestly instead.
+    /// Returns the instant the binding settles, so a warm daemon that binds in
+    /// well under a second costs a caller nothing. The server calls this in
+    /// short steps across a call's whole readiness budget, reporting progress
+    /// between them.
     pub async fn wait_until_settled(&self, grace: Duration) -> bool {
         if self.is_settled() {
             return true;
@@ -242,40 +278,97 @@ impl StartupDaemonBinding {
         settled.is_ok() && self.is_settled()
     }
 
-    /// The honest account of a `tools/call` that arrived while the binding is
-    /// still pending: what is happening, how long it has been happening, how
-    /// long this call actually waited before saying so, and what the caller
-    /// should do (retry, not remediate).
+    /// The honest account of a `tools/call` whose readiness budget ran out
+    /// while the binding was still pending: what is still loading, how far
+    /// along it is, how long this call waited before saying so, and what the
+    /// caller should do (retry, not remediate).
     ///
-    /// `waited` is stated rather than left to be inferred. Two calls in one
-    /// session now get different bounds, so a reader comparing two of these
-    /// reports would otherwise see the same sentence over waits that differ by
-    /// half a minute, and could not tell a call that gave up early from one
-    /// that gave the daemon its full patience.
+    /// `waited` is stated rather than left to be inferred, so a reader can
+    /// tell a call that gave the daemon its whole budget from one that did
+    /// not, and knows which knob widens it. The `(<phase>; <n>s so far)`
+    /// detail keeps its shape, because callers read the phase and the elapsed
+    /// seconds out of it.
     pub fn starting_report(&self, tool: &str, waited: Duration) -> String {
-        let phase = self.startup_phase();
-        let elapsed = self.began.elapsed().as_secs();
-        let waited = waited.as_secs();
+        let (progress, elapsed) = self.progress_and_elapsed();
         format!(
             "kin-mcp cannot answer '{tool}' yet: the repo daemon is still starting \
-             ({phase}; {elapsed}s so far, and this call waited {waited}s for it). The MCP \
-             transport is up and `initialize` and `tools/list` are served; retry this call \
-             once the daemon is ready. Large repositories can take minutes on a fully cold \
-             start. This is startup latency, not a failure: do not restart the MCP server or \
-             re-run `kin init`."
+             ({}; {}s so far), {}. This call waited {}s for it, its whole readiness budget. \
+             The MCP transport is up and `initialize` and `tools/list` are served; retry this \
+             call and it waits again from where the daemon has got to, or raise {} to let one \
+             call wait longer. This is startup latency, not a failure: do not restart the MCP \
+             server or re-run `kin init`.",
+            progress.phase,
+            elapsed.as_secs(),
+            yardstick(elapsed, progress.last_open),
+            waited.as_secs(),
+            crate::daemon_delegate::DAEMON_PATIENCE_ENV,
         )
     }
 
-    /// The daemon's startup phase from the launcher's injected probe, or the
-    /// resolve phase while no probe is installed (nothing has named a
+    /// One line on how far the daemon this server is waiting on has come, for
+    /// a progress notification while a call waits.
+    pub fn progress_line(&self) -> String {
+        let (progress, elapsed) = self.progress_and_elapsed();
+        format!(
+            "{}; {}",
+            progress.phase,
+            how_far(elapsed, progress.last_open)
+        )
+    }
+
+    /// The probe's reading, and how long it has been since a caller first
+    /// asked for a daemon (or since this server started, before one has).
+    fn progress_and_elapsed(&self) -> (StartupProgress, Duration) {
+        let since = self
+            .admitted_at
+            .lock()
+            .ok()
+            .and_then(|admitted_at| *admitted_at)
+            .unwrap_or(self.began);
+        (self.startup_progress(), since.elapsed())
+    }
+
+    /// The daemon's startup progress from the launcher's injected probe, or
+    /// the resolve phase while no probe is installed (nothing has named a
     /// repository to bind yet).
-    fn startup_phase(&self) -> &'static str {
+    fn startup_progress(&self) -> StartupProgress {
         if let Ok(guard) = self.phase_probe.lock() {
             if let Some(probe) = guard.as_ref() {
                 return probe();
             }
         }
-        "phase: resolving which repository daemon to bind"
+        StartupProgress::phase("phase: resolving which repository daemon to bind")
+    }
+}
+
+/// How far a start that has run `elapsed` has come: the time so far, measured
+/// against what the last open of the same store cost.
+pub fn how_far(elapsed: Duration, last_open: Option<Duration>) -> String {
+    format!(
+        "{}s so far, {}",
+        elapsed.as_secs(),
+        yardstick(elapsed, last_open)
+    )
+}
+
+/// `elapsed` against what the last open of the same store cost.
+///
+/// The comparison is labelled as one. The daemon publishes nothing until it
+/// can serve, so the last open is the only yardstick there is, and a store can
+/// open slower than last time (a busier machine, a larger graph); past the
+/// yardstick the line says so rather than claiming a percentage over 100.
+fn yardstick(elapsed: Duration, last_open: Option<Duration>) -> String {
+    match last_open {
+        Some(last) if !last.is_zero() && elapsed < last => format!(
+            "about {}% of the {}s the last open of this store took",
+            (elapsed.as_secs_f64() / last.as_secs_f64() * 100.0).floor() as u64,
+            last.as_secs().max(1)
+        ),
+        Some(last) if !last.is_zero() => format!(
+            "longer than the {}s the last open of this store took",
+            last.as_secs().max(1)
+        ),
+        _ => "and this store has no recorded open to compare against".to_string(),
     }
 }
 
@@ -422,7 +515,7 @@ mod tests {
     fn the_starting_report_carries_the_injected_phase() {
         let binding = StartupDaemonBinding::new();
         // Before a probe is installed, the report still explains itself.
-        let report = binding.starting_report("kin_graph_status", Duration::from_secs(10));
+        let report = binding.starting_report("kin_graph_status", Duration::from_secs(300));
         assert!(
             report.contains("resolving which repository"),
             "with no probe the report carries the resolve phase: {report}"
@@ -442,34 +535,102 @@ mod tests {
             "phase: the daemon process is up and loading the repository graph",
         ));
         let probe_phase = std::sync::Arc::clone(&phase);
-        binding.set_phase_probe(Box::new(move || *probe_phase.lock().unwrap()));
+        binding.set_phase_probe(Box::new(move || {
+            StartupProgress::phase(*probe_phase.lock().unwrap())
+        }));
         assert!(binding
-            .starting_report("kin_graph_status", Duration::from_secs(10))
+            .starting_report("kin_graph_status", Duration::from_secs(300))
             .contains("loading the repository graph"));
 
         *phase.lock().unwrap() = "phase: the daemon is listening and finishing readiness checks";
         assert!(binding
-            .starting_report("kin_graph_status", Duration::from_secs(10))
+            .starting_report("kin_graph_status", Duration::from_secs(300))
             .contains("finishing readiness checks"));
     }
 
-    /// The bound the call actually waited reaches the reader.
-    ///
-    /// Two calls in one session wait different amounts now, and a report that
-    /// named only the daemon's own elapsed time would read identically over a
-    /// ten-second give-up and a forty-five-second one.
+    /// The report names the wait this call spent and the knob that widens it,
+    /// so a reader can tell a call that gave the daemon its whole budget from
+    /// one that did not, and knows what to change.
     #[test]
-    fn the_starting_report_states_the_bound_this_call_waited() {
+    fn the_starting_report_states_the_budget_this_call_waited() {
         let binding = StartupDaemonBinding::new();
-        let patient = binding.starting_report("kin_graph_status", Duration::from_secs(45));
+        let report = binding.starting_report("kin_graph_status", Duration::from_secs(300));
         assert!(
-            patient.contains("this call waited 45s"),
-            "the long wait has to be visible in the report: {patient}"
+            report.contains("waited 300s") && report.contains("whole readiness budget"),
+            "the wait has to be visible in the report: {report}"
         );
-        let brief = binding.starting_report("kin_graph_status", Duration::from_secs(10));
         assert!(
-            brief.contains("this call waited 10s"),
-            "and so has the short one, or the two are indistinguishable: {brief}"
+            report.contains(crate::daemon_delegate::DAEMON_PATIENCE_ENV),
+            "the report must name the knob that lets a call wait longer: {report}"
+        );
+    }
+
+    /// The phase and elapsed seconds sit in one parenthetical a caller can
+    /// parse, as they always have, with the yardstick after it.
+    #[test]
+    fn the_starting_report_keeps_the_phase_and_elapsed_detail_callers_parse() {
+        let binding = StartupDaemonBinding::new();
+        binding.set_phase_probe(Box::new(|| StartupProgress {
+            phase: "phase: the daemon process is up and loading the repository graph",
+            last_open: Some(Duration::from_secs(600)),
+        }));
+        let report = binding.starting_report("find_references", Duration::from_secs(300));
+        assert!(
+            report.starts_with(
+                "kin-mcp cannot answer 'find_references' yet: the repo daemon is still starting"
+            ),
+            "{report}"
+        );
+        let open = report
+            .find("(phase: the daemon process is up and loading the repository graph; ")
+            .expect("the phase opens the detail");
+        let detail = &report[open..=open + report[open..].find(')').expect("detail closes")];
+        let seconds = detail
+            .rsplit("; ")
+            .next()
+            .and_then(|tail| tail.strip_suffix("s so far)"))
+            .expect("the detail ends with the elapsed seconds");
+        assert!(seconds.parse::<u64>().is_ok(), "{detail}");
+        assert!(report.contains("of the 600s the last open of this store took"));
+        assert!(report.contains("This is startup latency, not a failure"));
+    }
+
+    /// How far along a start is comes from the only yardstick a client has
+    /// before the daemon answers: what the last open of the same store cost.
+    #[test]
+    fn how_far_a_start_has_come_is_measured_against_the_last_open() {
+        let line = how_far(Duration::from_secs(90), Some(Duration::from_secs(360)));
+        assert!(
+            line.contains("90s") && line.contains("about 25%") && line.contains("360s"),
+            "{line}"
+        );
+        let over = how_far(Duration::from_secs(400), Some(Duration::from_secs(360)));
+        assert!(
+            over.contains("longer than the 360s") && !over.contains('%'),
+            "past the yardstick the line says so rather than claiming over 100%: {over}"
+        );
+        let unknown = how_far(Duration::from_secs(12), None);
+        assert!(
+            unknown.contains("12s") && unknown.contains("no recorded open"),
+            "{unknown}"
+        );
+    }
+
+    /// The progress line counts from the moment a caller asked for a daemon,
+    /// and carries the probe's phase and yardstick.
+    #[test]
+    fn the_progress_line_carries_phase_and_yardstick() {
+        let binding = StartupDaemonBinding::new();
+        binding.set_phase_probe(Box::new(|| StartupProgress {
+            phase: "phase: the daemon process is up and loading the repository graph",
+            last_open: Some(Duration::from_secs(240)),
+        }));
+        binding.admit_daemon_spawn();
+        let line = binding.progress_line();
+        assert!(
+            line.contains("loading the repository graph")
+                && line.contains("of the 240s the last open of this store took"),
+            "{line}"
         );
     }
 }

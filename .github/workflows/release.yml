@@ -1106,9 +1106,18 @@ jobs:
             Write-Error "kin-daemon.exe missing from $env:ARTIFACT.tar.gz"
             exit 1
           }
+          # A sidecar is the one LF-terminated line sha256sum writes. Set-Content
+          # ends a line with this platform's CRLF, and sha256sum -c on Linux or
+          # macOS then reads a file name ending in CR and finds no such archive,
+          # so write the LF explicitly and read the bytes back.
           foreach ($ArchivePath in @("$env:ARTIFACT.zip", "$env:ARTIFACT.tar.gz")) {
             $Hash = (Get-FileHash -Algorithm SHA256 $ArchivePath).Hash.ToLowerInvariant()
-            "$Hash  $ArchivePath" | Set-Content -Encoding ascii "$ArchivePath.sha256"
+            $Sidecar = "$Hash  $ArchivePath`n"
+            Set-Content -NoNewline -Encoding ascii -Path "$ArchivePath.sha256" -Value $Sidecar
+            if ((Get-Content -Raw -Encoding ascii "$ArchivePath.sha256") -cne $Sidecar) {
+              Write-Error "$ArchivePath.sha256 is not the single LF-terminated line sha256sum -c reads"
+              exit 1
+            }
           }
         env:
           TARGET: ${{ matrix.target }}
@@ -1447,11 +1456,16 @@ jobs:
           # Forward-compat: combine the per-artifact "*.sha256" files into a
           # single checksums-sha256.txt. Installers verify against the
           # per-artifact files, so this is published as a convenience only.
-          # PowerShell writes the Windows sidecar with CRLF; make the aggregate
-          # byte-canonical on the Linux publisher without changing any record.
+          # Every sidecar is published as well, so one carrying a carriage
+          # return is refused rather than cleaned up only here: sha256sum -c
+          # reads the CR as part of the file name and cannot verify it.
           : > checksums-sha256.txt
           for f in *.tar.gz.sha256 *.zip.sha256; do
             [ -e "$f" ] || continue
+            if LC_ALL=C grep -q $'\r' "$f"; then
+              echo "::error::$f contains a carriage return, so sha256sum -c cannot verify it" >&2
+              exit 1
+            fi
             tr -d '\r' < "$f" >> checksums-sha256.txt
           done
           if LC_ALL=C grep -q $'\r' checksums-sha256.txt; then
@@ -1474,6 +1488,11 @@ jobs:
             test -s "$asset"
             test -s "$asset.sha256"
             sha256sum -c "$asset.sha256"
+            # Byte for byte the line sha256sum itself writes, so it verifies
+            # with every sha256sum -c and shasum -c, not only a tolerant one.
+            printf '%s  %s\n' "$(sha256sum "$asset" | cut -d' ' -f1)" "$asset" \
+              | cmp -s - "$asset.sha256" \
+              || { echo "::error::$asset.sha256 is not the single LF-terminated line sha256sum writes" >&2; exit 1; }
             case "$asset" in
               *.tar.gz) artifact="${asset%.tar.gz}" ;;
               *.zip) artifact="${asset%.zip}" ;;

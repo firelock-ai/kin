@@ -37,6 +37,7 @@
 pub mod admission;
 #[cfg(test)]
 pub(crate) mod alloc_probe;
+pub mod binding_debt;
 pub mod branch;
 pub mod call_site_reading;
 pub(crate) mod canonical_ser;
@@ -59,11 +60,13 @@ pub mod identity;
 pub mod ids;
 pub mod layout;
 pub mod merge;
+pub mod parser_occurrence;
 pub mod preset;
 pub mod projection;
 pub mod provenance;
 pub mod refs;
 pub mod relation;
+pub mod relation_identity;
 pub mod repository;
 pub mod resolution;
 pub mod retrieval;
@@ -89,8 +92,10 @@ pub use admission::{
 };
 pub use branch::MergeState;
 pub use call_site_reading::{
-    in_a_file_without_calls, read_caller_sites, site_state_reason, CallSiteFacts, CallSiteTally,
-    CallerSites, NoResolver, SiteStateKind,
+    calling_languages, focal_call_names, holds_dynamic_access, in_a_file_without_calls,
+    language_of_path, read_caller_sites, scope_caller_sites, site_could_call, site_could_call_at,
+    site_state_reason, site_text, unplaceable_access, CallSiteFacts, CallSiteTally, CallerSites,
+    FocalEscape, NoResolver, SiteStateKind, UnplaceableAccess,
 };
 pub use change::{
     ChangeOrigin, EntityDelta, LocatedEntry, RelationDelta, ResolvedArtifact, ResolvedTree,
@@ -167,12 +172,13 @@ pub use preset::{
     ProjectionMode, ReconcilePolicy, ReconcilePolicyProvider, ValidationLevel, WorldPreset,
 };
 pub use projection::{Projection, ProjectionKind};
+pub use relation_identity::language_server_relation_id;
 pub use resolution::{
     proof_context_digest, site_key, validate_keyed_record, validate_resolution_records, CallSite,
-    CallSiteLedger, CallSiteState, DispatchProvenance, DispatchScope, DispatchSet,
-    DispatchSoundness, DispatchWorld, ProofContext, ResolutionRecord, ResolutionRecordDelta,
-    ResolutionRecordId, ResolutionRecordPlan, ResolutionRecordSet, ServerFailure, UnresolvedReason,
-    PROOF_CONTEXT_TOKEN_PREFIX, RESOLUTION_RECORD_ID_NAMESPACE_V1,
+    CallSiteLedger, CallSiteState, ContextValidation, ContextValidationState, DispatchProvenance,
+    DispatchScope, DispatchSet, DispatchSoundness, DispatchWorld, ProofContext, ResolutionRecord,
+    ResolutionRecordDelta, ResolutionRecordId, ResolutionRecordPlan, ResolutionRecordSet,
+    ServerFailure, UnresolvedReason, PROOF_CONTEXT_TOKEN_PREFIX, RESOLUTION_RECORD_ID_NAMESPACE_V1,
 };
 pub use review::{
     Review, ReviewAssignment, ReviewComment, ReviewCompletionState, ReviewDecision,
@@ -197,15 +203,17 @@ pub use relation::{
     CallArgShape, GraphNodeId, Relation, RelationEvidence, RelationKind, RelationOrigin,
     LSP_PROVEN_METHOD_REFERENCES_RULE, LSP_REFERENCES_RULE,
 };
+mod enrichment_proof;
+pub use enrichment_proof::{enrichment_proof_inputs_by_file, ENRICHMENT_PROOF_MARK_VERSION};
 pub use repository::{
     compute_resolved_tree_hash, enrichment_ledgers_by_file, enrichment_relations_by_owner_file,
-    enrichment_relations_digest, settle_enrichment_marks, AuthorityRoot, EnrichmentMark,
-    EnrichmentMarksDelta, RepositoryAuthorityStore, RepositoryCommitOutcome,
-    RepositoryCommitReceipt, RepositoryOperationRecord, RepositoryTransaction, RootBundle,
-    WorkspaceExpectation, WorkspaceMutation, WorkspaceSemanticDelta, WorkspaceSemanticOverlay,
-    WorkspaceSnapshotBinding, WorkspaceState, REPOSITORY_ROOT_SCHEMA_VERSION,
-    REPOSITORY_TRANSACTION_SCHEMA_VERSION, WORKSPACE_SEMANTIC_DELTA_SCHEMA_VERSION,
-    WORKSPACE_SEMANTIC_OVERLAY_SCHEMA_VERSION,
+    enrichment_relations_digest, settle_enrichment_marks, settle_enrichment_marks_with_digest,
+    AuthorityRoot, EnrichmentMark, EnrichmentMarksDelta, RepositoryAuthorityStore,
+    RepositoryCommitOutcome, RepositoryCommitReceipt, RepositoryOperationRecord,
+    RepositoryTransaction, RootBundle, WorkspaceExpectation, WorkspaceMutation,
+    WorkspaceSemanticDelta, WorkspaceSemanticOverlay, WorkspaceSnapshotBinding, WorkspaceState,
+    REPOSITORY_ROOT_SCHEMA_VERSION, REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+    WORKSPACE_SEMANTIC_DELTA_SCHEMA_VERSION, WORKSPACE_SEMANTIC_OVERLAY_SCHEMA_VERSION,
 };
 pub use retrieval::{ArtifactId, RetrievalKey, RetrievalKeyFileResolver};
 pub use sealed_observation::{SealedObservationBinding, SEALED_OBSERVATION_BINDING_SCHEMA_VERSION};

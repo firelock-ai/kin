@@ -571,6 +571,9 @@ fn defer_the_next_spine_pass(
 /// turn a moment of contention into a verdict that lasted as long as the daemon.
 #[tokio::test]
 async fn a_reference_read_while_spine_initialization_is_deferred_does_not_certify() {
+    let _readiness = kin_mcp::edge_coverage::test_support::scoped_language_servers(&[
+        kin_model::LanguageId::Python,
+    ]);
     let (state, target) = reference_fixture();
     // The case is a spine that is switched on and not built yet, whatever the
     // environment this test runs in says about the switch.
@@ -732,6 +735,9 @@ async fn a_deferral_another_request_clears_still_keeps_this_read_from_certifying
 /// is missing from its answer.
 #[tokio::test]
 async fn a_reference_read_with_the_spine_switched_off_still_certifies() {
+    let _readiness = kin_mcp::edge_coverage::test_support::scoped_language_servers(&[
+        kin_model::LanguageId::Python,
+    ]);
     let (state, target) = reference_fixture();
     state.set_spine_disabled_for_test(true);
 
@@ -773,6 +779,9 @@ async fn a_reference_read_with_the_spine_switched_off_still_certifies() {
 /// authority stands behind an answer read from it.
 #[tokio::test]
 async fn a_derived_member_refusal_is_not_reported_as_a_deferred_spine() {
+    let _readiness = kin_mcp::edge_coverage::test_support::scoped_language_servers(&[
+        kin_model::LanguageId::Python,
+    ]);
     let (state, target) = reference_fixture();
     state.set_spine_disabled_for_test(false);
     let mut inferred = test_entity("inferred_member", "src/generated.py");
@@ -955,9 +964,13 @@ async fn kin_refs_does_not_certify_an_absence_a_sibling_reference_disproves() {
 /// `kin refs` certifies it as it always has.
 #[tokio::test]
 async fn kin_refs_still_certifies_an_absence_nothing_disproves() {
-    let (state, focal) = unreached_focal_fixture();
+    let _readiness = kin_mcp::edge_coverage::test_support::scoped_language_servers(&[
+        kin_model::LanguageId::Python,
+    ]);
+    let (_repo, state) = refs_source_observation_fixture().await;
+    let focal = waiting_entity(&state, "unused.py", "unused_probe");
 
-    let response = refs_through_route(&state, &focal.id.to_string()).await;
+    let response = refs_calls_through_route(&state, &focal.id.to_string()).await;
     let negative = response
         .negative
         .clone()
@@ -976,6 +989,9 @@ async fn kin_refs_still_certifies_an_absence_nothing_disproves() {
 /// so the refusals below come from the spine state and from nothing else.
 #[tokio::test]
 async fn kin_refs_reads_a_deferred_or_refusing_spine_as_a_gap() {
+    let _readiness = kin_mcp::edge_coverage::test_support::scoped_language_servers(&[
+        kin_model::LanguageId::Python,
+    ]);
     let (state, focal) = unreached_focal_fixture();
     let envelope = kin_mcp::Envelope::daemon().with_health(&daemon_health_snapshot(&state).await);
     let request = kin_cli::commands::refs::RefsRequest {
@@ -991,6 +1007,7 @@ async fn kin_refs_reads_a_deferred_or_refusing_spine_as_a_gap() {
             kin_cli::commands::refs::RefsSpine {
                 repo_id: &state.cached_repo_id,
                 spine,
+                call_site_sources: None,
             },
         )
         .expect("kin refs answers")

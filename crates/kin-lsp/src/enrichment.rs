@@ -10,7 +10,6 @@
 //! 4. Produce Relations with RelationOrigin::Lsp
 
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 use tracing::debug;
@@ -792,27 +791,14 @@ fn position_evidence(rule: &'static str, span: SourceSpan) -> RelationEvidence {
     }
 }
 
+/// The id of an edge a language server proved between two repository
+/// entities (see [`crate::relation_identity`]).
 pub(crate) fn deterministic_relation_id(
     kind: RelationKind,
     src: EntityId,
     dst: EntityId,
 ) -> RelationId {
-    let mut first = std::collections::hash_map::DefaultHasher::new();
-    kind.hash(&mut first);
-    src.hash(&mut first);
-    dst.hash(&mut first);
-    "kin-lsp".hash(&mut first);
-
-    let mut second = std::collections::hash_map::DefaultHasher::new();
-    "kin-lsp".hash(&mut second);
-    dst.hash(&mut second);
-    src.hash(&mut second);
-    kind.hash(&mut second);
-
-    let mut bytes = [0u8; 16];
-    bytes[..8].copy_from_slice(&first.finish().to_le_bytes());
-    bytes[8..].copy_from_slice(&second.finish().to_le_bytes());
-    RelationId::from_bytes(bytes)
+    crate::relation_identity::language_server_relation_id(kind, src, dst)
 }
 
 /// What one caller's call hierarchy proved, and how much of the server's

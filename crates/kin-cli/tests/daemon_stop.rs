@@ -15,6 +15,8 @@
 //! model — the test needs no GPU.
 
 use kin_cli::daemon_client::is_process_alive;
+#[cfg(unix)]
+use kin_cli::daemon_client::{starting_daemon_owner, StartingDaemonOwner};
 use serde_json::Value;
 use std::path::Path;
 use std::process::Output;
@@ -185,6 +187,145 @@ fn daemon_status_and_stop_lifecycle() {
         assert!(
             !is_process_alive(sup_pid),
             "supervisor pid {sup_pid} still alive after `kin daemon stop --all`"
+        );
+    }
+}
+
+/// Start a real daemon on `repo` held before it opens any state by the gate
+/// file at `gate`, which this test creates and never removes while the daemon
+/// runs, and wait until the lock it holds and its own startup record name it.
+/// No clock decides whether it is still before its endpoint: it cannot pass
+/// the gate.
+#[cfg(unix)]
+fn spawn_starting_daemon(
+    runtime: &common::IsolatedDaemonRuntime,
+    repo: &Path,
+    gate: &Path,
+) -> common::RuntimeOwnedChild {
+    std::fs::write(gate, b"held").expect("arm the startup gate");
+    let mut child = runtime
+        .daemon_command()
+        .args(["--port", "0", "--repo"])
+        .arg(repo)
+        .env("KIN_DAEMON_DISABLE_LSP", "1")
+        .env("KIN_DAEMON_TEST_STARTUP_GATE", gate)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn_owned()
+        .expect("spawn a daemon held in startup");
+    let kin_root = repo.join(".kin");
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        if let StartingDaemonOwner::Starting(owner) = starting_daemon_owner(&kin_root) {
+            if owner.identity().pid() == child.id() {
+                break;
+            }
+        }
+        assert!(
+            child.try_wait().expect("poll the daemon").is_none(),
+            "the daemon exited before it held the repository"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "the daemon never recorded that it holds the repository"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        !kin_root.join("daemon.pid").exists(),
+        "the held daemon must not have published an endpoint"
+    );
+    child
+}
+
+#[cfg(unix)]
+fn wait_for_exit(child: &mut common::RuntimeOwnedChild, context: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while child.try_wait().expect("poll the daemon").is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "{context}: the daemon is still running"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// A daemon still starting, before it publishes `daemon.pid`, is found and
+/// stopped by `kin daemon stop` and by `kin daemon stop --all`. Before the
+/// fix both exited 0 reporting every daemon stopped while it kept running.
+///
+/// Falsify by resolving the worker from `daemon.pid` alone: both commands
+/// report an empty `stopped` list and the daemon outlives the wait.
+#[cfg(unix)]
+#[test]
+fn a_daemon_still_starting_is_stopped_by_stop_and_stop_all() {
+    let root = tempfile::tempdir().expect("temp root");
+    let repo = root.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("create repo dir");
+    kin_core::init(&repo).expect("init scratch repo");
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+
+    for args in [
+        &["daemon", "stop", "--json"][..],
+        &["daemon", "stop", "--all", "--json"][..],
+    ] {
+        let mut daemon = spawn_starting_daemon(&runtime, &repo, &root.path().join("gate"));
+        let pid = daemon.id();
+        let report = stdout_json(&kin(&runtime, &repo, args), &format!("kin {args:?}"));
+        assert_eq!(report["all_stopped"], true, "{report}");
+        let stopped = report["stopped"].as_array().expect("stopped list");
+        assert_eq!(stopped.len(), 1, "{report}");
+        assert_eq!(stopped[0]["pid"].as_u64(), Some(pid as u64), "{report}");
+        assert_eq!(stopped[0]["result"], "stopped", "{report}");
+        wait_for_exit(&mut daemon, &format!("kin {args:?}"));
+        std::fs::remove_file(root.path().join("gate")).expect("disarm the startup gate");
+    }
+}
+
+/// A maintenance command such as `kin upgrade` holds the same repository
+/// lock, with a live stamp and no daemon record. Neither stop signals it or
+/// reports every daemon stopped: the repository is reported busy and the
+/// command fails. The holder here is this test process, which a wrong signal
+/// would end.
+#[cfg(unix)]
+#[test]
+fn a_maintenance_holder_is_reported_busy_and_never_signalled() {
+    let root = tempfile::tempdir().expect("temp root");
+    let repo = root.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("create repo dir");
+    kin_core::init(&repo).expect("init scratch repo");
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    let _maintenance =
+        kin_cli::daemon_client::acquire_repository_runtime_authority(&repo.join(".kin"))
+            .expect("acquire the runtime authority")
+            .expect("nothing else holds the runtime authority");
+
+    for args in [
+        &["daemon", "stop", "--json"][..],
+        &["daemon", "stop", "--all", "--json"][..],
+    ] {
+        let output = kin(&runtime, &repo, args);
+        assert!(
+            !output.status.success(),
+            "kin {args:?} must fail on a busy repository: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+            panic!(
+                "kin {args:?} stdout is not JSON ({error}): {}",
+                String::from_utf8_lossy(&output.stdout)
+            )
+        });
+        assert_eq!(report["all_stopped"], false, "{report}");
+        let stopped = report["stopped"].as_array().expect("stopped list");
+        assert_eq!(stopped.len(), 1, "{report}");
+        assert_eq!(stopped[0]["result"], "busy", "{report}");
+        assert_eq!(
+            stopped[0]["pid"].as_u64(),
+            Some(u64::from(std::process::id())),
+            "{report}"
         );
     }
 }

@@ -62,6 +62,8 @@ import tempfile
 import time
 import urllib.request
 
+from trace_pages import mcp_references
+
 ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 
 PASS = "PASS"
@@ -91,6 +93,64 @@ print = functools.partial(print, flush=True)
 
 def strip_ansi(text):
     return ANSI.sub("", text or "")
+
+
+# BEGIN failure evidence excerpt
+# Every suite carries this block byte for byte, because a suite is also copied
+# out and run as a single file. test_failure_excerpt.py keeps the copies equal.
+EVIDENCE_LIMIT = 4000
+EVIDENCE_LINE_LIMIT = 600
+EVIDENCE_PANICS = ("panicked at", "has overflowed its stack")
+EVIDENCE_ESCAPES = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+EVIDENCE_ERROR = re.compile(r"^(?:[\w./-]+:\s*)?(?:error|fatal)\b", re.IGNORECASE)
+EVIDENCE_LOG_ERROR = re.compile(r"\sERROR\s")
+
+
+def failure_excerpt(text, limit=EVIDENCE_LIMIT):
+    """Bounded evidence from a command's output that still says why it failed.
+
+    Output that fits is returned whole. Longer output keeps its opening and its
+    end, and between them every line that carries a Rust panic, with the
+    message line under it, and the last error line, wherever they fall. A
+    warning printed around the error cannot push it out, and a long log cannot
+    cut the panic out. `limit` only ever raises the bound, never lowers it.
+    """
+    text = (text or "").strip()
+    limit = max(int(limit), EVIDENCE_LIMIT)
+    if len(text) <= limit:
+        return text
+    head_end = limit // 4
+    tail_start = len(text) - limit // 2
+    lines = text.split("\n")
+    starts, offset = [], 0
+    panics, errors = [], []
+    for index, line in enumerate(lines):
+        starts.append(offset)
+        offset += len(line) + 1
+        plain = EVIDENCE_ESCAPES.sub("", line).strip()
+        if any(marker in plain for marker in EVIDENCE_PANICS):
+            panics.extend((index, index + 1))
+        if EVIDENCE_ERROR.match(plain) or EVIDENCE_LOG_ERROR.search(plain):
+            errors.append(index)
+    # The first panic and its message, then the last error line, then any
+    # later panics, for as long as the middle's share of the bound lasts.
+    order = panics[:2] + errors[-1:] + panics[2:]
+    budget, kept = limit // 4, set()
+    for index in order:
+        if index >= len(lines) or index in kept:
+            continue
+        start, end = starts[index], starts[index] + len(lines[index])
+        if end <= head_end or start >= tail_start:
+            continue
+        cost = min(len(lines[index]), EVIDENCE_LINE_LIMIT) + 1
+        if cost > budget:
+            continue
+        kept.add(index)
+        budget -= cost
+    middle = [lines[index][:EVIDENCE_LINE_LIMIT] for index in sorted(kept)]
+    parts = [text[:head_end], "[...]"] + middle + (["[...]"] if middle else [])
+    return "\n".join(parts + [text[tail_start:]])
+# END failure evidence excerpt
 
 
 def run(cmd, cwd=None, env=None, timeout=600):
@@ -160,11 +220,18 @@ class Suite(object):
             self.responses.append({"repo": repo, "tool": tool, "args": args,
                                    "error": str(exc)})
             raise
-        self.responses.append({"repo": repo, "tool": tool, "args": args, "payload": payload})
+        self.responses.append({"repo": repo, "tool": tool, "args": args, "payload": payload,
+                               "page_bytes": list(getattr(payload, "page_bytes", ()))})
         return payload, size
 
     def _mcp_exchange(self, repo, tool, args, timeout):
         """The exchange `mcp` records: one initialize, one call, one parsed answer."""
+        if tool == "find_references":
+            try:
+                payload = mcp_references(self.kin, repo, self.env, args, timeout)
+                return payload, max(payload.page_bytes)
+            except ValueError as exc:
+                raise McpError(str(exc))
         env = dict(self.env)
         env["KIN_MCP_REPO"] = repo
         proc = subprocess.Popen(
@@ -206,7 +273,7 @@ class Suite(object):
                 resp = obj
         if resp is None:
             raise McpError("mcp %s returned no id=2 frame (stderr tail: %s)"
-                           % (tool, strip_ansi(err)[-200:].replace("\n", " ")))
+                           % (tool, failure_excerpt(strip_ansi(err)).replace("\n", " ")))
         if "error" in resp:
             raise McpError("mcp %s error: %s" % (tool, json.dumps(resp["error"])[:200]))
         result = resp.get("result") or {}
@@ -283,12 +350,12 @@ class Suite(object):
     def _kin_init(self, repo):
         rc, out, err = self.kin_run(["init", "."], repo)
         if rc != 0:
-            raise RuntimeError("kin init failed in %s: %s" % (repo, (err or out)[-300:]))
+            raise RuntimeError("kin init failed in %s: %s" % (repo, failure_excerpt(err or out)))
 
     def _kin_commit(self, repo, message):
         rc, out, err = self.kin_run(["commit", "-m", message], repo)
         if rc != 0:
-            raise RuntimeError("kin commit failed in %s: %s" % (repo, (err or out)[-300:]))
+            raise RuntimeError("kin commit failed in %s: %s" % (repo, failure_excerpt(err or out)))
 
     def _build_incremental(self, repo):
         """The greenfield shape: modules written and committed one at a time.
@@ -399,7 +466,7 @@ class Suite(object):
         self.git(["add", "-A"], repo)
         rc, out, err = self.git(["commit", "-q", "-m", "initial fixture"], repo)
         if rc != 0:
-            raise RuntimeError("git commit failed: %s" % (err or out)[-300:])
+            raise RuntimeError("git commit failed: %s" % failure_excerpt(err or out))
         self._kin_init(repo)
 
     def _build_graphsection(self, repo):
@@ -411,20 +478,20 @@ class Suite(object):
         """
         rc, out, err = self.git(["init", "-q", "."], repo)
         if rc != 0:
-            raise RuntimeError("git init failed: %s" % (err or out)[-300:])
+            raise RuntimeError("git init failed: %s" % failure_excerpt(err or out))
         self._write(repo, "src/lib.py", "def graph_truth():\n    return 29\n")
         rc, out, err = self.git(["add", "-A"], repo)
         if rc != 0:
-            raise RuntimeError("git add failed: %s" % (err or out)[-300:])
+            raise RuntimeError("git add failed: %s" % failure_excerpt(err or out))
         rc, out, err = self.git(
             ["commit", "-q", "-m", "graph section fixture"], repo)
         if rc != 0:
-            raise RuntimeError("git commit failed: %s" % (err or out)[-300:])
+            raise RuntimeError("git commit failed: %s" % failure_excerpt(err or out))
         rc, out, err = self.kin_run(["init", ".", "--no-enrich"], repo)
         if rc != 0:
             raise RuntimeError(
                 "kin init --no-enrich failed in %s: %s"
-                % (repo, (err or out)[-300:]))
+                % (repo, failure_excerpt(err or out)))
 
     def _build_threestate(self, repo):
         """A store converted from Git holding one file of each parse outcome.
@@ -447,7 +514,7 @@ class Suite(object):
         self.git(["add", "-A"], repo)
         rc, out, err = self.git(["commit", "-q", "-m", "three parse outcomes"], repo)
         if rc != 0:
-            raise RuntimeError("git commit failed: %s" % (err or out)[-300:])
+            raise RuntimeError("git commit failed: %s" % failure_excerpt(err or out))
         self._kin_init(repo)
 
     def _build_js(self, repo):
@@ -458,7 +525,7 @@ class Suite(object):
         self.git(["add", "-A"], repo)
         rc, out, err = self.git(["commit", "-q", "-m", "initial js fixture"], repo)
         if rc != 0:
-            raise RuntimeError("git commit failed: %s" % (err or out)[-300:])
+            raise RuntimeError("git commit failed: %s" % failure_excerpt(err or out))
         self._kin_init(repo)
 
     def _build_mixin(self, repo):
@@ -493,7 +560,7 @@ class Suite(object):
         self.git(["add", "-A"], repo)
         rc, out, err = self.git(["commit", "-q", "-m", "initial mixin adapter fixture"], repo)
         if rc != 0:
-            raise RuntimeError("git commit failed: %s" % (err or out)[-300:])
+            raise RuntimeError("git commit failed: %s" % failure_excerpt(err or out))
         self._kin_init(repo)
 
     def _build_reexport(self, repo):
@@ -522,7 +589,7 @@ class Suite(object):
         self.git(["add", "-A"], repo)
         rc, out, err = self.git(["commit", "-q", "-m", "initial reexport fixture"], repo)
         if rc != 0:
-            raise RuntimeError("git commit failed: %s" % (err or out)[-300:])
+            raise RuntimeError("git commit failed: %s" % failure_excerpt(err or out))
         self._kin_init(repo)
 
     def _build_relimport(self, repo):
@@ -551,7 +618,7 @@ class Suite(object):
         self.git(["add", "-A"], repo)
         rc, out, err = self.git(["commit", "-q", "-m", "initial relimport fixture"], repo)
         if rc != 0:
-            raise RuntimeError("git commit failed: %s" % (err or out)[-300:])
+            raise RuntimeError("git commit failed: %s" % failure_excerpt(err or out))
         self._kin_init(repo)
 
     def _build_venv(self, repo):
@@ -562,6 +629,48 @@ class Suite(object):
         self._kin_commit(repo, "Add tool module")
 
     # ------------------------------------------------------------ status probes
+
+    def await_absence_control_ready(self, repo, timeout=90):
+        """Establish check 16's healthy premise without reading its verdict.
+
+        Native commit queues enrichment asynchronously. A resolved focal is
+        not proof that the store has settled its callers, so the first refs
+        assertion must follow independent graph and worker observations.
+        """
+        with open(os.path.join(repo, ".kin", "daemon.port")) as handle:
+            port = int(handle.read().strip().splitlines()[0])
+        with open(os.path.join(repo, ".kin", "daemon.token")) as handle:
+            token = handle.read().strip()
+        endpoint = "http://127.0.0.1:%d/lsp/sweep/status" % port
+        started = time.monotonic()
+        deadline = started + timeout
+        samples = 0
+        last = None
+
+        def remaining():
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise RuntimeError("isolated absence fixture did not settle in %ss: %s"
+                                   % (timeout, last))
+            return min(5, left)
+
+        while True:
+            rc, out, err = self.kin_run(["graph", "status", "--json"], repo,
+                                        timeout=remaining())
+            if rc != 0:
+                raise RuntimeError("isolated graph status failed: %s"
+                                   % failure_excerpt(err or out))
+            graph = json.loads(out)
+            request = urllib.request.Request(endpoint, headers={
+                "Authorization": "Bearer " + token})
+            with urllib.request.urlopen(request, timeout=remaining()) as response:
+                work = json.load(response)
+            samples += 1
+            last = {"call_sites": graph.get("call_sites"), "work": work}
+            if absence_control_ready(graph, work):
+                return {"samples": samples, "seconds": time.monotonic() - started,
+                        "call_sites": graph["call_sites"], "work": work}
+            time.sleep(min(0.25, remaining()))
 
     def await_enrichment(self, repo, timeout=90):
         """Passively wait for every admitted job, then require the fixture edge.
@@ -626,7 +735,7 @@ class Suite(object):
             info["cross_file"] = (int(metric.group(1)), int(metric.group(2)))
         if info["entities"] is None:
             raise McpError("kin graph status rc=%d printed no counters: %s"
-                           % (rc, text.strip()[-200:]))
+                           % (rc, failure_excerpt(text)))
         return info
 
     def search_entities(self, repo, query):
@@ -698,7 +807,7 @@ class Suite(object):
         """The FIR-2644 experiment, run once and read by three checks.
 
         A `kin commit` of a module docstring and nothing else, with the caller
-        sets and the reference lines recorded on both sides of it. Cached
+        sets and the reference sites recorded on both sides of it. Cached
         because the experiment is destructive: the second checker to run it
         would be measuring a store the first one had already edited, and the
         edit is the whole subject.
@@ -736,10 +845,51 @@ class Suite(object):
         evidence["after_send"] = self.references(
             repo, MIXIN_FOCAL_SEND, relation_kinds=["calls"])
         evidence["after_adapter"] = self.references(repo, MIXIN_FOCAL_ADAPTER_SEND)
+        evidence["after_caller_starts"] = self.caller_span_starts(
+            repo, (evidence["after_send"], evidence["after_adapter"]))
         with open(source) as handle:
             evidence["source_lines"] = handle.read().splitlines()
         self._comment_only_evidence = evidence
         return evidence
+
+    def caller_span_starts(self, repo, payloads):
+        """Read each counted caller's start and body through `get_entity_source`.
+
+        A reference row addresses each site inside its caller, as `line_in_entity`
+        counted from 0 at the caller's first line, and never by a file line. A check
+        that grades a site against the file on disk crosses a materialization
+        boundary, and needs the caller's own first line to do it: the site's file
+        line is the response's 1-based `start_line` plus its `line_in_entity`.
+        The entity-only body independently proves the offset carries the call.
+        Read straight after the rows, over the same store, so the
+        two describe one graph.
+
+        Returns `{entity_id: {"start_line": int, "body": str}}`, or
+        `{"error": reason}` for a caller whose record could not be read, so a
+        check reports that caller as ungraded rather than guessing where it starts.
+        """
+        starts = {}
+        for payload in payloads:
+            for row in (payload or {}).get("references") or []:
+                entity_id = row.get("entity_id") if isinstance(row, dict) else None
+                if not isinstance(entity_id, str) or not entity_id or entity_id in starts:
+                    continue
+                if str(row.get("kind", "")).lower() in ("module", "file"):
+                    starts[entity_id] = {"error": "whole-file caller bodies are not requested"}
+                    continue
+                try:
+                    record, _ = self.mcp(repo, "get_entity_source", {"entity_id": entity_id})
+                except McpError as exc:
+                    starts[entity_id] = {"error": "get_entity_source unreadable: %s" % exc}
+                    continue
+                start = record.get("start_line") if isinstance(record, dict) else None
+                body = record.get("body") if isinstance(record, dict) else None
+                if type(start) is int and start >= 1 and isinstance(body, str):
+                    starts[entity_id] = {"start_line": start, "body": body}
+                else:
+                    starts[entity_id] = {
+                        "error": "get_entity_source carries no positive start_line and body"}
+        return starts
 
 
 # ----------------------------------------------------------------- fixture code
@@ -978,6 +1128,30 @@ def resolution_miss(payload, query):
     negative = payload.get("negative") or {}
     return "find_references(%s) resolved no focal entity (%s)" % (
         query, negative.get("kind") or negative.get("subject") or "no reason given")
+
+
+def projection_path(row):
+    """The file a reference row's caller is projected into, or None.
+
+    A row names its caller by `entity_id` and serves the caller's file only as
+    `projection.path`. A check that asks which file a caller lives in reads it
+    here, and a row that carries no readable path answers None rather than an
+    empty string, so no check can mistake a missing projection for a file.
+    """
+    projection = row.get("projection") if isinstance(row, dict) else None
+    path = projection.get("path") if isinstance(projection, dict) else None
+    return path if isinstance(path, str) and path else None
+
+
+def is_relimport_live_focal(focal):
+    """Whether a `find_references` focal is check 23's live `connect` in pkg/store.py.
+
+    The focal is addressed by id like every row, with its file only as
+    `projection.path`, so that is where its file is read.
+    """
+    return (isinstance(focal, dict)
+            and focal.get("name") == RELIMPORT_LIVE_FUNCTION
+            and (projection_path(focal) or "").endswith("pkg/store.py"))
 
 
 def trend_of(status, prior):
@@ -1369,8 +1543,9 @@ def check_1(suite):
     if miss:
         res.unknown(miss)
         return res
-    files = sorted({r.get("file_path") for r in payload.get("references") or []})
-    if any(f and f.endswith("storage.py") for f in files):
+    files = sorted({projection_path(r) or "<no projection>"
+                    for r in payload.get("references") or []})
+    if any(f.endswith("storage.py") for f in files):
         res.ok("find_references(parse_note) crosses into storage.py")
     else:
         res.bad("find_references(parse_note) returned %d reference(s) %s; "
@@ -1441,7 +1616,7 @@ def check_3(suite):
         res.unknown(miss)
         return res
     refs = payload.get("references") or []
-    files = sorted({r.get("file_path") for r in refs if r.get("file_path")})
+    files = sorted({projection_path(r) for r in refs if projection_path(r)})
     expected_files = {"pkg/parsing.py", "pkg/storage.py", "pkg/linkgraph.py"}
     if expected_files.issubset(set(files)):
         res.ok("all three calling files returned: %s" % files)
@@ -1584,11 +1759,17 @@ def check_5(suite):
     if miss:
         res.unknown(miss)
         return res
-    test_callers = [r for r in payload.get("references") or []
-                    if (r.get("file_path") or "").startswith("tests/")]
+    rows = payload.get("references") or []
+    test_callers = [r for r in rows if (projection_path(r) or "").startswith("tests/")]
+    # A caller whose projection cannot be read cannot be shown not to be a test,
+    # so the no-test-caller arm is not graded over one.
+    unplaced = [r.get("name", "?") for r in rows if projection_path(r) is None]
     if test_callers:
         res.bad("Adapter.send claims caller(s) %s; the test calls Session.send"
                 % ", ".join(r.get("name", "?") for r in test_callers))
+    elif unplaced:
+        res.unknown("Adapter.send caller(s) %s carry no projection.path, so whether one "
+                    "is a test caller cannot be read" % ", ".join(unplaced))
     else:
         res.ok("Adapter.send claims no test caller")
     drain = suite.inspect(repo, "Session.drain")
@@ -1877,7 +2058,7 @@ def check_8(suite):
     rc, out, err = run([sys.executable, "-m", "venv", "venv"], cwd=repo,
                        env=suite.env, timeout=300)
     if rc != 0:
-        res.unknown("python -m venv failed: %s" % (err or out)[-160:])
+        res.unknown("python -m venv failed: %s" % failure_excerpt(err or out))
     else:
         planted = 0
         for _root, _dirs, files in os.walk(os.path.join(repo, "venv")):
@@ -1902,8 +2083,8 @@ def check_8(suite):
             delta = (after["entities"] or 0) - (before["entities"] or 0)
             if crc != 0:
                 res.bad("a %d-file venv broke the next commit (rc=%d): %s"
-                        % (planted, crc, commit_text.strip().splitlines()[0][:200]
-                           if commit_text.strip() else "(no output)"))
+                        % (planted, crc,
+                           " ".join(failure_excerpt(commit_text).split()) or "(no output)"))
             else:
                 res.ok("the next commit after a %d-file venv succeeded" % planted)
             if delta > 50:
@@ -2249,10 +2430,11 @@ def check_12(suite):
         # The daemon's environment-override WARN lines land in this text and are
         # the last thing in it, so an excerpt taken off the end would be nothing
         # but them. The exit status is reported beside the excerpt either way.
-        excerpt = " / ".join(line.strip() for line in text.splitlines()
-                             if line.strip() and "WARN" not in line)
+        unwarned = "\n".join(line for line in text.splitlines() if "WARN" not in line)
+        excerpt = " / ".join(line.strip() for line in failure_excerpt(unwarned).splitlines()
+                             if line.strip())
         res.unknown("kin dead-code rc=%d printed no verdict sentence this suite can read: %s"
-                    % (dead["rc"], excerpt[-300:] or "(no output)"))
+                    % (dead["rc"], excerpt or "(no output)"))
         return res
 
     # The first arm. REFUSED replaces the answer outright, which is what this
@@ -2351,7 +2533,7 @@ def _check_13(suite, res, repo):
     rc, out, err = suite.kin_run(
         ["resources", "set", "--profile", "ci", "--embed-batch-size", "16"], repo)
     if rc != 0:
-        res.unknown("kin resources set rc=%d: %s" % (rc, (err or out).strip()[-200:]))
+        res.unknown("kin resources set rc=%d: %s" % (rc, failure_excerpt(err or out)))
         return res
     res.ok("kin resources set recorded both knobs")
 
@@ -2385,7 +2567,7 @@ def _check_13(suite, res, repo):
                 except ValueError:
                     continue
         raise McpError("kin resources inspect --json rc=%d printed no JSON object: %s"
-                       % (rc, ((err or out) or "").strip()[-200:]))
+                       % (rc, failure_excerpt(err or out)))
 
     try:
         report = inspect_after_restart()
@@ -2439,7 +2621,7 @@ def _check_13(suite, res, repo):
     rc, out, err = suite.kin_run(["resources", "inspect"], repo)
     if "KIN_RESOURCE_PROFILE" in (err or "") and "differs between this command" in (err or ""):
         res.bad("recording a profile makes the CLI report a behavior-env divergence it "
-                "cannot clear: %s" % " ".join((err or "").split())[:220])
+                "cannot clear: %s" % " ".join(failure_excerpt(err).split()))
     else:
         res.ok("recording a profile produces no behavior-env divergence")
 
@@ -2449,14 +2631,14 @@ def _check_13(suite, res, repo):
     if strict[0] != 0:
         res.bad("kin resources inspect exits %d under KIN_STRICT_BEHAVIOR_ENV=1 in a "
                 "repository that recorded a profile: %s"
-                % (strict[0], " ".join((strict[2] or strict[1]).split())[:220]))
+                % (strict[0], " ".join(failure_excerpt(strict[2] or strict[1]).split())))
     else:
         res.ok("the same command exits 0 under KIN_STRICT_BEHAVIOR_ENV=1")
 
     # Arm 6, the negative control.
     rc, out, err = suite.kin_run(["resources", "set", "--clear"], repo)
     if rc != 0:
-        res.unknown("kin resources set --clear rc=%d: %s" % (rc, (err or out).strip()[-200:]))
+        res.unknown("kin resources set --clear rc=%d: %s" % (rc, failure_excerpt(err or out)))
         return res
     try:
         cleared = inspect_after_restart()
@@ -2699,7 +2881,7 @@ def conversion_coverage(suite, repo, rel):
                           "exit": rc, "stdout": out, "stderr": err or ""})
     if rc != 0:
         return None, ("kin doctor --conversion-source %s exited %d: %s"
-                      % (rel, rc, (err or out).strip()[-300:]))
+                      % (rel, rc, failure_excerpt(err or out)))
     try:
         report = json.loads(out)
     except ValueError:
@@ -2803,7 +2985,7 @@ def check_15(suite):
         cov, why = read_until_enriched(coverage, rel)
         if cov is None:
             res.unknown("%s could not be read through kin doctor --conversion-source: %s"
-                        % (rel, why[:250]))
+                        % (rel, failure_excerpt(why)))
             return res
         readings[name] = cov
 
@@ -2970,6 +3152,24 @@ def certification_arm_reading(payload, cli):
                   % "; ".join(tripped))
 
 
+def absence_control_ready(graph, work):
+    """Independent preparation only; never substitute for absence assertions."""
+    sites = graph.get("call_sites")
+    counters = ("callers", "census", "callers_owed", "callers_stale",
+                "callers_unverified", "callers_unproven_no_resolver")
+    if (not isinstance(sites, dict) or not isinstance(sites.get("settled"), bool)
+            or any(type(sites.get(key)) is not int or sites[key] < 0 for key in counters)):
+        raise RuntimeError("isolated graph status lacks complete call-site readiness: %s"
+                           % sites)
+    if (type(work.get("files_owed")) is not int or work["files_owed"] < 0
+            or not isinstance(work.get("evidence_unrecorded_files"), list)):
+        raise RuntimeError("isolated enrichment status lacks durable-work readiness: %s" % work)
+    drained = enrichment_drained(work)
+    return (drained and sites["settled"] and sites["callers"] > 0 and sites["census"] > 0
+            and not any(sites[key] for key in counters[2:])
+            and not work["files_owed"] and not work["evidence_unrecorded_files"])
+
+
 def check_16(suite):
     """FIR-2524 rung three: the CLI must carry the verdict MCP publishes, on the
     partial-vocabulary command group.
@@ -3048,7 +3248,7 @@ def check_16(suite):
     has_rows = bool(re.search(r"referenced by \d+ entit", text_b))
     if not has_rows:
         res.unknown("kin refs normalize_title returned no rows, so the positive control "
-                    "cannot be evaluated: %s" % text_b.strip()[:200])
+                    "cannot be evaluated: %s" % failure_excerpt(text_b))
     elif CANNOT_RULE_OUT.search(text_b):
         res.bad("an answer holding rows was qualified anyway, which is the "
                 "stamp-everything-uncertain regression: %s" % text_b.strip()[:240])
@@ -3099,6 +3299,14 @@ def check_16(suite):
     suite._kin_init(isolated)
     suite._kin_commit(isolated, "Add absence control fixture")
     args = ["refs", focal, "--kind", "calls"]
+
+    try:
+        readiness = suite.await_absence_control_ready(isolated)
+    except (RuntimeError, OSError, ValueError, subprocess.TimeoutExpired) as exc:
+        res.unknown("isolated healthy fixture readiness: %s" % exc)
+        return res
+    res.ok("isolated healthy fixture has settled graph call sites and drained enrichment")
+    res.asserts[-1]["receipt"] = readiness
 
     def paired_probe():
         answer = suite.references(isolated, focal, relation_kinds=["calls"])
@@ -3209,7 +3417,7 @@ def check_17(suite):
     cov, why = read_until_enriched(coverage, parsed_rel)
     if cov is None:
         res.unknown("%s could not be read through kin doctor --conversion-source: %s"
-                    % (parsed_rel, why[:250]))
+                    % (parsed_rel, failure_excerpt(why)))
         return res
     if cov.get("certifies_enumeration") is True and cov.get("parsed") not in (None, "absent"):
         res.ok("%s holds %s entities in all, counted %s, and certifies them as the whole "
@@ -3233,7 +3441,7 @@ def check_17(suite):
         # file it cannot enumerate, and it is certainly not a false
         # certification, so it is reported rather than failed.
         res.ok("%s is refused by the surface rather than enumerated (%s), so nothing certifies "
-               "an enumeration of it" % (NO_ADAPTER_FILE, why[:120]))
+               "an enumeration of it" % (NO_ADAPTER_FILE, failure_excerpt(why)))
     elif control.get("certifies_enumeration") is True:
         res.bad("%s has no language adapter, yet its enumeration is certified "
                 "(parsed=%r tier=%r). Certification that is unconditional carries no "
@@ -3320,6 +3528,82 @@ def check_18(suite):
     return res
 
 
+def grade_sites_on_disk(focal, payload, starts, lines, path):
+    """Place every site a caller in `path` reports into the file on disk.
+
+    Returns `(graded, stale, ungraded)`: how many sites were read against the
+    file, one message per site that no longer carries the call, and one per
+    caller whose sites could not be placed at all.
+
+    A row addresses a site inside its caller, so the file line is computed at
+    this boundary and nowhere else: the caller's 1-based `start_line` from
+    `get_entity_source` (in `starts`) plus the site's `line_in_entity`.
+    Both that entity-body line and the file line must carry `<method>(`, which
+    is the check the old absolute `reference_lines` were read against. On top of it, a
+    site's `callee`, cut from the caller's own body, must name the method when
+    it is present, and a site whose text Kin says lies outside its caller is
+    stale by Kin's own account.
+
+    A site with no `line_in_entity` is failed, not skipped. The defect this
+    check guards was a remembered site that did not move with its file; once
+    the caller's span has moved and the site has not, the site sits above its
+    caller's first line and no offset inside the caller can name it. That null
+    is how the defect reads in this row shape, so passing over it would pass
+    the defect.
+    """
+    method = focal.rsplit(".", 1)[-1]
+    token = "%s(" % method
+    names_method = re.compile(r"\b%s\b" % re.escape(method))
+    graded = 0
+    stale = []
+    ungraded = []
+    for name, row in sorted(reference_rows(payload).items()):
+        if projection_path(row) != path:
+            continue
+        sites = row.get("sites")
+        if sites is None or sites == []:
+            # No site at all is a different answer from a wrong one, and the
+            # row's `sites_absent_reason` already says which absence it is.
+            continue
+        source = starts.get(row.get("entity_id")) or {}
+        start, body = source.get("start_line"), source.get("body")
+        if (not isinstance(sites, list) or type(start) is not int or start < 1
+                or not isinstance(body, str)):
+            ungraded.append("%s (%s)" % (
+                name, "sites is not a list" if not isinstance(sites, list) else
+                (starts.get(row.get("entity_id")) or {}).get("error")
+                or "no caller record was read"))
+            continue
+        body_lines = body.splitlines()
+        for site in sites:
+            graded += 1
+            site = site if isinstance(site, dict) else {}
+            offset = site.get("line_in_entity")
+            callee = site.get("callee")
+            if type(offset) is not int or offset < 0:
+                stale.append("%s -> %s reports a site Kin cannot place inside its caller "
+                             "(line_in_entity %r, callee_unavailable %r)"
+                             % (name, focal, offset, site.get("callee_unavailable")))
+                continue
+            if offset >= len(body_lines) or token not in body_lines[offset]:
+                stale.append("%s -> %s site +%d is outside its entity body or does not carry %r"
+                             % (name, focal, offset, token))
+                continue
+            line_no = start + offset
+            text = lines[line_no - 1] if 0 < line_no <= len(lines) else "<past end of file>"
+            if token not in text:
+                stale.append("%s -> %s site +%d is file line %d, which reads %r"
+                             % (name, focal, offset, line_no, text.strip()))
+            elif callee is None and site.get("callee_unavailable") == "site_outside_caller":
+                stale.append("%s -> %s site +%d: Kin says its text lies outside the caller"
+                             % (name, focal, offset))
+            elif callee is not None and (not isinstance(callee, str)
+                                         or not names_method.search(callee)):
+                stale.append("%s -> %s site +%d quotes %r, which does not name %s"
+                             % (name, focal, offset, callee, method))
+    return graded, stale, ungraded
+
+
 def check_19(suite):
     """FIR-2644: every reported reference line must still carry the call.
 
@@ -3330,9 +3614,12 @@ def check_19(suite):
     `kwargs.setdefault("cert", self.cert)`.
 
     Graded against the file on disk after the commit, because that is the only
-    thing that can tell a re-anchored line from a remembered one. A row that
-    reports no line at all is not failed here: an absent line is a different
-    answer from a wrong one, and the payload already distinguishes them.
+    thing that can tell a re-anchored site from a remembered one. A row names
+    each site inside its caller, so `grade_sites_on_disk` places it in the file
+    through the caller's entity source, read by `get_entity_source` over the
+    same store, and reads the call there. A row that reports no site at all is not failed
+    here: an absent site is a different answer from a wrong one, and the payload
+    already distinguishes them.
     """
     res = Result("19", "FIR-2644", "every reported reference line still carries the call")
     evidence = suite.comment_only_commit_evidence()
@@ -3343,34 +3630,33 @@ def check_19(suite):
     if not lines:
         res.unknown("the edited fixture source could not be read back")
         return res
+    starts = evidence.get("after_caller_starts") or {}
 
     graded = 0
     stale = []
+    ungraded = []
     for focal, payload in ((MIXIN_FOCAL_SEND, evidence["after_send"]),
                            (MIXIN_FOCAL_ADAPTER_SEND, evidence["after_adapter"])):
         unresolved = resolution_miss(payload, focal)
         if unresolved:
             res.unknown(unresolved)
             return res
-        token = "%s(" % focal.rsplit(".", 1)[-1]
-        for name, row in sorted(reference_rows(payload).items()):
-            if (row.get("file_path") or "") != "pkg/sessions.py":
-                continue
-            for line_no in row.get("reference_lines") or []:
-                graded += 1
-                text = lines[line_no - 1] if 0 < line_no <= len(lines) else "<past end of file>"
-                if token not in text:
-                    stale.append("%s -> %s line %d reads %r"
-                                 % (name, focal, line_no, text.strip()))
-    if graded == 0:
-        res.unknown("no caller reported a reference line in pkg/sessions.py after the commit, "
-                    "so there is nothing to grade")
-        return res
+        counted, wrong, unplaced = grade_sites_on_disk(
+            focal, payload, starts, lines, "pkg/sessions.py")
+        graded += counted
+        stale.extend(wrong)
+        ungraded.extend(unplaced)
     if stale:
-        res.bad("%d of %d reported reference line(s) no longer carry the call: %s"
+        res.bad("%d of %d reported reference site(s) no longer carry the call: %s"
                 % (len(stale), graded, "; ".join(stale)))
+    elif ungraded:
+        res.unknown("the sites of %d caller(s) could not be placed in the file, so not every "
+                    "reported site was graded: %s" % (len(ungraded), "; ".join(ungraded)))
+    elif graded == 0:
+        res.unknown("no caller reported a reference site in pkg/sessions.py after the commit, "
+                    "so there is nothing to grade")
     else:
-        res.ok("all %d reported reference line(s) still carry the call they name" % graded)
+        res.ok("all %d reported reference site(s) still carry the call they name" % graded)
     return res
 
 
@@ -3520,7 +3806,7 @@ def check_21(suite):
     cov, why = coverage(NO_ADAPTER_FILE)
     if cov is None:
         res.unknown("%s could not be read through kin doctor --conversion-source: %s"
-                    % (NO_ADAPTER_FILE, why[:250]))
+                    % (NO_ADAPTER_FILE, failure_excerpt(why)))
     elif "content_opaque" not in cov:
         res.unknown("%s reports no content_opaque field; file_coverage keys were %s"
                     % (NO_ADAPTER_FILE, sorted(cov.keys())))
@@ -3547,7 +3833,7 @@ def check_21(suite):
         cov, why = coverage(rel)
         if cov is None:
             res.unknown("%s could not be read through kin doctor --conversion-source: %s"
-                        % (rel, why[:250]))
+                        % (rel, failure_excerpt(why)))
             continue
         if "content_opaque" not in cov:
             res.unknown("%s reports no content_opaque field; keys were %s"
@@ -3609,7 +3895,7 @@ def check_22(suite):
                                  repo)
     if rc != 0:
         res.unknown("the rename commit itself failed rc=%d: %s"
-                    % (rc, strip_ansi(err or out)[-300:]))
+                    % (rc, failure_excerpt(strip_ansi(err or out))))
         return res
 
     rc, out, _ = suite.kin_run(["refs", "canonical_title"], repo)
@@ -3639,7 +3925,7 @@ def check_22(suite):
                 "declaration the file no longer has: rc=0 %r" % old_out[:300])
     elif "not found" not in old_err:
         res.bad("the old name was refused, but not as a resolution miss, so this check cannot "
-                "say the rename landed: rc=%d stderr=%r" % (rc, old_err[:300]))
+                "say the rename landed: rc=%d stderr=%r" % (rc, failure_excerpt(old_err)))
     elif old_out.strip():
         res.bad("a resolution miss must leave stdout empty, or a caller pipes the apology into "
                 "a prompt as repository material: %r" % old_out[:300])
@@ -3665,7 +3951,7 @@ def check_22(suite):
     combined = strip_ansi((out or "") + (err or ""))
     if rc != 0 or "unadmitted" in combined:
         res.bad("a commit to a file the rename never touched was refused rc=%d, which is the "
-                "whole repository wedged for writes: %s" % (rc, combined[-400:]))
+                "whole repository wedged for writes: %s" % (rc, failure_excerpt(combined)))
     else:
         res.ok("a later commit to an unrelated file still lands")
 
@@ -3776,29 +4062,28 @@ def check_23(suite):
         res.bad(miss)
         return res
     focal = live_refs.get("focal_entity") or {}
-    if (focal.get("name") != RELIMPORT_LIVE_FUNCTION
-            or not (focal.get("file_path") or "").endswith("pkg/store.py")):
+    if not is_relimport_live_focal(focal):
         res.bad("find_references(%s) resolved the wrong focal: %r"
                 % (RELIMPORT_LIVE_FUNCTION, focal))
         return res
     expected_callers = [
         row for row in live_refs.get("references") or []
         if row.get("name") == "main"
-        and (row.get("file_path") or "").endswith("pkg/cli.py")
+        and (projection_path(row) or "").endswith("pkg/cli.py")
         and "calls" in (row.get("relation_kinds") or [])
     ]
     if not expected_callers:
-        res.bad("find_references(%s, calls) did not return main @ pkg/cli.py; "
+        res.bad("find_references(%s, calls) did not return main projected into pkg/cli.py; "
                 "the live edge precondition is absent. Rows: %r"
                 % (RELIMPORT_LIVE_FUNCTION, live_refs.get("references") or []))
         return res
-    res.ok("graph truth contains %s and its incoming main @ pkg/cli.py Calls edge"
+    res.ok("graph truth contains %s and its incoming Calls edge from main, projected into pkg/cli.py"
            % RELIMPORT_LIVE_FUNCTION)
 
     clean, listed = listed_rows(repo)
     if clean["rc"] != 0:
         res.bad("kin dead-code exited %d on the clean fixture: %s"
-                % (clean["rc"], clean["raw"].strip()[-300:] or "(no output)"))
+                % (clean["rc"], failure_excerpt(clean["raw"]) or "(no output)"))
         return res
     verdict = ""
     for line in clean["raw"].splitlines():
@@ -3807,10 +4092,12 @@ def check_23(suite):
             verdict = stripped
             break
     if not verdict:
-        excerpt = " / ".join(line.strip() for line in clean["raw"].splitlines()
-                             if line.strip() and "WARN" not in line)
+        unwarned = "\n".join(line for line in clean["raw"].splitlines()
+                              if "WARN" not in line)
+        excerpt = " / ".join(line.strip() for line in failure_excerpt(unwarned).splitlines()
+                             if line.strip())
         res.unknown("kin dead-code rc=%d printed no verdict sentence this suite can read: %s"
-                    % (clean["rc"], excerpt[-300:] or "(no output)"))
+                    % (clean["rc"], excerpt or "(no output)"))
         return res
     # `Found N unreferenced entities, M of them UNVERIFIED:` also starts with
     # `Found `, and it is not a confident verdict. Both halves are required.
@@ -3945,7 +4232,7 @@ def check_24(suite):
     notes = strip_ansi(err)
     if rc != 0 or not rows.strip():
         res.unknown("`kin locate` on a symbol this fixture defines exited %d with no rows: %s"
-                    % (rc, notes[-300:]))
+                    % (rc, failure_excerpt(notes)))
         return res
 
     note_lines = [line for line in notes.splitlines() if line.strip().startswith("\u26a0")]
@@ -4003,7 +4290,7 @@ def check_24(suite):
     off_notes = strip_ansi(err_o)
     off_rows = [line for line in off.splitlines() if line.strip() and "[" in line]
     if rc_o != 0:
-        res.unknown("the off-topic control exited %d: %s" % (rc_o, off_notes[-200:]))
+        res.unknown("the off-topic control exited %d: %s" % (rc_o, failure_excerpt(off_notes)))
     elif not off_rows:
         # Not a pass. "No relevant files found." is an honest answer, and it is
         # also the one state in which this arm cannot grade the floor note it
@@ -4029,7 +4316,7 @@ def check_24(suite):
     rc_d, out_d, _ = suite.kin_run(["deps", "--all"], repo)
     deps = strip_ansi(out_d)
     if rc_d != 0:
-        res.unknown("`kin deps --all` exited %d: %s" % (rc_d, deps[-200:]))
+        res.unknown("`kin deps --all` exited %d: %s" % (rc_d, failure_excerpt(deps)))
     else:
         caveat = [line for line in deps.splitlines() if "predate" in line or "before this build" in line]
         repo_id = os.path.basename(repo)
@@ -4066,7 +4353,7 @@ def check_25(suite):
             ["graph", "materialize", "--json"], repo)
         if rc != 0:
             res.bad("%s exited %d: %s" %
-                    (label, rc, (err or out).strip()[-300:]))
+                    (label, rc, failure_excerpt(err or out)))
             return None
         try:
             payload = json.loads(out)
@@ -4265,7 +4552,7 @@ def main(argv):
                 res = fn(suite)
             except Exception as exc:
                 res = Result(check_id, "?", "harness failure")
-                res.unknown("%s: %s" % (type(exc).__name__, str(exc)[:200]))
+                res.unknown("%s: %s" % (type(exc).__name__, failure_excerpt(str(exc))))
             # A check that falls off the end returns None, which is legal Python and
             # survives every syntax check, then dies four lines down dereferencing
             # `res.id` with an AttributeError that names neither the check nor the

@@ -35,6 +35,14 @@ pub struct ServerLaunch {
     /// Environment variables set on the server process, beside the inherited
     /// environment.
     pub env: Vec<(String, String)>,
+    /// What a proof context records for a variable in [`Self::env`] whose value
+    /// names a file Kin wrote for the server, in place of that value: what the
+    /// file tells the server, with its paths relative to the workspace. A
+    /// proof then follows what the server was told rather than where the file
+    /// lives, which is named after the repository's absolute path, so a store
+    /// moved or copied elsewhere keeps its proofs. A variable not named here is
+    /// recorded as its value.
+    pub env_identity: Vec<(String, String)>,
     /// What this configuration is, in a few words, for logs and for the proof
     /// of which configuration answered.
     pub label: String,

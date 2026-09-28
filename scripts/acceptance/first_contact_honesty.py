@@ -105,6 +105,64 @@ def flatten(text):
     return " ".join(strip_ansi(text).split())
 
 
+# BEGIN failure evidence excerpt
+# Every suite carries this block byte for byte, because a suite is also copied
+# out and run as a single file. test_failure_excerpt.py keeps the copies equal.
+EVIDENCE_LIMIT = 4000
+EVIDENCE_LINE_LIMIT = 600
+EVIDENCE_PANICS = ("panicked at", "has overflowed its stack")
+EVIDENCE_ESCAPES = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+EVIDENCE_ERROR = re.compile(r"^(?:[\w./-]+:\s*)?(?:error|fatal)\b", re.IGNORECASE)
+EVIDENCE_LOG_ERROR = re.compile(r"\sERROR\s")
+
+
+def failure_excerpt(text, limit=EVIDENCE_LIMIT):
+    """Bounded evidence from a command's output that still says why it failed.
+
+    Output that fits is returned whole. Longer output keeps its opening and its
+    end, and between them every line that carries a Rust panic, with the
+    message line under it, and the last error line, wherever they fall. A
+    warning printed around the error cannot push it out, and a long log cannot
+    cut the panic out. `limit` only ever raises the bound, never lowers it.
+    """
+    text = (text or "").strip()
+    limit = max(int(limit), EVIDENCE_LIMIT)
+    if len(text) <= limit:
+        return text
+    head_end = limit // 4
+    tail_start = len(text) - limit // 2
+    lines = text.split("\n")
+    starts, offset = [], 0
+    panics, errors = [], []
+    for index, line in enumerate(lines):
+        starts.append(offset)
+        offset += len(line) + 1
+        plain = EVIDENCE_ESCAPES.sub("", line).strip()
+        if any(marker in plain for marker in EVIDENCE_PANICS):
+            panics.extend((index, index + 1))
+        if EVIDENCE_ERROR.match(plain) or EVIDENCE_LOG_ERROR.search(plain):
+            errors.append(index)
+    # The first panic and its message, then the last error line, then any
+    # later panics, for as long as the middle's share of the bound lasts.
+    order = panics[:2] + errors[-1:] + panics[2:]
+    budget, kept = limit // 4, set()
+    for index in order:
+        if index >= len(lines) or index in kept:
+            continue
+        start, end = starts[index], starts[index] + len(lines[index])
+        if end <= head_end or start >= tail_start:
+            continue
+        cost = min(len(lines[index]), EVIDENCE_LINE_LIMIT) + 1
+        if cost > budget:
+            continue
+        kept.add(index)
+        budget -= cost
+    middle = [lines[index][:EVIDENCE_LINE_LIMIT] for index in sorted(kept)]
+    parts = [text[:head_end], "[...]"] + middle + (["[...]"] if middle else [])
+    return "\n".join(parts + [text[tail_start:]])
+# END failure evidence excerpt
+
+
 def run(cmd, cwd=None, env=None, timeout=600, stdin_text=None):
     """(rc, stdout, stderr), never raising on a non-zero exit."""
     try:
@@ -481,7 +539,7 @@ def check_0(suite):
     res = Result("0", "FIR-2627", "kin commit --help names Kin authority and the git relationship")
     rc, out, err = run([suite.kin, "commit", "--help"], env=suite.base_env(), timeout=120)
     if rc != 0:
-        res.unknown("`kin commit --help` exited %d: %s" % (rc, flatten(err)[:200]))
+        res.unknown("`kin commit --help` exited %d: %s" % (rc, flatten(failure_excerpt(err))))
         return res
     ok, detail = grade_commit_help(out + "\n" + err)
     if ok is None:
@@ -550,7 +608,7 @@ def check_1(suite):
                        cwd=work, env=suite.npm_env(home), timeout=600)
     tarballs = [f for f in os.listdir(work) if f.endswith(".tgz")]
     if rc != 0 or not tarballs:
-        res.unknown("npm pack failed (%d): %s" % (rc, flatten(err)[:200]))
+        res.unknown("npm pack failed (%d): %s" % (rc, flatten(failure_excerpt(err))))
         return res
     tarball = os.path.join(work, tarballs[0])
 
@@ -575,7 +633,7 @@ def check_1(suite):
         return res
     if "EACCES" not in combined and "permission denied" not in combined.lower():
         res.unknown("the global install failed for a reason that is not the "
-                    "refusal under test: %s" % combined[:200])
+                    "refusal under test: %s" % flatten(failure_excerpt(out + "\n" + err)))
         return res
     res.ok("npm install -g is refused here exactly as it is in the stranger's container")
 
@@ -609,10 +667,12 @@ def check_1(suite):
     said = flatten(out + " " + err)
     if rc != 0:
         res.bad("the README's leading install block failed (%d) on a host whose "
-                "global npm prefix is refused: %s" % (rc, said[:250]))
+                "global npm prefix is refused: %s"
+                % (rc, flatten(failure_excerpt(out + "\n" + err))))
         return res
     if not re.search(r"\bkin\b.*\d+\.\d+\.\d+", said):
-        res.bad("the block ran but never printed a kin version: %s" % said[:250])
+        res.bad("the block ran but never printed a kin version: %s"
+                % flatten(failure_excerpt(out + "\n" + err)))
         return res
     res.ok("the README's leading block reached a working kin --version with the "
            "global prefix refused (download stubbed by KIN_NO_PROVISION)")
@@ -721,7 +781,7 @@ def doctor_report(suite, extra_env=None):
     rc, out, err = run([suite.kin, "doctor", "--json"], cwd=work, env=env, timeout=600)
     if not out.strip():
         return None, "`kin doctor --json` exited %d and printed nothing: %s" % (
-            rc, flatten(err)[:200])
+            rc, flatten(failure_excerpt(err)))
     try:
         return json.loads(strip_ansi(out)), ""
     except ValueError as exc:
@@ -1099,7 +1159,7 @@ def check_4(suite):
         rc, out, err = run([suite.kin, "init", "."], cwd=work, env=env, timeout=900)
         if rc != 0:
             res.unknown("kin init exited %d in the fixture repository: %s"
-                        % (rc, flatten(err)[:220]))
+                        % (rc, flatten(failure_excerpt(err))))
             return res
         # The repair installs servers only for the languages the repository
         # uses, so the fixture has to hold Rust for the Rust route to be taken.
@@ -1256,12 +1316,13 @@ def grade_unbound_start(verdict, alive, stderr_text, stdout_lines, kin_created):
         return None, ("the server neither answered `initialize` nor exited inside the "
                       "budget, so this run says nothing about either behaviour")
     if verdict.startswith("SPAWN_FAILED"):
-        return None, "the wrapper could not be started at all: %s" % flatten(stderr_text)[:200]
+        return None, ("the wrapper could not be started at all: %s"
+                      % flatten(failure_excerpt(stderr_text)))
     if verdict == MCP_EOF:
         return False, (
             "`initialize` got EOF with no response in a directory holding no `.kin/`, which "
             "is the advertised MCP entry dying before a first-time user has a repository: %s"
-            % flatten(stderr_text)[:220])
+            % flatten(failure_excerpt(stderr_text)))
     if not alive:
         return False, ("`initialize` was answered and the process was gone immediately after, "
                        "so a client gets one frame and a dead server")
@@ -1279,12 +1340,13 @@ def grade_unbound_start(verdict, alive, stderr_text, stdout_lines, kin_created):
     flat = flatten(stderr_text)
     if UNBOUND_NOTICE not in flat:
         return False, ("the server started and never said that no repository is bound, so the "
-                       "user is served an empty graph with no explanation: %s" % flat[:220])
+                       "user is served an empty graph with no explanation: %s"
+                       % flatten(failure_excerpt(stderr_text)))
     missing = [repair for repair in UNBOUND_REPAIRS if repair not in flat]
     if missing:
         return False, ("the notice does not name %s, so a reader whose only Kin is this npx "
                        "wrapper is told something is wrong and not what they can run: %s"
-                       % (" or ".join(missing), flat[:220]))
+                       % (" or ".join(missing), flatten(failure_excerpt(stderr_text))))
     return True, ("`initialize` was served, the process stayed up, no repository was created "
                   "behind the user, and the notice named the gap and the repair on stderr")
 
@@ -1485,7 +1547,7 @@ def grade_skipped_language_outcome(output, expected_files=None):
     at = _outcome_reported(flat)
     if at is None:
         return None, ("the run never reported a sweep outcome at all, so its silence about a "
-                      "skipped language is not evidence: %s" % flat[-220:])
+                      "skipped language is not evidence: %s" % flatten(failure_excerpt(output)))
     claimed = [claim for claim in COMPLETION_CLAIMS if claim in flat]
     if claimed:
         return False, ("the pass reported a completion while a language went unserved, which "
@@ -1515,7 +1577,7 @@ def grade_served_sweep_outcome(output):
     at = _outcome_reported(flat)
     if at is None:
         return None, ("the control never reported a sweep outcome at all, so it constrains "
-                      "nothing: %s" % flat[-220:])
+                      "nothing: %s" % flatten(failure_excerpt(output)))
     if SKIP_ROW.search(flat):
         return False, ("the control names a skipped language on a run where every server "
                        "started, so the outcome reports a skip whatever happened: %s"
@@ -1563,8 +1625,8 @@ def _fixture_repository(suite, name):
     for args in (["init", "-q", "."], ["add", "-A"], ["commit", "-q", "-m", "fixture"]):
         rc, _, err = run(common + args, cwd=work, timeout=300)
         if rc != 0:
-            return None, "could not build the fixture repository (%s): %s" % (args[0],
-                                                                             flatten(err)[:200])
+            return None, "could not build the fixture repository (%s): %s" % (
+                args[0], flatten(failure_excerpt(err)))
     return work, "three Rust and three TypeScript files under one commit"
 
 
@@ -1647,7 +1709,8 @@ def check_6(suite):
     rc, out, err = run([suite.kin, "init", "."], cwd=work, env=skipped_env, timeout=1800)
     combined = (out or "") + "\n" + (err or "")
     if rc != 0:
-        res.unknown("kin init exited %d on the fixture: %s" % (rc, flatten(err)[-260:]))
+        res.unknown("kin init exited %d on the fixture: %s"
+                    % (rc, flatten(failure_excerpt(err))))
         return res
     ok, detail = grade_skipped_language_outcome(combined, RUST_FIXTURE_FILES)
     if ok is None:
@@ -1663,7 +1726,7 @@ def check_6(suite):
     rc, out, err = run([suite.kin, "daemon", "sweep"], cwd=work, env=skipped_env, timeout=1800)
     sweep_output = (out or "") + "\n" + (err or "")
     if rc != 0:
-        res.unknown("kin daemon sweep exited %d: %s" % (rc, flatten(err)[-260:]))
+        res.unknown("kin daemon sweep exited %d: %s" % (rc, flatten(failure_excerpt(err))))
         return res
     ok, detail = grade_skipped_language_outcome(sweep_output, RUST_FIXTURE_FILES)
     if ok is None:
@@ -1690,7 +1753,8 @@ def check_6(suite):
     rc, out, err = run([suite.kin, "init", "."], cwd=control, env=control_env, timeout=1800)
     control_output = (out or "") + "\n" + (err or "")
     if rc != 0:
-        res.unknown("the control kin init exited %d: %s" % (rc, flatten(err)[-260:]))
+        res.unknown("the control kin init exited %d: %s"
+                    % (rc, flatten(failure_excerpt(err))))
         return res
     ok, detail = grade_served_sweep_outcome(control_output)
     if ok is None:
@@ -1771,7 +1835,8 @@ def check_7(suite):
     rc, out, err = run([suite.kin, "doctor"], cwd=work, env=env, timeout=600)
     page = flatten(strip_ansi(out or ""))
     if not page:
-        res.unknown("`kin doctor` exited %d and printed no page: %s" % (rc, flatten(err)[:200]))
+        res.unknown("`kin doctor` exited %d and printed no page: %s"
+                    % (rc, flatten(failure_excerpt(err))))
         return res
     claims_ready = "First-run ready" in page
     if claims_ready != bool(report.get("healthy")):

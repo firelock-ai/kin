@@ -291,6 +291,7 @@ pub(crate) async fn run_health_checks_sharing(graph_status: &RunGraphStatus) -> 
         check_vfs_projection(),
         check_projection_mode(),
         check_repo_init(),
+        check_commit_author(),
         check_session_runtime(),
         check_shell_path(),
         check_registry_authority(),
@@ -2225,6 +2226,51 @@ pub(crate) fn reclaim_stranded_stages_in(roots: &[PathBuf], json: bool) -> anyho
 
 /// Schema of the `--reclaim-staging --json` payload.
 pub const STRANDED_STAGE_RECLAIM_SCHEMA: &str = "kin.stranded-stage-reclaim.v1";
+
+fn check_commit_author() -> HealthCheck {
+    let cwd = env::current_dir().unwrap_or_default();
+    let layout = kin_core::KinLayout::discover(&cwd)
+        .unwrap_or_else(|| kin_core::KinLayout::new(cwd.join(".kin")));
+    commit_author_check_for(&layout)
+}
+
+fn commit_author_check_for(layout: &kin_core::KinLayout) -> HealthCheck {
+    commit_author_check(kin_core::resolve_commit_identity(layout))
+}
+
+fn commit_author_check(
+    resolved: Result<kin_core::CommitIdentity, kin_core::KinError>,
+) -> HealthCheck {
+    match resolved {
+        Ok(identity) => HealthCheck::new(
+            "commit_author",
+            "Author",
+            HealthStatus::Healthy,
+            format!("configured through {}", identity.source.id()),
+        ),
+        Err(error) => {
+            let detail = error.to_string();
+            if super::is_missing_author_identity(&error) {
+                HealthCheck::new(
+                    "commit_author",
+                    "Author",
+                    HealthStatus::Missing,
+                    "not configured; changes cannot be admitted or committed",
+                )
+                .with_manual_fix(kin_core::IDENTITY_REMEDIATION)
+            } else {
+                // An invalid explicit override must be repaired at its source;
+                // setting Git cannot override it. Preserve the resolver's advice.
+                HealthCheck::new(
+                    "commit_author",
+                    "Author",
+                    HealthStatus::Misconfigured,
+                    detail,
+                )
+            }
+        }
+    }
+}
 
 fn check_repo_init() -> HealthCheck {
     let cwd = env::current_dir().unwrap_or_default();
@@ -4716,6 +4762,9 @@ fn missing_language_servers(
             Some(LanguageServerReadiness::Unusable { reason }) => Some(format!(
                 "{language} (installed but it did not start: {reason})"
             )),
+            // Switched-off enrichment says nothing about what is installed, so
+            // it is not reported as a missing server either.
+            Some(LanguageServerReadiness::Disabled) => None,
             Some(LanguageServerReadiness::Absent) | None => {
                 Some(format!("{language} ({})", binaries.join(" or ")))
             }
@@ -6128,6 +6177,27 @@ mod tests {
     use kin_core::test_env::EnvVarGuard;
     use serial_test::serial;
 
+    #[test]
+    fn author_health_distinguishes_missing_from_misplaced_configuration() {
+        let missing = commit_author_check(Err(kin_core::KinError::Config(
+            kin_core::unresolved_identity_message(),
+        )));
+        assert!(matches!(missing.status, HealthStatus::Missing));
+        assert_eq!(
+            missing.manual_fix.as_deref(),
+            Some(kin_core::IDENTITY_REMEDIATION)
+        );
+        let detail = kin_core::identity::misplaced_identity_message("resources");
+        let misplaced = commit_author_check(Err(kin_core::KinError::Config(detail.clone())));
+        assert!(matches!(misplaced.status, HealthStatus::Misconfigured));
+        assert_eq!(misplaced.detail, format!("config error: {detail}"));
+        assert!(misplaced.detail.contains("Move the line to the top level"));
+        assert!(
+            misplaced.manual_fix.is_none(),
+            "do not replace the specific repair with generic commands"
+        );
+    }
+
     /// A Kin block that names a tool its client's profile does not serve fails
     /// its row, says which names and which profile, and says how to fix it; a
     /// block that matches passes.
@@ -6839,8 +6909,22 @@ mod tests {
         let (stage, owner) =
             kin_core::init::strand_repository_stage(&parent, &corpus.join(".kin")).unwrap();
 
-        let check =
-            stranded_init_stage_check_for(&kin_core::init_attempt::staging_scan_roots(&corpus));
+        let roots = kin_core::init_attempt::staging_scan_roots(&corpus);
+        // A sibling test's fork can briefly retain the fixture's owner lock
+        // after strand_repository_stage drops its descriptor. Establish the
+        // abandoned-stage premise before testing the health row, as the core
+        // survey tests do, without changing the production liveness rule.
+        let mut survey = survey_stranded_stages(&roots);
+        for _ in 0..40 {
+            if survey.live == 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            survey = survey_stranded_stages(&roots);
+        }
+        assert_eq!(survey.live, 0, "fixture owner lock stayed live: {survey:?}");
+
+        let check = stranded_init_stage_check_for(&roots);
         assert!(matches!(check.status, HealthStatus::Degraded), "{check:?}");
         assert!(
             check.detail.contains(&stage.display().to_string()),
@@ -7872,6 +7956,7 @@ mod tests {
     /// A healthy response for the fetch tests to hand back.
     fn answered_graph_status() -> GraphStatusForRun {
         GraphStatusForRun::Answered(Box::new(crate::commands::graph::GraphCommandResponse {
+            enrichment: None,
             lines: vec!["graph status".to_string()],
             error: None,
             source: None,
@@ -8170,6 +8255,7 @@ mod tests {
             Box::pin(async {
                 GraphStatusForRun::Answered(Box::new(
                     crate::commands::graph::GraphCommandResponse {
+                        enrichment: None,
                         lines: vec!["graph status".to_string()],
                         error: None,
                         source: None,
@@ -13045,6 +13131,7 @@ mod tests {
             expected_bytes: Some(crate::embed_model::DEFAULT_EMBED_MODEL_BYTES),
             fetching: false,
             no_fetch_reason: None,
+            declined: false,
             relocated_hf_home: None,
         }
     }

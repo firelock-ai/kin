@@ -272,7 +272,9 @@ fn list(
         authority_generation: lease.roots().generation,
         workspace_id: workspace.workspace_id,
         workspace_generation: workspace.generation,
-        workspace_dirty: workspace.is_dirty(),
+        // The same reading `stash push` gates on, so a list that says clean
+        // and a push that finds nothing to seal cannot disagree.
+        workspace_dirty: workspace.holds_uncommitted_work(),
         entries,
     };
     Ok(StashResponse {
@@ -310,7 +312,10 @@ fn push(
     let roots = lease.roots().clone();
     let metadata = lease.metadata();
     let workspace = local_workspace(authority, metadata)?.clone();
-    if !workspace.is_dirty() {
+    // Language-server enrichment in the overlay is Kin's derived state, not
+    // work to set aside: sealing it would publish a stash of nothing the
+    // author did.
+    if !workspace.holds_uncommitted_work() {
         return Err(stash_conflict(
             "workspace holds no graph-owned changes to seal; its exact tree and semantics already \
              match its authority base",
@@ -765,7 +770,9 @@ fn pop(
         .with_context(|| format!("resolve exact sealed change for stash {stash_ref}"))?;
     let sealed_change = sealed_change(&lease, &stash_ref, sealed_change_id)?;
 
-    if workspace.is_dirty() {
+    // Derived language-server enrichment is not state a stash has to seal: a
+    // daemon re-derives it for the restored tree.
+    if workspace.holds_uncommitted_work() {
         return Err(stash_conflict(format!(
             "workspace {} holds graph-owned changes of its own; restoring {stash_ref} over them \
              would discard state no stash sealed. Seal or discard the current workspace first",

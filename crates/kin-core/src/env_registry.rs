@@ -249,6 +249,7 @@ pub const OPERATIONAL: &[EnvVarSpec] = &[
     EnvVarSpec { name: "KIN_DAEMON_SHUTDOWN_FLUSH_SECS", kind: Kind::Secs, default: "300", sensitivity: Sensitivity::Operational, summary: "how long shutdown waits for the final persistence flush before giving up on it" },
     EnvVarSpec { name: "KIN_DAEMON_LSP_FILE_BUDGET_SECS", kind: Kind::Secs, default: "120", sensitivity: Sensitivity::Operational, summary: "wall-clock budget for one file's language-server definitions pass; an overrun is counted and the file gets no definitions from that pass" },
     EnvVarSpec { name: "KIN_DAEMON_PASS_STALL_SECS", kind: Kind::Secs, default: "600", sensitivity: Sensitivity::Operational, summary: "how long a background pass may run without recording durable progress before the daemon stops it; 0 disables stopping" },
+    EnvVarSpec { name: "KIN_DAEMON_EMBED_MEMORY_HOLD_SECS", kind: Kind::Secs, default: "1200", sensitivity: Sensitivity::Operational, summary: "how long a daemon stays up for an embedding pass memory pressure is holding back, so the pass resumes when memory frees; 0 lets it idle out at once" },
     EnvVarSpec { name: "KIN_DAEMON_PASS_RETRY_BUDGET_SECS", kind: Kind::Secs, default: "1800", sensitivity: Sensitivity::Operational, summary: "cumulative retry delay a failing background pass may spend before it is parked with an announced reason; 0 disables parking" },
     EnvVarSpec { name: "KIN_ALLOW_DAEMON_BOOTSTRAP_ADMIN", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Operational, summary: "allow the CLI to bootstrap an admin-scoped daemon" },
     EnvVarSpec { name: "KIN_STRICT_BEHAVIOR_ENV", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Operational, summary: "escalate a CLI/daemon behavior-env divergence from a warning to a hard error" },
@@ -459,6 +460,7 @@ pub const DOWNSTREAM: &[EnvVarSpec] = &[
     EnvVarSpec { name: "KIN_EMBED_BATCH_TRACE", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Diagnostic, summary: "kin-db per-sub-batch embedding shape and forward-timing trace; any non-empty value other than '0' enables it" },
     EnvVarSpec { name: "KIN_EMBED_TEST_FORCE_METAL_OOM", kind: Kind::Usize, default: "", sensitivity: Sensitivity::Diagnostic, summary: "kin-db fault injection: replaces the first N Metal embedding dispatches with a synthetic out-of-memory so the CPU-degrade retry path can be exercised; unset or non-positive disarms it" },
     EnvVarSpec { name: "KIN_DAEMON_TEST_STARTUP_HOLD_SECS", kind: Kind::Secs, default: "", sensitivity: Sensitivity::Diagnostic, summary: "kin-daemon fault injection: hold the endpoint unpublished for N seconds at startup, so a client's startup binding stays PENDING past the tools/call grace and the still-starting disclosure is reachable; unset or zero disarms it" },
+    EnvVarSpec { name: "KIN_DAEMON_TEST_STARTUP_GATE", kind: Kind::Path, default: "", sensitivity: Sensitivity::Diagnostic, summary: "kin-daemon fault injection: while the named file exists, hold a starting daemon before it opens any state, so it holds its repository with no endpoint published until the file is removed; unset or empty disarms it" },
     EnvVarSpec { name: "KIN_DAEMON_TEST_HOLD_ENRICHMENT_SWEEP", kind: Kind::Bool, default: "0", sensitivity: Sensitivity::Diagnostic, summary: "kin-daemon fault injection: refuse to admit the LSP enrichment sweep at start, so cross-file edges never publish and a reference answer is thin rather than late; off by default" },
     // ---- kin-db: lexical ranking weight ---------------------------------------
     EnvVarSpec { name: "KIN_LOCATE_WEIGHT_FILE_PATH", kind: Kind::NonNegF32, default: "0", sensitivity: Sensitivity::Correctness, summary: "kin-db BM25 field weight for the file path; 0 (the default) keeps file paths out of lexical scoring so entities rank on names, signatures, and bodies, and any positive value indexes path text and changes ranking" },
@@ -868,7 +870,11 @@ pub fn enforce_startup_env() -> Result<(), String> {
     if !report.non_default.is_empty() {
         if report.non_default.len() <= 12 {
             for f in &report.non_default {
-                tracing::warn!(var = %f.var, "correctness-relevant override active: {} {}", f.var, f.message);
+                // The value and its default, on one line. The lever's full
+                // description is `docs/env-vars.md`'s, and repeating it on
+                // every command a person runs buried the answer under it.
+                let headline = f.message.split("; ").next().unwrap_or(&f.message);
+                tracing::warn!(var = %f.var, "correctness-relevant override active: {} {}", f.var, headline);
             }
         } else {
             let names: Vec<&str> = report.non_default.iter().map(|f| f.var.as_str()).collect();

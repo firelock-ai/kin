@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-//! Daemon-owned on-demand trigger for one complete exact-tree admission.
+//! Daemon-owned complete exact-tree admission for requests and watcher recovery.
 //!
 //! This module runs no admission of its own. It calls the same
 //! [`crate::loop_runner::sync_filesystem_with_graph`] seam the watch loop and
@@ -227,6 +227,23 @@ fn watcher_loss_this_pass_can_cover(state: &DaemonState) -> crate::watcher_loss:
 }
 
 async fn run_pass(state: &DaemonState) -> Result<AdmitResponse> {
+    run_pass_with_loss_checkpoint(state, || true).await
+}
+
+/// Recover a pathless watcher loss through the same complete admission as an
+/// explicit request. The loop samples its watcher once more before recovery is
+/// recorded, so a signal delivered during the pass cannot be cleared unseen.
+pub(crate) async fn recover_watcher_loss(
+    state: &DaemonState,
+    checkpoint: impl FnOnce() -> bool,
+) -> Result<AdmitResponse> {
+    run_pass_with_loss_checkpoint(state, checkpoint).await
+}
+
+async fn run_pass_with_loss_checkpoint(
+    state: &DaemonState,
+    checkpoint: impl FnOnce() -> bool,
+) -> Result<AdmitResponse> {
     let repository_id =
         crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(state)?
             .repository_id()
@@ -289,6 +306,7 @@ async fn run_pass(state: &DaemonState) -> Result<AdmitResponse> {
     // on exactly the path where an operator most needs to know it did.
     // `summary_lines` derives its wording from the two sides instead.
     let after = census(state);
+    let loss_checkpoint_persisted = checkpoint();
 
     // The durable freshness marker is stamped from the after side, and only for
     // a pass that succeeded. Stamping a failed pass would record that the store
@@ -296,23 +314,25 @@ async fn run_pass(state: &DaemonState) -> Result<AdmitResponse> {
     // freshness this marker exists to prevent, reached by the other door.
     if failure.is_none() {
         crate::background_work::record_durable_admission(&state.layout, after.tracked as u64);
-        // The only path in the product that clears a watcher loss, and
-        // deliberately not the line above it. The ambient watch tick reaches
-        // `record_durable_admission` too, and an ambient tick admits what the
-        // watcher told it about, which for a loss that named no path is nothing
-        // at all. Putting the clear there would let every 100ms tick heal a gap
-        // no tick ever observed. This module is the explicit request, which is
-        // what the contract requires: fail loud, and let a person or an agent
-        // decide to admit.
-        crate::watcher_loss::record_recovery(&state.layout, watcher_loss);
+        // Only the full, unbounded admission covers a pathless loss. Ordinary
+        // watch ticks also stamp the durable marker, but observe only named
+        // paths and must never clear this record. A failed checkpoint leaves
+        // the old loss standing even if its newer signal could not be saved.
+        if loss_checkpoint_persisted {
+            crate::watcher_loss::record_recovery(&state.layout, watcher_loss);
+        }
     }
-    // Refreshed whatever the outcome, and before the report below reads the
+    // Refreshed whatever the admission outcome, and before the report reads the
     // reconcile surface, so `kin admit` answers with the state its own pass
-    // left rather than the state it found.
-    probes.record_watcher_loss(crate::watcher_loss::standing(
-        &state.layout,
-        state.layout.working_dir(),
-    ));
+    // left rather than the state it found. A failed checkpoint has already
+    // disclosed its unpersisted signal; rereading the older durable record
+    // must not overwrite that disclosure.
+    if loss_checkpoint_persisted {
+        probes.record_watcher_loss(crate::watcher_loss::standing(
+            &state.layout,
+            state.layout.working_dir(),
+        ));
+    }
 
     let embeddings = state.graph.embedding_status();
     let report = AdmitReport {
@@ -375,17 +395,16 @@ mod tests {
         Arc::new(DaemonState::open(init.layout).unwrap())
     }
 
-    /// The founder's contract in one test: rescan loss fails loud, and only an
-    /// explicit `kin admit` clears it.
+    /// Rescan loss stays visible until a completed full admission covers it.
     ///
     /// The bounded half is driven through the SAME seam and the SAME success
     /// bookkeeping the watch loop runs, `sync_filesystem_with_graph` followed by
     /// `record_admission_success` and `record_durable_admission`, because that
     /// is where a clearing call would most naturally be put and where it must
-    /// not be. Both paths reach that bookkeeping; only this module is the
-    /// explicit one.
+    /// not be. Both paths reach that bookkeeping; only this module captures
+    /// and recovers the generation its full pass covered.
     #[tokio::test]
-    async fn only_an_explicit_full_admission_clears_a_watcher_loss() {
+    async fn only_a_completed_full_admission_clears_a_watcher_loss() {
         let repo = tempfile::tempdir().unwrap();
         let state = open_test_state(&repo);
         std::fs::write(
@@ -430,6 +449,63 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn automatic_recovery_keeps_a_newer_loss_and_then_admits_its_source() {
+        use kin_model::EntityStore as _;
+
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        let source = repo.path().join("lost.rs");
+        std::fs::write(&source, "pub fn before_loss() {}\n").unwrap();
+        watcher_loss::record_loss(&state.layout, 1, Some("first loss"));
+
+        let first = recover_watcher_loss(&state, || {
+            // This edit arrived after the pass observed its tree. Its pathless
+            // loss must survive that pass, even though admission succeeded.
+            std::fs::write(&source, "pub fn after_loss() {}\n").unwrap();
+            watcher_loss::record_loss(&state.layout, 1, Some("loss during recovery"))
+        })
+        .await
+        .unwrap();
+        assert!(first.report.unwrap().admitted);
+        let watcher_loss::WatcherLossRead::Recorded(loss) = watcher_loss::read(&state.layout)
+        else {
+            panic!("the newer loss must remain durable");
+        };
+        assert_eq!((loss.generation, loss.recovered_through), (2, 0));
+        let names = || {
+            state
+                .graph
+                .query_entities(&kin_model::EntityFilter {
+                    file_path: Some(kin_model::FilePathId::new("lost.rs")),
+                    ..Default::default()
+                })
+                .unwrap()
+                .into_iter()
+                .map(|entity| entity.name)
+                .collect::<Vec<_>>()
+        };
+        assert!(names().iter().any(|name| name == "before_loss"));
+        assert!(!names().iter().any(|name| name == "after_loss"));
+
+        let second = recover_watcher_loss(&state, || true).await.unwrap();
+        assert!(second.report.unwrap().admitted);
+        assert!(names().iter().any(|name| name == "after_loss"));
+        assert!(!names().iter().any(|name| name == "before_loss"));
+        assert!(!watcher_loss::read(&state.layout).recovery_required());
+    }
+
+    #[tokio::test]
+    async fn automatic_recovery_does_not_clear_after_a_failed_loss_checkpoint() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        watcher_loss::record_loss(&state.layout, 1, None);
+
+        let response = recover_watcher_loss(&state, || false).await.unwrap();
+        assert!(response.report.unwrap().admitted);
+        assert!(watcher_loss::read(&state.layout).recovery_required());
+    }
+
     /// A pass that FAILED clears nothing. Clearing before the outcome is known
     /// would report a recovered store on the one path where no recovery
     /// happened.
@@ -459,7 +535,9 @@ mod tests {
         }
         watcher_loss::record_loss(&state.layout, 1, None);
 
-        let response = execute(&state).await.expect("the pass reported an outcome");
+        let response = recover_watcher_loss(&state, || true)
+            .await
+            .expect("the automatic pass reported an outcome");
         let report = response.report.expect("a reported pass carries its report");
         assert!(
             !report.admitted,

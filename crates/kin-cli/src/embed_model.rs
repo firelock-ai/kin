@@ -82,6 +82,13 @@ pub struct EmbedModelFetch {
     /// names a local directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub no_fetch_reason: Option<String>,
+    /// `kin setup` recorded that this machine does not download the model, and
+    /// it is not in the cache, so nothing embeds until someone runs `kin embed`.
+    /// `no_fetch_reason` carries the sentence; this says which of its causes it
+    /// is, because only this one is a choice a query should name the way back
+    /// from.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub declined: bool,
     /// `HF_HOME`, when it is set and names a root the embedding loader does not
     /// read. A model pre-seeded there is not the one this build loads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -145,6 +152,7 @@ impl EmbedModelFetch {
             present,
             fetched_bytes,
             fetching: embed_pass_working && !present,
+            declined: declined.is_some(),
             no_fetch_reason: declined,
             relocated_hf_home: relocated_hf_home(base.as_deref()),
             model_id,
@@ -277,6 +285,16 @@ impl EmbedModelFetch {
     /// nothing about the query or the store was short, the weights had simply
     /// not arrived.
     pub fn retrieval_clause(&self) -> Option<String> {
+        // A choice, not a gap: nothing will arrive on its own, so the line says
+        // what is off and the one command that turns it on.
+        if self.declined {
+            return Some(format!(
+                "semantic search is off because this machine does not download the search \
+                 model, so these results use lexical and graph signals only; `kin embed` \
+                 downloads it ({}) and turns semantic search on",
+                self.expected_download()
+            ));
+        }
         if self.present || self.no_fetch_reason.is_some() {
             return None;
         }
@@ -402,6 +420,65 @@ fn declined_model_fetch_reason() -> Option<String> {
          `kin embed` starts the fetch if you change your mind"
             .to_string()
     })
+}
+
+/// Install the gate that stops this process from downloading a declined model.
+///
+/// `kin` and `kin-daemon` call this first thing. Every embed trigger, the
+/// daemon's background pass, a query, `kin init`'s first embed pass and
+/// `kin embed`, reaches the model through `kin-db`, and `kin-db` asks this gate
+/// before it downloads anything the cache does not hold. The decision is read
+/// again on every ask rather than once at startup, so a running daemon honours
+/// `kin embed` changing it.
+pub fn install_model_fetch_gate() {
+    kin_db::install_model_fetch_gate(model_fetch_gate);
+}
+
+fn model_fetch_gate(model_id: &str) -> Result<(), String> {
+    model_fetch_gate_in(crate::commands::setup::kin_dir().ok().as_deref(), model_id)
+}
+
+/// The gate's decision for the Kin home at `kin_home`.
+fn model_fetch_gate_in(kin_home: Option<&Path>, model_id: &str) -> Result<(), String> {
+    let declined = kin_home.and_then(recorded_model_fetch).as_deref() == Some(MODEL_FETCH_DECLINED);
+    if !declined {
+        return Ok(());
+    }
+    Err(format!(
+        "semantic search is off: `kin setup` recorded that this machine does not download the \
+         {model_id} search model, so it was not fetched; `kin embed` downloads it and turns \
+         semantic search on"
+    ))
+}
+
+/// Why an embed pass must not start on its own here: the download was declined
+/// and the model is not in the cache.
+///
+/// `None` whenever starting one would download nothing, or nobody declined. The
+/// recorded decision is read first, so a machine that never declined pays one
+/// small file read and no cache walk.
+pub fn declined_and_absent() -> Option<String> {
+    let kin_home = crate::commands::setup::kin_dir().ok()?;
+    if recorded_model_fetch(&kin_home).as_deref() != Some(MODEL_FETCH_DECLINED) {
+        return None;
+    }
+    let fetch = EmbedModelFetch::probe(false);
+    fetch
+        .declined
+        .then(|| fetch.no_fetch_reason.unwrap_or_default())
+}
+
+/// Record consent to the download, because someone asked for embeddings.
+///
+/// `kin embed` is the way back from a declined download, and every surface that
+/// reports the decline names it. Returns `true` when this changed a recorded
+/// decline, so the command can say it did.
+pub fn consent_to_model_fetch(kin_home: &Path) -> anyhow::Result<bool> {
+    if recorded_model_fetch(kin_home).as_deref() != Some(MODEL_FETCH_DECLINED) {
+        return Ok(false);
+    }
+    record_model_fetch(kin_home, MODEL_FETCH_DEFERRED)?;
+    Ok(true)
 }
 
 /// The model-fetch decision recorded for this machine, if one was.
@@ -596,6 +673,7 @@ mod tests {
             expected_bytes: Some(DEFAULT_EMBED_MODEL_BYTES),
             fetching: true,
             no_fetch_reason: None,
+            declined: false,
             relocated_hf_home: None,
         }
     }
@@ -978,5 +1056,103 @@ mod tests {
 
         guard.apply("KIN_EMBED_MODEL_ID", Some(""));
         assert_eq!(configured_model_id(), DEFAULT_EMBED_MODEL_ID);
+    }
+
+    /// A machine whose setup declined the download gets no fetch at all, and
+    /// the refusal names the way back.
+    #[test]
+    fn the_gate_refuses_a_declined_download_and_names_kin_embed() {
+        let home = tempfile::tempdir().unwrap();
+        record_model_fetch(home.path(), MODEL_FETCH_DECLINED).unwrap();
+        let refusal = model_fetch_gate_in(Some(home.path()), DEFAULT_EMBED_MODEL_ID)
+            .expect_err("a declined download is refused");
+        assert!(refusal.contains("semantic search is off"), "{refusal}");
+        assert!(refusal.contains("`kin embed`"), "{refusal}");
+    }
+
+    /// Everything that is not a decline downloads as it always did: the
+    /// recommended answer, no answer at all, and no resolvable home.
+    #[test]
+    fn the_gate_allows_every_answer_but_a_decline() {
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(
+            model_fetch_gate_in(Some(home.path()), DEFAULT_EMBED_MODEL_ID),
+            Ok(())
+        );
+        record_model_fetch(home.path(), MODEL_FETCH_DEFERRED).unwrap();
+        assert_eq!(
+            model_fetch_gate_in(Some(home.path()), DEFAULT_EMBED_MODEL_ID),
+            Ok(())
+        );
+        assert_eq!(model_fetch_gate_in(None, DEFAULT_EMBED_MODEL_ID), Ok(()));
+    }
+
+    /// `kin embed` is the way back, so it records consent over a decline and
+    /// leaves every other answer alone.
+    #[test]
+    fn asking_for_embeddings_turns_a_decline_into_consent() {
+        let home = tempfile::tempdir().unwrap();
+        assert!(
+            !consent_to_model_fetch(home.path()).unwrap(),
+            "nothing to change"
+        );
+        assert_eq!(recorded_model_fetch(home.path()), None);
+
+        record_model_fetch(home.path(), MODEL_FETCH_DECLINED).unwrap();
+        assert!(consent_to_model_fetch(home.path()).unwrap());
+        assert_eq!(
+            recorded_model_fetch(home.path()).as_deref(),
+            Some(MODEL_FETCH_DEFERRED)
+        );
+        assert_eq!(
+            model_fetch_gate_in(Some(home.path()), DEFAULT_EMBED_MODEL_ID),
+            Ok(())
+        );
+    }
+
+    /// A query over a machine that declined the model says, in one line, that
+    /// semantic search is off and which command turns it on.
+    #[test]
+    fn a_declined_model_gives_a_query_one_plain_line() {
+        let declined = EmbedModelFetch {
+            model_id: DEFAULT_EMBED_MODEL_ID.to_string(),
+            expected_bytes: Some(DEFAULT_EMBED_MODEL_BYTES),
+            no_fetch_reason: Some("declined".to_string()),
+            declined: true,
+            ..Default::default()
+        };
+        let line = declined.retrieval_clause().expect("a decline is reported");
+        assert!(line.starts_with("semantic search is off"), "{line}");
+        assert!(line.contains("lexical and graph signals only"), "{line}");
+        assert!(
+            line.contains("`kin embed` downloads it (about 523 MB)"),
+            "{line}"
+        );
+        assert!(!line.contains('\n'), "one line: {line}");
+
+        // A remote provider or a local model directory is not a decline, and
+        // still says nothing.
+        let remote = EmbedModelFetch {
+            no_fetch_reason: Some("the openai provider embeds over HTTP".to_string()),
+            ..declined.clone()
+        };
+        let remote = EmbedModelFetch {
+            declined: false,
+            ..remote
+        };
+        assert_eq!(remote.retrieval_clause(), None);
+    }
+
+    /// The field is additive on the wire: absent when false, and an older
+    /// payload without it still parses.
+    #[test]
+    fn the_declined_flag_is_additive_on_the_wire() {
+        let quiet = serde_json::to_value(EmbedModelFetch::default()).unwrap();
+        assert!(quiet.get("declined").is_none(), "{quiet}");
+        let old: EmbedModelFetch = serde_json::from_str(
+            r#"{"model_id":"m","present":false,"fetched_bytes":0,"fetching":false}"#,
+        )
+        .unwrap();
+        assert!(!old.declined);
     }
 }

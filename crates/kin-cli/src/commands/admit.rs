@@ -320,12 +320,11 @@ pub fn summary_lines(report: &AdmitReport) -> Vec<String> {
         ));
     }
 
-    // An admission adds graph objects; embedding them is the pass that follows.
-    // Saying so is the difference between an operator waiting for retrieval to
-    // improve and an operator concluding the admission did not work.
+    // Coverage does not establish whether background embedding is enabled or
+    // queued. Name the explicit action without promising automatic progress.
     if report.embeddings_total > report.embeddings_indexed {
         lines.push(format!(
-            "Embeddings: {} of {} indexed; the remainder is queued for the background embed pass.",
+            "Embeddings: {} of {} indexed; run `kin embed` to finish.",
             report.embeddings_indexed, report.embeddings_total
         ));
     } else if report.embeddings_total > 0 {
@@ -478,6 +477,9 @@ async fn wait_for_admission(
 pub async fn run() -> Result<()> {
     let cwd = std::env::current_dir().context("resolve current directory")?;
     let layout = crate::commands::require_repository_layout_at(&cwd)?;
+    // Refuse before starting or holding a daemon session. An unresolved author
+    // cannot admit anything, and must not leave a liveness lease behind.
+    let actor = crate::commands::require_commit_author_for(&layout)?;
     let base_url = crate::daemon_client::resolve_daemon_url(&layout)
         .await?
         .ok_or_else(|| {
@@ -516,7 +518,7 @@ pub async fn run() -> Result<()> {
     // rather than asking for another.
     let request = AdmitRequest {
         operation_id: OperationId::new(),
-        actor: crate::commands::require_commit_author()?,
+        actor,
     };
     let outcome = wait_for_admission(&client, &request).await;
 
@@ -975,13 +977,12 @@ mod tests {
         assert!(text.contains("4 reconcile event(s) errored"), "{text}");
     }
 
-    /// Unembedded objects after an admission are the expected steady state, and
-    /// an operator who is not told so reads the store as still broken.
+    /// Incomplete coverage names an action without inventing worker state.
     #[test]
-    fn pending_embedding_work_is_named_as_queued_rather_than_missing() {
+    fn incomplete_embedding_coverage_names_the_explicit_action() {
         let text = summary_lines(&report(true)).join("\n");
         assert!(
-            text.contains("49 of 14187 indexed; the remainder is queued"),
+            text.contains("Embeddings: 49 of 14187 indexed; run `kin embed` to finish."),
             "{text}"
         );
     }

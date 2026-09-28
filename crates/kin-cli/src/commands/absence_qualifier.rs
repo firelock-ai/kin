@@ -73,7 +73,9 @@ pub fn qualify(
     envelope: &kin_mcp::Envelope,
     indent: &str,
 ) -> Vec<String> {
-    let Some(negative) = kin_mcp::negative::negative_for(tool, payload, envelope, &[]) else {
+    let response_gaps = kin_mcp::verdict::Verdict::pre_negative_gaps(payload);
+    let Some(negative) = kin_mcp::negative::negative_for(tool, payload, envelope, &response_gaps)
+    else {
         return Vec::new();
     };
     if negative
@@ -143,7 +145,7 @@ pub fn qualify(
     if missing.is_empty() && unproduced.is_empty() && unminted.is_empty() {
         let subject = absence_subject(tool);
         let disclosed = negative
-            .get("degraded_signals")
+            .get("bounding_signals")
             .and_then(serde_json::Value::as_array)
             .map(|signals| {
                 signals
@@ -153,11 +155,25 @@ pub fn qualify(
                     .join(", ")
             })
             .filter(|disclosed| !disclosed.is_empty());
-        return vec![match disclosed {
-            Some(disclosed) => format!(
-                "{indent}{QUALIFIER_MARK} {subject}: this answer carries [{disclosed}], so it \
-                 may not reflect current truth."
-            ),
+        return match disclosed {
+            Some(disclosed) => {
+                let mut lines = vec![format!(
+                    "{indent}{QUALIFIER_MARK} {subject}: this answer carries [{disclosed}], so it \
+                     may not reflect current truth."
+                )];
+                // Signals describe the substrate; they must not replace the
+                // verdict's more specific source, caller or binding limitation.
+                for clause in negative["trust_reason"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .split("; ")
+                {
+                    if let Some(factor) = clause_prose(clause) {
+                        lines.push(format!("{indent}{QUALIFIER_MARK} {subject}: {factor}."));
+                    }
+                }
+                lines
+            }
             // No degraded signal and no absent class, so the reason the verdict
             // refused is neither of the two things this renderer reads directly.
             // It is still ON the verdict, as the leading clause of
@@ -171,14 +187,14 @@ pub fn qualify(
             // down.
             // An unconfigured spine, alone, is not a gap in THIS repository.
             None if only_unconfigured_federation(&negative) => return Vec::new(),
-            None => match limiting_factor(&negative) {
+            None => vec![match limiting_factor(&negative) {
                 Some(factor) => format!("{indent}{QUALIFIER_MARK} {subject}: {factor}."),
                 None => format!(
                     "{indent}{QUALIFIER_MARK} {subject}: this answer's coverage could not be \
                      established."
                 ),
-            },
-        }];
+            }],
+        };
     }
 
     // One marked line per reason, in the order the verdict weighs them: the
@@ -243,16 +259,11 @@ pub fn qualify(
             absence_direction(tool)
         ));
     }
-    // A second, independent reason does not vanish because the class gap won
-    // the state. On a daemon whose embedding worker had died beside a graph
-    // that linked only its calls, the sentences above named the edge gap and
-    // the worker's death went unsaid, so a reader learned one of the two
-    // things wrong with the answer (FIR-2672). The signals the verdict
-    // disclosed that are not the class facts already spoken follow, in the
-    // order the verdict weighs them: the structural gap first, then the run's
-    // own degradations.
+    // Independent bounding signals remain visible beside a class gap. The
+    // verdict selects them, so a disclosed flag from an unrelated producer
+    // cannot become the explanation for why this answer was refused.
     let independent: Vec<&str> = negative
-        .get("degraded_signals")
+        .get("bounding_signals")
         .and_then(serde_json::Value::as_array)
         .map(|signals| {
             signals
@@ -338,6 +349,13 @@ fn only_unconfigured_federation(negative: &serde_json::Value) -> bool {
 fn limiting_factor(negative: &serde_json::Value) -> Option<String> {
     let reason = negative.get("trust_reason")?.as_str()?.trim();
     let head = reason.split("; ").next().unwrap_or(reason).trim();
+    clause_prose(head)
+}
+
+/// Retain a rendered trust-reason segment's explanation. This is prose
+/// presentation, not reconstruction of the verdict's machine clause codes.
+fn clause_prose(clause: &str) -> Option<String> {
+    let head = clause.trim();
     if head.is_empty() {
         return None;
     }
@@ -471,6 +489,190 @@ fn edge_class_noun(class: &str) -> &'static str {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn proof_context_unverified_keeps_its_reason_without_inventing_a_clause() {
+        let mut tally = kin_model::CallSiteTally::default();
+        tally.add(&kin_model::CallerSites::Unverified {
+            ledger: kin_model::CallSiteLedger {
+                caller: kin_model::EntityId::new(),
+                behavior_hash: kin_model::Hash256::from_bytes([0; 32]),
+                body_hash: kin_model::Hash256::from_bytes([0; 32]),
+                context: kin_model::ResolutionRecordId(uuid::Uuid::from_u128(1)),
+                census: 1,
+                sites: vec![kin_model::CallSite {
+                    offset: 0,
+                    length: 1,
+                    state: kin_model::CallSiteState::ProvenOutside,
+                }],
+            },
+            reason: "resolver validation failed; no server identified".into(),
+        });
+        let block = kin_mcp::call_sites::block_json(&tally, "the focal's own body");
+        assert!(!block["clauses"][0].as_str().unwrap().contains("; "));
+        let payload = json!({
+            "references": [],
+            "call_sites": block,
+            "relation_kinds": ["calls", "imports", "references"],
+            "focal_resolution": {"addressed_by": "entity_id", "same_name_candidates": 1},
+            "cross_repo": {"status": "not_configured"},
+            "caller_arrival": {"state": "accounted"},
+            "edge_coverage": {
+                "scope": "language", "language": "Python",
+                "classes": {"calls": "present", "imports": "present", "references": "present"},
+                "reference_enrichment": "available", "budget_exhausted": false
+            }
+        });
+        let envelope = kin_mcp::Envelope::daemon().with_health(&json!({
+            "initialized": true, "graph_loaded": true, "graph_entity_count": 3,
+        }));
+        let negative = kin_mcp::negative::negative_for(
+            "find_references",
+            &payload,
+            &envelope,
+            &kin_mcp::verdict::Verdict::pre_negative_gaps(&payload),
+        )
+        .unwrap();
+        assert_eq!(negative["safe_to_conclude_absent"], false);
+        let reason = negative["trust_reason"].as_str().unwrap();
+        assert!(
+            reason
+                .split("; ")
+                .any(|clause| clause.starts_with("proof_context_unverified:")),
+            "{reason}"
+        );
+        let rendered = qualify("find_references", &payload, &envelope, "").join("\n");
+        assert!(
+            rendered.contains("resolver validation failed, no server identified"),
+            "{rendered}"
+        );
+        let result = kin_mcp::finalize_with_envelope(
+            kin_mcp::ToolCallResult::text(payload.to_string()),
+            envelope,
+            "find_references",
+        );
+        let kin_mcp::ContentBlock::Text { text } = &result.content[0];
+        let value: serde_json::Value = serde_json::from_str(text).unwrap();
+        let factor = value["_kin"]["verdict"]["limiting_factor"]
+            .as_str()
+            .unwrap();
+        assert!(
+            factor
+                .split("; ")
+                .any(|code| code == "proof_context_unverified"),
+            "{value}"
+        );
+        assert!(!factor.contains("unlisted_clause"), "{value}");
+    }
+
+    #[test]
+    fn a_nonbounding_embedding_flag_does_not_hide_owed_callers() {
+        let envelope = kin_mcp::Envelope::daemon().with_health(&json!({
+            "initialized": true, "graph_loaded": true, "graph_entity_count": 3,
+            "embed_worker_failed": true
+        }));
+        let payload = json!({
+            "entity_impacts": [{"entity_name": "target", "consumer_count": 0}],
+            "caller_arrival": {
+                "state": "accounted",
+                "owed_outside_scope": {"file_count": 1, "callers": 2}
+            },
+            "edge_coverage": {
+                "scope": "language", "language": "Python",
+                "classes": {"calls": "present", "imports": "present", "references": "present"},
+                "reference_enrichment": "available", "budget_exhausted": false
+            }
+        });
+        let negative =
+            kin_mcp::negative::negative_for("impact_analysis", &payload, &envelope, &[]).unwrap();
+        assert_eq!(negative["safe_to_conclude_absent"], false, "{negative}");
+        assert_eq!(negative["degraded_signals"], json!(["embed_worker_failed"]));
+        assert_eq!(negative["bounding_signals"], json!([]));
+        assert!(
+            negative["trust_reason"]
+                .as_str()
+                .unwrap()
+                .contains("call_sites_owed"),
+            "{negative}"
+        );
+        let lines = qualify("impact_analysis", &payload, &envelope, "").join("\n");
+        assert!(lines.contains("2 caller(s)"), "{lines}");
+        assert!(lines.contains("kin daemon sweep"), "{lines}");
+        assert!(!lines.contains("embed_worker_failed"), "{lines}");
+    }
+
+    #[test]
+    fn a_pending_readiness_signal_does_not_hide_the_source_limitation() {
+        let envelope = kin_mcp::Envelope::daemon().with_health(&json!({
+            "initialized": true, "graph_loaded": true, "graph_entity_count": 3
+        }));
+        let payload = json!({
+            "entity_impacts": [],
+            "call_sites": {
+                "settled": false,
+                "clauses": [
+                    "proof_context_unverified: src/user.rs has no validated caller proof",
+                    "local_binding_outstanding: src/other.rs still has an unresolved prior binding"
+                ]
+            },
+            "edge_coverage": {
+                "scope": "language", "language": "Rust",
+                "classes": {"calls": "present", "imports": "present", "references": "present"},
+                "reference_enrichment": "unknown", "budget_exhausted": false
+            }
+        });
+        let gaps = kin_mcp::verdict::Verdict::pre_negative_gaps(&payload);
+        let negative =
+            kin_mcp::negative::negative_for("impact_analysis", &payload, &envelope, &gaps).unwrap();
+        assert_eq!(negative["safe_to_conclude_absent"], false);
+        let reason = negative["trust_reason"].as_str().unwrap();
+        assert!(reason.contains("src/user.rs"), "{reason}");
+        assert!(reason.contains("reference_enrichment_unknown"), "{reason}");
+        let lines = qualify("impact_analysis", &payload, &envelope, "");
+        let rendered = lines.join("\n");
+        assert!(
+            rendered.contains("src/user.rs has no validated caller proof"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("reference_enrichment_unknown"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("src/other.rs still has an unresolved prior binding"),
+            "{rendered}"
+        );
+        assert!(lines.iter().all(|line| line.contains(QUALIFIER_MARK)));
+    }
+
+    #[test]
+    fn a_bounding_flag_without_a_named_gap_remains_visible() {
+        let envelope = kin_mcp::Envelope::daemon().with_health(&json!({
+            "initialized": true, "graph_loaded": true, "graph_entity_count": 3,
+            "mass_deletion_blocked": true, "embed_worker_failed": true
+        }));
+        let payload = json!({
+            "chain": [],
+            "edge_coverage": {
+                "scope": "language", "language": "Python",
+                "classes": {"calls": "present", "imports": "present", "references": "present"},
+                "reference_enrichment": "available", "budget_exhausted": false
+            }
+        });
+        let negative =
+            kin_mcp::negative::negative_for("trace_data_flow", &payload, &envelope, &[]).unwrap();
+        assert_eq!(
+            negative["bounding_signals"],
+            json!(["mass_deletion_blocked"])
+        );
+        assert!(!negative["trust_reason"]
+            .as_str()
+            .unwrap()
+            .contains("mass_deletion_blocked"));
+        let lines = qualify("trace_data_flow", &payload, &envelope, "").join("\n");
+        assert!(lines.contains("mass_deletion_blocked"), "{lines}");
+        assert!(!lines.contains("embed_worker_failed"), "{lines}");
+    }
 
     #[test]
     fn missing_federation_authority_is_not_an_unconfigured_scope() {

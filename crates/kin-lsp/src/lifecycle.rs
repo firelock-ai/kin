@@ -369,10 +369,29 @@ impl LspServer {
         );
 
         let server_info = init_result.server_info.unwrap_or_default();
-        let proof_basis = crate::proof_context::ProofBasis::of(
+        // What is running now, read from the process after it answered
+        // initialize, by which time a shim has become the server it runs.
+        // Failing that, the program the daemon resolved, by content; failing
+        // both, an identity no other start shares.
+        #[cfg(unix)]
+        let running = crate::proof_context::running_resolver_identity(process.leader_pid());
+        #[cfg(not(unix))]
+        let running: Option<String> = None;
+        let resolver_identity = running
+            .or_else(|| crate::proof_context::resolver_content_identity(Path::new(command)))
+            .unwrap_or_else(|| {
+                tracing::info!(
+                    command,
+                    "the language server runs through a program Kin cannot identify by \
+                     content, so the proofs it makes are asked about again by every later start"
+                );
+                crate::proof_context::unverified_start_identity(std::process::id())
+            });
+        let proof_basis = crate::proof_context::ProofBasis::of_resolver(
             launch,
             workspace_root,
             command,
+            Some(resolver_identity.as_str()),
             Some(server_info.name.as_str()),
             server_info.version.as_deref(),
         );

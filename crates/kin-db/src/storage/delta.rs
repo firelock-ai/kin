@@ -159,7 +159,8 @@ pub struct GraphSnapshotDelta {
     ///
     /// Deliberately last and omitted when empty, so a delta without records
     /// keeps its exact v5 bytes. A delta that moves records is written at v6,
-    /// or at v7 when it adds or rewrites a call-site ledger.
+    /// at v7 when it adds or rewrites a call-site ledger, or v8 when it carries
+    /// a context validation, including in an added or rewritten change.
     #[serde(default, skip_serializing_if = "CollectionDelta::is_empty")]
     pub resolution_records: CollectionDelta<ResolutionRecordId, ResolutionRecord>,
 }
@@ -181,12 +182,33 @@ impl GraphSnapshotDelta {
     /// so it refuses the delta at its header instead.
     pub const CALL_SITE_LEDGERS_VERSION: u32 = 7;
 
+    /// A delta that adds or rewrites a context validation. Older readers must
+    /// refuse this record's proof-admission effect before replaying anything.
+    pub const CONTEXT_VALIDATIONS_VERSION: u32 = 8;
+
     /// The version these contents are written at.
     ///
     /// A removed record is written as its identity alone, so only an added or
-    /// rewritten ledger makes a delta carry one.
+    /// rewritten record makes that slot carry one. Changes also carry the old
+    /// states of removed records and must declare their validation capability.
     pub fn wire_version(&self) -> u32 {
-        if self.resolution_records.is_empty() {
+        if self
+            .resolution_records
+            .added
+            .iter()
+            .chain(&self.resolution_records.modified)
+            .any(|(_, record)| super::format::is_context_validation(record))
+            || self
+                .changes
+                .added
+                .iter()
+                .chain(&self.changes.modified)
+                .any(|(_, change)| {
+                    super::format::moves_context_validations(&change.resolution_record_deltas)
+                })
+        {
+            Self::CONTEXT_VALIDATIONS_VERSION
+        } else if self.resolution_records.is_empty() {
             Self::CURRENT_VERSION
         } else if self
             .resolution_records
@@ -439,7 +461,7 @@ impl GraphSnapshotDelta {
                 .try_into()
                 .map_err(|_| KinDbError::SliceConversionError("version bytes".to_string()))?,
         );
-        Self::check_readable_version(version, Self::CALL_SITE_LEDGERS_VERSION)?;
+        Self::check_readable_version(version, Self::CONTEXT_VALIDATIONS_VERSION)?;
 
         let body_len = u64::from_le_bytes(
             data[8..16]
@@ -837,7 +859,7 @@ pub fn apply_graph_delta(
     apply_map_delta(&mut staged.entity_revisions, &delta.entity_revisions);
 
     // A graph-only snapshot's version follows its contents: v13, v23 once it
-    // holds resolution records, or v25 once one of them is a call-site ledger.
+    // holds resolution records, v25 for ledgers, or v27 for context validations.
     staged.version = staged.wire_version();
     staged.validate_storage_admission()?;
     *snapshot = staged;
@@ -991,7 +1013,7 @@ mod tests {
 
         assert!(error
             .to_string()
-            .contains("unsupported delta version: 2 (expected 5 to 7)"));
+            .contains("unsupported delta version: 2 (expected 5 to 8)"));
     }
 
     /// A delta that moves resolution records is written at v6, which a v5
@@ -1143,6 +1165,125 @@ mod tests {
             header(&snapshot_bytes),
             GraphSnapshot::CALL_SITE_LEDGERS_VERSION
         );
+    }
+
+    fn delta_context_validations() -> [ResolutionRecord; 2] {
+        [
+            ResolutionRecord::ContextValidation(kin_model::ContextValidation {
+                language: LanguageId::Rust,
+                state: kin_model::ContextValidationState::Validated {
+                    context: kin_model::ProofContext {
+                        language: LanguageId::Rust,
+                        resolver: "lsp:rust-analyzer".into(),
+                        resolver_version: "0.3.2600".into(),
+                        configuration_hash: Hash256::from_bytes([1; 32]),
+                        environment_hash: Hash256::from_bytes([2; 32]),
+                        environment_summary: String::new(),
+                    },
+                },
+            }),
+            ResolutionRecord::ContextValidation(kin_model::ContextValidation {
+                language: LanguageId::Rust,
+                state: kin_model::ContextValidationState::Unverified {
+                    reason: "server identity is unavailable".into(),
+                },
+            }),
+        ]
+    }
+
+    #[test]
+    fn context_validation_deltas_round_trip_and_normalize_snapshot_versions() {
+        let mut snapshot = GraphSnapshot::empty();
+        for (index, record) in delta_context_validations().into_iter().enumerate() {
+            let mut delta = GraphSnapshotDelta::empty(index as u64);
+            let collection = if index == 0 {
+                &mut delta.resolution_records.added
+            } else {
+                &mut delta.resolution_records.modified
+            };
+            collection.push((record.id(), record.clone()));
+            let bytes = delta.to_bytes().unwrap();
+            let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+            assert_eq!(version, 8);
+            let error = GraphSnapshotDelta::check_readable_version(version, 7).unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("unsupported delta version: 8 (expected 5 to 7)"));
+            let decoded = GraphSnapshotDelta::from_bytes(&bytes).unwrap();
+            assert_eq!(decoded.to_bytes().unwrap(), bytes);
+            let mut relabeled = bytes;
+            relabeled[4..8].copy_from_slice(&7u32.to_le_bytes());
+            assert!(GraphSnapshotDelta::from_bytes(&relabeled)
+                .unwrap_err()
+                .to_string()
+                .contains("declares version 7"));
+            apply_graph_delta(&mut snapshot, &decoded).unwrap();
+            assert_eq!(snapshot.version, 27);
+            assert_eq!(snapshot.resolution_records.get(&record.id()), Some(&record));
+            snapshot.to_bytes().unwrap();
+        }
+        let mut removal = GraphSnapshotDelta::empty(2);
+        removal
+            .resolution_records
+            .removed
+            .push(delta_context_validations()[0].id());
+        assert_eq!(
+            removal.wire_version(),
+            6,
+            "identity-only removal carries no new variant"
+        );
+        apply_graph_delta(&mut snapshot, &removal).unwrap();
+        assert_eq!(snapshot.version, 13);
+        assert_eq!(
+            snapshot.to_bytes().unwrap(),
+            GraphSnapshot::empty().to_bytes().unwrap()
+        );
+    }
+
+    #[test]
+    fn a_delta_with_context_validation_only_in_history_requires_v8() {
+        for record in delta_context_validations() {
+            let change = seal_change(SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+                parents: Vec::new(),
+                timestamp: Timestamp::now(),
+                author: AuthorId::new("validation-format-test"),
+                message: "retire a validation".into(),
+                entity_deltas: Vec::new(),
+                relation_deltas: Vec::new(),
+                tree_deltas: Vec::new(),
+                projected_files: Vec::new(),
+                spec_link: None,
+                evidence: Vec::new(),
+                risk_summary: None,
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
+                resolution_record_deltas: vec![kin_model::ResolutionRecordDelta::Removed {
+                    old: record,
+                }],
+            });
+            for modified in [false, true] {
+                let mut delta = GraphSnapshotDelta::empty(0);
+                if modified {
+                    delta.changes.modified.push((change.id, change.clone()));
+                } else {
+                    delta.changes.added.push((change.id, change.clone()));
+                }
+                assert!(delta.resolution_records.is_empty());
+                assert_eq!(delta.wire_version(), 8);
+                let bytes = delta.to_bytes().unwrap();
+                let decoded = GraphSnapshotDelta::from_bytes(&bytes).unwrap();
+                assert_eq!(decoded.to_bytes().unwrap(), bytes);
+                let mut snapshot = GraphSnapshot::empty();
+                apply_graph_delta(&mut snapshot, &decoded).unwrap();
+                assert_eq!(snapshot.version, 27);
+                assert_eq!(
+                    snapshot.changes.read_change(&change.id).unwrap(),
+                    Some(change.clone())
+                );
+            }
+        }
     }
 
     // -- Helpers -----------------------------------------------------------

@@ -569,6 +569,18 @@ fn commit_exact_transaction_inner(
     // would fail on the state check and strand a caller whose only published
     // recovery is to re-send the identical call.
     if let Some(inline) = arguments.get("operations") {
+        // A relation naming a symbol outside the repository is refused by what
+        // it names before anything is staged, and before decoding, which would
+        // refuse its address as a malformed id.
+        if let Some(refusal) = kin_mcp::handlers::external_symbols::external_relation_refusal(
+            state.graph.as_ref(),
+            inline,
+            "kin_transaction_commit",
+        )
+        .map_err(|error| error.to_string())?
+        {
+            return Err(refusal);
+        }
         let operations = kin_mcp::session::parse_staged_operations(inline)?;
         kin_mcp::session::validate_staged_operations(&operations)?;
         kin_mcp::handlers::sessions::reject_truncated_bodies(&operations)?;
@@ -2934,6 +2946,19 @@ fn apply_relation_operations(
         let kin_mcp::McpMutationPayload::Relation { from, to, kind } = payload else {
             return Err("internal exact relation planner received a non-relation payload".into());
         };
+        for (end, endpoint) in [("from", from), ("to", to)] {
+            if let Some(refusal) = kin_mcp::handlers::external_symbols::external_id_refusal_text(
+                prospective,
+                &endpoint.to_string(),
+                "kin_mutate",
+                &format!("payload.Relation.{end}"),
+                "changes relationships between repository entities, not external symbols",
+            )
+            .map_err(|error| error.to_string())?
+            {
+                return Err(refusal);
+            }
+        }
         for endpoint in [from, to] {
             if prospective
                 .get_entity(&endpoint)
@@ -3285,7 +3310,7 @@ fn finalize_committed_transaction(
     // two views are level here either way; the live read is what keeps them
     // level on every later path too.
     crate::background_work::record_relation_census(
-        &state.layout,
+        state,
         state.graph.as_ref(),
         kin_core::relation_census::CensusSource::Commit,
     );
@@ -6666,6 +6691,133 @@ pub(crate) mod tests {
         );
     }
 
+    /// Record the call a language server proves from `entity` into
+    /// TypeScript's `Array.map` in the live graph, as the enrichment sweep
+    /// does, and return the symbol.
+    fn install_external_call_on(
+        state: &Arc<DaemonState>,
+        entity: &Entity,
+    ) -> kin_model::ExternalReference {
+        let reference = kin_model::ExternalSymbol::new(
+            kin_model::ScipPackage::new("npm", "typescript", "5.6.3").unwrap(),
+            vec![
+                kin_model::ScipDescriptor::namespace("lib.es5.d.ts"),
+                kin_model::ScipDescriptor::type_("Array"),
+                kin_model::ScipDescriptor::method("map"),
+            ],
+        )
+        .unwrap()
+        .to_reference()
+        .unwrap();
+        let src = GraphNodeId::Entity(entity.id);
+        let dst = GraphNodeId::ExternalReference(reference.id);
+        let guard = state.begin_graph_authority_mutation();
+        state
+            .graph
+            .apply_transaction_delta(&TransactionDelta {
+                relation_deltas: vec![RelationDelta::Added {
+                    new: Relation {
+                        id: kin_model::RelationId::resolver(
+                            kin_model::RelationKind::Calls,
+                            &src,
+                            &dst,
+                        ),
+                        kind: kin_model::RelationKind::Calls,
+                        src,
+                        dst,
+                        confidence: 1.0,
+                        origin: RelationOrigin::Lsp,
+                        created_in: None,
+                        import_source: None,
+                        evidence: Vec::new(),
+                    },
+                }],
+                external_reference_deltas: vec![kin_model::ExternalReferenceDelta::Added {
+                    new: reference.clone(),
+                }],
+                ..TransactionDelta::default()
+            })
+            .unwrap();
+        state.bump_version();
+        drop(guard);
+        reference
+    }
+
+    /// An edge into a symbol outside the repository exists only where a
+    /// language server proved the call. An inline relation naming one at either
+    /// end, by its address or by the bare id an edge's `dst` carries, is
+    /// refused by what it names before anything is staged, in the refusal the
+    /// in-process tool gives, and repository authority does not move.
+    #[test]
+    fn an_inline_relation_to_an_external_symbol_is_refused_by_what_it_names() {
+        let (_dir, state) = test_state();
+        let (entity, _) = install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\n",
+            "value",
+        );
+        let reference = install_external_call_on(&state, &entity);
+        let before = load_native_commit_base(&state.layout).unwrap();
+        let sessions = test_sessions();
+        let transaction = sessions
+            .begin_transaction(TEST_SESSION, "repository")
+            .unwrap();
+        let address = format!("external_reference:{}", reference.id);
+        for (verb, from, to, end) in [
+            ("create", entity.id.to_string(), address.clone(), "to"),
+            (
+                "remove",
+                entity.id.to_string(),
+                reference.id.to_string(),
+                "to",
+            ),
+            ("add", address.clone(), entity.id.to_string(), "from"),
+        ] {
+            let arguments = HashMap::from([
+                (
+                    "transaction_id".to_string(),
+                    serde_json::json!(transaction.transaction_id),
+                ),
+                (
+                    "operations".to_string(),
+                    serde_json::json!([{
+                        "verb": verb,
+                        "target": "",
+                        "payload": {"Relation": {"from": from, "to": to, "kind": "Calls"}},
+                        "description": "edge into the map",
+                    }]),
+                ),
+            ]);
+            let result = commit_exact_transaction(&state, &sessions, &arguments, None);
+            assert_eq!(result.is_error, Some(true), "{verb} {end}");
+            let text = result_text(&result);
+            let value: serde_json::Value =
+                serde_json::from_str(&text).unwrap_or_else(|_| panic!("not a refusal: {text}"));
+            assert_eq!(
+                value["error"]["code"], "external_symbol_not_served",
+                "{text}"
+            );
+            assert_eq!(value["error"]["tool"], "kin_transaction_commit", "{text}");
+            assert_eq!(
+                value["error"]["argument"],
+                format!("operations[0].payload.Relation.{end}"),
+                "{text}"
+            );
+            assert_eq!(value["error"]["id"], address, "{text}");
+            assert!(
+                sessions
+                    .get_transaction(&transaction.transaction_id)
+                    .unwrap()
+                    .staged_operations
+                    .is_empty(),
+                "nothing is staged"
+            );
+        }
+        let after = load_native_commit_base(&state.layout).unwrap();
+        assert_eq!(after.roots.generation, before.roots.generation);
+    }
+
     /// Re-sending an inline commit after its fence is a resume, not a restage.
     ///
     /// `kin_transaction_commit` documents itself as idempotent on re-entry: the
@@ -7626,6 +7778,53 @@ pub(crate) mod tests {
     /// reach it. Asserted through `kin_provenance_query` rather than through
     /// `query_audit_events`, because querying the store directly is exactly what
     /// hid the gap.
+    #[test]
+    fn exact_relation_planner_refuses_a_held_external_endpoint_by_its_kind() {
+        let graph = kin_db::InMemoryGraph::new();
+        let node = kin_model::ExternalSymbol::new(
+            kin_model::ScipPackage::new("npm", "example", "1.0.0").unwrap(),
+            vec![kin_model::ScipDescriptor::method("external")],
+        )
+        .unwrap()
+        .to_reference()
+        .unwrap();
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                external_reference_deltas: vec![kin_model::ExternalReferenceDelta::Added {
+                    new: node.clone(),
+                }],
+                ..Default::default()
+            })
+            .unwrap();
+        for (from, to) in [
+            (EntityId(node.id.0), EntityId::new()),
+            (EntityId::new(), EntityId(node.id.0)),
+        ] {
+            let error = apply_relation_operations(
+                &graph,
+                vec![(
+                    "create".into(),
+                    kin_mcp::McpMutationPayload::Relation {
+                        from,
+                        to,
+                        kind: kin_model::RelationKind::Calls,
+                    },
+                )],
+            )
+            .unwrap_err();
+            let value: serde_json::Value = serde_json::from_str(&error).unwrap();
+            assert_eq!(value["error"]["code"], "external_symbol_not_served");
+            assert_eq!(
+                value["error"]["id"],
+                format!("external_reference:{}", node.id)
+            );
+            assert!(graph
+                .get_all_relations_for_entity(&from)
+                .unwrap()
+                .is_empty());
+        }
+    }
+
     #[test]
     fn a_relation_only_commit_is_attributed_to_the_entities_it_joined() {
         let (_dir, state) = test_state();
@@ -8701,6 +8900,7 @@ pub(crate) mod tests {
                 destination: None,
             }],
             commit_payload_hash: None,
+            created_at: None,
             last_activity_at: kin_model::timestamp::Timestamp::now(),
         };
         assert_eq!(

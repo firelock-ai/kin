@@ -252,6 +252,7 @@ async fn default_status_admits_before_it_reads_and_names_a_refused_pass() {
         merge: None,
         workspace_tip: None,
         authority_readings_taken: false,
+        binding_history_checked: None,
     })
     .unwrap();
     let health = serde_json::json!({

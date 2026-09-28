@@ -2580,6 +2580,160 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn admission_walk_preserves_full_plan_validation() {
+        let fixture = SemanticFixture::octopus_polyglot();
+        let snapshot = capture_lossless_git_repository(
+            &fixture.repo,
+            RepositoryId::new("admission-single-walk").unwrap(),
+            &fixture.blob_store,
+        )
+        .unwrap();
+        let plan = plan_semantic_git_import(&snapshot, &fixture.blob_store).unwrap();
+        let bindings = plan
+            .changes
+            .ids()
+            .enumerate()
+            .map(|(index, id)| {
+                let (entities, relations) = historical_deltas_for(index);
+                HistoricalSemanticBinding::owned(id, entities, relations)
+            })
+            .collect();
+        let plan = plan
+            .with_historical_semantics(&fixture.blob_store, bindings)
+            .unwrap();
+        assert!(plan.changes.iter().all(|change| {
+            let change = change.unwrap();
+            !change.entity_deltas.is_empty() && !change.relation_deltas.is_empty()
+        }));
+        let admitted = admit_semantic_git_import(&plan, &fixture.blob_store).unwrap();
+        admitted.validate(&fixture.blob_store).unwrap();
+
+        // The standalone validator remains the reference for every refusal.
+        // Admission must make all of these checks in its own policy walk,
+        // including global facts that no per-commit comparison can cover.
+        macro_rules! refuses {
+            ($name:literal, $malformed:ident, $mutate:block) => {{
+                let mut $malformed = plan.clone();
+                $mutate
+                assert!(
+                    $malformed.validate(&fixture.blob_store).is_err(),
+                    "standalone validation accepted {}",
+                    $name
+                );
+                assert!(
+                    admit_semantic_git_import(&$malformed, &fixture.blob_store).is_err(),
+                    "admission accepted {}",
+                    $name
+                );
+            }};
+        }
+        refuses!("changed record", malformed, {
+            let mut changes = malformed
+                .changes
+                .iter()
+                .collect::<Result<Vec<_>>>()
+                .unwrap();
+            changes[0].message.push_str(" changed");
+            malformed.changes =
+                SemanticChangeSpool::from_changes(fixture.blob_store.root(), changes).unwrap();
+        });
+        refuses!("different origin", malformed, {
+            let mut changes = malformed
+                .changes
+                .iter()
+                .collect::<Result<Vec<_>>>()
+                .unwrap();
+            changes[0].origin = ChangeOrigin::GitCommit {
+                oid: GitObjectId::sha1([9; 20]),
+            };
+            malformed.changes =
+                SemanticChangeSpool::from_changes(fixture.blob_store.root(), changes).unwrap();
+        });
+        refuses!("missing record", malformed, {
+            let mut changes = malformed
+                .changes
+                .iter()
+                .collect::<Result<Vec<_>>>()
+                .unwrap();
+            changes.pop();
+            malformed.changes =
+                SemanticChangeSpool::from_changes(fixture.blob_store.root(), changes).unwrap();
+        });
+        refuses!("reordered records", malformed, {
+            let mut changes = malformed
+                .changes
+                .iter()
+                .collect::<Result<Vec<_>>>()
+                .unwrap();
+            changes.swap(0, 1);
+            malformed.changes =
+                SemanticChangeSpool::from_changes(fixture.blob_store.root(), changes).unwrap();
+        });
+        refuses!("changed alias", malformed, {
+            malformed.aliases[0].change_id = malformed.aliases[1].change_id;
+        });
+        refuses!("extra alias", malformed, {
+            malformed.aliases.push(malformed.aliases[0].clone());
+        });
+        refuses!("changed tree", malformed, {
+            malformed
+                .commit_tree_hashes
+                .insert(fixture.initial, Hash256::from_bytes([7; 32]));
+        });
+        refuses!("extra tree", malformed, {
+            malformed
+                .commit_tree_hashes
+                .insert(GitObjectId::sha1([9; 20]), Hash256::from_bytes([7; 32]));
+        });
+        refuses!("changed tree content", malformed, {
+            malformed
+                .content
+                .trees
+                .get_mut(&fixture.initial)
+                .unwrap()
+                .regular_file_entries += 1;
+        });
+        refuses!("extra aggregate content", malformed, {
+            malformed
+                .content
+                .identities
+                .insert(Hash256::from_bytes([7; 32]), repo_path(b"phantom"));
+        });
+        refuses!("workspace seed", malformed, {
+            malformed.workspace_seed.base_commit_oid = None;
+        });
+        refuses!("ref mutation", malformed, {
+            assert!(malformed.ref_mutations.pop().is_some());
+        });
+        refuses!("raw ref", malformed, {
+            assert!(malformed.refs.refs.pop().is_some());
+        });
+        refuses!("default ref mutation", malformed, {
+            assert!(malformed.default_ref_mutation.take().is_some());
+        });
+
+        // The opaque spool refuses these before a plan can hold them; reads
+        // also verify each record's origin against its authenticated index.
+        let first = plan.changes.read_at(0).unwrap().unwrap();
+        let mut native = first.clone();
+        native.origin = ChangeOrigin::Native;
+        assert!(SemanticChangeSpool::from_changes(fixture.blob_store.root(), [native]).is_err());
+        assert!(SemanticChangeSpool::from_changes(
+            fixture.blob_store.root(),
+            [first.clone(), first.clone()]
+        )
+        .is_err());
+        let mut duplicate_origin = plan.changes.read_at(1).unwrap().unwrap();
+        duplicate_origin.origin = first.origin;
+        assert!(SemanticChangeSpool::from_changes(
+            fixture.blob_store.root(),
+            [first, duplicate_origin]
+        )
+        .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn admits_branch_versioned_policy_from_exact_commit_trees_and_cas() {
         let fixture = SemanticFixture::octopus_polyglot();
         let snapshot = capture_lossless_git_repository(

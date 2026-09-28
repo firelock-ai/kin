@@ -238,6 +238,85 @@ fn a_commit_with_no_resolvable_identity_is_refused_with_its_remedy() {
     );
 }
 
+/// The runtime gives every child a fresh HOME and managed registry. Imported
+/// commit authors are history, not configuration for the person using Kin now.
+#[test]
+fn a_fresh_home_reports_missing_author_until_supported_local_configuration_admits() {
+    let root = tempdir().expect("temp root");
+    let repo = root.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    require_git(&repo, &["init", "--initial-branch=main"]);
+    require_git(&repo, &["config", "commit.gpgsign", "false"]);
+    fs::write(repo.join("lib.rs"), "pub fn shipped() -> u8 { 1 }\n").unwrap();
+    require_git(&repo, &["add", "lib.rs"]);
+    require_git(
+        &repo,
+        &[
+            "-c",
+            "user.name=Original Author",
+            "-c",
+            "user.email=original@example.com",
+            "commit",
+            "-m",
+            "original history",
+        ],
+    );
+
+    let read_author = || {
+        let output = run_kin(&runtime, &repo, &["setup", "status", "--json"]);
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+            panic!(
+                "health JSON: {error}; stderr={}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+        });
+        report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == "commit_author")
+            .expect("author health row")
+            .clone()
+    };
+    let missing = read_author();
+    assert_eq!(missing["status"], "missing", "{missing}");
+    assert!(missing["manual_fix"]
+        .as_str()
+        .unwrap()
+        .contains("user.email \"you@example.com\""));
+    let imported = require_kin(&runtime, &repo, &["init", ".", "--no-enrich"]);
+    let warning = String::from_utf8_lossy(&imported.stderr);
+    assert!(warning.contains("Author not configured"), "{warning}");
+    assert!(
+        warning.contains("git config --global user.name \"Your Name\""),
+        "{warning}"
+    );
+    assert!(
+        warning.contains("git config --global user.email \"you@example.com\""),
+        "{warning}"
+    );
+
+    fs::write(repo.join("lib.rs"), "pub fn shipped() -> u8 { 2 }\n").unwrap();
+    let refused = run_kin(&runtime, &repo, &["admit"]);
+    assert!(!refused.status.success());
+    let refusal = String::from_utf8_lossy(&refused.stderr);
+    assert!(refusal.contains("no author identity"), "{refusal}");
+    assert!(
+        refusal.contains("git config --global user.email \"you@example.com\""),
+        "{refusal}"
+    );
+
+    // Supported repository-local Git configuration leaves the real global
+    // configuration untouched and exercises the same resolver as setup.
+    require_git(&repo, &["config", "user.name", "New Contributor"]);
+    require_git(&repo, &["config", "user.email", "contributor@example.com"]);
+    assert_eq!(read_author()["status"], "healthy");
+    let admitted = require_kin(&runtime, &repo, &["admit"]);
+    let text = String::from_utf8_lossy(&admitted.stdout);
+    assert!(text.contains("Admitted the complete exact tree"), "{text}");
+}
+
 /// The Kin-specific setting outranks Git, so a repository can attribute its
 /// changes to something other than whatever the host developer set for
 /// themselves.

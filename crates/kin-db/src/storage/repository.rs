@@ -855,6 +855,19 @@ impl PersistedRepositoryAuthority {
             .any(super::format::operation_moves_call_site_ledgers)
     }
 
+    /// Context validations in a workspace overlay or a logged operation
+    /// require a reader that understands their proof-admission effect.
+    pub(crate) fn carries_context_validations(&self) -> bool {
+        self.workspaces.iter().any(|workspace| {
+            super::format::moves_context_validations(
+                workspace.semantic_overlay.resolution_record_deltas(),
+            )
+        }) || self
+            .operation_log
+            .iter()
+            .any(super::format::operation_moves_context_validations)
+    }
+
     pub(crate) fn empty(
         repository_id: RepositoryId,
         snapshot: &GraphSnapshot,
@@ -924,6 +937,7 @@ impl PersistedRepositoryAuthority {
             GitProjectionTreeReplay::Required,
             RootRecomputation::Required,
             &admitted,
+            HistoryProof::Required,
         )
     }
 
@@ -933,6 +947,7 @@ impl PersistedRepositoryAuthority {
         replay: GitProjectionTreeReplay,
         roots: RootRecomputation,
         admitted: &AdmittedChangeMap<'_>,
+        history: HistoryProof,
     ) -> Result<(), KinDbError> {
         let mut timer = PublicationPhaseTimer::start();
         if !(MIN_REPOSITORY_AUTHORITY_SCHEMA_VERSION..=REPOSITORY_AUTHORITY_SCHEMA_VERSION)
@@ -1005,7 +1020,11 @@ impl PersistedRepositoryAuthority {
             }
         }
         let shape_ms = timer.lap_ms();
-        validate_git_authority_shape_and_projection(snapshot, self, replay)?;
+        // Carried only on the exact obligation `HistoryProof` states: nothing
+        // this reads differs from the predecessor that passed it.
+        if history.git_authority_required() {
+            validate_git_authority_shape_and_projection(snapshot, self, replay)?;
+        }
         let git_projection_ms = timer.lap_ms();
         for workspace in &self.workspaces {
             workspace.validate()?;
@@ -1099,18 +1118,21 @@ impl PersistedRepositoryAuthority {
         super::derivation_ledger::validate_metadata(self)?;
 
         let operation_log_ms = timer.lap_ms();
-        let derived_policies = derive_admission_policies(&snapshot.changes)?;
-        if derived_policies != self.admission_policies {
-            return Err(storage(
-                "persisted per-change admission state does not match semantic history".to_string(),
-            ));
+        if history.history_required() {
+            let derived_policies = derive_admission_policies(&snapshot.changes)?;
+            if derived_policies != self.admission_policies {
+                return Err(storage(
+                    "persisted per-change admission state does not match semantic history"
+                        .to_string(),
+                ));
+            }
         }
         let admission_policies_ms = timer.lap_ms();
-        validate_unscoped_history_caches(snapshot)?;
+        validate_unscoped_history_caches(snapshot, history)?;
         let history_caches_ms = timer.lap_ms();
         validate_ref_targets(snapshot, self)?;
         let ref_targets_ms = timer.lap_ms();
-        validate_workspace_authority(snapshot, self, Some(admitted))?;
+        validate_workspace_authority(snapshot, self, Some(admitted), history)?;
         let workspace_authority_ms = timer.lap_ms();
 
         // Skipped only on an exact obligation the caller discharged over this
@@ -3572,10 +3594,20 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
     /// Missing bodies remain missing: authority paths never repair from Git
     /// or a filesystem object directory.
     pub fn load_source_blob(&self, digest: Hash256) -> Result<Option<Vec<u8>>, KinDbError> {
+        self.load_source_blob_bounded(digest, MAX_SOURCE_BLOB_BYTES)
+    }
+
+    /// Load exact source under a caller's allowance, rejecting oversized
+    /// objects in the backend before allocating and retaining digest checks.
+    pub fn load_source_blob_bounded(
+        &self,
+        digest: Hash256,
+        max_bytes: u64,
+    ) -> Result<Option<Vec<u8>>, KinDbError> {
         let Some(data) = self.backend.load_source_blob_bounded(
             self.repository_id.as_str(),
             *digest.as_bytes(),
-            MAX_SOURCE_BLOB_BYTES,
+            max_bytes.min(MAX_SOURCE_BLOB_BYTES),
         )?
         else {
             return Ok(None);
@@ -3586,8 +3618,9 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
                 digest
             ))
         })?;
-        validate_source_blob_size(
+        crate::storage::backend::validate_source_blob_read_size(
             byte_len,
+            max_bytes,
             &format!("repository authority {}", self.repository_id),
         )?;
         verify_source_blob_digest(
@@ -4844,6 +4877,8 @@ fn prepare_successor_with_history<B: StorageBackend + ?Sized>(
     // and these laps are siblings that each carry their own self time.
     let prepare_span = tracing::info_span!("kindb.commit.prepare_successor").entered();
     let prepare_started = std::time::Instant::now();
+    let history =
+        HistoryProof::owed_by(transaction, external_history).carrying_workspace_base(current)?;
     let mut timer = PublicationPhaseTimer::start();
     let lap = tracing::info_span!("kindb.prepare.clone").entered();
     let mut snapshot = current.snapshot.clone();
@@ -4872,7 +4907,7 @@ fn prepare_successor_with_history<B: StorageBackend + ?Sized>(
         snapshot.changes = changes.clone();
         snapshot.change_children = derive_change_children(&snapshot.changes)?;
         snapshot.entity_revisions.clear();
-    } else {
+    } else if history.history_required() {
         admit_changes(&mut snapshot, &transaction.changes)?;
     }
     admit_aliases(&snapshot, &mut metadata, &transaction.aliases)?;
@@ -4882,8 +4917,13 @@ fn prepare_successor_with_history<B: StorageBackend + ?Sized>(
         &mut metadata,
         transaction,
         external_history,
+        history,
     )?;
-    metadata.admission_policies = derive_admission_policies(&snapshot.changes)?;
+    // A carried successor keeps the predecessor's policies, which were derived
+    // from this same history.
+    if history.history_required() {
+        metadata.admission_policies = derive_admission_policies(&snapshot.changes)?;
+    }
     let admit_ms = timer.lap_ms();
     drop(lap);
 
@@ -4912,7 +4952,7 @@ fn prepare_successor_with_history<B: StorageBackend + ?Sized>(
     // Every remaining validation reads the same authority-free payload:
     // `changes` is final once admission above returns, and the steps below
     // mutate only the detached metadata. One shared decode serves them all.
-    let replay = SharedReplayGraph::new(&snapshot);
+    let replay = history.replay_graph(&snapshot, None);
     apply_workspace(backend, &replay, &snapshot, &mut metadata, transaction)?;
     let workspace_ms = timer.lap_ms();
     drop(lap);
@@ -4942,18 +4982,27 @@ fn prepare_successor_with_history<B: StorageBackend + ?Sized>(
 
     let lap = tracing::info_span!("kindb.prepare.change_bodies").entered();
     if let Some(changes) = external_history {
+        // One requirement per distinct body across the whole history, not per
+        // change: a file's body is the new side of the change that wrote it and
+        // the old side of the next one, so a per-change pass read most bodies
+        // twice. The bodies are then proven through one verified batch.
+        let mut requirements = BTreeMap::new();
         changes.visit_changes(|change| {
-            validate_change_tree_bodies(
-                backend,
-                &transaction.repository_id,
-                std::iter::once(change),
+            collect_tree_delta_body_requirements(
+                &mut requirements,
+                &change.tree_deltas,
+                &format!("change {}", change.id),
             )
         })?;
+        // Every change carries the admission policy it was judged under, and
+        // consecutive changes name the same few ignore-file bodies, so each is
+        // required once here rather than read again for every change.
         for resolved in &metadata.admission_policies {
             if let Some(policy) = &resolved.policy {
-                validate_shared_policy_bodies(backend, &transaction.repository_id, policy)?;
+                collect_shared_policy_body_requirements(&mut requirements, policy)?;
             }
         }
+        load_required_bodies(backend, &transaction.repository_id, &requirements)?;
     } else {
         validate_new_change_bodies(
             backend,
@@ -4966,18 +5015,19 @@ fn prepare_successor_with_history<B: StorageBackend + ?Sized>(
     drop(lap);
 
     let lap = tracing::info_span!("kindb.prepare.history_replay").entered();
-    validate_history_replay_with(&replay, &snapshot, &transaction.changes)?;
+    if history.history_required() {
+        validate_history_replay_with(&replay, &snapshot, &transaction.changes)?;
+    }
     let history_replay_ms = timer.lap_ms();
     drop(lap);
     // The shared proof is charged to whichever lap first forced it rather than
     // to a lap of its own, so `replay_decode_ms` is a part of the laps above and
     // not a thirteenth alongside them.
     //
-    // This used to `drop(replay)` here, and that drop was load-bearing: the
-    // replay owned a decoded copy of the whole snapshot and this was where it
-    // was released. It owns nothing now, so there is nothing to release and the
-    // borrow simply ends at its last read, which is the line above.
+    // Release any retained workspace base tree once its admission readers
+    // finish, before constructing the successor's roots and envelope.
     let replay_decode_ms = replay.build_ms();
+    drop(replay);
 
     let lap = tracing::info_span!("kindb.prepare.roots").entered();
     // Every workspace transition above is final here, so an owed record whose
@@ -5007,7 +5057,13 @@ fn prepare_successor_with_history<B: StorageBackend + ?Sized>(
     };
     operation.validate()?;
     metadata.operation_log.push(operation.clone());
-    metadata.roots = compute_roots(&snapshot, &metadata, next_generation)?;
+    metadata.roots = compute_successor_roots(
+        &snapshot,
+        &metadata,
+        next_generation,
+        history,
+        current.roots(),
+    )?;
     let roots_ms = timer.lap_ms();
     drop(lap);
 
@@ -5077,7 +5133,8 @@ fn prepare_successor_with_history<B: StorageBackend + ?Sized>(
     // points restores this caller's obligation to
     // `RootRecomputation::Required`. This is the ONE caller entitled to state
     // it, because it is the only one holding a bundle it folded itself.
-    snapshot.validate_storage_admission_with_proven_roots(GitProjectionTreeReplay::Proven)?;
+    snapshot
+        .validate_storage_admission_with_proven_roots(GitProjectionTreeReplay::Proven, history)?;
     let storage_admission_ms = timer.lap_ms();
     drop(lap);
 
@@ -5257,24 +5314,32 @@ pub(crate) fn derive_change_children(
         .collect())
 }
 
-fn validate_unscoped_history_caches(snapshot: &GraphSnapshot) -> Result<(), KinDbError> {
-    let mut expected_children: HashMap<SemanticChangeId, Vec<SemanticChangeId>> = HashMap::new();
-    let mut children: BTreeMap<SemanticChangeId, BTreeSet<SemanticChangeId>> = BTreeMap::new();
-    for id in snapshot.changes.change_ids()? {
-        for parent in snapshot.changes.change_parents(&id)?.unwrap_or_default() {
-            children.entry(parent).or_default().insert(id);
+fn validate_unscoped_history_caches(
+    snapshot: &GraphSnapshot,
+    history: HistoryProof,
+) -> Result<(), KinDbError> {
+    // The index is derived from history alone, so a carried successor holds
+    // the predecessor's index over the predecessor's history.
+    if history.history_required() {
+        let mut expected_children: HashMap<SemanticChangeId, Vec<SemanticChangeId>> =
+            HashMap::new();
+        let mut children: BTreeMap<SemanticChangeId, BTreeSet<SemanticChangeId>> = BTreeMap::new();
+        for id in snapshot.changes.change_ids()? {
+            for parent in snapshot.changes.change_parents(&id)?.unwrap_or_default() {
+                children.entry(parent).or_default().insert(id);
+            }
         }
-    }
-    expected_children.extend(
-        children
-            .into_iter()
-            .map(|(parent, children)| (parent, children.into_iter().collect())),
-    );
-    if snapshot.change_children != expected_children {
-        return Err(storage(
-            "repository change-child index does not derive exactly from immutable history"
-                .to_string(),
-        ));
+        expected_children.extend(
+            children
+                .into_iter()
+                .map(|(parent, children)| (parent, children.into_iter().collect())),
+        );
+        if snapshot.change_children != expected_children {
+            return Err(storage(
+                "repository change-child index does not derive exactly from immutable history"
+                    .to_string(),
+            ));
+        }
     }
 
     if !snapshot.entities.is_empty()
@@ -5328,6 +5393,7 @@ fn apply_git_authority<B: StorageBackend + ?Sized>(
     metadata: &mut PersistedRepositoryAuthority,
     transaction: &RepositoryTransaction,
     external_history: Option<&ChangeMap>,
+    history: HistoryProof,
 ) -> Result<(), KinDbError> {
     if let Some(delta) = &transaction.git_authority_delta {
         if metadata.git_external_authority.as_ref() != delta.old.as_ref() {
@@ -5345,11 +5411,13 @@ fn apply_git_authority<B: StorageBackend + ?Sized>(
         metadata.git_external_authority.as_ref(),
         external_history,
     )?;
-    validate_git_authority_shape_and_projection(
-        snapshot,
-        metadata,
-        GitProjectionTreeReplay::Required,
-    )?;
+    if history.git_authority_required() {
+        validate_git_authority_shape_and_projection(
+            snapshot,
+            metadata,
+            GitProjectionTreeReplay::Required,
+        )?;
+    }
     if transaction.git_authority_delta.is_some() {
         validate_git_authority_bodies(
             backend,
@@ -5469,6 +5537,157 @@ pub(crate) enum GitProjectionTreeReplay {
 pub(crate) enum RootRecomputation {
     Required,
     Proven,
+}
+
+/// Whether a successor still owes the proofs that read immutable history alone.
+///
+/// Five checks in successor preparation and storage admission read nothing a
+/// ref or workspace mutation can change: the Git authority shape, projection
+/// tree replay and alias coverage; the per-change admission policies; the
+/// parent-to-children index; the history replay that proves the
+/// authority-free payload decodes into a coherent graph; and each unmutated
+/// workspace's validation, which resolves its base through that replay. Each
+/// walks the whole change map, and a transaction that admits no history paid
+/// for all of them, some twice and the replay three times, to re-prove inputs
+/// it never touched. On a converted Flask store of 26,353 Git objects that was
+/// most of the minutes `kin branch create` spent preparing a one-ref successor.
+///
+/// [`HistoryProof::CarriedFromPredecessor`] states an exact obligation. The
+/// transaction admits no change, alias, external object, Git authority delta,
+/// collaboration record or local overlay, so the successor's history, Git
+/// authority, admission policies, child index and authority-free payload are
+/// the predecessor's own values, and the one operation it appends records no
+/// Git delta. The predecessor passed every one of these checks, because every
+/// [`RepositoryAuthorityState`] did: an open runs them or trusts a
+/// history-validation record bound to the exact bytes that passed them, a
+/// frozen lock and an equivalent rewrite run them, and a successor runs them
+/// or carries them from a predecessor that did. The workspace the transaction
+/// mutates is not carried; storage admission validates it, reusing only the
+/// predecessor's exact base-change/tree-hash binding when the requested base
+/// still resolves to that change. Proposed hashes, changed targets and every
+/// workspace materialization remain checked.
+///
+/// Everything a ref or workspace mutation can change still runs on a carried
+/// successor: the ref leases, targets and fast-forward checks, the
+/// operation-log and receipt chain, the mutated workspace, and the ref-state,
+/// ref-log and local roots. The other three roots carry, for the same reason,
+/// through [`compute_successor_roots`].
+/// A persisted full snapshot still re-verifies every history record as it
+/// serializes, so history bytes edited after the open are refused at the write.
+///
+/// [`HistoryProof::GitAuthorityCarried`] is the narrower obligation of an
+/// ordinary native commit. It adds history, so every other history proof runs
+/// over it, but it admits no alias, external object or Git authority delta,
+/// and every change it adds is native. The Git checks read the Git authority,
+/// the external objects, the aliases, the Git deltas the operation log
+/// records, and, among the changes, only those an alias names or whose origin
+/// is a Git commit; the projection replay walks aliased changes alone. None of
+/// that differs from the predecessor, so their verdict carries too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HistoryProof {
+    Required,
+    GitAuthorityCarried,
+    CarriedFromPredecessor {
+        mutated_workspace: Option<WorkspaceId>,
+        // Authenticated by the predecessor's workspace admission, never by
+        // the proposed mutation. Valid only while its history is unchanged.
+        workspace_base: Option<(SemanticChangeId, Hash256)>,
+    },
+}
+
+impl HistoryProof {
+    /// The obligation a successor built from `transaction` is under.
+    fn owed_by(transaction: &RepositoryTransaction, external_history: Option<&ChangeMap>) -> Self {
+        let git_authority_untouched = external_history.is_none()
+            && transaction.aliases.is_empty()
+            && transaction.external_objects.is_empty()
+            && transaction.git_authority_delta.is_none()
+            && transaction
+                .changes
+                .iter()
+                .all(|change| matches!(change.origin, kin_model::ChangeOrigin::Native));
+        if !git_authority_untouched {
+            return Self::Required;
+        }
+        if !transaction.changes.is_empty()
+            || transaction.collaboration_delta.is_some()
+            || transaction.local_overlay_delta.is_some()
+        {
+            return Self::GitAuthorityCarried;
+        }
+        Self::CarriedFromPredecessor {
+            mutated_workspace: transaction
+                .workspace_mutation
+                .as_ref()
+                .map(|mutation| mutation.workspace_id),
+            workspace_base: None,
+        }
+    }
+
+    /// Carry only the base binding of the workspace the transaction mutates.
+    /// Its predecessor was fully admitted, including the exact target's tree
+    /// hash. Changes, aliases and Git authority are all unchanged in this arm,
+    /// so that binding stays true even if the workspace head or overlay moves.
+    /// A different target still resolves its own tree below.
+    fn carrying_workspace_base(
+        self,
+        current: &RepositoryAuthorityState,
+    ) -> Result<Self, KinDbError> {
+        let Self::CarriedFromPredecessor {
+            mutated_workspace, ..
+        } = self
+        else {
+            return Ok(self);
+        };
+        let metadata = current.metadata();
+        let workspace = metadata
+            .workspaces
+            .iter()
+            .find(|workspace| Some(workspace.workspace_id) == mutated_workspace);
+        let workspace_base = workspace
+            .and_then(|workspace| workspace.base_target.as_ref().zip(workspace.base_tree_hash))
+            .map(|(target, hash)| target_change_id(metadata, target).map(|change| (change, hash)))
+            .transpose()?;
+        Ok(Self::CarriedFromPredecessor {
+            mutated_workspace,
+            workspace_base,
+        })
+    }
+
+    /// Whether the proofs over the whole history still run.
+    fn history_required(self) -> bool {
+        !matches!(self, Self::CarriedFromPredecessor { .. })
+    }
+
+    /// Whether the Git authority shape, projection and alias checks still run.
+    fn git_authority_required(self) -> bool {
+        matches!(self, Self::Required)
+    }
+
+    /// Whether storage admission still validates `workspace` in full.
+    fn validates_workspace(self, workspace: &WorkspaceId) -> bool {
+        match self {
+            Self::Required | Self::GitAuthorityCarried => true,
+            Self::CarriedFromPredecessor {
+                mutated_workspace, ..
+            } => mutated_workspace.as_ref() == Some(workspace),
+        }
+    }
+
+    /// The replay view the history proofs read, already proven when the
+    /// payload it reads is the predecessor's own.
+    fn replay_graph<'a>(
+        self,
+        snapshot: &'a GraphSnapshot,
+        admitted: Option<&AdmittedChangeMap<'a>>,
+    ) -> SharedReplayGraph<'a> {
+        let mut replay = SharedReplayGraph::new_with_admission(snapshot, admitted);
+        if let Self::CarriedFromPredecessor { workspace_base, .. } = self {
+            let _ = replay.proven.set(());
+            replay.workspace_base = workspace_base;
+        }
+        replay
+    }
 }
 
 fn validate_git_authority_shape_and_projection(
@@ -6469,6 +6688,12 @@ fn apply_workspace<B: StorageBackend + ?Sized>(
             next.workspace_id
         )));
     }
+    // Admission below also needs the base's tracked artifact and Gitlink
+    // identities. Keep this exact resolved tree only if the held predecessor
+    // authenticated its change/hash binding; otherwise admission replays it.
+    if let Some(change_id) = next_base_change {
+        replay.retain_admitted_workspace_base(change_id, &next_base.resolved_tree)?;
+    }
     // Narrowed at the call for the same reason the desired graph is: the exact
     // comparison below reads four domains, and holding the rest of a
     // whole-history snapshot beside them buys nothing.
@@ -6545,15 +6770,37 @@ fn settle_workspace_enrichment_marks(
         kin_model::enrichment_relations_by_owner_file(desired.relations.values(), entity_file);
     let ledgers_by_path =
         kin_model::enrichment_ledgers_by_file(desired.resolution_records.values(), entity_file);
-    let (marks, dropped) = kin_model::settle_enrichment_marks(held, delta, &next.tree, |path| {
-        kin_model::enrichment_relations_digest(
-            path,
-            by_path.get(path).into_iter().flatten().copied(),
-            entity_file,
-            ledgers_by_path.get(path).into_iter().flatten().copied(),
-        )
-    })
-    .map_err(|error| storage(format!("workspace enrichment marks refused: {error}")))?;
+    let proof_paths: BTreeSet<&str> = held
+        .iter()
+        .chain(&delta.marks)
+        .filter(|mark| mark.version == kin_model::ENRICHMENT_PROOF_MARK_VERSION)
+        .map(|mark| mark.path.as_str())
+        .collect();
+    let proofs = kin_model::enrichment_proof_inputs_by_file(
+        proof_paths,
+        desired.entities.values(),
+        desired.relations.values(),
+        desired.resolution_records.values(),
+    )
+    .map_err(|error| storage(format!("workspace enrichment proof inputs: {error}")))?;
+    let (marks, dropped) =
+        kin_model::settle_enrichment_marks_with_digest(held, delta, &next.tree, |mark| match mark
+            .version
+        {
+            kin_model::ENRICHMENT_PROOF_MARK_VERSION => proofs.get(&mark.path).copied(),
+            1..=7 => Some(kin_model::enrichment_relations_digest(
+                &mark.path,
+                by_path.get(&mark.path).into_iter().flatten().copied(),
+                entity_file,
+                ledgers_by_path
+                    .get(&mark.path)
+                    .into_iter()
+                    .flatten()
+                    .copied(),
+            )),
+            _ => None,
+        })
+        .map_err(|error| storage(format!("workspace enrichment marks refused: {error}")))?;
     if !dropped.is_empty() {
         tracing::warn!(
             workspace = %next.workspace_id,
@@ -7483,6 +7730,8 @@ fn verify_artifact_admission<B: StorageBackend + ?Sized>(
 struct SharedReplayGraph<'a> {
     snapshot: &'a GraphSnapshot,
     admitted: Option<AdmittedChangeMap<'a>>,
+    workspace_base: Option<(SemanticChangeId, Hash256)>,
+    workspace_base_tree: std::cell::OnceCell<ResolvedTree>,
     proven: std::cell::OnceCell<()>,
     proof_runs: std::cell::Cell<u32>,
     build_ms: std::cell::Cell<u128>,
@@ -7505,6 +7754,8 @@ impl<'a> SharedReplayGraph<'a> {
         Self {
             snapshot,
             admitted: admitted.copied(),
+            workspace_base: None,
+            workspace_base_tree: std::cell::OnceCell::new(),
             proven: std::cell::OnceCell::new(),
             proof_runs: std::cell::Cell::new(0),
             build_ms: std::cell::Cell::new(0),
@@ -7545,7 +7796,39 @@ impl<'a> SharedReplayGraph<'a> {
         self.proof_runs.get()
     }
 
+    /// Reuse a resolved base for artifact admission only when its exact tree
+    /// matches the unchanged predecessor's independently admitted binding.
+    /// This is private to one successor preparation, not a serialized cache or
+    /// evidence that newly admitted history has passed validation.
+    fn retain_admitted_workspace_base(
+        &self,
+        change_id: SemanticChangeId,
+        tree: &ResolvedTree,
+    ) -> Result<(), KinDbError> {
+        let Some((proven_change, hash)) = self.workspace_base else {
+            return Ok(());
+        };
+        if change_id != proven_change {
+            return Ok(());
+        }
+        if kin_model::compute_resolved_tree_hash(tree)? != hash {
+            return Err(storage(format!(
+                "resolved workspace base {change_id} does not match its admitted tree hash"
+            )));
+        }
+        let _ = self.workspace_base_tree.set(tree.clone());
+        Ok(())
+    }
+
     fn resolve_tree(&self, change_id: SemanticChangeId) -> Result<ResolvedTree, KinDbError> {
+        if self
+            .workspace_base
+            .is_some_and(|(proven_change, _)| proven_change == change_id)
+        {
+            if let Some(tree) = self.workspace_base_tree.get() {
+                return Ok(tree.clone());
+            }
+        }
         self.resolve_trees(&[change_id])?
             .remove(&change_id)
             .ok_or_else(|| {
@@ -7573,6 +7856,8 @@ impl<'a> SharedReplayGraph<'a> {
         change_ids: &[SemanticChangeId],
     ) -> Result<BTreeMap<SemanticChangeId, ResolvedTree>, KinDbError> {
         self.prove()?;
+        #[cfg(test)]
+        REPLAY_TREE_RESOLUTIONS.with(|count| count.set(count.get() + 1));
         crate::storage::history_replay::resolve_first_parent_trees(
             &self.snapshot.changes,
             change_ids,
@@ -8066,6 +8351,10 @@ fn workspace_base_change_id(
 
 #[cfg(test)]
 thread_local! {
+    /// Actual first-parent tree folds in the shared replay view. A carried
+    /// workspace-base hash answers without entering this fold.
+    static REPLAY_TREE_RESOLUTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+
     /// Base-graph resolutions performed on this thread, ever.
     ///
     /// Read only as the endpoints of a span; the running total is meaningless
@@ -8427,8 +8716,8 @@ fn resolve_workspace_base_graph_snapshot_capturing(
     // persisted authority adjacency is never copied at all.
     let mut base = GraphSnapshot {
         // Materialized graph has no authority envelope or materialized section,
-        // so it is v13, v23 when its history holds resolution records, or v25
-        // when one of them is a call-site ledger.
+        // so its rung follows the selected records. Retained history is
+        // included in the normalization after this literal.
         version: GraphSnapshot::graph_only_version(resolution_records.values()),
         entities,
         relations,
@@ -8481,6 +8770,9 @@ fn resolve_workspace_base_graph_snapshot_capturing(
         materialized_graph: None,
         resolution_records,
     };
+    // History can still carry a validation after the selected live record
+    // disappears. Normalize from everything this export actually serializes.
+    base.version = base.wire_version();
     let domain_clone_ms = timer.lap_ms();
     rebuild_snapshot_adjacency(&mut base);
     let adjacency_ms = timer.lap_ms();
@@ -8729,11 +9021,18 @@ fn validate_workspace_authority(
     snapshot: &GraphSnapshot,
     metadata: &PersistedRepositoryAuthority,
     admitted: Option<&AdmittedChangeMap<'_>>,
+    history: HistoryProof,
 ) -> Result<(), KinDbError> {
     // One decode serves every workspace's base-tree check instead of one
-    // rebuild per workspace.
-    let replay = SharedReplayGraph::new_with_admission(snapshot, admitted);
-    for workspace in &metadata.workspaces {
+    // rebuild per workspace. A workspace validation reads no ref, and the only
+    // operations it reads are those that mutated it, so a carried successor
+    // re-validates the one workspace its transaction moved and carries the rest.
+    let replay = history.replay_graph(snapshot, admitted);
+    for workspace in metadata
+        .workspaces
+        .iter()
+        .filter(|workspace| history.validates_workspace(&workspace.workspace_id))
+    {
         validate_workspace_state(&replay, snapshot, metadata, workspace, admitted)?;
         for artifact in workspace.tree.artifacts() {
             workspace_artifact_projection_mtime(metadata, workspace, artifact.artifact_id)?;
@@ -9085,6 +9384,11 @@ fn resolve_target_tree_hash(
     target: &RefTarget,
 ) -> Result<Hash256, KinDbError> {
     let change_id = target_change_id(metadata, target)?;
+    if let Some((proven_change, hash)) = replay.workspace_base {
+        if change_id == proven_change {
+            return Ok(hash);
+        }
+    }
     let tree = replay.resolve_tree(change_id)?;
     kin_model::compute_resolved_tree_hash(&tree).map_err(Into::into)
 }
@@ -9115,17 +9419,24 @@ fn validate_new_change_bodies<B: StorageBackend + ?Sized>(
     changes: &[kin_model::SemanticChange],
     policies: &[ChangeAdmissionPolicy],
 ) -> Result<(), KinDbError> {
-    validate_change_tree_bodies(backend, repository_id, changes)?;
+    let mut requirements = BTreeMap::new();
+    for change in changes {
+        collect_tree_delta_body_requirements(
+            &mut requirements,
+            &change.tree_deltas,
+            &format!("change {}", change.id),
+        )?;
+    }
     let changed_ids: BTreeSet<_> = changes.iter().map(|change| change.id).collect();
     for resolved in policies
         .iter()
         .filter(|resolved| changed_ids.contains(&resolved.change_id))
     {
         if let Some(policy) = &resolved.policy {
-            validate_shared_policy_bodies(backend, repository_id, policy)?;
+            collect_shared_policy_body_requirements(&mut requirements, policy)?;
         }
     }
-    Ok(())
+    load_required_bodies(backend, repository_id, &requirements)
 }
 
 fn validate_merge_transaction_delta_bodies<B: StorageBackend + ?Sized>(
@@ -9769,35 +10080,48 @@ fn validate_all_authority_bodies_with<B: StorageBackend + ?Sized>(
     Ok(())
 }
 
-fn validate_change_tree_bodies<'a, B, I>(
+/// Prove every required body is present in the immutable source CAS, within
+/// its size bound and hashing to its identity, through one verified batch.
+///
+/// A local backend confirms the repository's lock and namespace once for the
+/// batch instead of once per body. Reading bodies one at a time reopened the
+/// storage root, re-confirmed the lock and resolved the repository path for
+/// every body, which made a history import's commit bound by those system
+/// calls rather than by the bytes it reads.
+fn load_required_bodies<B: StorageBackend + ?Sized>(
     backend: &B,
     repository_id: &RepositoryId,
-    changes: I,
-) -> Result<(), KinDbError>
-where
-    B: StorageBackend + ?Sized,
-    I: IntoIterator<Item = &'a kin_model::SemanticChange>,
-{
-    let mut validated = BTreeSet::new();
-    for change in changes {
-        for delta in &change.tree_deltas {
-            for (state, side) in [(delta.old_state(), "old"), (delta.new_state(), "new")] {
-                let Some(state) = state else {
-                    continue;
-                };
-                let Some(digest) = state.entry.blob_identity() else {
-                    continue;
-                };
-                if validated.insert(digest) {
-                    validate_tree_entry_body(
-                        backend,
-                        repository_id,
-                        state.entry,
-                        &format!("change {} {side} artifact {}", change.id, state.path),
-                    )?;
-                }
-            }
+    requirements: &BTreeMap<Hash256, AuthorityBodyRequirement>,
+) -> Result<(), KinDbError> {
+    if requirements.is_empty() {
+        return Ok(());
+    }
+    let mut invocations = 0usize;
+    let mut proven = 0usize;
+    backend.with_verified_source_blob_batch(repository_id.as_str(), &mut |batch| {
+        invocations += 1;
+        if invocations != 1 {
+            return Err(storage(
+                "storage backend invoked the body batch more than once".to_string(),
+            ));
         }
+        for (digest, requirement) in requirements {
+            load_verified_authority_body(batch, *digest, requirement)?.ok_or_else(|| {
+                storage(format!(
+                    "{} body {digest} is absent from immutable source CAS",
+                    requirement.label
+                ))
+            })?;
+            proven += 1;
+        }
+        Ok(())
+    })?;
+    if invocations != 1 || proven != requirements.len() {
+        return Err(storage(format!(
+            "storage backend proved {proven} of {} bodies in {invocations} batch invocations; \
+             expected every body in exactly one",
+            requirements.len()
+        )));
     }
     Ok(())
 }
@@ -10017,6 +10341,85 @@ fn compute_roots(
         ref_log: AuthorityRoot::new(REPOSITORY_ROOT_SCHEMA_VERSION, ref_log),
         collaboration: AuthorityRoot::new(REPOSITORY_ROOT_SCHEMA_VERSION, collaboration),
         replication: AuthorityRoot::new(REPOSITORY_ROOT_SCHEMA_VERSION, replication),
+        local_state: AuthorityRoot::new(REPOSITORY_ROOT_SCHEMA_VERSION, local_state),
+    })
+}
+
+/// The successor's root bundle, carrying the roots its transaction cannot move.
+///
+/// The replication root reads the external objects, the Git authority and the
+/// aliases, which no transaction under [`HistoryProof::GitAuthorityCarried`] or
+/// [`HistoryProof::CarriedFromPredecessor`] touches, so it is taken from the
+/// predecessor's bundle, which was folded over those same values. It hashes
+/// the store's whole Git object closure as one leaf, which was most of a
+/// ref-only preparation on a converted Flask store once the history proofs
+/// carried, and a large part of every native commit's. Under
+/// [`HistoryProof::CarriedFromPredecessor`] the history root, which reads the
+/// changes and admission policies, and the collaboration root, which reads the
+/// collaboration records, carry for the same reason. Every other root is
+/// folded here as always.
+///
+/// A bundle of another root schema is never carried from; the whole bundle is
+/// folded instead, so a carried root is always one this binary would compute.
+fn compute_successor_roots(
+    snapshot: &GraphSnapshot,
+    authority: &PersistedRepositoryAuthority,
+    generation: u64,
+    history: HistoryProof,
+    predecessor: &RootBundle,
+) -> Result<RootBundle, KinDbError> {
+    let carried_schema = [
+        predecessor.version,
+        predecessor.history.version,
+        predecessor.collaboration.version,
+        predecessor.replication.version,
+    ]
+    .iter()
+    .all(|version| *version == REPOSITORY_ROOT_SCHEMA_VERSION);
+    if history.git_authority_required() || !carried_schema {
+        return compute_roots(snapshot, authority, generation);
+    }
+    #[cfg(test)]
+    ROOT_BUNDLES_FOLDED_ON_THIS_THREAD.with(|count| count.set(count.get() + 1));
+    let (history_hash, collaboration_hash) = if history.history_required() {
+        let history_hash = {
+            let _s = tracing::info_span!("kindb.roots.history").entered();
+            history_root(snapshot, authority)?
+        };
+        let collaboration_hash = {
+            let _s = tracing::info_span!("kindb.roots.collaboration").entered();
+            collaboration_root(snapshot)?
+        };
+        (
+            AuthorityRoot::new(REPOSITORY_ROOT_SCHEMA_VERSION, history_hash),
+            AuthorityRoot::new(REPOSITORY_ROOT_SCHEMA_VERSION, collaboration_hash),
+        )
+    } else {
+        (
+            predecessor.history.clone(),
+            predecessor.collaboration.clone(),
+        )
+    };
+    let ref_state = {
+        let _s = tracing::info_span!("kindb.roots.ref_state").entered();
+        ref_state_root(authority)?
+    };
+    let ref_log = {
+        let _s = tracing::info_span!("kindb.roots.ref_log").entered();
+        ref_log_root(authority)?
+    };
+    let local_state = {
+        let _s = tracing::info_span!("kindb.roots.local_state").entered();
+        local_state_root(snapshot, authority)?
+    };
+    Ok(RootBundle {
+        version: REPOSITORY_ROOT_SCHEMA_VERSION,
+        generation,
+        history: history_hash,
+        ref_state: AuthorityRoot::new(REPOSITORY_ROOT_SCHEMA_VERSION, ref_state),
+        ref_log: AuthorityRoot::new(REPOSITORY_ROOT_SCHEMA_VERSION, ref_log),
+        collaboration: collaboration_hash,
+        replication: predecessor.replication.clone(),
         local_state: AuthorityRoot::new(REPOSITORY_ROOT_SCHEMA_VERSION, local_state),
     })
 }
@@ -10263,6 +10666,7 @@ mod tests {
     include!("enrichment_marks_format_tests.rs");
     include!("resolution_records_format_tests.rs");
     include!("call_site_ledgers_format_tests.rs");
+    include!("context_validations_format_tests.rs");
     include!("repository/session_publication_tests.rs");
     use super::*;
     use crate::storage::backend::{HistoryValidationProof, VerifiedSourceBlob};
@@ -21155,6 +21559,471 @@ mod tests {
             )
             .unwrap(),
         )
+    }
+
+    /// A transaction that admits no history carries the history proofs of the
+    /// state it succeeds instead of running them again, and what it carries is
+    /// exactly what a from-scratch validation of the successor proves.
+    ///
+    /// Two witnesses, because a skip alone says nothing about soundness. The
+    /// replay counter shows the skip: a commit that admits a change still
+    /// replays history, the positive control that the counter moves at all,
+    /// and a ref-only or a workspace-only commit replays none. Then
+    /// `validate_against_snapshot` runs every proof the carried path skipped,
+    /// under `HistoryProof::Required`, over the exact successor the carried
+    /// path published, including a fold of the whole root bundle compared with
+    /// the one whose history, collaboration and replication roots were carried,
+    /// and a reopen from the backend loads what it wrote.
+    #[test]
+    fn a_transaction_that_admits_no_history_carries_the_history_proofs() {
+        let store = build_synthetic_history_store(2, 8, 1, 3);
+        let validate_from_scratch = |label: &str| {
+            let lease = store.manager.read_authority();
+            let snapshot = lease.snapshot();
+            snapshot
+                .repository_authority
+                .as_ref()
+                .expect("a published successor carries its authority envelope")
+                .validate_against_snapshot(snapshot)
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "{label}: the carried successor fails a from-scratch validation: {error}"
+                    )
+                });
+        };
+
+        let replays = history_replays_on_this_thread();
+        store
+            .manager
+            .commit_repository_transaction(advance_synthetic_base(&store))
+            .unwrap()
+            .validate()
+            .unwrap();
+        assert!(
+            history_replays_on_this_thread() > replays,
+            "control: a commit that admits a change must replay history, or the counts below \
+             prove nothing"
+        );
+        validate_from_scratch("native commit");
+
+        let base_target = store.manager.read_authority().metadata().workspaces[0]
+            .base_target
+            .clone()
+            .expect("the synthetic workspace has a base");
+        let mut ref_only = transaction_shell(&store.manager, 0xca77_0001);
+        ref_only.ref_mutations.push(RefMutation {
+            name: RefName::branch(b"carried").unwrap(),
+            expected: RefExpectation::MustNotExist,
+            new_target: Some(base_target),
+            policy: RefUpdatePolicy::FastForwardOnly,
+        });
+        let replays = history_replays_on_this_thread();
+        store
+            .manager
+            .commit_repository_transaction(ref_only)
+            .unwrap()
+            .validate()
+            .unwrap();
+        assert_eq!(
+            history_replays_on_this_thread(),
+            replays,
+            "a ref-only commit replayed history it cannot change"
+        );
+        validate_from_scratch("ref-only");
+
+        let replays = history_replays_on_this_thread();
+        store
+            .manager
+            .commit_repository_transaction(overlay_transaction_at_unchanged_base(
+                &store,
+                0xca77_0002,
+                0,
+            ))
+            .unwrap()
+            .validate()
+            .unwrap();
+        assert_eq!(
+            history_replays_on_this_thread(),
+            replays,
+            "a workspace-only commit replayed history it cannot change"
+        );
+        validate_from_scratch("workspace-only");
+
+        let reopened =
+            RepositoryAuthorityManager::open(repository_id(), Arc::clone(&store.backend)).unwrap();
+        assert_eq!(
+            reopened.read_authority().roots(),
+            store.manager.read_authority().roots(),
+            "a reopen must load exactly what the carried commits published"
+        );
+    }
+
+    #[test]
+    fn an_unchanged_workspace_base_carries_its_admitted_tree_hash() {
+        let store = build_synthetic_history_store(2, 8, 1, 3);
+        store
+            .manager
+            .materialize_workspace_base_graph_section(&repository_id(), &store.workspace_id)
+            .unwrap();
+        let empty_delta = || WorkspaceSemanticDelta::new(Vec::new(), Vec::new()).unwrap();
+        let mut detach = semantic_workspace_transaction(&store.manager, 0xca77_2001, empty_delta());
+        let mutation = detach.workspace_mutation.as_mut().unwrap();
+        mutation.new_head = WorkspaceHead::Detached {
+            target: mutation.new_base_target.clone().unwrap(),
+        };
+        store.manager.commit_repository_transaction(detach).unwrap();
+
+        let before = store.manager.read_authority();
+        let base = before.metadata().workspaces[0].base_target.clone();
+        let base_hash = before.metadata().workspaces[0].base_tree_hash;
+        let history_root = before.roots().history.clone();
+        drop(before);
+        let mut switch = semantic_workspace_transaction(&store.manager, 0xca77_2002, empty_delta());
+        switch.workspace_mutation.as_mut().unwrap().new_head = WorkspaceHead::Symbolic {
+            target: RefName::branch(b"main").unwrap(),
+        };
+        let folds = REPLAY_TREE_RESOLUTIONS.with(|count| count.get());
+        let base_folds = BASE_GRAPHS_RESOLVED_FROM_HISTORY.with(|count| count.get());
+        // Measure the production successor seam itself: this test backend
+        // deliberately validates full bytes again when it saves them.
+        let held = store.manager.read_authority();
+        let (after, receipt) = prepare_successor(
+            &held,
+            &switch,
+            switch.transaction_hash().unwrap(),
+            store.backend.as_ref(),
+            NativeAdmissionSource::LocalWorkspace,
+            None,
+        )
+        .unwrap();
+        receipt.validate().unwrap();
+        assert_eq!(
+            REPLAY_TREE_RESOLUTIONS.with(|count| count.get()),
+            folds,
+            "switching to the same admitted base must not fold its first-parent tree again"
+        );
+        assert_eq!(
+            BASE_GRAPHS_RESOLVED_FROM_HISTORY.with(|count| count.get()),
+            base_folds,
+            "the prepared graph must still serve the unchanged workspace base"
+        );
+        let workspace = &after.metadata().workspaces[0];
+        assert_eq!(workspace.base_target, base);
+        assert_eq!(workspace.base_tree_hash, base_hash);
+        assert_eq!(
+            workspace.head,
+            WorkspaceHead::Symbolic {
+                target: RefName::branch(b"main").unwrap(),
+            }
+        );
+        assert_eq!(after.roots().history, history_root);
+        after
+            .metadata()
+            .validate_against_snapshot(after.snapshot())
+            .unwrap();
+        assert!(
+            REPLAY_TREE_RESOLUTIONS.with(|count| count.get()) > folds,
+            "a full admission must independently rederive the hash the successor carried"
+        );
+        drop(held);
+        store.manager.commit_repository_transaction(switch).unwrap();
+        let roots = store.manager.read_authority().roots().clone();
+        let reopened =
+            RepositoryAuthorityManager::open(repository_id(), Arc::clone(&store.backend)).unwrap();
+        assert_eq!(reopened.read_authority().roots(), &roots);
+    }
+
+    #[test]
+    fn a_carried_workspace_base_hash_never_answers_for_a_different_target() {
+        let store = build_synthetic_history_store(2, 8, 1, 3);
+        let transaction = overlay_transaction_at_unchanged_base(&store, 0xca77_2100, 0);
+        let held = store.manager.read_authority();
+        let proof = HistoryProof::owed_by(&transaction, None)
+            .carrying_workspace_base(&held)
+            .unwrap();
+        let replay = proof.replay_graph(held.snapshot(), None);
+        let base = held.metadata().workspaces[0].base_target.as_ref().unwrap();
+        let base_id = target_change_id(held.metadata(), base).unwrap();
+        let parent = held
+            .snapshot()
+            .changes
+            .read_change(&base_id)
+            .unwrap()
+            .unwrap()
+            .parents[0];
+        let before = REPLAY_TREE_RESOLUTIONS.with(|count| count.get());
+        assert_eq!(
+            resolve_target_tree_hash(&replay, held.metadata(), base).unwrap(),
+            held.metadata().workspaces[0].base_tree_hash.unwrap()
+        );
+        assert_eq!(REPLAY_TREE_RESOLUTIONS.with(|count| count.get()), before);
+        resolve_target_tree_hash(&replay, held.metadata(), &RefTarget::change(parent)).unwrap();
+        assert_eq!(
+            REPLAY_TREE_RESOLUTIONS.with(|count| count.get()),
+            before + 1,
+            "even another valid target with the same tree hash must resolve its own lineage"
+        );
+        let missing =
+            RefTarget::change(SemanticChangeId::from_hash(Hash256::from_bytes([0xee; 32])));
+        assert!(resolve_target_tree_hash(&replay, held.metadata(), &missing).is_err());
+    }
+
+    #[test]
+    fn a_retained_workspace_base_requires_the_exact_admitted_binding() {
+        let store = build_synthetic_history_store(2, 8, 1, 3);
+        let transaction = overlay_transaction_at_unchanged_base(&store, 0xca77_2120, 0);
+        let held = store.manager.read_authority();
+        let proof = HistoryProof::owed_by(&transaction, None)
+            .carrying_workspace_base(&held)
+            .unwrap();
+        let replay = proof.replay_graph(held.snapshot(), None);
+        let base = held.metadata().workspaces[0].base_target.as_ref().unwrap();
+        let base_id = target_change_id(held.metadata(), base).unwrap();
+        let actual = SharedReplayGraph::new(held.snapshot())
+            .resolve_tree(base_id)
+            .unwrap();
+        let wrong_tree = actual
+            .apply(&[TreeDelta::Added {
+                artifact_id: ArtifactId(Uuid::from_u128(0xca77_2121)),
+                new: LocatedEntry::new(
+                    RepoPath::from_utf8("forged.txt").unwrap(),
+                    TreeEntry::blob(digest(b"not the admitted tree"), false),
+                ),
+            }])
+            .unwrap();
+        assert_ne!(actual, wrong_tree);
+        let parent = held
+            .snapshot()
+            .changes
+            .read_change(&base_id)
+            .unwrap()
+            .unwrap()
+            .parents[0];
+
+        replay
+            .retain_admitted_workspace_base(parent, &actual)
+            .unwrap();
+        assert!(
+            replay.workspace_base_tree.get().is_none(),
+            "even identical tree bytes cannot authenticate another change"
+        );
+        assert!(replay
+            .retain_admitted_workspace_base(base_id, &wrong_tree)
+            .is_err());
+        assert!(
+            replay.workspace_base_tree.get().is_none(),
+            "a false tree must not seed artifact or Gitlink admission"
+        );
+
+        replay
+            .retain_admitted_workspace_base(base_id, &actual)
+            .unwrap();
+        let folds = REPLAY_TREE_RESOLUTIONS.with(|count| count.get());
+        assert_eq!(replay.resolve_tree(base_id).unwrap(), actual);
+        assert_eq!(REPLAY_TREE_RESOLUTIONS.with(|count| count.get()), folds);
+        replay.resolve_tree(parent).unwrap();
+        assert_eq!(
+            REPLAY_TREE_RESOLUTIONS.with(|count| count.get()),
+            folds + 1,
+            "a retained tree must not answer another target's admission"
+        );
+
+        let unproven = SharedReplayGraph::new(held.snapshot());
+        unproven
+            .retain_admitted_workspace_base(base_id, &actual)
+            .unwrap();
+        assert!(unproven.workspace_base_tree.get().is_none());
+        let folds = REPLAY_TREE_RESOLUTIONS.with(|count| count.get());
+        assert_eq!(unproven.resolve_tree(base_id).unwrap(), actual);
+        assert_eq!(
+            REPLAY_TREE_RESOLUTIONS.with(|count| count.get()),
+            folds + 1,
+            "without the predecessor witness, full admission must still fold history"
+        );
+    }
+
+    #[test]
+    fn a_carried_workspace_base_hash_resolves_an_exact_external_alias() {
+        let manager = initial_manager(Arc::new(MemoryBackend::default()));
+        let (imported, change_id, external_target) = imported_repository_transaction(&manager);
+        manager.commit_repository_transaction(imported).unwrap();
+        let transaction = semantic_workspace_transaction(
+            &manager,
+            0xca77_2150,
+            WorkspaceSemanticDelta::default(),
+        );
+        let held = manager.read_authority();
+        assert_eq!(
+            held.metadata().workspaces[0].base_target.as_ref(),
+            Some(&external_target)
+        );
+        let proof = HistoryProof::owed_by(&transaction, None)
+            .carrying_workspace_base(&held)
+            .unwrap();
+        let replay = proof.replay_graph(held.snapshot(), None);
+        let before = REPLAY_TREE_RESOLUTIONS.with(|count| count.get());
+        let expected = held.metadata().workspaces[0].base_tree_hash.unwrap();
+        assert_eq!(
+            resolve_target_tree_hash(&replay, held.metadata(), &external_target).unwrap(),
+            expected
+        );
+        assert_eq!(
+            resolve_target_tree_hash(&replay, held.metadata(), &RefTarget::change(change_id))
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            REPLAY_TREE_RESOLUTIONS.with(|count| count.get()),
+            before,
+            "the admitted external alias and semantic target bind the same exact change"
+        );
+    }
+
+    #[test]
+    fn a_workspace_base_hash_is_not_carried_across_history_or_git_authority_changes() {
+        let store = build_synthetic_history_store(2, 8, 1, 3);
+        let transaction = overlay_transaction_at_unchanged_base(&store, 0xca77_2200, 0);
+        let fixture = git_authority_transaction_fixture(&store.manager, 0xca77_2201);
+        assert!(!fixture.transaction.aliases.is_empty());
+        assert!(!fixture.transaction.external_objects.is_empty());
+        assert!(fixture.transaction.git_authority_delta.is_some());
+        let mut variants = vec![("native history", advance_synthetic_base(&store))];
+        let mut aliases = transaction.clone();
+        aliases.aliases = fixture.transaction.aliases;
+        variants.push(("aliases", aliases));
+        let mut objects = transaction.clone();
+        objects.external_objects = fixture.transaction.external_objects;
+        variants.push(("external objects", objects));
+        let mut git = transaction.clone();
+        git.git_authority_delta = fixture.transaction.git_authority_delta;
+        variants.push(("Git authority", git));
+        let held = store.manager.read_authority();
+        for (label, transaction) in variants {
+            let proof = HistoryProof::owed_by(&transaction, None)
+                .carrying_workspace_base(&held)
+                .unwrap();
+            assert!(proof.history_required(), "{label} must revalidate history");
+            assert!(
+                proof
+                    .replay_graph(held.snapshot(), None)
+                    .workspace_base
+                    .is_none(),
+                "{label} must not inherit a predecessor's tree-hash shortcut"
+            );
+        }
+        let streamed = HistoryProof::owed_by(&transaction, Some(&held.snapshot().changes))
+            .carrying_workspace_base(&held)
+            .unwrap();
+        assert!(streamed.history_required());
+        assert!(streamed
+            .replay_graph(held.snapshot(), None)
+            .workspace_base
+            .is_none());
+    }
+
+    #[test]
+    fn carrying_a_workspace_base_hash_still_refuses_forged_workspace_hashes() {
+        let store = build_synthetic_history_store(2, 8, 1, 3);
+        let transaction = overlay_transaction_at_unchanged_base(&store, 0xca77_2300, 0);
+        let before = store.manager.read_authority().roots().clone();
+        for (base_hash, tree_hash) in [(true, false), (false, true), (true, true)] {
+            let mut forged = transaction.clone();
+            let mutation = forged.workspace_mutation.as_mut().unwrap();
+            let wrong_hash = Hash256::from_bytes([0xe1; 32]);
+            if base_hash {
+                mutation.new_base_tree_hash = Some(wrong_hash);
+            }
+            if tree_hash {
+                mutation.new_tree_hash = wrong_hash;
+            }
+            assert!(
+                store.manager.commit_repository_transaction(forged).is_err(),
+                "carrying the predecessor's base must not trust the mutation's proposed hashes"
+            );
+            assert_eq!(
+                store.manager.read_authority().roots(),
+                &before,
+                "a refused workspace mutation must publish nothing"
+            );
+        }
+    }
+
+    /// A native commit over a store with Git authority carries the Git checks
+    /// and the replication root, which read nothing a native change can move,
+    /// and what it carries is what a from-scratch validation proves: the Git
+    /// shape, projection replay and alias coverage run again over the
+    /// successor, and the whole root bundle is folded and compared.
+    #[test]
+    fn a_native_commit_carries_the_git_authority_checks_it_cannot_change() {
+        let manager = initial_manager(Arc::new(MemoryBackend::default()));
+        let fixture = git_authority_transaction_fixture(&manager, 0xca77_1000);
+        let target = fixture.gitlink_target;
+        let artifact_id = fixture
+            .transaction
+            .changes
+            .iter()
+            .flat_map(|change| &change.tree_deltas)
+            .find_map(|delta| match delta {
+                TreeDelta::Added { artifact_id, new }
+                | TreeDelta::Updated {
+                    artifact_id, new, ..
+                } if new.entry == TreeEntry::gitlink(target) => Some(*artifact_id),
+                _ => None,
+            })
+            .expect("the imported fixture must authenticate this exact gitlink artifact");
+        manager
+            .commit_repository_transaction(fixture.transaction)
+            .unwrap();
+        assert!(manager
+            .read_authority()
+            .authenticated_gitlinks()
+            .contains(&(artifact_id, target)));
+        let replication_before = manager.read_authority().roots().replication.clone();
+
+        let transaction =
+            native_gitlink_transaction(&manager, 0xca77_1001, 0xca77_1002, artifact_id, target);
+        assert_eq!(
+            HistoryProof::owed_by(&transaction, None),
+            HistoryProof::GitAuthorityCarried,
+            "the fixture must be a native commit over Git authority for this to test anything"
+        );
+        manager.commit_repository_transaction(transaction).unwrap();
+
+        let lease = manager.read_authority();
+        assert_eq!(lease.roots().replication, replication_before);
+        let snapshot = lease.snapshot();
+        snapshot
+            .repository_authority
+            .as_ref()
+            .expect("a published successor carries its authority envelope")
+            .validate_against_snapshot(snapshot)
+            .expect("a native commit's carried Git checks and replication root must hold");
+    }
+
+    /// Carrying the history proofs carries nothing a ref mutation can break:
+    /// a ref-only commit naming a target the history does not hold is still
+    /// refused, and publishes nothing.
+    #[test]
+    fn a_ref_only_commit_still_refuses_a_target_its_history_does_not_hold() {
+        let store = build_synthetic_history_store(2, 8, 1, 3);
+        let before = store.manager.read_authority().roots().clone();
+        let mut dangling = transaction_shell(&store.manager, 0xca77_0003);
+        dangling.ref_mutations.push(RefMutation {
+            name: RefName::branch(b"dangling").unwrap(),
+            expected: RefExpectation::MustNotExist,
+            new_target: Some(RefTarget::change(SemanticChangeId::from_hash(
+                Hash256::from_bytes([0xd4; 32]),
+            ))),
+            policy: RefUpdatePolicy::FastForwardOnly,
+        });
+        assert!(
+            store
+                .manager
+                .commit_repository_transaction(dangling)
+                .is_err(),
+            "a carried ref-only commit accepted a ref to a change the history does not hold"
+        );
+        assert_eq!(store.manager.read_authority().roots(), &before);
     }
 
     /// A workspace mutation is three materialization steps over a base graph

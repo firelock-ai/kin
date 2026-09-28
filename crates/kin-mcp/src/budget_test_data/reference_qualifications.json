@@ -1,0 +1,433 @@
+{
+  "_kin": {
+    "completeness": {
+      "bound": "at_least",
+      "classes": {
+        "calls": "present",
+        "imports": "present",
+        "references": "present"
+      },
+      "counted": {
+        "exact": false,
+        "reported": 2,
+        "sites": {
+          "known_reference_sites": 2,
+          "reference_sites": null,
+          "reference_sites_complete": false
+        },
+        "unit": "referencing_entities"
+      },
+      "decided_by": [
+        "calls",
+        "imports",
+        "references"
+      ],
+      "limits": [
+        "degraded:relation_census_loss",
+        "verdict_inconclusive"
+      ],
+      "status": "unknown",
+      "substrate": "edges"
+    },
+    "degraded": {
+      "embed_persistence_unavailable": false,
+      "embed_worker_failed": false,
+      "mass_deletion_blocked": false,
+      "relation_census_loss": true
+    },
+    "durability": {
+      "durable_entities": 897,
+      "durable_relations": 8177,
+      "live_entities": 897,
+      "live_only_entities": 0,
+      "live_only_relations": 0,
+      "live_relations": 8177,
+      "state": "recorded"
+    },
+    "envelope_version": 2,
+    "freshness": {
+      "state": "no_admission_recorded"
+    },
+    "graph_as_of": {
+      "generation": 12
+    },
+    "graph_state": {
+      "entity_count": 897,
+      "initialized": true,
+      "loaded": true,
+      "reconciliation_outcome": "settled",
+      "reconciliation_status": "idle"
+    },
+    "hydration_semantics": {
+      "created_under": 31,
+      "derives": 31,
+      "standing": "current"
+    },
+    "repository": {
+      "root": "/fixture"
+    },
+    "response": {
+      "bounded": false,
+      "chars_after_budget": 24164,
+      "chars_before_budget": 33079,
+      "compact": true,
+      "max_chars": 60000,
+      "primary_collection": "references",
+      "primary_rows": 2
+    },
+    "runtime": "repo-daemon",
+    "source_derivation": {
+      "checked_scope": "admitted_inventory",
+      "local_binding_requirement": "required",
+      "report": {
+        "body_binding": "current",
+        "call_extraction": "incomplete",
+        "call_shape_parse_coverage_complete": false,
+        "excluded_artifacts": 93,
+        "full_adapter_sources": 37,
+        "import_resolution": "incomplete",
+        "inventory": "graph_admitted_full_adapter_sources",
+        "issue_count": 3,
+        "issues": [
+          {
+            "path": "src/requests/structures.py",
+            "reason": "local_binding_outstanding: prior local bindings remain outstanding"
+          },
+          {
+            "path": "src/requests/utils.py",
+            "reason": "local_binding_outstanding: prior local bindings remain outstanding"
+          },
+          {
+            "path": "tests/test_requests.py",
+            "reason": "local_binding_outstanding: prior local bindings remain outstanding"
+          }
+        ],
+        "outstanding_local_binding_obligations": 53,
+        "parse_coverage": "unproven",
+        "prior_local_binding": "outstanding"
+      },
+      "sampled": "selected_graph_after_query",
+      "scope": "live_head"
+    },
+    "verdict": {
+      "absence_claim": "not_applicable",
+      "inputs": {
+        "absence_gate": "inconclusive",
+        "call_sites": "inconclusive",
+        "caller_arrival": "not_applicable",
+        "completeness": "certified",
+        "cross_repo": "certified",
+        "degradations": "not_applicable",
+        "edge_coverage": "certified",
+        "enrichment": "not_applicable",
+        "graph_empty": "not_applicable",
+        "graph_freshness": "not_applicable",
+        "outside_graph": "not_applicable",
+        "source_derivation": "inconclusive",
+        "tracked_changes": "not_applicable",
+        "watcher_loss": "not_applicable",
+        "withheld_candidates": "certified"
+      },
+      "limiting_factor": "local_binding_outstanding; binding_unproven; call_sites_unresolved; method_call_resolution_incomplete",
+      "safe_to_conclude_absent": false,
+      "state": "inconclusive"
+    }
+  },
+  "call_sites": {
+    "by_state": {
+      "binding": 183,
+      "proven_external": 1126,
+      "proven_outside": 6,
+      "proven_target": 1015,
+      "unresolved": 430
+    },
+    "call_names": [
+      "send"
+    ],
+    "callers": 782,
+    "callers_owed_derivation": 0,
+    "callers_owed_enrichment": 0,
+    "callers_stale": 0,
+    "callers_unproven_no_resolver": 0,
+    "callers_unverified": 0,
+    "candidate_count": 613,
+    "candidates": [
+      {
+        "callee": "send",
+        "caller": "e1f2086d-6413-4606-b4f1-f10068008297",
+        "caller_name": "echo_response_handler",
+        "line_in_entity": 9,
+        "projection": {
+          "path": "tests/test_lowlevel.py"
+        },
+        "reason": "callee spells the name",
+        "state": "unresolved",
+        "state_reason": "no_answer"
+      }
+    ],
+    "candidates_by_reason": {
+      "callee spells the name": 22,
+      "caller text unknown": 14,
+      "focal escapes as a value": 577
+    },
+    "candidates_withheld": 612,
+    "clauses": [
+      "binding_unproven: 183 of the 2760 call sites in the store's callers that could call the focal call through a value binding, which proves no target",
+      "call_sites_unresolved: 430 of the 2760 call sites in the store's callers that could call the focal got an answer that proves no target"
+    ],
+    "focal_escape": {
+      "escape": "unknown",
+      "reason": "dynamic reflective access in the domain"
+    },
+    "no_resolver": {},
+    "scope": "the store's callers that could call the focal",
+    "settled": false,
+    "sites": 2760,
+    "unverified_contexts": {}
+  },
+  "caller_arrival": {
+    "count_exact": true,
+    "family_files": 4,
+    "family_measured": 4,
+    "files_counted_from_site_ledgers": 4,
+    "owed_caller_count": 0,
+    "scope": "this reading counts a call site as arrived when the graph holds any call edge from it, including a call the linker bound to a same-named definition in the caller's own file, and it reads only the files that hold an import edge into the focal's file, so a caller that reaches the focal without one is not read",
+    "state": "unaccounted",
+    "unaccounted_file_count": 3,
+    "unaccounted_files": [
+      {
+        "count_exact": true,
+        "count_source": "site_ledgers",
+        "file": "src/requests/models.py",
+        "owed_callers": 0,
+        "parsed_call_sites": 214,
+        "resolved_call_edges": 192,
+        "shortfall_is_floor": false,
+        "unaccounted_call_sites": 22,
+        "unsettled_by_state": {
+          "binding": 2,
+          "unresolved": 20
+        }
+      },
+      {
+        "count_exact": true,
+        "count_source": "site_ledgers",
+        "file": "src/requests/sessions.py",
+        "owed_callers": 0,
+        "parsed_call_sites": 147,
+        "resolved_call_edges": 138,
+        "shortfall_is_floor": false,
+        "unaccounted_call_sites": 9,
+        "unsettled_by_state": {
+          "binding": 1,
+          "unresolved": 8
+        }
+      },
+      {
+        "count_exact": true,
+        "count_source": "site_ledgers",
+        "file": "tests/test_requests.py",
+        "owed_callers": 0,
+        "parsed_call_sites": 1195,
+        "resolved_call_edges": 844,
+        "shortfall_is_floor": false,
+        "unaccounted_call_sites": 351,
+        "unsettled_by_state": {
+          "binding": 166,
+          "unresolved": 185
+        }
+      }
+    ],
+    "unaccounted_files_truncated": false,
+    "unmeasured_reason": null
+  },
+  "candidates": [],
+  "counts": {
+    "counted": "referencing_entities",
+    "files": 2,
+    "known_reference_sites": 2,
+    "receiver_name_candidates": 0,
+    "reference_sites": null,
+    "reference_sites_complete": false,
+    "referencing_entities": 2,
+    "unresolved_name_candidates": 0,
+    "upstream_including_unconfirmed": 2
+  },
+  "cross_repo": {
+    "authority_anchor": {
+      "entity_id": "19bc37ca-d709-4d6f-b0e8-6e13a252c547",
+      "repo_id": "220df77a-9be3-4235-b4a3-ab33d91852ca"
+    },
+    "authority_complete": true,
+    "authority_revision": "sha256:a94ca96392ec9cc2e3f0986ce2f76edae9890e72d26a861eea760c4483b289ae",
+    "authority_roots": {
+      "220df77a-9be3-4235-b4a3-ab33d91852ca": "26183f2d5260a0d516b11bcc5bdbb6ca3f78967ca881981fef65876421b18b7c",
+      "fd87107e-0f97-43b2-b630-0a66436aeab0": "14c76d0f98e834b28d16b1523a3d39227b272fc3a53e58cb01cc0f91bd62c6bf"
+    },
+    "federated_reference_count": 0,
+    "federated_references": [],
+    "payload_version": 1,
+    "reference_count": 0,
+    "relation_subtype_complete": true,
+    "status": "available"
+  },
+  "edge_coverage": {
+    "budget_exhausted": false,
+    "classes": {
+      "calls": "present",
+      "imports": "present",
+      "references": "present"
+    },
+    "cross_file_classes": [
+      "calls",
+      "imports",
+      "references"
+    ],
+    "entities_examined": 2,
+    "language": "Python",
+    "limits": [
+      "absence_gate:inconclusive",
+      "call_sites:inconclusive",
+      "source_derivation:inconclusive"
+    ],
+    "reference_enrichment": "available",
+    "requested_classes": [
+      "calls",
+      "imports",
+      "references"
+    ],
+    "scan": "ran",
+    "scope": "language",
+    "unproduced_evidence": null,
+    "witnessed_by_answer": [
+      "calls",
+      "references"
+    ]
+  },
+  "focal_entity": {
+    "id": "19bc37ca-d709-4d6f-b0e8-6e13a252c547",
+    "kind": "method",
+    "name": "HTTPAdapter.send",
+    "projection": {
+      "path": "src/requests/adapters.py"
+    },
+    "signature": "def send(self, request: PreparedRequest, stream: bool = False, timeout: _t.TimeoutType = None, verify: _t.VerifyType = True, cert: _t.CertType = None, proxies: dict[str, str] | None = None,) -> Response"
+  },
+  "focal_resolution": {
+    "addressed_by": "name",
+    "matched": "query_name_pattern",
+    "other_candidates": [],
+    "same_name_candidates": 1
+  },
+  "negative": {
+    "advice": "this answer returned rows, so it asserts no absence; the verdict below says how far those rows can be trusted as the whole set, against graph as-of {\"generation\":12} with graph coverage for Python (calls present, imports present, references present; a language server available for it) and degraded signals [relation_census_loss]. Treat these rows as a lower bound rather than the whole set, and do not conclude anything from what is missing from them. Limiting factor: local_binding_outstanding: previously local source bindings remain unresolved, so current body and parse evidence cannot establish complete dependency or call-shape knowledge; binding_unproven: 183 of the 2760 call sites in the store's callers that could call the focal call through a value binding, which proves no target; call_sites_unresolved: 430 of the 2760 call sites in the store's callers that could call the focal got an answer that proves no target; method_call_resolution_incomplete: receiver-method calls are linked by bare name and may be unresolved, so an empty result is not an authoritative absence for a method",
+    "bounding_signals": [
+      "relation_census_loss"
+    ],
+    "coverage_basis": "graph_structure",
+    "degraded_signals": [
+      "relation_census_loss"
+    ],
+    "graph_as_of": {
+      "generation": 12
+    },
+    "interpretation": "qualified_answer",
+    "kind": "qualified_answer",
+    "result_count": 2,
+    "safe_to_conclude_absent": false,
+    "semantic_coverage": null,
+    "subject": "this answer returned rows, so it asserts no absence; the verdict below says how far those rows can be trusted as the whole set",
+    "trust": "inconclusive",
+    "trust_reason": "local_binding_outstanding: previously local source bindings remain unresolved, so current body and parse evidence cannot establish complete dependency or call-shape knowledge; binding_unproven: 183 of the 2760 call sites in the store's callers that could call the focal call through a value binding, which proves no target; call_sites_unresolved: 430 of the 2760 call sites in the store's callers that could call the focal got an answer that proves no target; method_call_resolution_incomplete: receiver-method calls are linked by bare name and may be unresolved, so an empty result is not an authoritative absence for a method"
+  },
+  "references": [
+    {
+      "entity_id": "564a36a8-4d7b-4246-bb69-210c90e6bf8d",
+      "kind": "Method",
+      "name": "HTTPDigestAuth.handle_401",
+      "projection": {
+        "path": "src/requests/auth.py"
+      },
+      "relation_kinds": [
+        "calls",
+        "references"
+      ],
+      "resolution": "type_resolved",
+      "role": "source",
+      "site_count": 1,
+      "sites": [
+        {
+          "callee": "r.connection.send",
+          "line_in_entity": 39
+        }
+      ],
+      "sites_absent_reason": null,
+      "sites_partial_reason": "incomplete_call_evidence",
+      "via_override_of": null
+    },
+    {
+      "entity_id": "64b04e0e-0545-4040-8ff2-f525097ad51e",
+      "kind": "Method",
+      "name": "Session.send",
+      "projection": {
+        "path": "src/requests/sessions.py"
+      },
+      "relation_kinds": [
+        "calls",
+        "references"
+      ],
+      "resolution": "via_override_of=BaseAdapter.send",
+      "role": "source",
+      "site_count": 1,
+      "sites": [
+        {
+          "callee": "adapter.send",
+          "line_in_entity": 32
+        }
+      ],
+      "sites_absent_reason": null,
+      "sites_partial_reason": "language_server_edge",
+      "via_override_of": "BaseAdapter.send"
+    }
+  ],
+  "relation_kinds": [
+    "calls",
+    "imports",
+    "references"
+  ],
+  "source_derivation": {
+    "checked_scope": "admitted_inventory",
+    "local_binding_requirement": "required",
+    "report": {
+      "body_binding": "current",
+      "call_extraction": "incomplete",
+      "call_shape_parse_coverage_complete": false,
+      "excluded_artifacts": 93,
+      "full_adapter_sources": 37,
+      "import_resolution": "incomplete",
+      "inventory": "graph_admitted_full_adapter_sources",
+      "issue_count": 3,
+      "issues": [
+        {
+          "path": "src/requests/structures.py",
+          "reason": "local_binding_outstanding: prior local bindings remain outstanding"
+        },
+        {
+          "path": "src/requests/utils.py",
+          "reason": "local_binding_outstanding: prior local bindings remain outstanding"
+        },
+        {
+          "path": "tests/test_requests.py",
+          "reason": "local_binding_outstanding: prior local bindings remain outstanding"
+        }
+      ],
+      "outstanding_local_binding_obligations": 53,
+      "parse_coverage": "unproven",
+      "prior_local_binding": "outstanding"
+    },
+    "sampled": "selected_graph_after_query",
+    "scope": "live_head"
+  },
+  "total_upstream": 2,
+  "unconfirmed_candidates": 0
+}

@@ -31,11 +31,12 @@ mod named_imports;
 pub mod reconciler;
 mod rust_project;
 
+pub use binding_debt::has_reintroduced_withdrawn_guess;
 pub use collision::{
     check_entity_collision, check_file_collision, check_signature_change, check_visibility_change,
     group_conflicts_by_file, CollisionCheck, MergeConflict, MergeConflictKind, TrafficChecker,
 };
-pub use coverage::plan_local_binding_obligations;
+pub use coverage::{plan_local_binding_obligations, plan_withdrawn_local_binding_obligations};
 pub use cross_file::{CrossFilePass, LiveCrossFileLinker, ReferencedDestinations};
 pub use error::{ReconcileError, Result};
 pub use external::verify_external_import_predecessor;

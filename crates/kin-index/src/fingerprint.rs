@@ -152,9 +152,38 @@ fn finalize_hash(hasher: Sha256) -> Hash256 {
 /// still changes on a docstring edit; the equivalence hash removes exactly that
 /// residual, behavior-irrelevant sensitivity and nothing more.
 pub fn behavior_equivalence_hash(node: &Node, source: &[u8], language: LanguageId) -> Hash256 {
+    let file = FileEquivalenceContext::for_file(node, source, language);
+    behavior_equivalence_hash_in_file(node, source, language, &file)
+}
+
+/// The file-level facts [`behavior_equivalence_hash`] reads, derived once from
+/// a file's parse tree.
+///
+/// They depend only on the file, so a caller hashing every entity of one file
+/// derives them once and passes them to [`behavior_equivalence_hash_in_file`].
+/// Deriving them per entity scanned the whole file once for each entity in it,
+/// which made hashing a file quadratic in its size.
+#[derive(Clone, Copy)]
+pub struct FileEquivalenceContext(EquivalenceContext);
+
+impl FileEquivalenceContext {
+    /// Derive the facts for the file containing `node`, which may be the
+    /// file's root.
+    pub fn for_file(node: &Node, source: &[u8], language: LanguageId) -> Self {
+        Self(EquivalenceContext::for_entity_file(node, source, language))
+    }
+}
+
+/// [`behavior_equivalence_hash`] with the file-level facts already derived by
+/// [`FileEquivalenceContext::for_file`] from the file containing `node`.
+pub fn behavior_equivalence_hash_in_file(
+    node: &Node,
+    source: &[u8],
+    language: LanguageId,
+    file: &FileEquivalenceContext,
+) -> Hash256 {
     let mut hasher = Sha256::new();
-    let ctx = EquivalenceContext::for_entity_file(node, source, language);
-    hash_equivalence_stream(node, source, language, ctx, &mut hasher);
+    hash_equivalence_stream(node, source, language, file.0, &mut hasher);
     finalize_hash(hasher)
 }
 
@@ -813,6 +842,42 @@ mod equivalence_tests {
             .descendant_for_byte_range(span.start_byte, span.end_byte.saturating_sub(1))
             .expect("entity node should resolve from its span");
         behavior_equivalence_hash(&node, bytes, adapter.language_id())
+    }
+
+    /// The facts derived once per file give every entity the digest it gets
+    /// when they are derived from that entity, whichever way the file's
+    /// bindings open or close the NoneType gates.
+    #[test]
+    fn file_context_hashes_each_entity_as_its_own_derivation_does() {
+        use super::{behavior_equivalence_hash_in_file, FileEquivalenceContext};
+        let files = [
+            "import types\nfrom types import NoneType\n\ndef a(x):\n    \"\"\"doc\"\"\"\n    return type(None) is NoneType\n\nclass B:\n    def c(self):\n        return types.NoneType\n",
+            "import types\ntype = 3\n\ndef a(x):\n    return type(None)\n\ndef b():\n    types = None\n    return types\n",
+            "from types import *\n\ndef a():\n    return NoneType\n\ndef b(NoneType):\n    return NoneType\n",
+        ];
+        for source in files {
+            let bytes = source.as_bytes();
+            let adapter = PythonAdapter;
+            let tree = adapter.parse(bytes).expect("parse should succeed");
+            let output = adapter
+                .extract(&tree, bytes, &FilePathId("test/eq.py".to_string()))
+                .expect("extract should succeed");
+            let root = tree.root_node();
+            let file = FileEquivalenceContext::for_file(&root, bytes, adapter.language_id());
+            assert!(output.entities.len() > 1, "{source}");
+            for entity in &output.entities {
+                let span = &entity.span;
+                let node = root
+                    .descendant_for_byte_range(span.start_byte, span.end_byte.saturating_sub(1))
+                    .expect("entity node should resolve from its span");
+                assert_eq!(
+                    behavior_equivalence_hash_in_file(&node, bytes, adapter.language_id(), &file),
+                    behavior_equivalence_hash(&node, bytes, adapter.language_id()),
+                    "{} in {source}",
+                    entity.name
+                );
+            }
+        }
     }
 
     // ---- Equivalence: behavior-preserving edits collapse to one class -------

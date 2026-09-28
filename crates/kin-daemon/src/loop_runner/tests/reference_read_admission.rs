@@ -2681,8 +2681,8 @@ impl ArmedAdmissionLoop {
             receiver,
             Some(WatchArmed::new(armed)),
         ));
-        let arming =
-            crate::daemon::await_watch_armed(ready, std::time::Duration::from_secs(10)).await;
+        // Observe the delivery contract before starting the controlled edit.
+        let arming = crate::daemon::await_watch_armed(ready, WATCH_ARMING_BOUND).await;
         assert_eq!(arming, crate::daemon::WatchArming::Armed);
         // Let any startup work finish first, so the round under test is the
         // one that picks the test's edit up.

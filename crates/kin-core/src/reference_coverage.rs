@@ -75,9 +75,17 @@ pub enum LanguageServerReadiness {
     Unusable { reason: String },
     /// No server binary for this language was found at all.
     Absent,
+    /// Language-server enrichment is switched off for the publishing process,
+    /// so no server was resolved or started and none will be for its lifetime.
+    ///
+    /// A completed finding about the process rather than the host: nothing is
+    /// pending, and nothing says a server is missing. Recording it keeps a
+    /// switched-off process from reading as a probe that never finishes.
+    Disabled,
 }
 
-/// Per-language readiness as published by the process that probed.
+/// Per-language completed readiness observations. A missing entry is unobserved
+/// or currently being refreshed, not evidence that no server is installed.
 pub type LanguageServerReadinessMap =
     std::collections::HashMap<LanguageId, LanguageServerReadiness>;
 
@@ -137,6 +145,14 @@ pub enum ReferenceEnrichment {
     /// This build wires no adapter for the language, so reference and override
     /// edges are unavailable regardless of what is installed.
     Unsupported,
+    /// Language-server enrichment is switched off for the process serving this
+    /// graph, so no server was consulted.
+    ///
+    /// A completed finding, unlike [`ReferenceEnrichment::Unknown`]: nothing is
+    /// pending. It is not [`ReferenceEnrichment::NoLanguageServer`] either,
+    /// because it says nothing about what the host has installed, and install
+    /// advice would send an operator to the wrong repair.
+    EnrichmentDisabled,
 }
 
 impl ReferenceEnrichment {
@@ -145,7 +161,9 @@ impl ReferenceEnrichment {
     /// A missing language server is a host gap an operator can close.
     /// `Unsupported` is a property of the build, and a row a reader can do
     /// nothing about is noise rather than a finding. `Unknown` is not a gap
-    /// either: nothing looked, so nothing was found missing.
+    /// either: nothing looked, so nothing was found missing. Nor is
+    /// `EnrichmentDisabled`, which is the operator's own configuration rather
+    /// than something found missing on the host.
     pub fn is_actionable_gap(&self) -> bool {
         matches!(
             self,
@@ -167,7 +185,9 @@ pub fn reference_enrichment_for(
         Some(LanguageServerReadiness::Unusable { .. }) => {
             ReferenceEnrichment::LanguageServerUnusable
         }
-        Some(LanguageServerReadiness::Absent) | None => ReferenceEnrichment::NoLanguageServer,
+        Some(LanguageServerReadiness::Absent) => ReferenceEnrichment::NoLanguageServer,
+        Some(LanguageServerReadiness::Disabled) => ReferenceEnrichment::EnrichmentDisabled,
+        None => ReferenceEnrichment::Unknown,
     }
 }
 
@@ -1593,9 +1613,16 @@ mod tests {
 
     /// A host where exactly these languages have a usable server.
     fn usable(languages: &[LanguageId]) -> LanguageServerReadinessMap {
-        languages
+        ENRICHABLE_LANGUAGES
             .iter()
-            .map(|language| (*language, LanguageServerReadiness::Usable))
+            .copied()
+            .map(|language| (language, LanguageServerReadiness::Absent))
+            .chain(
+                languages
+                    .iter()
+                    .copied()
+                    .map(|language| (language, LanguageServerReadiness::Usable)),
+            )
             .collect()
     }
 
@@ -2322,6 +2349,74 @@ mod tests {
         let complete =
             unfilled.with_language_servers(&usable(&[LanguageId::Python, LanguageId::Rust]));
         assert!(complete.languages_missing_a_language_server().is_empty());
+    }
+
+    #[test]
+    fn partial_readiness_maps_distinguish_pending_from_completed_findings() {
+        let mut readiness =
+            LanguageServerReadinessMap::from([(LanguageId::Rust, LanguageServerReadiness::Usable)]);
+        assert_eq!(
+            reference_enrichment_for(LanguageId::Python, &readiness),
+            ReferenceEnrichment::Unknown,
+        );
+        for (observed, expected) in [
+            (
+                LanguageServerReadiness::Usable,
+                ReferenceEnrichment::Available,
+            ),
+            (
+                LanguageServerReadiness::Absent,
+                ReferenceEnrichment::NoLanguageServer,
+            ),
+            (
+                LanguageServerReadiness::Unusable {
+                    reason: "initialize failed".into(),
+                },
+                ReferenceEnrichment::LanguageServerUnusable,
+            ),
+            (
+                LanguageServerReadiness::Disabled,
+                ReferenceEnrichment::EnrichmentDisabled,
+            ),
+        ] {
+            readiness.insert(LanguageId::Python, observed);
+            assert_eq!(
+                reference_enrichment_for(LanguageId::Python, &readiness),
+                expected
+            );
+            readiness.remove(&LanguageId::Python);
+            assert_eq!(
+                reference_enrichment_for(LanguageId::Python, &readiness),
+                ReferenceEnrichment::Unknown
+            );
+            assert_eq!(
+                reference_enrichment_for(LanguageId::Rust, &readiness),
+                ReferenceEnrichment::Available
+            );
+        }
+    }
+
+    /// A switched-off process is a completed finding: not pending, and not a
+    /// missing installation an operator is told to repair.
+    #[test]
+    fn switched_off_enrichment_is_a_completed_finding_and_no_install_gap() {
+        let readiness = ENRICHABLE_LANGUAGES
+            .iter()
+            .map(|language| (*language, LanguageServerReadiness::Disabled))
+            .collect::<LanguageServerReadinessMap>();
+        for language in ENRICHABLE_LANGUAGES {
+            let state = reference_enrichment_for(*language, &readiness);
+            assert_eq!(state, ReferenceEnrichment::EnrichmentDisabled);
+            assert!(!state.is_actionable_gap());
+        }
+        assert_eq!(
+            reference_enrichment_for(LanguageId::Ruby, &readiness),
+            ReferenceEnrichment::Unsupported
+        );
+        assert_eq!(
+            serde_json::to_value(ReferenceEnrichment::EnrichmentDisabled).unwrap(),
+            serde_json::json!("enrichment_disabled")
+        );
     }
 
     fn language_row(name: &str, enrichment: ReferenceEnrichment) -> LanguageReferenceCoverage {

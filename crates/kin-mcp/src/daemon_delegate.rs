@@ -503,15 +503,24 @@ fn install_daemon_url_override(url: &str) {
 /// Every forwarded request goes through this rather than through
 /// [`daemon_base_url`] directly, so recovery is a property of the delegate and
 /// not of the one code path somebody remembered to add it to.
+///
+/// The session's idle floor is kept here for the same reason. However this
+/// process came to hold its daemon (the launcher's bind, a workspace re-bind,
+/// an on-demand re-resolution, a revival), the call about to reach it renews
+/// the floor that keeps it from idling out under this session, and a daemon it
+/// has not held a floor on yet gets one before the call goes out.
 async fn resolved_daemon_base_url() -> Option<String> {
-    if let Some(base) = daemon_base_url() {
+    let base = if let Some(base) = daemon_base_url() {
         DELEGATE_EVER_RESOLVED.store(true, std::sync::atomic::Ordering::Release);
-        return Some(base);
-    }
-    match resolve_delegate().await {
-        DelegateResolution::Resolved(url) => Some(url),
-        DelegateResolution::Gap(_) => None,
-    }
+        base
+    } else {
+        match resolve_delegate().await {
+            DelegateResolution::Resolved(url) => url,
+            DelegateResolution::Gap(_) => return None,
+        }
+    };
+    crate::session_idle_floor::keep(&base).await;
+    Some(base)
 }
 
 // ── MCP-path idle timeout ───────────────────────────────────────────────
@@ -1151,6 +1160,12 @@ fn parse_capabilities(args: &HashMap<String, serde_json::Value>) -> Option<Sessi
 
 fn scope_to_string(value: &serde_json::Value) -> Result<String, String> {
     if let Some(scope) = value.as_str() {
+        // A symbol outside the repository's address is forwarded as it is,
+        // because only the daemon holds the graph that says whether it names
+        // a symbol, and it refuses the scope by what it names.
+        if crate::handlers::external_symbols::is_external_address(scope) {
+            return Ok(scope.trim().to_string());
+        }
         // Forwarded verbatim to the daemon's intent parser, so it is checked
         // here against the spellings that parser accepts, and this route gives
         // the daemon's own MCP route's answer for the same input.
@@ -1170,6 +1185,9 @@ fn scope_to_string(value: &serde_json::Value) -> Result<String, String> {
         );
     };
     if let Some(entity) = obj.get("Entity").and_then(|value| value.as_str()) {
+        if crate::handlers::external_symbols::is_external_address(entity) {
+            return Ok(entity.trim().to_string());
+        }
         return Ok(format!("entity:{entity}"));
     }
     if let Some(contract) = obj.get("Contract").and_then(|value| value.as_str()) {
@@ -1204,6 +1222,31 @@ fn scope_strings(args: &HashMap<String, serde_json::Value>) -> Result<Vec<String
         .and_then(|value| value.as_array())
         .ok_or_else(|| "missing required parameter: scopes".to_string())?;
     scopes.iter().map(scope_to_string).collect()
+}
+
+/// The refusal a daemon intent or traffic route gave a scope naming a symbol
+/// outside the repository, as the tool error it is, or `None` for any other
+/// failure.
+///
+/// The route answers such a scope with the refusal's own JSON, or with the
+/// absence `get_entity` reports for an address naming nothing held, as its
+/// error body. The request helper frames every error body in the operation and
+/// status that carried it, which is right for a failure and wrong for a
+/// refusal the caller is meant to read by its code, so the body is relayed
+/// alone, in the shape the in-process tool refuses with.
+pub(crate) fn relayed_scope_refusal(error: &str) -> Option<ToolCallResult> {
+    use crate::handlers::external_symbols::{
+        EXTERNAL_SYMBOL_NOT_FOUND, EXTERNAL_SYMBOL_NOT_SERVED,
+    };
+    let (_, rest) = error.split_once(": HTTP ")?;
+    let (_, body) = rest.split_once(": ")?;
+    let body = body.trim();
+    if body.starts_with(&format!("{EXTERNAL_SYMBOL_NOT_FOUND}: ")) {
+        return Some(ToolCallResult::error(body.to_string()));
+    }
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    (value["error"]["code"].as_str() == Some(EXTERNAL_SYMBOL_NOT_SERVED))
+        .then(|| ToolCallResult::error(body.to_string()))
 }
 
 // ── Daemon revival seam ─────────────────────────────────────────────────
@@ -1321,7 +1364,12 @@ pub(crate) struct RealDaemonSeam;
 
 impl DaemonReviver for RealDaemonSeam {
     async fn revive(&self) -> Result<String, String> {
-        revive_mcp_daemon().await
+        let revived = revive_mcp_daemon().await?;
+        // A revival may hand back a daemon another caller started with the
+        // short CLI window, and the retry that follows goes straight to it
+        // rather than through the resolver, so the floor is held here.
+        crate::session_idle_floor::hold(&revived).await;
+        Ok(revived)
     }
 }
 
@@ -1604,14 +1652,37 @@ async fn await_revived_daemon(
     // the caller to restart. It prices off the same record the CLI's idle window
     // reads, the one the daemon writes when it finishes opening a store, so the
     // two paths cannot disagree about what this store costs.
+    let last_open_ms = kin_daemon_spawn::read_boot_cost(kin_dir).map(|cost| cost.total_ms);
     let patience = kin_daemon_spawn::daemon_startup_patience(
-        kin_daemon_spawn::read_boot_cost(kin_dir).map(|cost| cost.total_ms),
+        last_open_ms,
         kin_daemon_spawn::daemon_startup_patience_override(),
     );
-    let port_deadline = tokio::time::Instant::now() + patience;
-    let port = kin_daemon_spawn::await_reported_port(kin_dir, child, port_deadline)
-        .await
-        .map_err(|e| format!("MCP revival: {e}"))?;
+    let started = tokio::time::Instant::now();
+    let last_open = last_open_ms.map(Duration::from_millis);
+    let revival_progress = |phase: &str| {
+        format!(
+            "restarting the repo daemon, which had stopped: {phase}; {}",
+            crate::startup_binding::how_far(started.elapsed(), last_open)
+        )
+    };
+    let port_deadline = started + patience;
+    // The daemon publishes its port only once its store is open, so this wait
+    // is most of a cold start. It reports while it waits, for a caller that
+    // asked to hear.
+    let port = {
+        let port_wait = kin_daemon_spawn::await_reported_port(kin_dir, child, port_deadline);
+        tokio::pin!(port_wait);
+        let mut ticker = tokio::time::interval(PROGRESS_INTERVAL);
+        loop {
+            tokio::select! {
+                reported = &mut port_wait => break reported,
+                _ = ticker.tick() => report_call_progress(|| {
+                    revival_progress("the new daemon process is loading this repository's graph")
+                }),
+            }
+        }
+    }
+    .map_err(|e| format!("MCP revival: {e}"))?;
 
     // Poll /readiness until the daemon can actually serve, under the same
     // patience.
@@ -1642,7 +1713,13 @@ async fn await_revived_daemon(
     // separates "bound and openly not ready" from "not answering yet". Both are
     // retryable and they are not the same news, so the timeout says which.
     let mut answered_readiness = false;
+    let mut pacer = ProgressPacer::default();
     loop {
+        if pacer.due() {
+            report_call_progress(|| {
+                revival_progress("the new daemon is listening and finishing readiness checks")
+            });
+        }
         match poll_revival_readiness(&probe, &new_base).await {
             ReadinessPoll::Ready => {
                 // A daemon the supervisor does not know about is unroutable to
@@ -1798,15 +1875,95 @@ fn fast_path_patience() -> Duration {
     env_secs("KIN_MCP_DAEMON_TIMEOUT_SECS", 60)
 }
 
+/// The variable that sets how long one call waits for a daemon to become able
+/// to answer it.
+pub const DAEMON_PATIENCE_ENV: &str = "KIN_MCP_DAEMON_PATIENCE_SECS";
+
 /// Total patience for one forwarded call once the daemon has shown it is alive.
-/// Override with `KIN_MCP_DAEMON_PATIENCE_SECS`.
+/// Override with [`DAEMON_PATIENCE_ENV`].
 ///
 /// Matches the CLI's `KIN_DAEMON_READY_TIMEOUT_SECS` default deliberately: both
 /// bound how long a caller waits on a *live* daemon still doing startup work,
 /// and a repository large enough to need five minutes over one transport needs
 /// it over the other.
 fn escalated_patience() -> Duration {
-    env_secs("KIN_MCP_DAEMON_PATIENCE_SECS", 300)
+    env_secs(DAEMON_PATIENCE_ENV, 300)
+}
+
+/// How long one `tools/call` waits for the repo daemon to become ready before
+/// it answers that the daemon is still starting.
+///
+/// The same budget a forwarded call gives a daemon that is open and still
+/// loading, because the caller is waiting on the same thing either way: a
+/// daemon that cannot answer yet. Whether this process is still binding that
+/// daemon or has already bound it is not something a caller can see, and it
+/// used to decide whether the call waited five minutes or ten seconds.
+pub fn readiness_budget() -> Duration {
+    escalated_patience()
+}
+
+// ── Progress while a call waits ─────────────────────────────────────────
+
+tokio::task_local! {
+    static CALL_PROGRESS: CallProgress;
+}
+
+/// Where a call that is waiting on the daemon says how far it has come.
+///
+/// The stdio server opens one for a `tools/call` whose client asked for
+/// progress, runs the call inside [`with_call_progress`], and turns each line
+/// into an MCP `notifications/progress` for that call. Anything that waits on
+/// the daemon inside the call reports through [`report_call_progress`], which
+/// is a no-op when nobody is listening.
+#[derive(Debug, Clone)]
+pub struct CallProgress {
+    lines: tokio::sync::mpsc::UnboundedSender<String>,
+}
+
+impl CallProgress {
+    /// A reporter and the receiver its lines arrive on.
+    pub fn channel() -> (Self, tokio::sync::mpsc::UnboundedReceiver<String>) {
+        let (lines, receiver) = tokio::sync::mpsc::unbounded_channel();
+        (Self { lines }, receiver)
+    }
+}
+
+/// Run `call` with `progress` as the place its waits report to.
+pub async fn with_call_progress<F: std::future::Future>(
+    progress: CallProgress,
+    call: F,
+) -> F::Output {
+    CALL_PROGRESS.scope(progress, call).await
+}
+
+/// Report how far a wait inside the current call has come, when the call's
+/// client is listening.
+pub(crate) fn report_call_progress(line: impl FnOnce() -> String) {
+    let _ = CALL_PROGRESS.try_with(|progress| {
+        let _ = progress.lines.send(line());
+    });
+}
+
+/// How often a wait reports progress: often enough that a client which resets
+/// its own timeout on progress never reaches it, rarely enough to be noise.
+pub const PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Paces one wait's progress reports to [`PROGRESS_INTERVAL`], the first one
+/// straight away.
+#[derive(Debug, Default)]
+struct ProgressPacer {
+    next_at: Option<tokio::time::Instant>,
+}
+
+impl ProgressPacer {
+    fn due(&mut self) -> bool {
+        let now = tokio::time::Instant::now();
+        if self.next_at.is_some_and(|next_at| now < next_at) {
+            return false;
+        }
+        self.next_at = Some(now + PROGRESS_INTERVAL);
+        true
+    }
 }
 
 fn env_secs(key: &str, default: u64) -> Duration {
@@ -1839,6 +1996,8 @@ where
     Fut: std::future::Future<Output = Result<T, DaemonCallError>>,
 {
     let mut warming_detail: Option<String> = None;
+    let mut pacer = ProgressPacer::default();
+    let warming_since = tokio::time::Instant::now();
     loop {
         let budget = match warming_detail {
             None => budget,
@@ -1852,6 +2011,16 @@ where
                     return Err(DaemonCallError::Timeout(format!(
                         "daemon is still opening its state ({detail})"
                     )));
+                }
+                if pacer.due() {
+                    report_call_progress(|| {
+                        format!(
+                            "the repo daemon at {url} is listening and still opening its \
+                             repository authority; waited {}s, up to {}s more",
+                            warming_since.elapsed().as_secs(),
+                            remaining_until(deadline).as_secs()
+                        )
+                    });
                 }
                 warming_detail = Some(detail);
                 tokio::time::sleep(WARMING_POLL_INTERVAL).await;
@@ -2326,16 +2495,18 @@ pub async fn forward_tool_call(
             let lock_type = optional_string(arguments, "lock_type").unwrap_or("soft");
             let expires_at = optional_string(arguments, "expires_at");
             let scopes = scope_strings(arguments)?;
-            forward_register_intent(
+            match forward_register_intent(
                 &session_id,
                 &scopes,
                 lock_type,
                 &task_description,
                 expires_at,
             )
-            .await?
-            .map(text_result_from_value)
-            .transpose()
+            .await
+            {
+                Err(error) => relayed_scope_refusal(&error).map(Some).ok_or(error),
+                Ok(value) => value.map(text_result_from_value).transpose(),
+            }
         }
         "kin_release_intent" => {
             let session_id = required_string(arguments, "session_id")?;
@@ -2347,10 +2518,10 @@ pub async fn forward_tool_call(
         }
         "kin_check_traffic" => {
             let scopes = scope_strings(arguments)?;
-            forward_check_traffic(&scopes)
-                .await?
-                .map(text_result_from_value)
-                .transpose()
+            match forward_check_traffic(&scopes).await {
+                Err(error) => relayed_scope_refusal(&error).map(Some).ok_or(error),
+                Ok(value) => value.map(text_result_from_value).transpose(),
+            }
         }
         // Coverage exposure: the structured graph-status response binds entity,
         // relation, and embedding counts to one daemon-selected query graph.
@@ -2388,6 +2559,12 @@ fn validate_stage_arguments(arguments: &HashMap<String, serde_json::Value>) -> R
     let Some(operations_val) = arguments.get("operations") else {
         return Ok(());
     };
+    // A relation naming a symbol outside the repository by its address is no
+    // entity id, so decoding would refuse it as malformed; the daemon holds the
+    // graph that says what it names and refuses it by that.
+    if crate::handlers::sessions::names_external_relation_endpoint(operations_val) {
+        return Ok(());
+    }
     let operations = crate::session::parse_staged_operations(operations_val)?;
     crate::session::validate_staged_operations(&operations)
 }
@@ -5636,6 +5813,52 @@ mod tests {
 
     fn timed_out() -> DaemonCallError {
         DaemonCallError::Timeout("operation timed out".to_string())
+    }
+
+    /// A call waiting on a daemon that is open and still loading tells a
+    /// client that asked for progress how far it has come, paced so a long
+    /// wait is a handful of notifications rather than one per poll.
+    #[tokio::test(start_paused = true)]
+    async fn a_warming_wait_reports_progress_to_a_listening_call() {
+        // Fifteen seconds of warming at the 250 ms poll interval.
+        let attempts = ScriptedAttempts::new((0..60).map(|_| warming()).collect());
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
+        let (progress, mut lines) = CallProgress::channel();
+
+        let value = with_call_progress(
+            progress,
+            attempt_through_warmup(
+                &|url, budget| attempts.attempt(url, budget),
+                "http://127.0.0.1:1",
+                Duration::from_secs(60),
+                deadline,
+            ),
+        )
+        .await
+        .expect("a daemon that finishes warming answers the call");
+        assert_eq!(value, 7);
+
+        let mut reported = Vec::new();
+        while let Ok(line) = lines.try_recv() {
+            reported.push(line);
+        }
+        assert!(
+            (3..=4).contains(&reported.len()),
+            "fifteen seconds reported every five must be three or four lines: {reported:#?}"
+        );
+        assert!(
+            reported
+                .iter()
+                .all(|line| line.contains("still opening its repository authority")),
+            "each line says what the daemon is doing: {reported:#?}"
+        );
+    }
+
+    /// Outside a call whose client asked for progress, reporting costs nothing:
+    /// the line is never even built.
+    #[test]
+    fn progress_outside_a_listening_call_is_never_built() {
+        report_call_progress(|| unreachable!("no call is listening"));
     }
 
     /// FALSIFICATION, "a slow daemon is never destroyed" direction.

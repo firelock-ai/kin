@@ -289,10 +289,12 @@ avoid clobbering it, and you can see if someone is already there. Reach for it b
 making changes in a multi-agent setting so concurrent work coordinates through graph \
 truth instead of racing. Optionally set an expiry; release it early with \
 kin_release_intent, and check who else is active with kin_check_traffic. Requires an \
-active session from kin_session_start.";
+active session from kin_session_start. A scope naming a symbol outside the repository is \
+refused with external_symbol_not_served.";
 
-pub async fn handle_register_intent(
+pub async fn handle_register_intent<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
+    store: &G,
     sessions: &SessionRegistry,
     session_authority_mode: SessionAuthorityMode,
 ) -> Result<ToolCallResult> {
@@ -303,6 +305,14 @@ pub async fn handle_register_intent(
     let scopes_val = args.get("scopes").ok_or_else(|| {
         crate::error::McpError::InvalidParams("missing required parameter: scopes".into())
     })?;
+    if let Some(refusal) = super::external_symbols::external_scope_refusal(
+        store,
+        scopes_val,
+        "kin_register_intent",
+        "scopes",
+    )? {
+        return Ok(ToolCallResult::error(refusal));
+    }
     let scopes = parse_scopes(scopes_val)?;
 
     let lock_type_str = args
@@ -341,7 +351,8 @@ pub async fn handle_register_intent(
             }
             Ok(None) => {}
             Err(err) => {
-                return Ok(ToolCallResult::error(err));
+                return Ok(crate::daemon_delegate::relayed_scope_refusal(&err)
+                    .unwrap_or_else(|| ToolCallResult::error(err)));
             }
         }
     }
@@ -483,16 +494,26 @@ contracts, or artifacts), and what they're doing. Reach for it before you start 
 changing something in a multi-agent setting. It surfaces in-flight intents and locks \
 so you can avoid collisions, coordinate, or pick different work. It's the read-side \
 companion to kin_register_intent (the write side): one declares what you'll touch, the \
-other tells you what others are touching.";
+other tells you what others are touching. A scope naming a symbol outside the repository \
+is refused with external_symbol_not_served, since no intent can be declared on one.";
 
-pub async fn handle_check_traffic(
+pub async fn handle_check_traffic<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
+    store: &G,
     sessions: &SessionRegistry,
     session_authority_mode: SessionAuthorityMode,
 ) -> Result<ToolCallResult> {
     let scopes_val = args.get("scopes").ok_or_else(|| {
         crate::error::McpError::InvalidParams("missing required parameter: scopes".into())
     })?;
+    if let Some(refusal) = super::external_symbols::external_scope_refusal(
+        store,
+        scopes_val,
+        "kin_check_traffic",
+        "scopes",
+    )? {
+        return Ok(ToolCallResult::error(refusal));
+    }
     let scopes = parse_scopes(scopes_val)?;
 
     if session_authority_mode.uses_daemon() {
@@ -508,7 +529,8 @@ pub async fn handle_check_traffic(
             }
             Ok(None) => {}
             Err(err) => {
-                return Ok(ToolCallResult::error(err));
+                return Ok(crate::daemon_delegate::relayed_scope_refusal(&err)
+                    .unwrap_or_else(|| ToolCallResult::error(err)));
             }
         }
     }
@@ -751,7 +773,7 @@ verb, target and description; unknown fields are refused.";
 
 pub async fn handle_transaction_stage<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
-    _store: &G,
+    store: &G,
     sessions: &SessionRegistry,
     session_authority_mode: SessionAuthorityMode,
 ) -> Result<ToolCallResult> {
@@ -759,6 +781,14 @@ pub async fn handle_transaction_stage<G: GraphStore>(
     let operations_val = args.get("operations").ok_or_else(|| {
         crate::error::McpError::InvalidParams("missing required parameter: operations".into())
     })?;
+
+    if let Some(refusal) = super::external_symbols::external_relation_refusal(
+        store,
+        operations_val,
+        "kin_transaction_stage",
+    )? {
+        return Ok(ToolCallResult::error(refusal));
+    }
 
     let operations: Vec<McpMutationOperation> =
         crate::session::parse_staged_operations(operations_val)
@@ -1233,6 +1263,14 @@ pub async fn handle_transaction_commit<G: GraphStore>(
         ));
     }
 
+    if let Some(refusal) = super::external_symbols::external_relation_refusal(
+        store,
+        &serde_json::to_value(&tx.staged_operations)?,
+        "kin_transaction_commit",
+    )? {
+        return Ok(ToolCallResult::error(refusal));
+    }
+
     // Load-bearing ordering: run coordination enforcement against the fully
     // staged operation set before constructing or applying any graph delta.
     // A denied transaction remains active and graph truth is unchanged.
@@ -1522,7 +1560,29 @@ anchored creation uses the anchor's \
 source_base. An unkeyed success also carries the next repository_base and created_entities; \
 a keyed receipt keeps its fixed shape, so a keyed caller reads the next base with status. \
 A new stale request refuses without discarding its operations; an already-published \
-key still recovers its original receipt. Keys are retained within configurable daemon quotas.";
+key still recovers its original receipt. Keys are retained within configurable daemon quotas. \
+A relation whose from or to names a symbol outside the repository is refused with \
+external_symbol_not_served, to add or to remove it: a language server proves such an \
+edge from the caller's source.";
+
+/// Whether any relation operation in a raw `operations` array names a symbol
+/// outside the repository by its `external_reference:` address at either end.
+///
+/// A route that holds no graph asks this before it decodes the array, because
+/// an address is no entity id and decoding refuses it as a malformed
+/// operation. Such an array is left for the route that holds the graph, which
+/// answers the address by what it names.
+pub fn names_external_relation_endpoint(operations: &serde_json::Value) -> bool {
+    operations.as_array().is_some_and(|entries| {
+        entries.iter().any(|entry| {
+            ["from", "to"].iter().any(|end| {
+                entry["payload"]["Relation"][*end]
+                    .as_str()
+                    .is_some_and(super::external_symbols::is_external_address)
+            })
+        })
+    })
+}
 
 /// Decode and check the operations a `kin_mutate` call carries.
 ///
@@ -1657,9 +1717,15 @@ where
         }
         Ok(None) => {}
     }
-    let ops_val = match checked_mutate_operations(arguments) {
-        Ok(ops_val) => ops_val,
-        Err(refusal) => return Ok(refusal),
+    // An operation naming a symbol outside the repository by its address is
+    // no entity id, so it cannot be decoded here, and only the daemon holds
+    // the graph that says what it names; its commit refuses it by that.
+    let ops_val = match arguments.get("operations") {
+        Some(ops_val) if names_external_relation_endpoint(ops_val) => ops_val,
+        _ => match checked_mutate_operations(arguments) {
+            Ok(ops_val) => ops_val,
+            Err(refusal) => return Ok(refusal),
+        },
     };
     let session_id = match required_session(arguments) {
         Ok(session_id) => session_id,
@@ -1811,6 +1877,26 @@ fn name_the_mutate_door(result: &mut ToolCallResult) {
     let Some(crate::types::ContentBlock::Text { text }) = result.content.first_mut() else {
         return;
     };
+    // The commit refuses a relation naming a symbol outside the repository in
+    // its own name; the caller sent `kin_mutate`, which refuses it offline in
+    // that name, so the forwarded refusal is renamed to match.
+    if let Ok(mut refusal) = serde_json::from_str::<serde_json::Value>(text) {
+        let error = &mut refusal["error"];
+        if error["code"].as_str() == Some(super::external_symbols::EXTERNAL_SYMBOL_NOT_SERVED)
+            && error["tool"].as_str() == Some("kin_transaction_commit")
+        {
+            error["tool"] = serde_json::json!("kin_mutate");
+            if let Some(message) = error["message"].as_str() {
+                error["message"] = serde_json::json!(message.replacen(
+                    "so kin_transaction_commit ",
+                    "so kin_mutate ",
+                    1
+                ));
+            }
+            *text = refusal.to_string();
+            return;
+        }
+    }
     for door in [WriteDoor::Begin, WriteDoor::Commit] {
         let forwarded = format!("read_only_session: {} writes", door.name());
         if let Some(rest) = text.strip_prefix(&forwarded) {
@@ -1868,6 +1954,20 @@ pub async fn handle_mutate<G: GraphStore>(
     sessions: &SessionRegistry,
     session_authority_mode: SessionAuthorityMode,
 ) -> Result<ToolCallResult> {
+    // A keyed retry belongs to the daemon receipt path, which must recover a
+    // committed result before examining today's graph. Unkeyed/offline work
+    // has no receipt to recover and can refuse before creating a transaction.
+    if let Some(operations) = arguments
+        .get("operations")
+        .filter(|_| !arguments.contains_key("request_id"))
+    {
+        if let Some(refusal) =
+            super::external_symbols::external_relation_refusal(store, operations, "kin_mutate")?
+        {
+            return Ok(ToolCallResult::error(refusal));
+        }
+    }
+
     if session_authority_mode.uses_daemon() {
         return mutate_through_daemon(arguments).await;
     }

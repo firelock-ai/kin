@@ -42,8 +42,9 @@ winning. These checks hold the envelope to it on a live store:
               linker emits no entity-level import edge, and `present` on one
               whose linker does. `absent` on this source is the 0.5.52 wording
               this ticket is about.
-  two_reasons the same query under the server's smallest response budget,
-              which withholds rows and refuses on its own. Every input the
+  two_reasons the same query under the server's smallest response budget.
+              Every partial page refuses absence with its own paging reason,
+              and reassembly restores the original verdict. Every input that
               verdict records as inconclusive keeps its clause in
               `limiting_factor`, each label once: the budget's clause beside
               the class gap on a build that cannot produce the import class,
@@ -78,6 +79,8 @@ import subprocess
 import sys
 import tempfile
 import time
+
+from trace_pages import mcp_references
 
 PASS = "PASS"
 FAIL = "FAIL"
@@ -117,9 +120,67 @@ SHIPPED_0552 = {
 }
 
 
-def tail(text, limit=400):
+# BEGIN failure evidence excerpt
+# Every suite carries this block byte for byte, because a suite is also copied
+# out and run as a single file. test_failure_excerpt.py keeps the copies equal.
+EVIDENCE_LIMIT = 4000
+EVIDENCE_LINE_LIMIT = 600
+EVIDENCE_PANICS = ("panicked at", "has overflowed its stack")
+EVIDENCE_ESCAPES = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+EVIDENCE_ERROR = re.compile(r"^(?:[\w./-]+:\s*)?(?:error|fatal)\b", re.IGNORECASE)
+EVIDENCE_LOG_ERROR = re.compile(r"\sERROR\s")
+
+
+def failure_excerpt(text, limit=EVIDENCE_LIMIT):
+    """Bounded evidence from a command's output that still says why it failed.
+
+    Output that fits is returned whole. Longer output keeps its opening and its
+    end, and between them every line that carries a Rust panic, with the
+    message line under it, and the last error line, wherever they fall. A
+    warning printed around the error cannot push it out, and a long log cannot
+    cut the panic out. `limit` only ever raises the bound, never lowers it.
+    """
     text = (text or "").strip()
-    return text if len(text) <= limit else "..." + text[-limit:]
+    limit = max(int(limit), EVIDENCE_LIMIT)
+    if len(text) <= limit:
+        return text
+    head_end = limit // 4
+    tail_start = len(text) - limit // 2
+    lines = text.split("\n")
+    starts, offset = [], 0
+    panics, errors = [], []
+    for index, line in enumerate(lines):
+        starts.append(offset)
+        offset += len(line) + 1
+        plain = EVIDENCE_ESCAPES.sub("", line).strip()
+        if any(marker in plain for marker in EVIDENCE_PANICS):
+            panics.extend((index, index + 1))
+        if EVIDENCE_ERROR.match(plain) or EVIDENCE_LOG_ERROR.search(plain):
+            errors.append(index)
+    # The first panic and its message, then the last error line, then any
+    # later panics, for as long as the middle's share of the bound lasts.
+    order = panics[:2] + errors[-1:] + panics[2:]
+    budget, kept = limit // 4, set()
+    for index in order:
+        if index >= len(lines) or index in kept:
+            continue
+        start, end = starts[index], starts[index] + len(lines[index])
+        if end <= head_end or start >= tail_start:
+            continue
+        cost = min(len(lines[index]), EVIDENCE_LINE_LIMIT) + 1
+        if cost > budget:
+            continue
+        kept.add(index)
+        budget -= cost
+    middle = [lines[index][:EVIDENCE_LINE_LIMIT] for index in sorted(kept)]
+    parts = [text[:head_end], "[...]"] + middle + (["[...]"] if middle else [])
+    return "\n".join(parts + [text[tail_start:]])
+# END failure evidence excerpt
+
+
+def tail(text, limit=400):
+    """Quote a command's output as evidence through failure_excerpt."""
+    return failure_excerpt(text, limit)
 
 
 def run(cmd, cwd=None, env=None, timeout=600):
@@ -247,9 +308,24 @@ INPUT_CLAUSE_LABELS = {
     # actually carries and requires each of ITS labels in the factor, which
     # needs no vocabulary guess.
 }# The smallest response budget the server serves (`RESPONSE_MIN_MAX_CHARS`).
-# Asking for it on a populated answer withholds rows, which is the one refusal
-# an acceptance run can add to an answer on purpose.
+# Asking for it on a populated answer makes the transport withhold rows or
+# split them across pages, without changing the underlying graph evidence.
 BUDGET_FLOOR_CHARS = 2000
+
+
+def readiness_pending(payload):
+    """Whether the answer says its language-server readiness observation is pending.
+
+    A daemon that has just started establishes readiness with its own server
+    handshake, and until that observation completes its answers read
+    `reference_enrichment: unknown`, which the verdict rightly refuses to
+    certify. The fixture waits on that observation, read from the coverage the
+    answer carries, rather than grading the window. A completed finding of any
+    kind (available, no language server, unusable, switched off) ends the wait,
+    so the checks still grade whatever the host can actually do.
+    """
+    coverage = payload.get("edge_coverage") if isinstance(payload, dict) else None
+    return isinstance(coverage, dict) and coverage.get("reference_enrichment") == "unknown"
 
 
 def factor_labels(factor):
@@ -445,6 +521,8 @@ class Suite(object):
         return rc, out
 
     def mcp(self, repo, tool, args, timeout=300):
+        if tool == "find_references":
+            return mcp_references(self.kin, repo, self.env, args, timeout)
         env = dict(self.env)
         env["KIN_MCP_REPO"] = repo
         proc = subprocess.Popen([self.kin, "mcp", "start", "--repo", repo],
@@ -477,7 +555,7 @@ class Suite(object):
                     resp = obj
         if resp is None:
             raise RuntimeError("mcp %s returned no id=2 frame (stderr tail: %s)"
-                               % (tool, err[-300:].replace("\n", " ")))
+                               % (tool, failure_excerpt(err).replace("\n", " ")))
         if "error" in resp:
             raise RuntimeError("mcp %s error: %s" % (tool, json.dumps(resp["error"])[:200]))
         content = (resp.get("result") or {}).get("content") or []
@@ -515,6 +593,8 @@ class Suite(object):
         """find_references(blank_code), retried while the reference sweep
         settles, because `references` reads short until the language server has
         run and that is a fact about timing rather than about the verdict.
+        Retried too while the answer says its language-server readiness
+        observation is still pending (see `readiness_pending`).
         `extra` adds arguments to the call, such as a response budget."""
         repo = self.fixture()
         key = (tuple(kinds or ()), tuple(sorted((extra or {}).items())))
@@ -529,7 +609,8 @@ class Suite(object):
             self.kin_run(["graph", "status"], repo)
             payload = self.mcp(repo, "find_references", args)
             classes = ((payload.get("_kin") or {}).get("completeness") or {}).get("classes") or {}
-            if all(classes.get(c) == "present" for c in classes if c != "imports"):
+            if (all(classes.get(c) == "present" for c in classes if c != "imports")
+                    and not readiness_pending(payload)):
                 break
             time.sleep(4)
         self.payloads[key] = payload
@@ -635,9 +716,9 @@ def check_unproduced(suite):
 def check_two_reasons(suite):
     result = Result("two_reasons", "a verdict with more than one reason to refuse names every "
                                    "one of them in its limiting factor, each once")
-    # The response budget at the server's floor withholds rows from the
-    # populated answer, which downgrades the verdict independently of what the
-    # graph holds. Beside an import class this build cannot produce that is two
+    # At the floor, withheld rows or partial pages qualify the transport
+    # independently of what the graph holds. A paged answer must name that
+    # limit on every page and recover the original graph verdict afterward. Beside an import class this build cannot produce that is two
     # reasons; on a build whose linker produces the class it is one, and the
     # check says which world it graded. Either way every refusing input must
     # keep its clause: the shape this guards against kept the budget's clause
@@ -650,9 +731,37 @@ def check_two_reasons(suite):
                        % (BUDGET_FLOOR_CHARS, error))
         return result
     inputs = (((payload.get("_kin") or {}).get("verdict") or {}).get("inputs") or {})
-    if inputs.get("response_budget") != "inconclusive":
-        result.unknown("the response budget did not withhold rows at max_chars=%d (inputs %s), "
-                       "so no second reason was added and nothing was graded"
+    pages = getattr(payload, "page_observations", ())
+    partial = [page for page in pages if page["page"].get("complete") is False]
+    page_problems = []
+    if partial:
+        if len(partial) != len(pages) or len(pages) < 2:
+            page_problems.append("partial reference evidence did not traverse a complete continuation sequence")
+        for index, page in enumerate(pages):
+            verdict = page["verdict"]
+            if (page["page"].get("kind") != "references"
+                    or verdict.get("state") != "inconclusive"
+                    or verdict.get("safe_to_conclude_absent") is not False
+                    or page["negative"].get("safe_to_conclude_absent") is not False
+                    or factor_labels(verdict.get("limiting_factor")) != ["reference_page_partial"]):
+                page_problems.append("reference page %d lost its explicit partial-answer qualification" % index)
+        if "reference_page_partial" in factor_labels(
+                ((payload.get("_kin") or {}).get("verdict") or {}).get("limiting_factor")):
+            page_problems.append("the assembled original verdict still carries a transport-only partial clause")
+        if not payload.get("references"):
+            page_problems.append("the page sequence reconstructed no populated reference answer")
+        if inputs.get("call_sites") == "inconclusive":
+            block = payload.get("call_sites") or {}
+            clauses = block.get("clauses")
+            original_labels = factor_labels(((payload.get("_kin") or {}).get("verdict") or {})
+                                            .get("limiting_factor"))
+            if (block.get("settled") is not False or not isinstance(clauses, list) or not clauses
+                    or any(not isinstance(clause, str) or ": " not in clause
+                           or clause.split(":", 1)[0] not in original_labels for clause in clauses)):
+                page_problems.append("reassembly lost a recorded call-site limitation")
+    elif inputs.get("response_budget") != "inconclusive":
+        result.unknown("the response budget neither withheld nor paged rows at max_chars=%d (inputs %s), "
+                       "so no response limit was exercised"
                        % (BUDGET_FLOOR_CHARS, inputs))
         return result
     labels, problems = factor_carries_every_refusing_input(payload)
@@ -664,13 +773,13 @@ def check_two_reasons(suite):
     # map, because its clauses are `trust_reason`'s and therefore other inputs'
     # labels. See the note above INPUT_CLAUSE_LABELS.
     gate_checked, gate_problems = factor_carries_the_absence_gates_own_clauses(payload)
-    problems = list(problems) + list(gate_problems)
+    problems = list(problems) + list(gate_problems) + page_problems
     if problems:
         result.bad("%s (refusing inputs %s, factor labels %s)"
                    % ("; ".join(problems), refusing, labels))
     else:
-        result.ok("%d refusing input(s) %s and the factor carries %s%s"
-                  % (len(refusing), refusing, labels,
+        result.ok("%d explicitly limited page(s); %d original refusing input(s) %s and the factor carries %s%s"
+                  % (len(partial), len(refusing), refusing, labels,
                      "" if gate_checked
                      else "; the absence gate carried no trust_reason, so its clauses were not "
                           "checked"))
@@ -822,6 +931,16 @@ def self_test():
                "state": "certified", "limiting_factor": "retrieval_degraded: x",
                "inputs": {"edge_coverage": "certified"}}}})[1]), 1)
     expect("no verdict inputs is unreadable", factor_carries_every_refusing_input({})[0], None)
+
+    # The fixture waits only while readiness is pending. Every completed
+    # finding, and an answer that carries no coverage, ends the wait.
+    expect("pending readiness waits",
+           readiness_pending({"edge_coverage": {"reference_enrichment": "unknown"}}), True)
+    for finding in ("available", "no_language_server", "language_server_unusable",
+                    "enrichment_disabled", "unsupported"):
+        expect("completed readiness %s does not wait" % finding,
+               readiness_pending({"edge_coverage": {"reference_enrichment": finding}}), False)
+    expect("no coverage does not wait", readiness_pending({}), False)
 
     expect("every declared id has a check",
            tuple(c.__name__.replace("check_", "") for c in CHECKS), DECLARED)

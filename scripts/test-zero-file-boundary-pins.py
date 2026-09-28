@@ -40,6 +40,10 @@ FILES = (
     "crates/kin-agent/src/tests.rs",
     "crates/kin-daemon/src/mcp_source_base.rs",
     "crates/kin-daemon/src/unit_lifecycle.rs",
+    "crates/kin-lsp/src/analysis_env/unpack.rs",
+    "crates/kin-lsp/src/analysis_env/python/interpreter.rs",
+    "crates/kin-lsp/src/analysis_env/python/store.rs",
+    "crates/kin-daemon/src/daemon/readiness.rs",
 )
 UNPINNED_FILES = ("crates/kin-agent/src/belt.rs",)
 FUNCTIONS = (
@@ -58,6 +62,17 @@ FUNCTIONS = (
     (FILES[15], "write_supervisor_endpoint_files_under_authority"),
     (FILES[16], "probe_image"),
     (FILES[22], "rewrite_upgrade_sidecar"),
+    (FILES[27], "unpack_tar"),
+    (FILES[27], "observe_gzip"),
+    (FILES[27], "untar_gz_checked"),
+    (FILES[28], "hash_archive"),
+    (FILES[28], "insensitive_destination"),
+    (FILES[28], "save_failure_receipt"),
+    (FILES[29], "claim"),
+    (FILES[29], "drop"),
+    (FILES[30], "executable_permissions"),
+    (FILES[30], "executable_head"),
+    (FILES[30], "native_input"),
 )
 POISON = (
     '\nfn __boundary_pin_probe(p: &str) -> String { '

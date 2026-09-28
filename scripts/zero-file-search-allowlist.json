@@ -185,13 +185,17 @@
     },
     {
       "file": "crates/kin-cli/src/commands/upgrade.rs",
-      "reason": "Review 2026-09-23: `kin upgrade` reads typed RepositoryAuthorityState metadata through its read lease, `lease.metadata()`, to enumerate the workspace, refs, open merges and stashes it plans against, and, after its commit, to read whether authority recorded that commit's payment of the workspace's owed derivation work. Those two reads are the expression excused. It reads no host metadata and no working file: every body the upgrade re-derives from is read by content address from repository authority or the staging store, and the census and hydration records it writes go through kin-core's own writers. Review 2026-09-24: remove_legacy_owed_work_records is the migration boundary for the owed-work records an earlier build's daemon kept beside the store, <kin_root>/semantic-debt.json and <kin_root>/unpublished-enrichment.json. It removes them, and nothing else, only after authority records that the upgrade's own commit paid the workspace's owed derivation work; it reads neither file and decides nothing from either, and a removal that fails is left for the next daemon start to judge against authority. Review 2026-09-25: rewrite_upgrade_sidecar is the atomic migration boundary for three operational language-server records under the repository layout root: lsp-accepted-evidence.jsonl, lsp-enriched-files.json and lsp-owed-files.json. Its fixed callers retire stale Python enrichment only after repository authority commits the upgrade. The helper reads those records, writes and syncs a staged replacement, atomically persists it and syncs its parent. It never reads source bodies or produces a semantic query answer. Only the helper body is excused; the surrounding upgrade planning and publication paths remain scanned.",
+      "reason": "Review 2026-09-23: `kin upgrade` reads typed RepositoryAuthorityState metadata through its read lease, `lease.metadata()`, to enumerate the workspace, refs, open merges and stashes it plans against, and, after its commit, to read whether authority recorded that commit's payment of the workspace's owed derivation work. Those two reads are the expression excused. It reads no host metadata and no working file: every body the upgrade re-derives from is read by content address from repository authority or the staging store, and the census and hydration records it writes go through kin-core's own writers. Review 2026-09-24: remove_legacy_owed_work_records is the migration boundary for the owed-work records an earlier build's daemon kept beside the store, <kin_root>/semantic-debt.json and <kin_root>/unpublished-enrichment.json. It removes them, and nothing else, only after authority records that the upgrade's own commit paid the workspace's owed derivation work; it reads neither file and decides nothing from either, and a removal that fails is left for the next daemon start to judge against authority. Review 2026-09-25: rewrite_upgrade_sidecar is the atomic migration boundary for three operational language-server records under the repository layout root: lsp-accepted-evidence.jsonl, lsp-enriched-files.json and lsp-owed-files.json. Its fixed callers retire stale Python enrichment only after repository authority commits the upgrade. The helper reads those records, writes and syncs a staged replacement, atomically persists it and syncs its parent. It never reads source bodies or produces a semantic query answer. Only the helper body is excused; the surrounding upgrade planning and publication paths remain scanned. The automatic startup re-qualification shares upgrade_store's core and reads the same typed authority metadata through the lineage envelope, `envelope.metadata()`, which returns graph-owned state and only shares a name with the filesystem probe.",
       "owner": "kin-cli",
       "expiration": "2027-03-23",
       "allow_match": [
         {
           "expr": "lease.metadata()",
           "count": 2
+        },
+        {
+          "expr": "envelope.metadata()",
+          "count": 1
         }
       ],
       "allow_fn": [
@@ -742,7 +746,7 @@
     },
     {
       "file": "crates/kin-daemon/src/daemon.rs",
-      "reason": "Daemon run loop boundary. Two pins are the liveness checks that ask whether this daemon's own repository root and control plane are still present, which is a question about the process rather than about the repository. The rest are the run loop reporting its process id, exiting, and canonicalizing the bound repository root twice while wiring authority into the server. No repository content is read and no query answer derives from any of it. Pinned by expression rather than by function, because the run loop is half this module and exempting its body would leave more unscanned than the primitives justify. The liveness pins first named endpoint_files_missing and control_plane_missing, expressions that stopped existing when a classifier replaced them to verify who owns an endpoint before treating its absence as an eviction notice. Their successors, repository_root_missing and classify_control_plane, were then exempted per function, which excused twenty-four lines to license two expressions. They are pinned again, but on the primitive rather than on a snippet: the two `.exists()` calls are the only filesystem primitive in either body, and a count on the primitive survives the rewording that made the first pins stale while still failing the guard the moment a third appears. Two further pins are the cold sweep's completion marker at <kin_dir>/lsp-enriched-files.json, one read at startup and one write per file finished. It records which files a background enrichment pass has already queried a language server about, so a restart resumes instead of re-sweeping the whole repository, and it is bookkeeping about that pass rather than repository content: no entity, relation or query answer derives from it, and an absent or unreadable marker degrades to a full re-sweep rather than to a wrong answer. It exists because inferring the same fact from the graph failed twice, silently and on the three files the enrichment ticket is about, which is why the sweep now records what it DID instead. Pinned on the primitives with counts, matching the rest of this entry: a third fs call fails the guard. Two further pins are the cold sweep's consecutive-interruption counter at <kin_dir>/lsp-sweep-interruptions, one read when the daemon decides whether to queue a sweep and one write when a sweep ends. It records how many sweeps in a row ended early without enriching anything, so a store whose sweep cannot survive stops being handed another one on every daemon start; one stranger session logged 24 such sweeps against one repository. It is bookkeeping about the pass in exactly the sense the marker above is: no entity, relation or query answer derives from it, and an absent or unreadable counter degrades to the current behaviour of queueing a sweep rather than to a wrong answer. It is a file rather than in-memory state because the loop it guards spans daemon RESTARTS, and a counter that resets on every start cannot see the pattern it exists to detect. Pinned on the primitives with counts like the rest of this entry, so the write pin rises from one to two and the read is pinned on read_to_string rather than read: a third write or a second read_to_string fails the guard. Three further pins are the cold sweep's in-flight record at <kin_dir>/lsp-sweep-in-flight, one write when a sweep begins, one removal when it reaches its end, and one existence probe with its removal on the next daemon start. Everything a sweep makes durable happens after its last file, so a process that ends mid-sweep reaches none of it and the store keeps no trace that a sweep ever ran: a killed sweep and a sweep that never started read the same, which is what made the interruption counter above blind to the very loop it guards. This record is the difference, and it is bookkeeping about the pass in exactly the sense the two above are. No entity, relation or query answer derives from it, and an absent or unreadable record degrades to today's behaviour of queueing a sweep rather than to a wrong answer. It is a file rather than in-memory state for the same reason the counter is, because the fact it carries is only ever read by a LATER process. Pinned on the primitives with counts like the rest of this entry, so the write pin rises from two to three, the existence pin from two to three, and removal is pinned at two: a fourth write, a fourth probe or a third removal fails the guard. The interruption tally's own read and write moved down to `kin-daemon-spawn` once `kin graph status`, `kin doctor` and the MCP envelope had to answer the same question about it, so this module keeps the tally's callers and none of its IO: the write pin falls back from three to two and the read pin is gone entirely, which means a reintroduced read here fails the guard rather than passing under an inherited count. A third write pin is the same completion marker being RETIRED for a file a reconcile just changed. Nothing removed an entry before, so a file swept once was skipped by every later sweep for the life of the store however far its declarations had moved, which is what made that edge loss permanent and what let `kin daemon sweep` report \"enriched 37/37 files\" in 518 ms over 37 files it skipped. The primitive is the same rewrite of the same bookkeeping file the per-sweep write above performs, on the same terms: no entity, relation or query answer derives from it, and a failed rewrite degrades to a re-sweep rather than to a wrong answer. The write pin rises from two to three; a fourth fails the guard. The process-id pin rises from two to three for the shutdown watchdog, which names this process in the death note it writes before a forced exit, so the next start reads that ending as the daemon's own rather than as a kill; a fourth fails the guard. Review 2026-09-20: The additional exact exit(70) is the protected prepared-publication fail-stop: it terminates this process before custody can be dropped after an unresolved acknowledgement, following bounded optional diagnostic IO through an existing helper. This is not spawning a query subprocess; only the single fixed exit expression is excused.",
+      "reason": "Daemon run loop boundary. Two pins are the liveness checks that ask whether this daemon's own repository root and control plane are still present, which is a question about the process rather than about the repository. The rest are the run loop reporting its process id, exiting, and canonicalizing the bound repository root twice while wiring authority into the server. No repository content is read and no query answer derives from any of it. Pinned by expression rather than by function, because the run loop is half this module and exempting its body would leave more unscanned than the primitives justify. The liveness pins first named endpoint_files_missing and control_plane_missing, expressions that stopped existing when a classifier replaced them to verify who owns an endpoint before treating its absence as an eviction notice. Their successors, repository_root_missing and classify_control_plane, were then exempted per function, which excused twenty-four lines to license two expressions. They are pinned again, but on the primitive rather than on a snippet: the two `.exists()` calls are the only filesystem primitive in either body, and a count on the primitive survives the rewording that made the first pins stale while still failing the guard the moment a third appears. Two further pins are the cold sweep's completion marker at <kin_dir>/lsp-enriched-files.json, one read at startup and one write per file finished. It records which files a background enrichment pass has already queried a language server about, so a restart resumes instead of re-sweeping the whole repository, and it is bookkeeping about that pass rather than repository content: no entity, relation or query answer derives from it, and an absent or unreadable marker degrades to a full re-sweep rather than to a wrong answer. It exists because inferring the same fact from the graph failed twice, silently and on the three files the enrichment ticket is about, which is why the sweep now records what it DID instead. Pinned on the primitives with counts, matching the rest of this entry: a third fs call fails the guard. Two further pins are the cold sweep's consecutive-interruption counter at <kin_dir>/lsp-sweep-interruptions, one read when the daemon decides whether to queue a sweep and one write when a sweep ends. It records how many sweeps in a row ended early without enriching anything, so a store whose sweep cannot survive stops being handed another one on every daemon start; one stranger session logged 24 such sweeps against one repository. It is bookkeeping about the pass in exactly the sense the marker above is: no entity, relation or query answer derives from it, and an absent or unreadable counter degrades to the current behaviour of queueing a sweep rather than to a wrong answer. It is a file rather than in-memory state because the loop it guards spans daemon RESTARTS, and a counter that resets on every start cannot see the pattern it exists to detect. Pinned on the primitives with counts like the rest of this entry, so the write pin rises from one to two and the read is pinned on read_to_string rather than read: a third write or a second read_to_string fails the guard. Three further pins are the cold sweep's in-flight record at <kin_dir>/lsp-sweep-in-flight, one write when a sweep begins, one removal when it reaches its end, and one existence probe with its removal on the next daemon start. Everything a sweep makes durable happens after its last file, so a process that ends mid-sweep reaches none of it and the store keeps no trace that a sweep ever ran: a killed sweep and a sweep that never started read the same, which is what made the interruption counter above blind to the very loop it guards. This record is the difference, and it is bookkeeping about the pass in exactly the sense the two above are. No entity, relation or query answer derives from it, and an absent or unreadable record degrades to today's behaviour of queueing a sweep rather than to a wrong answer. It is a file rather than in-memory state for the same reason the counter is, because the fact it carries is only ever read by a LATER process. Pinned on the primitives with counts like the rest of this entry, so the write pin rises from two to three, the existence pin from two to three, and removal is pinned at two: a fourth write, a fourth probe or a third removal fails the guard. The interruption tally's own read and write moved down to `kin-daemon-spawn` once `kin graph status`, `kin doctor` and the MCP envelope had to answer the same question about it, so this module keeps the tally's callers and none of its IO: the write pin falls back from three to two and the read pin is gone entirely, which means a reintroduced read here fails the guard rather than passing under an inherited count. A third write pin is the same completion marker being RETIRED for a file a reconcile just changed. Nothing removed an entry before, so a file swept once was skipped by every later sweep for the life of the store however far its declarations had moved, which is what made that edge loss permanent and what let `kin daemon sweep` report \"enriched 37/37 files\" in 518 ms over 37 files it skipped. The primitive is the same rewrite of the same bookkeeping file the per-sweep write above performs, on the same terms: no entity, relation or query answer derives from it, and a failed rewrite degrades to a re-sweep rather than to a wrong answer. The write pin rises from two to three; a fourth fails the guard. The process-id pin rises from two to three for the shutdown watchdog, which names this process in the death note it writes before a forced exit, so the next start reads that ending as the daemon's own rather than as a kill; a fourth fails the guard. Review 2026-09-20: The additional exact exit(70) is the protected prepared-publication fail-stop: it terminates this process before custody can be dropped after an unresolved acknowledgement, following bounded optional diagnostic IO through an existing helper. This is not spawning a query subprocess; only the single fixed exit expression is excused. Two further pins are the startup gate, a fault-injection lever (KIN_DAEMON_TEST_STARTUP_GATE) that holds a starting daemon while a test-controlled file exists: one probe decides whether the gate is armed and one polls until the test removes it. Only the file's existence is read, it names no repository content, and it is disarmed unless the lever is set.",
       "owner": "kin-daemon",
       "expiration": "2027-05-24",
       "allow_match": [
@@ -772,7 +776,11 @@
           "count": 2
         },
         "kin_daemon_spawn::publish_serving_daemon(state.layout.root(), std::process::id());",
-        "std::process::exit(70);"
+        "std::process::exit(70);",
+        {
+          "expr": "std::fs::symlink_metadata(&gate)",
+          "count": 2
+        }
       ]
     },
     {
@@ -783,6 +791,17 @@
       "allow_fn": [
         "proxy_rustup_for",
         "run_rustup"
+      ]
+    },
+    {
+      "file": "crates/kin-daemon/src/daemon/readiness.rs",
+      "reason": "Language-server launch identity boundary. These helpers inspect the already-resolved executable and native interpreter permissions, canonical identity and bounded 256-byte header to invalidate cached readiness after replacement or permission changes. They read no repository source, produce no semantic answers and validate no graph ledger. All surrounding readiness logic remains scanned.",
+      "owner": "kin-daemon",
+      "expiration": "2026-12-31",
+      "allow_fn": [
+        "executable_permissions",
+        "executable_head",
+        "native_input"
       ]
     },
     {
@@ -1649,13 +1668,13 @@
     },
     {
       "file": "crates/kin-cli/src/commands/status.rs",
-      "reason": "Coherent repository-v6 status, and its own doc is the point: every count comes from one immutable authority lease and nothing here inspects checkout contents, Git or legacy sidecars. NOT a filesystem call. The reported `.metadata()` is `RepositoryAuthorityState::metadata()`, which returns the graph-owned repository-v6 authority envelope; this module reads workspace, alias, external-object or merge-transaction state out of it. It shares a method name with the filesystem metadata probe in the shared deny set, which is the only reason it appears here, and pinning by exact occurrence count rather than exempting the file keeps every other line scanned. Measured across the whole scan on 2026-09-04, 57 of 78 `.metadata()` hits are this in-memory accessor rather than a filesystem probe. Tracked as FIR-3162, which makes the pattern precise; these pins retire with it.",
+      "reason": "Coherent repository-v6 status, and its own doc is the point: every count comes from one immutable authority lease and nothing here inspects checkout contents, Git or legacy sidecars. NOT a filesystem call. The reported `.metadata()` is `RepositoryAuthorityState::metadata()`, which returns the graph-owned repository-v6 authority envelope; this module reads workspace, alias, external-object or merge-transaction state out of it. It shares a method name with the filesystem metadata probe in the shared deny set, which is the only reason it appears here, and pinning by exact occurrence count rather than exempting the file keeps every other line scanned. Measured across the whole scan on 2026-09-04, 57 of 78 `.metadata()` hits are this in-memory accessor rather than a filesystem probe. These pins retire once the deny pattern tells this accessor from the filesystem probe. The third occurrence, added for 0.8.2, is `binding_history_checked_at`, which reads the same authority envelope's binding-history witnesses to say whether the workspace graph carries a checked lineage.",
       "owner": "kin-cli",
       "expiration": "2027-01-29",
       "allow_match": [
         {
           "expr": ".metadata()",
-          "count": 2
+          "count": 3
         }
       ]
     },
@@ -1853,14 +1872,15 @@
     },
     {
       "file": "crates/kin-lsp/src/lifecycle.rs",
-      "reason": "Pinned to the exact site rather than exempted whole, so any other filesystem or subprocess primitive added to this file still fails the guard. It moved into crates/ from its own repository on 2026-09-11. The language-server spawn, which is what an LSP client is. Enrichment writes type-resolved relations INTO the graph; the server is an ingestion input, never the answer to a query. Since the server became the leader of its own process group, this file builds the server's Command and hands it to server_process.rs, which starts it, so the Stdio and Child imports moved there with the spawn and only the ChildStderr and Command import stays here. The additional exact ExitStatus type/import pins describe the already-owned language server exit; they launch no process and read no repository source.",
+      "reason": "Pinned to the exact site rather than exempted whole, so any other filesystem or subprocess primitive added to this file still fails the guard. It moved into crates/ from its own repository on 2026-09-11. The language-server spawn, which is what an LSP client is. Enrichment writes type-resolved relations INTO the graph; the server is an ingestion input, never the answer to a query. Since the server became the leader of its own process group, this file builds the server's Command and hands it to server_process.rs, which starts it, so the Stdio and Child imports moved there with the spawn and only the ChildStderr and Command import stays here. The additional exact ExitStatus type/import pins describe the already-owned language server exit; they launch no process and read no repository source. When no identity for the server's program can be proven, the start is labelled unverified with a nonce built from this client's own process id (std::process::id), which reads nothing and starts nothing.",
       "owner": "kin-lsp",
       "expiration": "2028-01-28",
       "allow_match": [
         "tokio::process::{ChildStderr, Command}",
         "Command::new(command)",
         "fn describe_exit(status: std::process::ExitStatus) -> String {",
-        "use std::os::unix::process::ExitStatusExt;"
+        "use std::os::unix::process::ExitStatusExt;",
+        "crate::proof_context::unverified_start_identity(std::process::id())"
       ]
     },
     {
@@ -2053,7 +2073,7 @@
     },
     {
       "file": "crates/kin-lsp/src/analysis_env/unpack.rs",
-      "reason": "Analysis-environment boundary: it prepares, outside the repository and under Kin's cache, the dependencies and toolchain a repository's lockfile pins, so a language server can resolve calls into them. It fetches hash-verified bytes, unpacks them as data, and never runs what it fetched or any repository code. The language server is an ingestion input to enrichment, and no entity, relation or query answer derives from these files. This module unpacks archives that already matched the lock's digest into a staging directory in the store: unzip and untar_gz read the archive and create its entries, copy_bounded writes each file within fixed byte and entry budgets, make_executable sets the executable bit on a toolchain's binaries, and make_link recreates a link that stays inside the tree. Every entry path is checked before it lands, so none lands outside the tree, and nothing unpacked is executed. Each function is IO in whole, so each is named. Pinned to the named functions rather than exempted whole, so any other filesystem or subprocess primitive added elsewhere in this file still fails the guard.",
+      "reason": "Analysis-environment boundary: it prepares, outside the repository and under Kin's cache, the dependencies and toolchain a repository's lockfile pins, so a language server can resolve calls into them. It fetches hash-verified bytes, unpacks them as data, and never runs what it fetched or any repository code. The language server is an ingestion input to enrichment, and no entity, relation or query answer derives from these files. This module unpacks archives that already matched the lock's digest into a staging directory in the store: unzip and untar_gz read the archive and create its entries, copy_bounded writes each file within fixed byte and entry budgets, make_executable sets the executable bit on a toolchain's binaries, and make_link recreates a link that stays inside the tree. Every entry path is checked before it lands, so none lands outside the tree, and nothing unpacked is executed. Each function is IO in whole, so each is named. Pinned to the named functions rather than exempted whole, so any other filesystem or subprocess primitive added elsewhere in this file still fails the guard. unpack_tar creates contained archive entries under staging; observe_gzip reads the verified open archive through bounded decoders and checks its gzip trailer; untar_gz_checked checks destination filename compatibility and exclusively creates the extraction tree before unpacking.",
       "owner": "kin-lsp",
       "expiration": "2027-11-12",
       "allow_fn": [
@@ -2067,7 +2087,10 @@
         {
           "fn": "make_link",
           "count": 2
-        }
+        },
+        "unpack_tar",
+        "observe_gzip",
+        "untar_gz_checked"
       ]
     },
     {
@@ -2121,7 +2144,7 @@
     },
     {
       "file": "crates/kin-lsp/src/analysis_env/python/interpreter.rs",
-      "reason": "Analysis-environment boundary: it prepares, outside the repository and under Kin's cache, the dependencies and toolchain a repository's lockfile pins, so a language server can resolve calls into them. It fetches hash-verified bytes, unpacks them as data, and never runs what it fetched or any repository code. The language server is an ingestion input to enrichment, and no entity, relation or query answer derives from these files. is_executable checks that a stored CPython build's interpreter file is executable, one version per platform, and ensure downloads a pinned CPython build, checks its digest, unpacks it into the store and replaces an older copy. The interpreter is never started here. Pinned to the named functions rather than exempted whole, so any other filesystem or subprocess primitive added elsewhere in this file still fails the guard.",
+      "reason": "Analysis-environment boundary: it prepares, outside the repository and under Kin's cache, the dependencies and toolchain a repository's lockfile pins, so a language server can resolve calls into them. It fetches hash-verified bytes, unpacks them as data, and never runs what it fetched or any repository code. The language server is an ingestion input to enrichment, and no entity, relation or query answer derives from these files. is_executable checks that a stored CPython build's interpreter file is executable, one version per platform, and ensure downloads a pinned CPython build, checks its digest, unpacks it into the store and replaces an older copy. The interpreter is never started here. Pinned to the named functions rather than exempted whole, so any other filesystem or subprocess primitive added elsewhere in this file still fails the guard. hash_archive checks the opened downloaded archive's on-disk digest and size before decoding; insensitive_destination creates two exclusively owned probe entries to determine the staging filesystem's case behavior; save_failure_receipt atomically replaces bounded local provisioning diagnostics before the owned attempt is removed.",
       "owner": "kin-lsp",
       "expiration": "2027-11-12",
       "allow_fn": [
@@ -2129,7 +2152,10 @@
           "fn": "is_executable",
           "count": 2
         },
-        "ensure"
+        "ensure",
+        "hash_archive",
+        "insensitive_destination",
+        "save_failure_receipt"
       ]
     },
     {
@@ -2180,7 +2206,7 @@
     },
     {
       "file": "crates/kin-lsp/src/analysis_env/python/store.rs",
-      "reason": "Analysis-environment boundary: it prepares, outside the repository and under Kin's cache, the dependencies and toolchain a repository's lockfile pins, so a language server can resolve calls into them. It fetches hash-verified bytes, unpacks them as data, and never runs what it fetched or any repository code. The language server is an ingestion input to enrichment, and no entity, relation or query answer derives from these files. This module is the content-addressed store itself: ensure_artifact downloads a verified wheel or sdist and unpacks it, merge_wheel_data moves a wheel's purelib and platlib contents to its root, extract_sdist and copy_importable_source copy a pure-Python sdist's importable source and refuse one that needs a build, build_env writes an environment's pyvenv.cfg and links its artifacts into site-packages, merge_into rewrites .pth files to their path lines and leaves out startup hooks so nothing runs when an interpreter starts, and publish_dir, copy_tree, link, is_importable, artifact_tags, installed_distributions and site_packages_under are their file helpers. Each named function is store IO in whole. The exact std::process::id() only names staging files uniquely; it starts no process. Pinned to the named functions and exact sites rather than exempted whole, so any other filesystem or subprocess primitive added to this file still fails the guard.",
+      "reason": "Analysis-environment boundary: it prepares, outside the repository and under Kin's cache, the dependencies and toolchain a repository's lockfile pins, so a language server can resolve calls into them. It fetches hash-verified bytes, unpacks them as data, and never runs what it fetched or any repository code. The language server is an ingestion input to enrichment, and no entity, relation or query answer derives from these files. This module is the content-addressed store itself: ensure_artifact downloads a verified wheel or sdist and unpacks it, merge_wheel_data moves a wheel's purelib and platlib contents to its root, extract_sdist and copy_importable_source copy a pure-Python sdist's importable source and refuse one that needs a build, build_env writes an environment's pyvenv.cfg and links its artifacts into site-packages, merge_into rewrites .pth files to their path lines and leaves out startup hooks so nothing runs when an interpreter starts, and publish_dir, copy_tree, link, is_importable, artifact_tags, installed_distributions and site_packages_under are their file helpers. Each named function is store IO in whole. The exact std::process::id() only names staging files uniquely; it starts no process. Pinned to the named functions and exact sites rather than exempted whole, so any other filesystem or subprocess primitive added to this file still fails the guard. OwnedAttempt::claim exclusively creates a private staging directory, refusing existing owners; its Drop::drop removes only that claimed attempt.",
       "owner": "kin-lsp",
       "expiration": "2027-11-12",
       "allow_match": [
@@ -2202,7 +2228,9 @@
         "merge_into",
         "build_env",
         "installed_distributions",
-        "site_packages_under"
+        "site_packages_under",
+        "claim",
+        "drop"
       ]
     },
     {
@@ -2535,7 +2563,7 @@
     },
     {
       "file": "crates/kin-db/src/storage/repository.rs",
-      "reason": "Pinned to the functions that hold its filesystem primitives rather than exempted whole, so every other function in the file, including any added later, stays graded. It moved into crates/ from its own repository on 2026-09-11 and is graded by this checker for the first time. The pinned functions handle the repository store's on-disk layout, publication and authority records. Every query this file answers (ref and tree resolution, name lookup, the locate cache) stays graded, which is where the thesis forbids a raw-file fallback. Review 2026-09-20: The stale metadata pins are now individually attributed: three multiline typed authority accessors select the exact workspace/Native parent; two self.metadata calls bind/materialize a workspace; exact current/next accesses check schema/history; exact lease expressions resolve parent and frozen overlay. They read RepositoryAuthorityState, not filesystem metadata. Counts are measured after existing function scopes and longest exact matches, so no occurrence budget comes from tests or masked bodies. Review 2026-09-23: the re-derivation commit adds one comparison of the current and next authority schema versions, so a successor that raises the schema is persisted whole rather than offered to the frame encoder; both reads are typed RepositoryAuthorityState metadata. Review 2026-09-24: the re-derivation commit's payment adds one typed read, `next.metadata()`, handed to `rederived_by` so a workspace is paid only where the successor records the verifier's witness naming this commit's operation; it is RepositoryAuthorityState metadata, not a filesystem probe.",
+      "reason": "Pinned to the functions that hold its filesystem primitives rather than exempted whole, so every other function in the file, including any added later, stays graded. It moved into crates/ from its own repository on 2026-09-11 and is graded by this checker for the first time. The pinned functions handle the repository store's on-disk layout, publication and authority records. Every query this file answers (ref and tree resolution, name lookup, the locate cache) stays graded, which is where the thesis forbids a raw-file fallback. Review 2026-09-20: The stale metadata pins are now individually attributed: three multiline typed authority accessors select the exact workspace/Native parent; two self.metadata calls bind/materialize a workspace; exact current/next accesses check schema/history; exact lease expressions resolve parent and frozen overlay. They read RepositoryAuthorityState, not filesystem metadata. Counts are measured after existing function scopes and longest exact matches, so no occurrence budget comes from tests or masked bodies. Review 2026-09-23: the re-derivation commit adds one comparison of the current and next authority schema versions, so a successor that raises the schema is persisted whole rather than offered to the frame encoder; both reads are typed RepositoryAuthorityState metadata. Review 2026-09-24: the re-derivation commit's payment adds one typed read, `next.metadata()`, handed to `rederived_by` so a workspace is paid only where the successor records the verifier's witness naming this commit's operation; it is RepositoryAuthorityState metadata, not a filesystem probe. Review 2026-09-27: carrying_workspace_base reads the exact admitted predecessor through `let metadata = current.metadata();`; this typed authority accessor supplies the held change and tree-hash binding and performs no filesystem query.",
       "owner": "kin-db",
       "expiration": "2027-03-22",
       "allow_fn": [
@@ -2555,6 +2583,7 @@
       ],
       "allow_match": [
         "&self.metadata().roots",
+        "let metadata = current.metadata();",
         {
           "expr": ".metadata()",
           "count": 5
@@ -2957,6 +2986,59 @@
       "allow_match": [
         "manager.read_authority().metadata().workspaces[0].clone()",
         "lease.metadata().workspaces[0].clone()"
+      ]
+    },
+    {
+      "file": "crates/kin-lsp/src/proof_context.rs",
+      "reason": "Resolver identity boundary: before a language server starts, Kin identifies the executable it would run by content, so a proof made by that exact executable is known to be current without starting it. It resolves the executable the daemon already chose, reads its bytes and, for a Node package's entry script, that package's package.json. These files are the language server's own installation, outside the repository. Once the server runs, Kin identifies what the running process actually executes: on Linux it reads the process's /proc exe link and cmdline (running_process_image, a cfg-gated pair whose macOS twin asks the kernel through proc_pidpath and touches no file), so a server behind a shell shim or a launcher is identified by the program it ended up running. Nothing in the repository is read, no query answer reads these files, and only a digest is kept. Pinned to the named functions.",
+      "owner": "kin-lsp",
+      "expiration": "2027-07-23",
+      "allow_fn": [
+        "resolver_content_identity",
+        {
+          "fn": "running_process_image",
+          "count": 2
+        }
+      ]
+    },
+    {
+      "file": "crates/kin-cli/src/daemon_client/starting_owner.rs",
+      "reason": "Daemon process lifecycle boundary, the starting-owner record. A daemon that holds its repository's daemon.lock but has not yet published daemon.pid or its endpoint (while it opens the store or re-qualifies it at startup) writes a small record naming its own process identity and executable image beside the lock it holds, and `kin daemon stop` reads it back so a stop can find and stop that starting daemon instead of reporting that nothing runs. The pinned expressions resolve the repository's .kin root to its canonical form, probe daemon.lock's metadata without following symlinks, test whether that lock is still held (the contended-lock error kind), and remove the record the daemon itself wrote. They carry process identity and lock state only, read no repository content, and can only decide whether a verified starting daemon is signalled or reported busy; none can produce, rank, fill or repair an answer to locate, search, context, trace, review, xref, or rename. Pinned by exact expression with counts, so any added filesystem primitive in this module fails the guard. One further pin sizes the probe budget for the recording daemon's own executing image through process_executable::observation_budget, passing this process's id; it reads the image's length only, on Linux, and no repository content.",
+      "owner": "kin-cli",
+      "expiration": "2027-07-30",
+      "allow_match": [
+        {
+          "expr": "std::fs::remove_file(path)",
+          "count": 1
+        },
+        {
+          "expr": "fs2::lock_contended_error()",
+          "count": 2
+        },
+        {
+          "expr": "kin_root.canonicalize()",
+          "count": 2
+        },
+        {
+          "expr": "std::fs::symlink_metadata(root.join(\"daemon.lock\"))",
+          "count": 1
+        },
+        {
+          "expr": "process_executable::observation_budget(std::process::id(), DAEMON_BINARY_PROBE_TIMEOUT)",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "file": "crates/kin-cli/src/daemon_client/process_executable.rs",
+      "reason": "Daemon process lifecycle boundary, the executing-image identity a stop verifies before it signals a recorded pid. `observation_budget` reads the length of /proc/<pid>/exe on Linux so the observation deadline covers hashing an image of that size on a loaded machine; the identity the observation proves is unchanged. It reads process metadata only, no repository content, and can only decide how long a stop waits before it refuses; none of it can produce, rank, fill or repair an answer to locate, search, context, trace, review, xref, or rename. Pinned by exact expression with a count, so any added filesystem primitive in this module fails the guard.",
+      "owner": "kin-cli",
+      "expiration": "2027-07-30",
+      "allow_match": [
+        {
+          "expr": "std::fs::metadata(format!(\"/proc/{pid}/exe\"))",
+          "count": 1
+        }
       ]
     }
   ]

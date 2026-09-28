@@ -38,6 +38,18 @@
 //! choice is between missing a twelve-edge regression and warning on every
 //! deletion.
 //!
+//! One fall is not a loss, and it is the one the language server causes on
+//! purpose. The parser's linker binds a call by name alone when it cannot do
+//! better, and a sweep that proves where such a call really lands retires the
+//! name-only guess the proof contradicts. `Calls` falls with no entity removed,
+//! which is the exact shape of the regression above, and the graph just became
+//! more precise. A pass that retired guesses that way says how many, per kind,
+//! and [`record_settled`] credits them against the fall: a kind that fell no
+//! further than its proven retirements has settled and advances the baseline,
+//! while any fall beyond them is judged exactly as before. The credit is a
+//! count, so it can only ever excuse as many edges as proof removed, and it
+//! lasts until the baseline next moves.
+//!
 //! Reads are three-way for the same reason [`crate::last_admission`] reads are.
 //! Absent and unreadable are different answers and neither may present as
 //! "nothing changed": a surface that turns a missing record into a clean bill
@@ -186,6 +198,11 @@ pub enum CensusMovement {
     /// The kind fell by less than [`SHARP_DROP_FRACTION`]. Carried so a reader
     /// asking for the whole comparison gets it, and never on its own a warning.
     Slipped,
+    /// The kind fell, and no further than the edges of that kind exact
+    /// language-server proof retired since the previous census. Not a loss: a
+    /// name-only call guess the server contradicted at its call site leaves
+    /// the graph by design, and the graph is more precise for it.
+    Settled,
     /// The kind grew.
     Grew,
     /// The kind is present now and was absent from the previous census.
@@ -213,6 +230,15 @@ pub struct CensusChange {
     pub previous: u64,
     pub current: u64,
     pub movement: CensusMovement,
+    /// Edges of this kind exact language-server proof retired since the
+    /// previous census, credited against the fall. Zero when the comparison
+    /// was given no retirements.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub settled: u64,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 impl CensusChange {
@@ -221,27 +247,54 @@ impl CensusChange {
     /// Zero when the kind did not fall, and zero when there was nothing to fall
     /// from: a kind that appears from an absent previous count has no
     /// denominator, and inventing one would report a new kind as a loss.
+    ///
+    /// Edges proof retired are not lost, so they are counted as still held.
     pub fn lost_fraction(&self) -> f64 {
-        if self.previous == 0 || self.current >= self.previous {
+        let held = self.current.saturating_add(self.settled);
+        if self.previous == 0 || held >= self.previous {
             return 0.0;
         }
-        (self.previous - self.current) as f64 / self.previous as f64
+        (self.previous - held) as f64 / self.previous as f64
+    }
+
+    /// The clause crediting proven retirements, when there were any.
+    fn settled_clause(&self) -> String {
+        if self.settled == 0 {
+            return String::new();
+        }
+        format!(
+            ", beyond the {} edges exact language-server proof retired",
+            self.settled
+        )
     }
 
     /// One sentence naming what this kind did, for a status or doctor line.
     pub fn describe(&self) -> String {
         match self.movement {
-            CensusMovement::Vanished => format!("{} went {} to 0", self.kind, self.previous),
+            CensusMovement::Vanished => format!(
+                "{} went {} to 0{}",
+                self.kind,
+                self.previous,
+                self.settled_clause()
+            ),
             CensusMovement::Fell => format!(
-                "{} fell {} to {} ({:.0}% of its edges)",
+                "{} fell {} to {} ({:.0}% of its edges){}",
                 self.kind,
                 self.previous,
                 self.current,
-                self.lost_fraction() * 100.0
+                self.lost_fraction() * 100.0,
+                self.settled_clause()
             ),
             CensusMovement::Slipped => format!(
-                "{} slipped {} to {}",
-                self.kind, self.previous, self.current
+                "{} slipped {} to {}{}",
+                self.kind,
+                self.previous,
+                self.current,
+                self.settled_clause()
+            ),
+            CensusMovement::Settled => format!(
+                "{} settled {} to {}, within the {} edges exact language-server proof retired",
+                self.kind, self.previous, self.current, self.settled
             ),
             CensusMovement::Grew => {
                 format!("{} grew {} to {}", self.kind, self.previous, self.current)
@@ -263,6 +316,20 @@ pub fn compare(
     previous: &BTreeMap<String, u64>,
     current: &BTreeMap<String, u64>,
 ) -> Vec<CensusChange> {
+    compare_settled(previous, current, &BTreeMap::new())
+}
+
+/// Classify every kind in either census, crediting the edges of each kind
+/// exact language-server proof retired between them.
+///
+/// A kind that fell no further than its credit has [`CensusMovement::Settled`].
+/// A kind that fell further is classified on what is left after the credit,
+/// so proof excuses exactly the edges it removed and not one more.
+pub fn compare_settled(
+    previous: &BTreeMap<String, u64>,
+    current: &BTreeMap<String, u64>,
+    settled: &BTreeMap<String, u64>,
+) -> Vec<CensusChange> {
     let mut kinds: Vec<&String> = previous.keys().chain(current.keys()).collect();
     kinds.sort_unstable();
     kinds.dedup();
@@ -272,11 +339,17 @@ pub fn compare(
         .map(|kind| {
             let before = previous.get(kind).copied().unwrap_or(0);
             let after = current.get(kind).copied().unwrap_or(0);
+            let retired = if after < before {
+                settled.get(kind).copied().unwrap_or(0)
+            } else {
+                0
+            };
             let mut change = CensusChange {
                 kind: kind.clone(),
                 previous: before,
                 current: after,
                 movement: CensusMovement::Unchanged,
+                settled: retired,
             };
             change.movement = if before == 0 && after > 0 {
                 CensusMovement::Appeared
@@ -284,6 +357,8 @@ pub fn compare(
                 CensusMovement::Grew
             } else if after == before {
                 CensusMovement::Unchanged
+            } else if after.saturating_add(retired) >= before {
+                CensusMovement::Settled
             } else if after == 0 {
                 CensusMovement::Vanished
             } else if change.lost_fraction() >= SHARP_DROP_FRACTION {
@@ -324,6 +399,11 @@ pub struct RelationCensusComparison {
     /// Entities the graph holds now, when the caller measured them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_entities: Option<u64>,
+    /// Edges of each kind exact language-server proof retired since the
+    /// previous census, credited against that kind's fall. Empty unless the
+    /// caller knows of retirements, which only the pass that made them does.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub settled: BTreeMap<String, u64>,
 }
 
 impl RelationCensusComparison {
@@ -342,6 +422,7 @@ impl RelationCensusComparison {
                 causes,
                 previous_entities: recorded.entities,
                 current_entities: None,
+                settled: BTreeMap::new(),
             },
             RelationCensusRead::Absent => Self {
                 previous_at: None,
@@ -356,6 +437,7 @@ impl RelationCensusComparison {
                 causes,
                 previous_entities: None,
                 current_entities: None,
+                settled: BTreeMap::new(),
             },
             RelationCensusRead::Unreadable(reason) => Self {
                 previous_at: None,
@@ -369,6 +451,7 @@ impl RelationCensusComparison {
                 causes,
                 previous_entities: None,
                 current_entities: None,
+                settled: BTreeMap::new(),
             },
         }
     }
@@ -381,6 +464,28 @@ impl RelationCensusComparison {
     /// was counted from.
     pub fn with_current_entities(mut self, entities: u64) -> Self {
         self.current_entities = Some(entities);
+        self
+    }
+
+    /// Credit the edges of each kind exact language-server proof retired
+    /// since the previous census, and classify every kind again with them.
+    ///
+    /// Chained for the reason [`Self::with_current_entities`] is: only the
+    /// pass that retired edges knows it did, so every other caller says so by
+    /// omission and keeps the comparison it always had.
+    pub fn with_settled(mut self, settled: BTreeMap<String, u64>) -> Self {
+        let previous = self
+            .changes
+            .iter()
+            .map(|change| (change.kind.clone(), change.previous))
+            .collect();
+        let current = self
+            .changes
+            .iter()
+            .map(|change| (change.kind.clone(), change.current))
+            .collect();
+        self.changes = compare_settled(&previous, &current, &settled);
+        self.settled = settled;
         self
     }
 
@@ -714,6 +819,13 @@ pub struct CensusHold {
     /// One line per kind that lost ground, as [`RelationCensusComparison`]
     /// renders them.
     pub losses: Vec<String>,
+    /// Edges of each kind exact language-server proof retired since
+    /// `held_at`. Carried so a later pass, in this process or the next one,
+    /// still credits them against the same baseline: the pass that retired
+    /// them is the only one that knew, and a hold that forgot would report the
+    /// retirements as lost once whatever else held the baseline recovered.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub settled: BTreeMap<String, u64>,
 }
 
 impl CensusHold {
@@ -800,12 +912,49 @@ pub fn rebaseline(layout: &KinLayout, census: &RelationCensus) -> std::io::Resul
 ///
 /// [`Held`]: CensusRecordOutcome::Held
 pub fn record(layout: &KinLayout, census: &RelationCensus) -> CensusRecordOutcome {
+    record_settled(layout, census, &BTreeMap::new())
+}
+
+/// [`record`], crediting the edges of each kind that exact language-server
+/// proof retired in the pass that measured `census`.
+///
+/// A sweep that proves where a call lands retires the name-only guess the
+/// proof contradicts, so `Calls` falls while every entity stays. Judged
+/// without the credit that is the twelve-edge regression this record exists
+/// for, and the store would hold below a baseline no later pass can reach,
+/// since the guesses are gone for good. With it, a kind that fell no further
+/// than its retirements has settled and the census advances. A fall beyond
+/// them is judged on what remains, so a pass that retired nineteen guesses
+/// and lost five other edges still holds.
+///
+/// The credit accumulates against one baseline. A pass that holds for any
+/// reason writes what it was credited into the hold, and the next pass,
+/// whichever process runs it, adds its own to what the hold carries against
+/// the same baseline. It resets when the baseline moves, because the new
+/// baseline was measured after the retirements.
+pub fn record_settled(
+    layout: &KinLayout,
+    census: &RelationCensus,
+    settled: &BTreeMap<String, u64>,
+) -> CensusRecordOutcome {
     let previous = read(layout);
     if let RelationCensusRead::Recorded(recorded) = &previous {
+        let mut credited = CensusHold::read(layout.root())
+            .filter(|hold| hold.held_at == recorded.at)
+            .map(|hold| hold.settled)
+            .unwrap_or_default();
+        for (kind, count) in settled {
+            let entry = credited.entry(kind.clone()).or_insert(0);
+            *entry = entry.saturating_add(*count);
+        }
+        credited.retain(|_, count| *count > 0);
         let mut comparison =
             RelationCensusComparison::build(&previous, &census.kinds, census.causes.clone());
         if let Some(entities) = census.entities {
             comparison = comparison.with_current_entities(entities);
+        }
+        if !credited.is_empty() {
+            comparison = comparison.with_settled(credited.clone());
         }
         if comparison.reports_loss() {
             let losses = comparison.loss_lines();
@@ -815,6 +964,7 @@ pub fn record(layout: &KinLayout, census: &RelationCensus) -> CensusRecordOutcom
                     held_at: recorded.at,
                     held_source: recorded.source.label().to_string(),
                     losses: losses.clone(),
+                    settled: credited,
                 }),
             );
             return CensusRecordOutcome::Held {
@@ -1614,5 +1764,193 @@ mod tests {
             CensusHold::read(layout.root()).is_none(),
             "a graph that holds what it held again reports no loss"
         );
+    }
+
+    /// The census an upgrade leaves, then the sweep after it, with the counts
+    /// a Flask store showed. The sweep's language server contradicted nineteen
+    /// name-only call guesses, which leave the graph for good, and with the
+    /// calls it proved in the same pass `Calls` fell 1596 to 1589 over an
+    /// unmoved entity count. Judged without the retirements that is a loss
+    /// nothing will ever recover, and every answer after it read degraded.
+    #[test]
+    fn a_fall_no_further_than_proven_retirements_settles_and_advances() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = layout_in(dir.path());
+        let upgraded = RelationCensus::new(
+            at(1_000_000),
+            CensusSource::Commit,
+            census(&[("Calls", 1596), ("References", 3054)]),
+            Vec::new(),
+        )
+        .with_entities(1091);
+        rebaseline(&layout, &upgraded).unwrap();
+        let swept = |secs| {
+            RelationCensus::new(
+                at(secs),
+                CensusSource::Sweep,
+                census(&[("Calls", 1589), ("References", 3054)]),
+                Vec::new(),
+            )
+            .with_entities(1091)
+        };
+
+        assert!(
+            matches!(
+                record(&layout, &swept(1_000_300)),
+                CensusRecordOutcome::Held { .. }
+            ),
+            "without the retirements the same fall is a loss, or this test proves nothing"
+        );
+        assert!(CensusHold::read(layout.root()).is_some());
+
+        let retired = census(&[("Calls", 19)]);
+        assert_eq!(
+            record_settled(&layout, &swept(1_000_600), &retired),
+            CensusRecordOutcome::Advanced
+        );
+        assert!(
+            CensusHold::read(layout.root()).is_none(),
+            "a settled fall retires the hold"
+        );
+        match read(&layout) {
+            RelationCensusRead::Recorded(recorded) => {
+                assert_eq!(recorded.kinds.get("Calls"), Some(&1589));
+                assert_eq!(recorded.at, at(1_000_600));
+            }
+            other => panic!("the settled census is the new baseline, got {other:?}"),
+        }
+
+        assert_eq!(
+            record(&layout, &swept(1_000_900)),
+            CensusRecordOutcome::Advanced,
+            "the next pass, with nothing left to retire, compares against the settled graph"
+        );
+        assert!(CensusHold::read(layout.root()).is_none());
+    }
+
+    /// Proof excuses exactly the edges it removed. Nineteen retired and
+    /// twenty-six gone leaves seven nobody explained, over an entity count
+    /// that held, which is the regression this record exists for.
+    #[test]
+    fn a_fall_beyond_proven_retirements_still_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = layout_in(dir.path());
+        rebaseline(
+            &layout,
+            &RelationCensus::new(
+                at(1_000_000),
+                CensusSource::Commit,
+                census(&[("Calls", 1596)]),
+                Vec::new(),
+            )
+            .with_entities(1091),
+        )
+        .unwrap();
+
+        let outcome = record_settled(
+            &layout,
+            &RelationCensus::new(
+                at(1_000_300),
+                CensusSource::Sweep,
+                census(&[("Calls", 1570)]),
+                Vec::new(),
+            )
+            .with_entities(1091),
+            &census(&[("Calls", 19)]),
+        );
+        match outcome {
+            CensusRecordOutcome::Held {
+                held_at, losses, ..
+            } => {
+                assert_eq!(held_at, at(1_000_000));
+                assert!(
+                    losses.iter().any(|line| line.contains(
+                        "Calls slipped 1596 to 1570, beyond the 19 edges exact \
+                         language-server proof retired"
+                    )),
+                    "the hold names the fall and what proof already explained: {losses:?}"
+                );
+            }
+            other => panic!("an unexplained fall must hold, got {other:?}"),
+        }
+        let hold = CensusHold::read(layout.root()).expect("the refusal published a hold");
+        assert_eq!(hold.settled, census(&[("Calls", 19)]));
+
+        let vanished = compare_settled(
+            &census(&[("Overrides", 10)]),
+            &census(&[("Overrides", 0)]),
+            &census(&[("Overrides", 4)]),
+        );
+        assert_eq!(
+            movement_of(&vanished, "Overrides"),
+            CensusMovement::Vanished,
+            "a kind proof explains only part of is still gone"
+        );
+        let settled = compare_settled(
+            &census(&[("Overrides", 4)]),
+            &census(&[("Overrides", 0)]),
+            &census(&[("Overrides", 4)]),
+        );
+        assert_eq!(movement_of(&settled, "Overrides"), CensusMovement::Settled);
+        assert!(!CensusMovement::Settled.is_loss());
+    }
+
+    /// A pass that holds for another kind must not forget what proof retired.
+    /// The daemon that retired the guesses may be gone by the time the other
+    /// kind recovers, and the guesses stay retired, so the hold carries the
+    /// credit to whichever pass comes next against the same baseline.
+    #[test]
+    fn a_hold_carries_its_credit_to_the_next_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = layout_in(dir.path());
+        rebaseline(
+            &layout,
+            &RelationCensus::new(
+                at(1_000_000),
+                CensusSource::Commit,
+                census(&[("Calls", 1596), ("Overrides", 76)]),
+                Vec::new(),
+            )
+            .with_entities(1091),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            record_settled(
+                &layout,
+                &RelationCensus::new(
+                    at(1_000_300),
+                    CensusSource::Sweep,
+                    census(&[("Calls", 1589), ("Overrides", 40)]),
+                    Vec::new(),
+                )
+                .with_entities(1091),
+                &census(&[("Calls", 19)]),
+            ),
+            CensusRecordOutcome::Held { .. }
+        ));
+        let hold = CensusHold::read(layout.root()).expect("Overrides fell, so the pass holds");
+        assert_eq!(hold.settled, census(&[("Calls", 19)]));
+        assert!(
+            hold.losses.iter().all(|line| !line.contains("Calls")),
+            "the settled kind is not named as lost: {:?}",
+            hold.losses
+        );
+
+        assert_eq!(
+            record(
+                &layout,
+                &RelationCensus::new(
+                    at(1_000_600),
+                    CensusSource::Sweep,
+                    census(&[("Calls", 1589), ("Overrides", 76)]),
+                    Vec::new(),
+                )
+                .with_entities(1091),
+            ),
+            CensusRecordOutcome::Advanced,
+            "the recovered pass retired nothing itself and still credits the hold's retirements"
+        );
+        assert!(CensusHold::read(layout.root()).is_none());
     }
 }

@@ -12,8 +12,8 @@ walk found none", and no counter elsewhere in the response outranks it.
 So this suite asserts both directions on one walk each, because either half alone
 can be satisfied by a broken tool:
 
-  0  a walk the budget cut keeps at least one step and publishes `elisions.chain`
-     with a count and a reason that agree with `steps_omitted` and the chain
+  0  trace pages fit the byte ceiling and preserve every discovered step and
+     safety reading through an advancing continuation
   1  a walk that reached nothing still answers with an empty chain and claims no
      elision, so an empty array means exactly one thing
   2  the budget the tool advertises is the budget it enforces, and its ceiling is
@@ -61,10 +61,13 @@ a failure here rather than a silent pass in CI.
 """
 from __future__ import print_function
 
+from trace_pages import TraceAnswer, mcp_trace
+
 import argparse
 import functools
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -130,6 +133,64 @@ def grade_reason(label, elision):
 # well under the 60,000-character response ceiling, which is what lets check 5
 # attribute a cut to one budget rather than to two.
 WIDE_CALLEES = 35
+
+
+# BEGIN failure evidence excerpt
+# Every suite carries this block byte for byte, because a suite is also copied
+# out and run as a single file. test_failure_excerpt.py keeps the copies equal.
+EVIDENCE_LIMIT = 4000
+EVIDENCE_LINE_LIMIT = 600
+EVIDENCE_PANICS = ("panicked at", "has overflowed its stack")
+EVIDENCE_ESCAPES = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+EVIDENCE_ERROR = re.compile(r"^(?:[\w./-]+:\s*)?(?:error|fatal)\b", re.IGNORECASE)
+EVIDENCE_LOG_ERROR = re.compile(r"\sERROR\s")
+
+
+def failure_excerpt(text, limit=EVIDENCE_LIMIT):
+    """Bounded evidence from a command's output that still says why it failed.
+
+    Output that fits is returned whole. Longer output keeps its opening and its
+    end, and between them every line that carries a Rust panic, with the
+    message line under it, and the last error line, wherever they fall. A
+    warning printed around the error cannot push it out, and a long log cannot
+    cut the panic out. `limit` only ever raises the bound, never lowers it.
+    """
+    text = (text or "").strip()
+    limit = max(int(limit), EVIDENCE_LIMIT)
+    if len(text) <= limit:
+        return text
+    head_end = limit // 4
+    tail_start = len(text) - limit // 2
+    lines = text.split("\n")
+    starts, offset = [], 0
+    panics, errors = [], []
+    for index, line in enumerate(lines):
+        starts.append(offset)
+        offset += len(line) + 1
+        plain = EVIDENCE_ESCAPES.sub("", line).strip()
+        if any(marker in plain for marker in EVIDENCE_PANICS):
+            panics.extend((index, index + 1))
+        if EVIDENCE_ERROR.match(plain) or EVIDENCE_LOG_ERROR.search(plain):
+            errors.append(index)
+    # The first panic and its message, then the last error line, then any
+    # later panics, for as long as the middle's share of the bound lasts.
+    order = panics[:2] + errors[-1:] + panics[2:]
+    budget, kept = limit // 4, set()
+    for index in order:
+        if index >= len(lines) or index in kept:
+            continue
+        start, end = starts[index], starts[index] + len(lines[index])
+        if end <= head_end or start >= tail_start:
+            continue
+        cost = min(len(lines[index]), EVIDENCE_LINE_LIMIT) + 1
+        if cost > budget:
+            continue
+        kept.add(index)
+        budget -= cost
+    middle = [lines[index][:EVIDENCE_LINE_LIMIT] for index in sorted(kept)]
+    parts = [text[:head_end], "[...]"] + middle + (["[...]"] if middle else [])
+    return "\n".join(parts + [text[tail_start:]])
+# END failure evidence excerpt
 
 
 class SetupError(Exception):
@@ -781,12 +842,12 @@ class Suite(object):
             if proc.returncode != 0:
                 raise SetupError(
                     "%s failed: %s"
-                    % (" ".join(args), proc.stderr.decode("utf-8", "replace")[-500:])
+                    % (" ".join(args), failure_excerpt(proc.stderr.decode("utf-8", "replace")))
                 )
         self.repo = repo
         proc = self.run([self.kin, "init"], cwd=repo, timeout=900)
         if proc.returncode != 0:
-            raise SetupError("kin init failed: %s" % proc.stderr.decode("utf-8", "replace")[-1000:])
+            raise SetupError("kin init failed: %s" % failure_excerpt(proc.stderr.decode("utf-8", "replace")))
         return repo
 
     def mcp(self, method, params, timeout=600, raw_result=False):
@@ -796,6 +857,11 @@ class Suite(object):
         `content[0].text` first, because the outer frame is an envelope and
         reading payload keys off its top level comes back empty for every key.
         """
+        if method == "trace_data_flow" and not raw_result:
+            try:
+                return mcp_trace(self.kin, self.repo, self.env, params, timeout)
+            except ValueError as exc:
+                raise McpError(str(exc))
         env = dict(self.env)
         env["KIN_MCP_REPO"] = self.repo
         proc = subprocess.Popen(
@@ -852,7 +918,7 @@ class Suite(object):
         if response is None:
             raise McpError(
                 "%s returned no id=2 frame (stderr tail: %s)"
-                % (method, err[-300:].replace("\n", " "))
+                % (method, failure_excerpt(err).replace("\n", " "))
             )
         if "error" in response:
             raise McpError("%s error: %s" % (method, json.dumps(response["error"])[:300]))
@@ -928,36 +994,37 @@ def grade_buckets(payload, buckets):
     return problems, graded
 
 
+def grade_paged_walk(payload, whole):
+    problems = []
+    if len(getattr(payload, "page_bytes", ())) < 2:
+        problems.append("the small-budget arm did not exercise a continuation")
+    if not whole.get("chain"):
+        problems.append("the wide control has no discovered steps")
+    if payload.get("chain") != whole.get("chain"):
+        problems.append("trace pages did not preserve every step and its semantic fields")
+    for key in ("total_steps", "steps_omitted", "clipped_steps", "degradations"):
+        if payload.get(key) != whole.get(key):
+            problems.append("trace pagination changed %s" % key)
+    return problems
+
+
 def check_0(suite):
-    res = Result("0", "FIR-2600", "a budget-cut chain is elided, never emptied")
+    res = Result("0", "trace-pagination", "bounded trace pages preserve the complete walk")
+    query = {"focal":"entry", "depth":8, "direction":"calls",
+             "limit_per_step":25, "include_body":False}
     try:
-        payload = suite.mcp(
-            "trace_data_flow",
-            {
-                "focal": "entry",
-                "depth": 8,
-                "direction": "calls",
-                "limit_per_step": 25,
-                "include_body": False,
-                "max_chars": 2000,
-            },
-        )
+        whole = suite.mcp("trace_data_flow", dict(query, max_chars=60000))
+        payload = suite.mcp("trace_data_flow", dict(query, max_chars=2000))
     except McpError as exc:
-        res.unknown("cut walk unreadable: %s" % exc)
+        res.bad("trace page contract unreadable: %s" % exc)
         return res
-    problems = grade_cut_walk(payload)
+    problems = grade_paged_walk(payload, whole)
     if problems:
         for problem in problems:
             res.bad(problem)
         return res
-    res.ok(
-        "the cut walk kept %d of %d steps and published elisions.chain %s"
-        % (
-            len(payload["chain"]),
-            len(payload["chain"]) + payload["steps_omitted"],
-            json.dumps(payload["elisions"]["chain"], sort_keys=True),
-        )
-    )
+    res.ok("%d bounded pages preserved all %d steps and safety readings" %
+           (len(payload.page_bytes), len(payload["chain"])))
     return res
 
 
@@ -1742,60 +1809,20 @@ def grade_ceiling_walk(payload, ceiling, must_fit):
 
 
 def check_12(suite):
-    """FIR-3107: a deep trace answers inside the ceiling the agent belt advertises.
-
-    The demo drove Kin's real MCP server on 2026-09-02 and `trace_data_flow`
-    returned 15,875 characters against the 12,000 its own schema advertises. It
-    had already cut every list it could: the part of a response the budget never
-    trims, the `_kin` envelope and the `negative` object, was 9,210 characters of
-    that ceiling, and roughly 7,700 of it was four verbatim copies of one
-    limiting-factor sentence.
-
-    Two arms. At 12,000 the answer has to fit. At a ceiling small enough that the
-    fixed part cannot fit inside it, the answer may ship over, and then it has to
-    say so rather than ship over in silence. Neither arm passes on a walk the
-    ceiling never pressed.
-
-    Both ceilings are named in the call rather than read from the belt, which is
-    what keeps this arm grading the budgeter instead of the profile. 12,000 was
-    the belt's one number when this was written and is now what `agent-default`
-    serves a LIST tool; `trace_data_flow` itself is served 24,576, which is
-    wider, so an answer that fits here fits there. The number this walk is graded
-    at is deliberately the tighter one.
-    """
+    """Deep traces preserve discovery while each individual page fits its ceiling."""
     res = Result("12", "FIR-3107", "a deep trace answers inside the ceiling it advertises")
-    args = {
-        "focal": "entry",
-        "depth": 8,
-        "direction": "calls",
-        "limit_per_step": 25,
-        "include_body": False,
-    }
-    # 12,000 was the one number `agent-default` injected and advertised for every
-    # tool, and is still what it serves a list tool, so it is a ceiling a client
-    # sizes on. 3,000 is below the fixed part of this response.
-    for ceiling, must_fit in ((12000, True), (3000, False)):
-        try:
+    args = {"focal":"entry", "depth":8, "direction":"calls",
+            "limit_per_step":25, "include_body":False}
+    try:
+        whole = suite.mcp("trace_data_flow", dict(args, max_chars=60000))
+        for ceiling in (12000, 3000):
             payload = suite.mcp("trace_data_flow", dict(args, max_chars=ceiling))
-        except McpError as exc:
-            res.unknown("the walk at %d was unreadable: %s" % (ceiling, exc))
-            return res
-        problems, seen = grade_ceiling_walk(payload, ceiling, must_fit)
-        if problems is None:
-            res.unknown(
-                "the walk at %d was never cut, so the fixture does not press the ceiling "
-                "and this says nothing about whether it holds" % ceiling
-            )
-            return res
-        if problems:
-            for problem in problems:
+            for problem in grade_paged_walk(payload, whole):
                 res.bad(problem)
-            return res
-        shipped, reasons, _ = seen
-        res.ok(
-            "at a %d ceiling the cut walk shipped %d characters, disclosing %s"
-            % (ceiling, shipped, sorted(r for r in reasons if r) or ["nothing"])
-        )
+            res.ok("%d pages at a %d-byte ceiling preserved %d steps" %
+                   (len(payload.page_bytes), ceiling, len(payload.get("chain") or [])))
+    except McpError as exc:
+        res.bad("trace page contract unreadable: %s" % exc)
     return res
 
 
@@ -1823,6 +1850,14 @@ def self_test():
     def expect(label, got, want):
         if got != want:
             problems.append("%s: got %r, wanted %r" % (label, got, want))
+
+    paged = TraceAnswer({"chain":[{"step":1,"entity_id":"one"}], "total_steps":1})
+    paged.page_bytes = (1900, 1800)
+    expect("lossless trace pages pass", grade_paged_walk(paged, dict(paged)), [])
+    lost = TraceAnswer(paged)
+    lost.page_bytes = paged.page_bytes
+    lost["chain"] = []
+    expect("trace pages losing a step fail", bool(grade_paged_walk(lost, paged)), True)
 
     token_only = {
         "_kin": {"response": {"bounded": True, "max_chars": 60000}},

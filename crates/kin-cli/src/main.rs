@@ -332,6 +332,13 @@ enum Command {
         /// identity, which is right for a repository nothing else holds.
         #[arg(long = "adopt-repository-id", value_name = "ID")]
         adopt_repository_id: Option<String>,
+        /// Print the full record: every admission stage, the ids and the
+        /// enrichment detail
+        ///
+        /// On a terminal `kin init` prints one line per phase and a short
+        /// result. A pipe, CI and this flag keep the full record.
+        #[arg(long, default_value_t = false, conflicts_with = "json")]
+        verbose: bool,
     },
     /// Show coherent repository-v6 workspace status
     Status {
@@ -344,6 +351,13 @@ enum Command {
         /// was observed, nor on an absence a re-read cannot clear. 0 reads once
         #[arg(long, value_name = "SECONDS", default_value_t = 0)]
         wait_quiesce: u64,
+        /// Print the full record: ids, generations, the working copy's basis,
+        /// the store and the daemon
+        ///
+        /// On a terminal `kin status` prints a short page. A pipe, CI and this
+        /// flag keep the full record.
+        #[arg(long, default_value_t = false, conflicts_with = "json")]
+        verbose: bool,
     },
     /// Create an exact semantic and artifact commit
     ///
@@ -789,6 +803,21 @@ enum Command {
         /// Force verbose bulk-mode rows (overrides --compact). Required for clap to accept `--no-compact`.
         #[arg(long = "no-compact", default_value_t = false, action = clap::ArgAction::SetTrue)]
         no_compact: bool,
+        /// List every caller in full, each with its id and projection, instead of
+        /// the first 20 sized to the terminal. Output that is not a terminal is
+        /// always complete
+        #[arg(long, default_value_t = false, conflicts_with = "bulk_json")]
+        all: bool,
+        /// Print the complete answer as JSON: its lines, the absence verdict and
+        /// the call-site block
+        #[arg(long, default_value_t = false, conflicts_with = "bulk_json")]
+        json: bool,
+        /// Bound the JSON answer in bytes and page every semantic record
+        #[arg(long, requires = "json", conflicts_with_all = ["bulk_json", "all"])]
+        max_chars: Option<usize>,
+        /// Continue a frozen JSON reference answer with its next_cursor
+        #[arg(long, requires = "json", conflicts_with_all = ["bulk_json", "all"])]
+        cursor: Option<String>,
     },
     /// Run semantic review on changes, or manage review state
     Review {
@@ -806,6 +835,12 @@ enum Command {
         /// Comma-separated change IDs to combine into one review
         #[arg(long)]
         changes: Option<String>,
+        /// Show the full review, including every relation change by name
+        #[arg(long, default_value_t = false, conflicts_with = "json")]
+        relations: bool,
+        /// Show all findings, entity changes and file detail (JSON is always complete)
+        #[arg(long, default_value_t = false)]
+        details: bool,
         /// Review mutation subcommand
         #[command(subcommand)]
         action: Option<ReviewAction>,
@@ -871,6 +906,9 @@ enum Command {
         /// entity name (resolved via the same ranking path as `graph source`).
         #[arg(long = "focal", value_name = "ENTITY")]
         focal: String,
+        /// Continue the same trace with the prior response's next_cursor.
+        #[arg(long, value_name = "CURSOR")]
+        cursor: Option<String>,
         /// Maximum traversal depth from the focal (default 3, capped at 8).
         #[arg(long = "depth", value_name = "N")]
         depth: Option<usize>,
@@ -890,12 +928,9 @@ enum Command {
         /// edges, without inlining any source body.
         #[arg(long = "no-bodies", default_value_t = false)]
         no_bodies: bool,
-        /// UTF-8 bytes the printed JSON may occupy. A hard limit here: the walk
-        /// cuts bodies, and then steps, to fit, and a walk whose smallest
-        /// retained form still does not fit is refused rather than printed over
-        /// it. Defaults to the same budget every retrieval tool answers under,
-        /// and is clamped to the same range; the numbers live in one place,
-        /// `kin_mcp::budget`, rather than being written out here to go stale.
+        /// Hard UTF-8 JSON byte ceiling, including trust metadata. A larger
+        /// trace returns a page and next_cursor; oversized semantic fields
+        /// carry lossless fragments. Repeat this query with --cursor to resume.
         #[arg(long = "max-response-chars", value_name = "C")]
         max_response_chars: Option<usize>,
         /// Walk through a type-annotation edge to a type this repository
@@ -1138,6 +1173,13 @@ enum Command {
         /// Native repository identity when URL is a peer daemon HTTP endpoint
         #[arg(long)]
         repository: Option<String>,
+        /// Print the full record: Git's own progress, every admission stage,
+        /// the ids and the enrichment detail
+        ///
+        /// On a terminal `kin clone` prints one line per phase and a short
+        /// result. A pipe, CI and this flag keep the full record.
+        #[arg(long, default_value_t = false)]
+        verbose: bool,
     },
     /// Restore an exact path or subtree from immutable repository-v6 history
     Checkout {
@@ -1624,6 +1666,9 @@ enum Command {
         /// Emit the machine-readable health report as JSON
         #[arg(long, default_value_t = false)]
         json: bool,
+        /// List every check on a terminal, not only the ones that need something
+        #[arg(long, default_value_t = false)]
+        verbose: bool,
         /// Compare an explicit projection observation with graph truth
         #[arg(long, default_value_t = false)]
         drift: bool,
@@ -1729,6 +1774,13 @@ enum Command {
             value_parser = ["agent-default", "agent-query", "agent-search", "agent-routed", "agent-routed-query"]
         )]
         tool_profile: Option<String>,
+        /// Print every step and check in full, as a pipe or a CI log sees it
+        ///
+        /// On a terminal setup prints a short summary: the questions it asked,
+        /// what it changed on this machine, the AI clients it connected and
+        /// what to run next. This prints the full record instead.
+        #[arg(long, default_value_t = false)]
+        verbose: bool,
         /// Skip the wizard and only run the first-run health check
         #[arg(long, default_value_t = false)]
         check: bool,
@@ -2016,6 +2068,15 @@ enum GraphAction {
         /// and call-site shares
         #[arg(long, default_value_t = false)]
         json: bool,
+        /// Exact graph-owned dependency paths; every requested path is accounted for
+        #[arg(long = "dependency")]
+        dependencies: Vec<String>,
+        /// Continue the same immutable status observation
+        #[arg(long)]
+        cursor: Option<String>,
+        /// Maximum serialized status payload bytes
+        #[arg(long)]
+        max_chars: Option<usize>,
     },
     /// Structural integrity validation
     Validate,
@@ -2836,6 +2897,13 @@ enum SetupAction {
         /// Emit the machine-readable health report as JSON
         #[arg(long, default_value_t = false)]
         json: bool,
+        /// Print every check, including the ones that pass or do not apply
+        ///
+        /// On a terminal `kin setup status` prints only the checks that need
+        /// something, and one line for the rest. A pipe, CI and this flag keep
+        /// the full table.
+        #[arg(long, default_value_t = false, conflicts_with = "json")]
+        verbose: bool,
     },
     /// Quick health check
     Doctor {
@@ -2962,6 +3030,9 @@ enum DaemonAction {
         /// Emit machine-readable JSON
         #[arg(long)]
         json: bool,
+        /// Print the daemon's answer and a line per file, not one live line
+        #[arg(long, default_value_t = false, conflicts_with = "json")]
+        verbose: bool,
     },
 }
 
@@ -3336,6 +3407,9 @@ fn run() -> Result<()> {
     // so on a stock Mac `kin init` died on the first real repository a person
     // tried. Silent either way, and it never lowers a limit an operator raised.
     kin_core::file_limit::raise_open_file_limit();
+    // Before anything can reach the embedder: a machine whose `kin setup`
+    // declined the embedding model download never fetches it from here.
+    kin_cli::embed_model::install_model_fetch_gate();
     // Select this process's resource profile before anything reads it: the GPU
     // kernel plan and the Metal submission depth are each resolved once per
     // process, and mutating the environment is only safe while the process is
@@ -3388,8 +3462,26 @@ fn run() -> Result<()> {
         .clone()
         .map(|path| kin_cli::profile::ProfileSession::new(command_name.clone(), cwd.clone(), path));
 
+    let mut directives = installed_directives(&command_name);
+    // The short `kin status` page is the whole answer on a terminal. The
+    // missing-.kinignore advice is for whoever maintains the repository's
+    // admission rules, so it stays in the daemon log and in the full record
+    // (`kin status --verbose`) rather than opening a person's status page.
+    if std::env::var_os("RUST_LOG").is_none()
+        && matches!(
+            cli.command,
+            Command::Status {
+                json: false,
+                verbose: false,
+                ..
+            }
+        )
+        && kin_cli::screen::short_form(false)
+    {
+        directives.push_str(",kin_index::repository=error");
+    }
     tracing_stack(
-        &installed_directives(&command_name),
+        &directives,
         profile_session.clone(),
         std::io::stderr,
         // The fmt layer does not sniff for a terminal, so without this it
@@ -3439,9 +3531,11 @@ fn run() -> Result<()> {
                     json,
                     no_enrich,
                     adopt_repository_id,
+                    verbose,
                 } => {
                     let code =
-                        commands::init::run(path, json, no_enrich, adopt_repository_id).await?;
+                        commands::init::run(path, json, no_enrich, adopt_repository_id, verbose)
+                            .await?;
                     // A conversion whose store exists but whose enrichment a
                     // killed daemon left unattested reports that through the
                     // exit code, so a scripted or agent-driven setup can branch
@@ -3452,15 +3546,22 @@ fn run() -> Result<()> {
                     }
                     Ok(())
                 }
-                Command::Status { json, wait_quiesce } => {
+                Command::Status {
+                    json,
+                    wait_quiesce,
+                    verbose,
+                } => {
                     // A working copy nothing admitted is an answer, not an
                     // error, and it travels in the exit code the way a parked
                     // merge and an unrouted `kin path` already do. The report is
                     // printed either way; the code says whether any of it
                     // describes the files on disk.
-                    let code =
-                        commands::status::run(json, std::time::Duration::from_secs(wait_quiesce))
-                            .await?;
+                    let code = commands::status::run(
+                        json,
+                        verbose,
+                        std::time::Duration::from_secs(wait_quiesce),
+                    )
+                    .await?;
                     if code != 0 {
                         std::process::exit(code);
                     }
@@ -3948,6 +4049,10 @@ fn run() -> Result<()> {
                     entities,
                     compact,
                     no_compact,
+                    all,
+                    json,
+                    max_chars,
+                    cursor,
                 } => {
                     // Both requirements are clap's now, so a caller who names
                     // nothing to operate on gets a usage block and exit 2 like
@@ -3966,7 +4071,11 @@ fn run() -> Result<()> {
                             file.as_deref(),
                             entity_kind.as_deref(),
                         );
-                        commands::refs::run(entity, kind).await
+                        if max_chars.is_some() || cursor.is_some() {
+                            commands::refs::run_page(entity, kind, cursor, max_chars).await
+                        } else {
+                            commands::refs::run(entity, kind, all, json).await
+                        }
                     }
                 }
                 Command::Review {
@@ -3975,6 +4084,8 @@ fn run() -> Result<()> {
                     entities,
                     files,
                     changes,
+                    relations,
+                    details,
                     action,
                 } => {
                     if let Some(review_action) = action {
@@ -4061,7 +4172,8 @@ fn run() -> Result<()> {
                     } else if json {
                         commands::review::run_json(change, entities, files, changes).await
                     } else {
-                        commands::review::run(change, entities, files, changes).await
+                        commands::review::run(change, entities, files, changes, relations, details)
+                            .await
                     }
                 }
                 Command::History {
@@ -4138,6 +4250,7 @@ fn run() -> Result<()> {
                 },
                 Command::TraceDataFlow {
                     focal,
+                    cursor,
                     depth,
                     direction,
                     limit_per_step,
@@ -4155,6 +4268,7 @@ fn run() -> Result<()> {
                         max_response_chars,
                         include_type_edges.then_some(true),
                         target,
+                        cursor,
                     )
                     .await
                 }
@@ -4385,7 +4499,16 @@ fn run() -> Result<()> {
                     url,
                     path,
                     repository,
-                } => commands::clone::run(url, path, repository).await,
+                    verbose,
+                } => {
+                    // Exit 7 and 8 mean for a clone what they mean for
+                    // `kin init`, whose post-admission work a clone now runs.
+                    let code = commands::clone::run(url, path, repository, verbose).await?;
+                    if code != 0 {
+                        std::process::exit(code);
+                    }
+                    Ok(())
+                }
                 Command::Checkout {
                     path,
                     path_hex,
@@ -4543,7 +4666,22 @@ fn run() -> Result<()> {
                     } => commands::cache::gc(dry_run, budget_gb, prune_stale_schema).await,
                 },
                 Command::Graph { action } => match action {
-                    GraphAction::Status { json } => commands::graph::status(json).await,
+                    GraphAction::Status {
+                        json,
+                        dependencies,
+                        cursor,
+                        max_chars,
+                    } => {
+                        commands::graph::status_with_request(
+                            json,
+                            kin_mcp::status_pages::StatusRequest {
+                                dependencies,
+                                cursor,
+                                max_chars,
+                            },
+                        )
+                        .await
+                    }
                     GraphAction::Validate => commands::graph::validate().await,
                     GraphAction::Materialize { json } => commands::graph::materialize(json).await,
                     GraphAction::Owed { json } => commands::graph_owed::owed(json).await,
@@ -4798,14 +4936,17 @@ fn run() -> Result<()> {
                         when_unused,
                         json,
                     } => commands::daemon::stop(all, machine, when_unused, json).await,
-                    DaemonAction::Sweep { no_wait, json } => {
-                        commands::daemon::sweep(no_wait, json).await
-                    }
+                    DaemonAction::Sweep {
+                        no_wait,
+                        json,
+                        verbose,
+                    } => commands::daemon::sweep(no_wait, json, verbose).await,
                 },
                 Command::Doctor {
                     fix,
                     install_language_servers,
                     json,
+                    verbose,
                     drift,
                     heal,
                     reclaim_staging,
@@ -4834,7 +4975,8 @@ fn run() -> Result<()> {
                         // for.
                         commands::health::reclaim_stranded_stages(json)
                     } else {
-                        commands::setup::doctor(fix, install_language_servers, json).await
+                        commands::setup::doctor_with(fix, install_language_servers, json, verbose)
+                            .await
                     }
                 }
                 Command::Vfs { action } => match action {
@@ -4897,9 +5039,12 @@ fn run() -> Result<()> {
                     embedding_provider,
                     skip_path,
                     tool_profile,
+                    verbose,
                     check,
                 } => match action {
-                    Some(SetupAction::Status { json }) => commands::setup::status(json).await,
+                    Some(SetupAction::Status { json, verbose }) => {
+                        commands::setup::status(json, verbose).await
+                    }
                     Some(SetupAction::Doctor { fix, json }) => {
                         commands::setup::doctor(fix, install_language_servers, json).await
                     }
@@ -4927,6 +5072,7 @@ fn run() -> Result<()> {
                             embedding_provider,
                             skip_path,
                             tool_profile,
+                            verbose,
                         })
                         .await
                     }
@@ -6283,7 +6429,7 @@ mod tests {
             assert!(matches!(
                 setup_status.command,
                 Command::Setup {
-                    action: Some(SetupAction::Status { json: true }),
+                    action: Some(SetupAction::Status { json: true, .. }),
                     ..
                 }
             ));
@@ -6294,7 +6440,8 @@ mod tests {
                 status.command,
                 Command::Status {
                     json: false,
-                    wait_quiesce: 0
+                    wait_quiesce: 0,
+                    verbose: false
                 }
             ));
 
@@ -6318,6 +6465,8 @@ mod tests {
                     entities: None,
                     files: None,
                     changes: None,
+                    relations: false,
+                    details: false,
                     action: Some(ReviewAction::Shadow {
                         range: Some(range),
                         base: None,
@@ -6337,7 +6486,7 @@ mod tests {
             let readme = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../README.md"));
             for command in [
                 "kin setup --intent editor",
-                "kin setup status --json",
+                "kin setup status",
                 "kin status",
                 "kin overview",
                 "kin review shadow",
@@ -6351,6 +6500,21 @@ mod tests {
                     "README.md must carry the parser-checked `{command}` surface"
                 );
             }
+            // The README names the page a person reads; the machine-readable
+            // report is the quickstart's to document.
+            assert!(
+                quickstart.contains("kin setup status --json"),
+                "docs/quickstart.md must carry the parser-checked `kin setup status --json` surface"
+            );
+            let setup_status_page = Cli::try_parse_from(["kin", "setup", "status"])
+                .expect("the documented setup status page must parse");
+            assert!(matches!(
+                setup_status_page.command,
+                Command::Setup {
+                    action: Some(SetupAction::Status { json: false, .. }),
+                    ..
+                }
+            ));
         });
     }
 
@@ -6605,6 +6769,90 @@ mod tests {
                     .unwrap_or_else(|| panic!("{argv:?} must not parse"));
                 assert_eq!(error.exit_code(), 2, "{argv:?} must be a usage error");
             }
+        });
+    }
+
+    #[test]
+    fn reference_page_flags_require_json_and_preserve_the_requested_page() {
+        on_cli_test_stack(|| {
+            let cli = Cli::try_parse_from([
+                "kin",
+                "refs",
+                "send",
+                "--json",
+                "--max-chars",
+                "4000",
+                "--cursor",
+                "held",
+            ])
+            .unwrap();
+            assert!(
+                matches!(cli.command, Command::Refs { json:true, max_chars:Some(4000), cursor:Some(value), .. } if value == "held")
+            );
+            for argv in [
+                vec!["kin", "refs", "send", "--cursor", "held"],
+                vec!["kin", "refs", "send", "--max-chars", "4000"],
+                vec!["kin", "refs", "send", "--json", "--all", "--cursor", "held"],
+            ] {
+                assert_eq!(Cli::try_parse_from(argv).err().unwrap().exit_code(), 2);
+            }
+        });
+    }
+
+    #[test]
+    fn review_details_expands_human_output_without_changing_json_mode() {
+        on_cli_test_stack(|| {
+            for argv in [
+                vec!["kin", "review", "--details"],
+                vec!["kin", "review", "--details", "--json"],
+                vec!["kin", "review", "--details", "--relations"],
+            ] {
+                let cli = Cli::try_parse_from(argv).expect("review detail options must parse");
+                assert!(matches!(cli.command, Command::Review { details: true, .. }));
+            }
+            let cli = Cli::try_parse_from(["kin", "review"]).unwrap();
+            assert!(matches!(
+                cli.command,
+                Command::Review {
+                    details: false,
+                    relations: false,
+                    ..
+                }
+            ));
+        });
+    }
+
+    /// `--relations` lists what the text review only counts. The JSON answer
+    /// has a fixed contract that does not carry the list, so asking for both is
+    /// a usage error rather than a flag that silently does nothing.
+    #[test]
+    fn review_relations_lists_in_text_and_is_refused_beside_json() {
+        on_cli_test_stack(|| {
+            let cli = Cli::try_parse_from(["kin", "review", "--relations"])
+                .expect("`kin review --relations` must parse");
+            assert!(matches!(
+                cli.command,
+                Command::Review {
+                    relations: true,
+                    json: false,
+                    action: None,
+                    ..
+                }
+            ));
+
+            let plain = Cli::try_parse_from(["kin", "review"]).expect("`kin review` must parse");
+            assert!(matches!(
+                plain.command,
+                Command::Review {
+                    relations: false,
+                    ..
+                }
+            ));
+
+            let error = Cli::try_parse_from(["kin", "review", "--relations", "--json"])
+                .err()
+                .expect("`--relations` beside `--json` must not parse");
+            assert_eq!(error.exit_code(), 2, "{error}");
         });
     }
 

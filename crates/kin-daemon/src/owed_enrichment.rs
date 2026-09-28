@@ -47,6 +47,34 @@ pub(crate) struct OwedFile {
 /// Every owed file, by repository path.
 pub(crate) type OwedFiles = BTreeMap<String, OwedFile>;
 
+/// The largest aggregate uses-type allowance, including later sweeps.
+pub(crate) const USES_TYPE_MAX_BUDGET: Duration = Duration::from_secs(45);
+
+/// Uses-type walks an entity's identifiers with multiple sequential RPCs.
+/// A retry needs more time than the aggregate limit it already exhausted, but
+/// never an unbounded pass. Only debt over these bytes and this resolver counts;
+/// changing either starts a new question at the initial budget. The in-sweep
+/// retries advance too, before their failure has reached the durable record.
+pub(crate) fn uses_type_budget(
+    owed: &OwedFiles,
+    file: &str,
+    blob: Option<&str>,
+    context: &str,
+    in_sweep_retries: u32,
+) -> Duration {
+    let failures = owed
+        .get(file)
+        .filter(|previous| {
+            Some(previous.blob.as_str()) == blob && previous.context.as_deref() == Some(context)
+        })
+        .map_or(0, |previous| previous.attempts);
+    match failures.saturating_add(in_sweep_retries) {
+        0 => Duration::from_secs(5),
+        1 => Duration::from_secs(15),
+        _ => USES_TYPE_MAX_BUDGET,
+    }
+}
+
 /// The first retry waits this long, and every failure after it doubles the wait.
 const FIRST_RETRY: Duration = Duration::from_secs(5 * 60);
 
@@ -73,6 +101,39 @@ pub(crate) fn retry_after(owed: &OwedFile, blob: &str, now_unix_s: u64) -> Optio
         .last_attempt_unix_s
         .saturating_add(retry_interval(owed.attempts).as_secs());
     (due > now_unix_s).then(|| Duration::from_secs(due - now_unix_s))
+}
+
+/// When the idle worker should queue a pass for persisted debt. An expired
+/// backoff is ready now; an empty record leaves the worker asleep until a
+/// request or shutdown arrives.
+pub(crate) fn next_retry_delay(owed: &OwedFiles, now_unix_s: u64) -> Option<Duration> {
+    owed.values()
+        .map(|file| {
+            let due = file
+                .last_attempt_unix_s
+                .saturating_add(retry_interval(file.attempts).as_secs());
+            Duration::from_secs(due.saturating_sub(now_unix_s))
+        })
+        .min()
+}
+
+/// Back off debt that was already due when a pass began but never reached a
+/// query. No proof context answered this attempt, and no completion is earned.
+/// Files whose deadline elapsed during the pass remain due for the next pass.
+pub(crate) fn defer_unattempted(
+    owed: &mut OwedFiles,
+    due_before_unix_s: u64,
+    reason: &str,
+    now_unix_s: u64,
+) {
+    let due: Vec<_> = owed
+        .iter()
+        .filter(|(_, entry)| retry_after(entry, &entry.blob, due_before_unix_s).is_none())
+        .map(|(file, entry)| (file.clone(), entry.blob.clone()))
+        .collect();
+    for (file, blob) in due {
+        record_failure(owed, &file, &blob, None, reason.to_owned(), now_unix_s);
+    }
 }
 
 /// How many consecutive failed attempts over the same bytes, under the same
@@ -196,11 +257,57 @@ mod tests {
     use super::*;
 
     #[test]
+    fn uses_type_retries_escalate_only_for_the_same_inputs_and_stay_bounded() {
+        let mut owed = OwedFiles::new();
+        let budget = |owed: &OwedFiles, blob, context, retry| {
+            uses_type_budget(owed, "large.py", blob, context, retry).as_secs()
+        };
+        assert_eq!(budget(&owed, Some("a"), "context", 0), 5);
+        assert_eq!(budget(&owed, Some("a"), "context", 1), 15);
+        assert_eq!(budget(&owed, Some("a"), "context", 2), 45);
+        record_failure(
+            &mut owed,
+            "large.py",
+            "a",
+            Some("context"),
+            "timeout".into(),
+            1,
+        );
+        assert_eq!(budget(&owed, Some("a"), "context", 0), 15);
+        assert_eq!(budget(&owed, Some("a"), "context", 1), 45);
+        assert_eq!(budget(&owed, Some("b"), "context", 0), 5);
+        assert_eq!(budget(&owed, None, "context", 0), 5);
+        assert_eq!(budget(&owed, Some("a"), "new context", 0), 5);
+        owed.get_mut("large.py").unwrap().attempts = u32::MAX;
+        assert_eq!(budget(&owed, Some("a"), "context", 1), 45);
+    }
+
+    #[test]
     fn the_wait_doubles_per_failure_up_to_a_ceiling() {
         assert_eq!(retry_interval(1), Duration::from_secs(300));
         assert_eq!(retry_interval(2), Duration::from_secs(600));
         assert_eq!(retry_interval(3), Duration::from_secs(1200));
         assert_eq!(retry_interval(40), LONGEST_RETRY);
+    }
+
+    #[test]
+    fn idle_retry_uses_the_earliest_persisted_deadline_and_stops_when_empty() {
+        let mut owed = OwedFiles::new();
+        assert_eq!(next_retry_delay(&owed, 1_000), None);
+        record_failure(&mut owed, "a.ts", "a", None, "timeout".into(), 1_000);
+        record_failure(&mut owed, "b.ts", "b", None, "timeout".into(), 1_100);
+        assert_eq!(
+            next_retry_delay(&owed, 1_050),
+            Some(Duration::from_secs(250))
+        );
+        assert_eq!(next_retry_delay(&owed, 1_300), Some(Duration::ZERO));
+        owed.remove("a.ts");
+        assert_eq!(
+            next_retry_delay(&owed, 1_300),
+            Some(Duration::from_secs(100))
+        );
+        owed.clear();
+        assert_eq!(next_retry_delay(&owed, 2_000), None);
     }
 
     #[test]
@@ -241,6 +348,56 @@ mod tests {
             1_400,
         );
         assert_eq!(owed["pkg/a.go"].attempts, 1, "new bytes start again");
+    }
+
+    #[test]
+    fn blocked_passes_defer_due_debt_without_postponing_future_deadlines() {
+        let mut owed = OwedFiles::new();
+        record_failure(
+            &mut owed,
+            "due.py",
+            "old",
+            Some("previous-server"),
+            "timeout".into(),
+            1_000,
+        );
+        record_failure(
+            &mut owed,
+            "later.py",
+            "later",
+            None,
+            "timeout".into(),
+            1_200,
+        );
+        let later = owed["later.py"].clone();
+        defer_unattempted(&mut owed, 1_300, "source authority unavailable", 1_600);
+        assert_eq!(owed["due.py"].last_attempt_unix_s, 1_600);
+        assert_eq!(
+            owed["due.py"].context, None,
+            "no server answered this attempt"
+        );
+        assert_eq!(owed["due.py"].reason, "source authority unavailable");
+        assert_eq!(
+            retry_after(&owed["due.py"], "old", 1_600),
+            Some(Duration::from_secs(300))
+        );
+        assert!(!attempts_exhausted(
+            &owed,
+            "due.py",
+            Some("old"),
+            "previous-server"
+        ));
+        assert_eq!(
+            owed["later.py"], later,
+            "a deadline reached during the pass must be eligible for the next pass"
+        );
+        owed.remove("later.py");
+        defer_unattempted(&mut owed, 1_900, "source authority unavailable", 1_900);
+        assert_eq!(owed["due.py"].attempts, 2);
+        assert_eq!(
+            next_retry_delay(&owed, 1_900),
+            Some(Duration::from_secs(600))
+        );
     }
 
     #[test]

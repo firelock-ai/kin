@@ -36,12 +36,15 @@ use crate::daemon_client::{
     supervisor_pid_path, supervisor_port_path, supervisor_recorded_endpoint,
     try_acquire_supervisor_startup_lock_in_dir, DaemonHomeScope, DaemonPortProbe,
     EndpointOwnerRecord, PreservedDaemonEndpoint, ProcessIdentity, RegisteredRepoDaemon,
-    SupervisorStartupLock,
+    StartingDaemonOwner, SupervisorStartupLock,
 };
 
 #[derive(Debug, Clone)]
 struct AttributedStopTarget {
     owner: EndpointOwnerRecord,
+    /// The repository a daemon attributed before it published an endpoint.
+    /// Its hold on that repository is re-proved before every signal.
+    startup_root: Option<PathBuf>,
     #[cfg(unix)]
     selected_install_image: Option<ExecutableIdentity>,
 }
@@ -50,9 +53,21 @@ impl AttributedStopTarget {
     fn published(owner: EndpointOwnerRecord) -> Self {
         Self {
             owner,
+            startup_root: None,
             #[cfg(unix)]
             selected_install_image: None,
         }
+    }
+
+    fn starting(kin_root: &Path, owner: EndpointOwnerRecord) -> Self {
+        Self {
+            startup_root: Some(kin_root.to_path_buf()),
+            ..Self::published(owner)
+        }
+    }
+
+    fn is_starting(&self) -> bool {
+        self.startup_root.is_some()
     }
 
     #[cfg(unix)]
@@ -78,6 +93,7 @@ impl std::ops::Deref for AttributedStopTarget {
 #[cfg(unix)]
 struct UnixSignalTarget {
     identity: ProcessIdentity,
+    startup_owner: Option<(PathBuf, EndpointOwnerRecord)>,
     expected_image: ExecutableIdentity,
     #[cfg(target_os = "linux")]
     pidfd: std::os::fd::OwnedFd,
@@ -118,6 +134,10 @@ impl UnixSignalTarget {
         }
         Ok(Some(Self {
             identity: target.owner.identity().clone(),
+            startup_owner: target
+                .startup_root
+                .as_ref()
+                .map(|root| (root.clone(), target.owner.clone())),
             expected_image,
             #[cfg(target_os = "linux")]
             pidfd,
@@ -178,6 +198,18 @@ impl UnixSignalTarget {
         if !probe(&self.identity)? {
             return Ok(false);
         }
+        // A daemon attributed before it published an endpoint must still hold
+        // the repository, under the same record, at delivery. The guard keeps
+        // lifecycle coordination across the signal only, never the exit wait,
+        // so a replaced owner, a released lock or a maintenance command that
+        // took the lock since can never inherit the daemon's signal.
+        let _startup_guard = self
+            .startup_owner
+            .as_ref()
+            .map(|(root, owner)| {
+                crate::daemon_client::revalidate_starting_daemon_owner(root, owner, deadline)
+            })
+            .transpose()?;
         process_executable::check_deadline(deadline)?;
         #[cfg(target_os = "linux")]
         let rc = {
@@ -376,6 +408,9 @@ enum StopOutcome {
     /// Asked to retire (`--when-unused`), the daemon is still needed, so it was
     /// left running. It exits on its own once what it named has ended.
     InUse(Vec<String>),
+    /// Something holds the repository that cannot be attributed to a daemon,
+    /// such as an offline maintenance command, so nothing was signalled.
+    Busy(String),
 }
 
 impl StopOutcome {
@@ -399,6 +434,7 @@ impl StopOutcome {
             StopOutcome::Timeout => "timeout",
             StopOutcome::SignalFailed(_) => "signal-failed",
             StopOutcome::InUse(_) => "in-use",
+            StopOutcome::Busy(_) => "busy",
         }
     }
 }
@@ -656,6 +692,12 @@ async fn retire_worker_at(kin_root: &Path, pid: u32, deadline: Instant) -> Resul
     let Some(identity) = attributed_worker_identity(kin_root, pid)? else {
         return Ok(StopOutcome::NotRunning);
     };
+    if identity.is_starting() && !endpoint_published_by(kin_root, &identity) {
+        // A retirement is a request, and a daemon that has not published an
+        // endpoint cannot take one. It is left running, as retirement leaves
+        // any daemon it cannot ask.
+        return Ok(StopOutcome::InUse(vec![STILL_STARTING.to_string()]));
+    }
     let (recorded_pid, recorded_port) = repo_daemon_recorded_endpoint(kin_root);
     if recorded_pid != Some(identity.pid()) {
         return Ok(StopOutcome::SignalFailed(format!(
@@ -809,6 +851,31 @@ fn stop_supervisor_identity(identity: &ProcessIdentity, wait: Duration) -> StopO
 }
 
 fn attributed_worker_identity(kin_root: &Path, pid: u32) -> Result<Option<AttributedStopTarget>> {
+    let (recorded_pid, _) = repo_daemon_recorded_endpoint(kin_root);
+    if recorded_pid != Some(pid) {
+        // A daemon publishes its endpoint only once its state is open. Until
+        // then only its own record beside the lock it holds can attribute it,
+        // never advisory startup progress or a bare PID.
+        match crate::daemon_client::starting_daemon_owner(kin_root) {
+            StartingDaemonOwner::Starting(owner) if owner.identity().pid() == pid => {
+                return Ok(Some(AttributedStopTarget::starting(kin_root, owner)));
+            }
+            // Nothing holds the repository and nothing is published for it,
+            // so whatever this pid named is no daemon of this repository.
+            StartingDaemonOwner::Absent
+                if recorded_pid.is_none()
+                    && matches!(
+                        std::fs::symlink_metadata(repo_daemon_owner_path(kin_root)),
+                        Err(ref error) if error.kind() == std::io::ErrorKind::NotFound
+                    ) =>
+            {
+                return Ok(None);
+            }
+            // Everything else is judged as a published endpoint, which refuses
+            // a torn or unattributed one.
+            _ => {}
+        }
+    }
     let owner = read_endpoint_owner_record(kin_root).with_context(|| {
         format!(
             "worker endpoint {} has no valid process-incarnation owner record",
@@ -886,15 +953,48 @@ const ESCALATION_POLL: Duration = Duration::from_millis(50);
 /// Whether the recorded incarnation is gone, polled until `window` expires.
 #[cfg(unix)]
 fn wait_for_recorded_exit(identity: &ProcessIdentity, window: Duration) -> bool {
-    let deadline = Instant::now() + window;
+    wait_for_recorded_exit_until(identity, Instant::now() + window)
+}
+
+#[cfg(unix)]
+fn wait_for_recorded_exit_until(identity: &ProcessIdentity, deadline: Instant) -> bool {
     loop {
         if matches!(process_identity_is_current(identity), Ok(false)) {
             return true;
         }
-        if Instant::now() >= deadline {
+        let now = Instant::now();
+        if now >= deadline {
             return matches!(process_identity_is_current(identity), Ok(false));
         }
-        std::thread::sleep(ESCALATION_POLL);
+        std::thread::sleep(ESCALATION_POLL.min(deadline.saturating_duration_since(now)));
+    }
+}
+
+/// An absent executable proof forbids signalling, but does not forbid waiting
+/// for a daemon already draining after its HTTP listener closed. Observe only
+/// the captured incarnation and spend only the escalation window that remains.
+/// Unknown liveness or the same live incarnation preserves the original refusal.
+#[cfg(unix)]
+fn wait_after_escalation_refusal(
+    identity: &ProcessIdentity,
+    deadline: Instant,
+    steps: &mut Vec<String>,
+) -> Option<StopOutcome> {
+    let pid = identity.pid();
+    steps.push(format!(
+        "waiting up to {:.1}s for the recorded daemon incarnation at pid {pid} without sending a signal",
+        remaining_budget(deadline).as_secs_f64()
+    ));
+    if wait_for_recorded_exit_until(identity, deadline) {
+        steps.push(format!(
+            "the recorded daemon incarnation at pid {pid} ended during the passive wait"
+        ));
+        Some(StopOutcome::Stopped)
+    } else {
+        steps.push(format!(
+            "the recorded daemon incarnation at pid {pid} was not confirmed gone before the passive wait ended"
+        ));
+        None
     }
 }
 
@@ -908,11 +1008,25 @@ fn escalate_to_recorded_pid(
     sigkill_wait: Duration,
     steps: &mut Vec<String>,
 ) -> Option<StopOutcome> {
-    let pid = target.pid();
     // Executable observation consumes this stage's existing budget, rather
     // than adding an unbounded read/hash before either wait. Preserve the full
-    // TERM grace after delivery; observation reduces the final KILL wait.
+    // TERM grace after delivery; observation reduces the final KILL wait. The
+    // stage is never shorter than reading the recorded image takes on a loaded
+    // machine, or a large image would be refused for its size alone.
+    let sigkill_wait = process_executable::observation_budget(target.pid(), sigkill_wait);
     let deadline = Instant::now() + sigterm_wait.saturating_add(sigkill_wait);
+    try_escalate_to_recorded_pid_until(target, sigterm_wait, deadline, steps)
+        .or_else(|| wait_after_escalation_refusal(target, deadline, steps))
+}
+
+#[cfg(unix)]
+fn try_escalate_to_recorded_pid_until(
+    target: &AttributedStopTarget,
+    sigterm_wait: Duration,
+    deadline: Instant,
+    steps: &mut Vec<String>,
+) -> Option<StopOutcome> {
+    let pid = target.pid();
     let signal_target = match UnixSignalTarget::open(target) {
         Ok(Some(target)) => target,
         Ok(None) => return Some(StopOutcome::NotRunning),
@@ -971,7 +1085,8 @@ fn escalate_if_unstopped(
 ) -> StopOutcome {
     // A daemon still in use was asked to retire, not to stop. Signalling it
     // would take it out from under the client the request just deferred to.
-    if outcome.is_settled() {
+    // A busy repository was never attributed to a daemon at all.
+    if outcome.is_settled() || matches!(outcome, StopOutcome::Busy(_)) {
         return outcome;
     }
     #[cfg(unix)]
@@ -1043,11 +1158,27 @@ fn stop_worker_at(
         Some(identity) => {
             #[cfg(unix)]
             let wait = remaining_budget(deadline);
-            let outcome = stop_worker_identity(kin_root, &identity, wait);
+            // A daemon still starting has no endpoint to ask. Once it publishes
+            // one, which can happen at any moment of this stop, it is asked like
+            // any other.
+            let outcome = if identity.is_starting() && !endpoint_published_by(kin_root, &identity) {
+                StopOutcome::SignalFailed(STILL_STARTING.to_string())
+            } else {
+                stop_worker_identity(kin_root, &identity, wait)
+            };
             escalate_if_unstopped(&identity, outcome, steps)
         }
         None => StopOutcome::NotRunning,
     })
+}
+
+/// Why a daemon attributed before its endpoint could not be asked to stop.
+const STILL_STARTING: &str = "it is still starting and has published no endpoint to ask yet";
+
+/// Whether `target`'s own incarnation now owns the published endpoint.
+fn endpoint_published_by(kin_root: &Path, target: &ProcessIdentity) -> bool {
+    repo_daemon_recorded_endpoint(kin_root).0 == Some(target.pid())
+        && read_endpoint_owner_record(kin_root).is_some_and(|owner| owner.identity() == target)
 }
 
 fn supervisor_identity_for_stop(
@@ -1478,8 +1609,13 @@ const SWEEP_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// Loud when no daemon answers, rather than quietly doing nothing: a command
 /// whose whole purpose is to make enrichment happen must never exit zero having
 /// enriched nothing.
-pub async fn sweep(no_wait: bool, json: bool) -> Result<()> {
+pub async fn sweep(no_wait: bool, json: bool, verbose: bool) -> Result<()> {
     let layout = crate::commands::require_repository_layout()?;
+    // A person at a terminal gets one live line and one row; `--json`,
+    // `--verbose`, a pipe and CI keep the daemon's own words and a line per
+    // file.
+    let view = (!json && crate::screen::short_form(verbose))
+        .then(|| crate::first_run::Screen::new(crate::screen::Style::for_stdout()));
     let base_url = crate::daemon_client::resolve_daemon_url(&layout)
         .await?
         .ok_or_else(|| crate::daemon_client::daemon_required_error("daemon sweep", &layout))?;
@@ -1499,7 +1635,7 @@ pub async fn sweep(no_wait: bool, json: bool) -> Result<()> {
     // server, which is a different problem with a different fix.
     if json {
         println!("{}", serde_json::to_string_pretty(&queued)?);
-    } else {
+    } else if view.is_none() {
         println!("daemon: {queued}");
     }
 
@@ -1512,6 +1648,14 @@ pub async fn sweep(no_wait: bool, json: bool) -> Result<()> {
     }
 
     if no_wait {
+        if let Some(screen) = &view {
+            screen.row(
+                crate::screen::Status::Off,
+                "Linking",
+                "queued · the daemon links in the background",
+                None,
+            );
+        }
         return Ok(());
     }
 
@@ -1519,7 +1663,39 @@ pub async fn sweep(no_wait: bool, json: bool) -> Result<()> {
         .get("sweeps_completed")
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
-    wait_for_sweep(&client, baseline, json).await
+    if let Some(screen) = &view {
+        screen.start("Linking");
+        screen.note("asking the language server");
+        // Named from the repository's own languages, the configuration read
+        // `kin doctor` makes, so the row says which server did the linking.
+        let servers = serving_language_servers(layout.working_dir());
+        screen.facts().servers = servers;
+    }
+    wait_for_sweep(&client, baseline, json, view.as_ref()).await
+}
+
+/// The language servers installed for this repository's languages, by name.
+fn serving_language_servers(working_dir: &std::path::Path) -> Vec<String> {
+    use crate::commands::language_servers::{self as servers, LanguageScope};
+    let LanguageScope::Repository(languages) = servers::language_scope(working_dir, None) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = Vec::new();
+    for language in languages {
+        let installed = servers::recipe_for(language).and_then(|recipe| {
+            recipe
+                .binaries
+                .iter()
+                .find(|binary| which::which(binary).is_ok())
+        });
+        if let Some(binary) = installed {
+            let name = crate::first_run::server_name(binary);
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+    }
+    names
 }
 
 /// Poll the sweep to completion, or to the budget, reporting progress.
@@ -1527,6 +1703,7 @@ async fn wait_for_sweep(
     client: &crate::daemon_client::DaemonClient,
     baseline: u64,
     json: bool,
+    view: Option<&crate::first_run::Screen>,
 ) -> Result<()> {
     wait_for_sweep_with(
         || client.lsp_sweep_status(),
@@ -1534,6 +1711,7 @@ async fn wait_for_sweep(
         SWEEP_WAIT_BUDGET,
         SWEEP_POLL_INTERVAL,
         json,
+        view,
     )
     .await
 }
@@ -1547,6 +1725,7 @@ async fn wait_for_sweep_with<F, Fut>(
     budget: Duration,
     poll: Duration,
     json: bool,
+    view: Option<&crate::first_run::Screen>,
 ) -> Result<()>
 where
     F: FnMut() -> Fut,
@@ -1567,9 +1746,14 @@ where
             .get("files_total")
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
-        if done > last_reported && !json {
-            last_reported = done;
-            println!("  enriched {done}/{total} files");
+        match view {
+            Some(screen) if total > 0 => screen.progress(done, total, "files"),
+            Some(_) => {}
+            None if done > last_reported && !json => {
+                last_reported = done;
+                println!("  enriched {done}/{total} files");
+            }
+            None => {}
         }
         let completed = status
             .get("sweeps_completed")
@@ -1585,6 +1769,22 @@ where
         if completed > baseline && !running {
             if json {
                 println!("{}", serde_json::to_string_pretty(&status)?);
+            } else if let Some(screen) = view {
+                let linking = crate::first_run::Linking::Finished(
+                    crate::first_run::SweepTally::from_status(&status),
+                );
+                let servers = screen.facts().servers.clone();
+                let (status, value, hint) = crate::first_run::linked_row(&linking, &[], &servers);
+                screen.finish_row(status, "Linked", &value);
+                if let Some(hint) = hint {
+                    screen.hint(&hint);
+                }
+                screen.lines(&crate::first_run::unlinked_lines(
+                    screen.style(),
+                    &linking,
+                    &servers,
+                    false,
+                ));
             } else {
                 let blocked = status
                     .get("files_blocked")
@@ -1610,6 +1810,9 @@ where
             return Ok(());
         }
         if Instant::now() >= deadline {
+            if let Some(screen) = view {
+                screen.finish();
+            }
             bail!("{}", sweep_wait_ended(budget, done, total));
         }
     }
@@ -1853,8 +2056,12 @@ fn retire_worker_endpoint(
             None
         }
         // Still running, whether it refused or is still in use: its endpoint
-        // is still the truth, so it stays published.
-        StopOutcome::Timeout | StopOutcome::SignalFailed(_) | StopOutcome::InUse(_) => return None,
+        // is still the truth, so it stays published. A busy repository was
+        // never touched.
+        StopOutcome::Timeout
+        | StopOutcome::SignalFailed(_)
+        | StopOutcome::InUse(_)
+        | StopOutcome::Busy(_) => return None,
     };
     // Only an escalated stop reports this. A healthy one needs no account of
     // itself, and a step line on every stop would bury the one case a reader
@@ -1916,7 +2123,28 @@ async fn stop_current_repo_outcome(
     let working_dir = kin_root.parent().unwrap_or(&kin_root).to_path_buf();
     let label = repo_label(&working_dir);
 
-    let pid = resolve_repo_worker_pid(&kin_root, &working_dir).await?;
+    let pid = match resolve_repo_worker(&kin_root, &working_dir).await? {
+        LocalWorker::Pid(pid) => Some(pid),
+        LocalWorker::None => None,
+        LocalWorker::Busy { pid, reason } => {
+            // Reported, and a failure, for the operator's own stop. A quiet
+            // caller is about to take the runtime authority itself, and its own
+            // refusal names the holder and says nothing changed; a holder that
+            // is not an attributable daemon is no daemon this stop failed to
+            // end, so it is handed back for that caller to judge.
+            if !quiet {
+                let report = vec![LocalWorker::busy_report(pid, reason.clone(), label)];
+                finish_stop_with_output(
+                    "current-repo",
+                    &report,
+                    json,
+                    quiet,
+                    &StopDisclosure::default(),
+                )?;
+            }
+            return Ok(Some(StopOutcome::Busy(reason)));
+        }
+    };
 
     let Some(pid) = pid else {
         // Nothing live to stop. Clear any stale endpoint files so a later status
@@ -1957,13 +2185,23 @@ async fn stop_current_repo_outcome(
         preserved_endpoint,
         steps,
     }];
-    if !quiet {
-        finish_stop("current-repo", &report, json)?;
+    if !quiet || matches!(mode, StopMode::Now) {
+        finish_stop_with_output(
+            "current-repo",
+            &report,
+            json,
+            quiet,
+            &StopDisclosure::default(),
+        )?;
     }
     Ok(Some(outcome))
 }
 
 /// Stop this repository's worker daemon without writing a report to stdout.
+///
+/// A repository held by something that is not an attributable daemon, such as
+/// offline maintenance, is not an error here: nothing was signalled, and the
+/// caller's own runtime-authority acquisition refuses it with its own remedy.
 pub(crate) async fn stop_current_repo_quiet(kin_root: &Path) -> Result<()> {
     stop_current_repo(false, true, Some(kin_root), StopMode::Now).await
 }
@@ -1987,6 +2225,7 @@ impl RetirementAnswer {
             None | Some(StopOutcome::NotRunning | StopOutcome::Stopped) => Self::Gone,
             Some(StopOutcome::InUse(blocked_by)) => Self::StaysUntilDone(blocked_by),
             Some(StopOutcome::SignalFailed(error)) => Self::NotAsked(error),
+            Some(StopOutcome::Busy(reason)) => Self::NotAsked(reason),
             // A retirement never escalates, so a daemon that outlived the wait
             // was asked and is still finishing, which is the in-use answer.
             Some(StopOutcome::Timeout) => {
@@ -2011,21 +2250,66 @@ pub(crate) async fn retire_current_repo_quiet(kin_root: &Path) -> Result<Retirem
     Ok(RetirementAnswer::from_outcome(outcome))
 }
 
-/// Resolve the pid of the current repo's worker daemon, the way the daemon
-/// client resolves it: prefer the local `.kin/daemon.pid` record, and if that is
-/// absent or dead, fall back to the supervisor's `/daemons` registry (matched by
-/// canonical repo root). Returns a pid only when the process is actually alive.
-async fn resolve_repo_worker_pid(kin_root: &Path, working_dir: &Path) -> Result<Option<u32>> {
+/// What a repository's own records say about the worker a stop should reach.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LocalWorker {
+    /// Nothing holds the repository and no live endpoint is published.
+    None,
+    /// A daemon, published or still starting, attributed to this pid.
+    Pid(u32),
+    /// Something holds the repository that is not an attributable daemon.
+    Busy { pid: Option<u32>, reason: String },
+}
+
+impl LocalWorker {
+    /// The report of a stop that found the repository busy. Nothing was
+    /// signalled, and it is never a stopped daemon.
+    fn busy_report(pid: Option<u32>, reason: String, label: String) -> StopReport {
+        StopReport {
+            kind: "repo-daemon",
+            label,
+            pid: pid.unwrap_or(UNKNOWN_PID),
+            outcome: StopOutcome::Busy(reason),
+            preserved_endpoint: None,
+            steps: Vec::new(),
+        }
+    }
+}
+
+/// Resolve this repository's worker from its own records: the published
+/// `.kin/daemon.pid` when its owner is live, and otherwise whoever holds the
+/// repository's runtime lock. A daemon takes that lock before it opens any
+/// state and publishes `daemon.pid` only after, so a stop that read only the
+/// endpoint reported a starting daemon as nothing running.
+fn local_worker_for_stop(kin_root: &Path) -> Result<LocalWorker> {
     let (local_pid, _) = repo_daemon_recorded_endpoint(kin_root);
     if let Some(pid) = local_pid {
         if attributed_worker_identity(kin_root, pid)?.is_some() {
-            return Ok(Some(pid));
+            return Ok(LocalWorker::Pid(pid));
         }
     }
-    // Local file missing or stale — ask the supervisor if it still routes a live
-    // worker for this repo root.
+    Ok(
+        match crate::daemon_client::starting_daemon_owner(kin_root) {
+            StartingDaemonOwner::Absent => LocalWorker::None,
+            StartingDaemonOwner::Starting(owner) => LocalWorker::Pid(owner.identity().pid()),
+            StartingDaemonOwner::Busy { reason, pid } => LocalWorker::Busy { pid, reason },
+        },
+    )
+}
+
+/// Resolve the current repo's worker the way the daemon client resolves it:
+/// the repository's own records first, and when they name nothing, the
+/// supervisor's `/daemons` registry (matched by canonical repo root). Returns a
+/// pid only when the process is actually alive.
+async fn resolve_repo_worker(kin_root: &Path, working_dir: &Path) -> Result<LocalWorker> {
+    let local = local_worker_for_stop(kin_root)?;
+    if local != LocalWorker::None {
+        return Ok(local);
+    }
+    // Nothing local: ask the supervisor if it still routes a live worker for
+    // this repo root.
     let Some(url) = supervisor_url_if_running() else {
-        return Ok(None);
+        return Ok(LocalWorker::None);
     };
     let daemons = fetch_registered_daemons(&url)
         .await
@@ -2034,7 +2318,7 @@ async fn resolve_repo_worker_pid(kin_root: &Path, working_dir: &Path) -> Result<
     Ok(daemons
         .into_iter()
         .find(|d| canonical(Path::new(&d.repo_root)) == target && is_process_alive(d.pid))
-        .map(|d| d.pid))
+        .map_or(LocalWorker::None, |d| LocalWorker::Pid(d.pid)))
 }
 
 async fn stop_all(scope: StopScope, json: bool, quiet: bool, mode: StopMode) -> Result<()> {
@@ -2180,8 +2464,28 @@ async fn stop_all_inner(
     if let Ok(cwd) = std::env::current_dir() {
         if let Some(layout) = kin_core::KinLayout::discover(&cwd) {
             let kin_root = layout.root().to_path_buf();
-            let (pid, _) = repo_daemon_recorded_endpoint(&kin_root);
-            if let Some(pid) = pid {
+            let local = local_worker_for_stop(&kin_root)?;
+            if let LocalWorker::Busy { pid, reason } = &local {
+                // Never a stopped daemon, and never signalled. Full uninstall
+                // judges processes through its own install-owned fence below.
+                if uninstall_root.is_none()
+                    && pid.is_none_or(|pid| {
+                        fallback_may_stop(
+                            pid,
+                            reports.iter().map(|r| r.pid),
+                            foreign.iter().map(|skipped| skipped.pid),
+                        )
+                    })
+                {
+                    let working_dir = kin_root.parent().unwrap_or(&kin_root).to_path_buf();
+                    reports.push(LocalWorker::busy_report(
+                        *pid,
+                        reason.clone(),
+                        repo_label(&working_dir),
+                    ));
+                }
+            }
+            if let LocalWorker::Pid(pid) = local {
                 let may_stop = fallback_may_stop(
                     pid,
                     reports.iter().map(|r| r.pid),
@@ -2530,6 +2834,7 @@ fn legacy_managed_identity(
     if process_identity_is_current(&identity)? {
         Ok(Some(AttributedStopTarget {
             owner: EndpointOwnerRecord::for_identity(identity),
+            startup_root: None,
             #[cfg(unix)]
             selected_install_image,
         }))
@@ -2743,8 +3048,16 @@ fn stop_install_owned_daemons(
 
 /// Emit the stop report and fail loud (nonzero exit) if any endpoint would not
 /// die, so scripts can trust the exit code.
-fn finish_stop(scope: &str, reports: &[StopReport], json: bool) -> Result<()> {
-    finish_stop_with_output(scope, reports, json, false, &StopDisclosure::default())
+/// The pid a busy report carries when the repository's holder named none.
+/// Zero is never a process a stop could target.
+const UNKNOWN_PID: u32 = 0;
+
+fn pid_label(pid: u32) -> String {
+    if pid == UNKNOWN_PID {
+        "pid unknown".to_string()
+    } else {
+        format!("pid {pid}")
+    }
 }
 
 fn finish_stop_with_output(
@@ -2771,7 +3084,7 @@ fn finish_stop_with_output(
                 let mut entry = serde_json::json!({
                     "kind": r.kind,
                     "label": r.label,
-                    "pid": r.pid,
+                    "pid": (r.pid != UNKNOWN_PID).then_some(r.pid),
                     "result": r.outcome.detail(),
                 });
                 if !r.steps.is_empty() {
@@ -2785,6 +3098,9 @@ fn finish_stop_with_output(
                 }
                 if let StopOutcome::InUse(reasons) = &r.outcome {
                     entry["in_use"] = serde_json::json!(reasons);
+                }
+                if let StopOutcome::Busy(reason) = &r.outcome {
+                    entry["busy"] = serde_json::json!(reason);
                 }
                 entry
             })
@@ -2821,6 +3137,12 @@ fn finish_stop_with_output(
                     r.pid,
                     reasons.join("; ")
                 ),
+                StopOutcome::Busy(reason) => format!(
+                    "{} ({}): not stopped, the repository is busy: {reason}. Nothing was \
+                     signalled.",
+                    r.label,
+                    pid_label(r.pid)
+                ),
             };
             println!("  {line}");
             for step in &r.steps {
@@ -2849,7 +3171,20 @@ fn finish_stop_with_output(
     let failed: Vec<String> = reports
         .iter()
         .filter(|r| !r.outcome.is_settled())
-        .map(|r| format!("{} (pid {})", r.label, r.pid))
+        .map(|r| {
+            let reason = match &r.outcome {
+                StopOutcome::SignalFailed(reason) => reason.clone(),
+                StopOutcome::Timeout => format!("still alive after {}s", stop_timeout().as_secs()),
+                StopOutcome::Busy(reason) => format!("busy, nothing signalled: {reason}"),
+                other => other.detail().to_string(),
+            };
+            let steps = if r.steps.is_empty() {
+                String::new()
+            } else {
+                format!("; steps: {}", r.steps.join("; "))
+            };
+            format!("{} ({}): {reason}{steps}", r.label, pid_label(r.pid))
+        })
         .collect();
     if !failed.is_empty() {
         bail!(
@@ -2894,6 +3229,44 @@ mod tests {
             preserved_endpoint: preserved,
             steps: Vec::new(),
         }
+    }
+
+    #[test]
+    fn quiet_stop_preserves_the_failed_outcome_and_attempted_steps() {
+        for outcome in [
+            StopOutcome::SignalFailed("executable identity could not be confirmed".into()),
+            StopOutcome::Timeout,
+        ] {
+            let mut report = stop_report(None);
+            report.outcome = outcome;
+            report.steps = vec!["cooperative shutdown endpoint already closed".into()];
+            let error = finish_stop_with_output(
+                "current-repo",
+                &[report],
+                false,
+                true,
+                &StopDisclosure::default(),
+            )
+            .expect_err("quiet output must not turn a failed stop into success");
+            let message = error.to_string();
+            assert!(message.contains("pid 4242"), "{message}");
+            assert!(
+                message.contains("cooperative shutdown endpoint already closed"),
+                "{message}"
+            );
+            assert!(
+                message.contains("executable identity") || message.contains("still alive"),
+                "{message}"
+            );
+        }
+        finish_stop_with_output(
+            "current-repo",
+            &[stop_report(None)],
+            false,
+            true,
+            &StopDisclosure::default(),
+        )
+        .expect("a completed quiet stop remains successful");
     }
 
     /// A stop whose endpoint survived must fail, and must name the survivor.
@@ -3652,16 +4025,15 @@ mod tests {
         assert!(process_identity_is_current(&child.target).unwrap());
         let mut steps = Vec::new();
         let original = StopOutcome::SignalFailed("connection timed out".to_owned());
-        #[cfg(target_os = "linux")]
-        let outcome = escalate_to_recorded_pid(
+        // Grade signal refusal directly. The outer stop also waits passively
+        // for this live incarnation, which the dedicated drain tests cover.
+        let outcome = try_escalate_to_recorded_pid_until(
             &child.target,
-            ESCALATION_SIGTERM_WAIT,
-            STANDIN_IMAGE_BUDGET,
+            Duration::ZERO,
+            Instant::now() + STANDIN_IMAGE_BUDGET,
             &mut steps,
         )
         .unwrap_or_else(|| original.clone());
-        #[cfg(not(target_os = "linux"))]
-        let outcome = escalate_if_unstopped(&child.target, original.clone(), &mut steps);
         assert_eq!(outcome, original, "{steps:?}");
         assert!(
             process_identity_is_current(&child.target).unwrap(),
@@ -3759,6 +4131,160 @@ mod tests {
             "a live process with no published image must not become a signal target"
         );
         assert!(process_identity_is_current(&target).unwrap());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn incarnation_only_drain_fixture() -> (OwnedTestChild, AttributedStopTarget) {
+        // This owned native child finishes successfully only when its input
+        // closes. It needs no copied debug image, daemon, server or sleep child.
+        let child = OwnedTestChild(
+            std::process::Command::new("/bin/cat")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn the owned drain fixture"),
+        );
+        let identity = process_identity(child.id()).unwrap().unwrap();
+        // The exact publication shape an exhausted image-capture budget leaves:
+        // a current incarnation, with no permission for signal escalation.
+        let target = AttributedStopTarget::published(EndpointOwnerRecord::for_identity(identity));
+        assert!(target.expected_image().is_err());
+        (child, target)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn an_unsignalable_daemon_finishes_its_drain_before_stop_returns() {
+        let (mut child, target) = incarnation_only_drain_fixture();
+        // Model a cooperative listener that has closed during shutdown. The
+        // failed request does not mean the process has finished its drain.
+        let original = stop_identity_cooperatively(&target, Duration::from_secs(1), |_, _| {
+            Err(std::io::Error::from(std::io::ErrorKind::ConnectionRefused))
+        });
+        assert!(matches!(original, StopOutcome::SignalFailed(_)));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let recorded = target.clone();
+        let waiter = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let mut steps = Vec::new();
+            let outcome = escalate_to_recorded_pid(
+                &recorded,
+                Duration::from_secs(3),
+                Duration::ZERO,
+                &mut steps,
+            )
+            .unwrap_or(original);
+            let _ = finished_tx.send((outcome, steps));
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let before_release = finished_rx.recv_timeout(Duration::from_millis(150));
+        let stayed_waiting = matches!(
+            before_release,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        );
+        let live_before_release = process_identity_is_current(&target).unwrap();
+        // Release only our child's drain. Reap and join even if the stop
+        // returned early, so a failed assertion leaves no fixture behind.
+        drop(child.stdin.take());
+        let exit = child.wait().unwrap();
+        let (outcome, steps) = match before_release {
+            Ok(result) => result,
+            Err(_) => finished_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+        };
+        waiter.join().unwrap();
+        assert!(
+            stayed_waiting,
+            "stop returned before the owned drain was released: {outcome:?}; {steps:?}"
+        );
+        assert!(
+            live_before_release,
+            "the drain must remain live until released"
+        );
+        assert!(
+            exit.success(),
+            "the fixture must exit by EOF, never a signal: {exit}"
+        );
+        assert_eq!(outcome, StopOutcome::Stopped, "{steps:?}");
+        assert!(
+            steps
+                .iter()
+                .any(|step| step.contains("no executable identity")),
+            "{steps:?}"
+        );
+        assert!(
+            steps
+                .iter()
+                .any(|step| step.contains("ended during the passive wait")),
+            "{steps:?}"
+        );
+        assert!(
+            !steps.iter().any(|step| step.contains("sent SIG")),
+            "{steps:?}"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_live_unsignalable_daemon_preserves_its_failure_at_the_deadline() {
+        let (mut child, target) = incarnation_only_drain_fixture();
+        let window = Duration::from_millis(80);
+        for original in [
+            StopOutcome::SignalFailed("cooperative listener closed".into()),
+            StopOutcome::Timeout,
+        ] {
+            let started = Instant::now();
+            let mut steps = Vec::new();
+            let outcome = escalate_to_recorded_pid(&target, window, Duration::ZERO, &mut steps)
+                .unwrap_or_else(|| original.clone());
+            assert!(
+                started.elapsed() >= window,
+                "the passive wait returned early"
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "the passive wait exceeded its bounded window"
+            );
+            assert_eq!(outcome, original, "{steps:?}");
+            assert!(process_identity_is_current(&target).unwrap());
+            assert!(
+                steps.iter().any(|step| step.contains("not confirmed gone")),
+                "{steps:?}"
+            );
+            assert!(
+                !steps.iter().any(|step| step.contains("sent SIG")),
+                "{steps:?}"
+            );
+        }
+        drop(child.stdin.take());
+        assert!(child.wait().unwrap().success());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn passive_wait_judges_the_recorded_incarnation_not_a_reused_pid() {
+        let (mut child, target) = incarnation_only_drain_fixture();
+        let mut old_identity = serde_json::to_value(target.owner.identity()).unwrap();
+        old_identity["birth_token"] = serde_json::json!("a-predecessor-birth-token");
+        let predecessor: ProcessIdentity = serde_json::from_value(old_identity).unwrap();
+        assert!(is_process_alive(predecessor.pid()));
+        assert!(!process_identity_is_current(&predecessor).unwrap());
+        let mut steps = Vec::new();
+        assert_eq!(
+            wait_after_escalation_refusal(&predecessor, Instant::now(), &mut steps),
+            Some(StopOutcome::Stopped),
+            "the old incarnation is gone even though its numeric PID is live"
+        );
+        assert!(process_identity_is_current(&target).unwrap());
+        assert!(!steps.iter().any(|step| step.contains("sent SIG")));
+        // An exhausted deadline cannot read the same live incarnation as gone.
+        assert_eq!(
+            wait_after_escalation_refusal(&target, Instant::now(), &mut steps),
+            None
+        );
+        drop(child.stdin.take());
+        assert!(child.wait().unwrap().success());
     }
 
     #[cfg(unix)]
@@ -4631,6 +5157,7 @@ mod tests {
             Duration::from_millis(40),
             Duration::from_millis(5),
             true,
+            None,
         )
         .await
         .expect_err("a sweep still running at the budget is not a finished sweep");
@@ -4676,6 +5203,7 @@ mod tests {
             Duration::from_secs(30),
             Duration::from_millis(5),
             true,
+            None,
         )
         .await
         .expect("a sweep that ends inside the budget ends the wait");
@@ -4704,5 +5232,251 @@ mod tests {
             RetirementAnswer::from_outcome(Some(StopOutcome::SignalFailed("no port".into()))),
             RetirementAnswer::NotAsked("no port".to_string())
         );
+        assert_eq!(
+            RetirementAnswer::from_outcome(Some(StopOutcome::Busy("held".into()))),
+            RetirementAnswer::NotAsked("held".to_string())
+        );
+    }
+
+    /// A repository whose runtime lock the test holds on behalf of `standin`,
+    /// stamped and recorded exactly as a daemon still starting there leaves
+    /// them: before it opens state, so before any endpoint exists.
+    #[cfg(unix)]
+    fn starting_repository(
+        standin: &Standin,
+    ) -> (
+        tempfile::TempDir,
+        crate::daemon_client::RepositoryRuntimeAuthority,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let authority =
+            crate::daemon_client::acquire_repository_runtime_authority(directory.path())
+                .unwrap()
+                .expect("take the runtime authority for the stand-in");
+        crate::daemon_client::stand_in_as_starting_daemon_for_test(
+            directory.path(),
+            &standin.target.owner,
+        );
+        (directory, authority)
+    }
+
+    /// A daemon that holds its repository but has not published an endpoint
+    /// is found through the lock it holds and actually stopped, not reported
+    /// as nothing running.
+    ///
+    /// Falsify by resolving the worker from `daemon.pid` alone: the stop finds
+    /// nothing and the stand-in keeps running.
+    #[cfg(unix)]
+    #[test]
+    fn a_daemon_still_starting_is_found_through_its_lock_and_stopped() {
+        let standin = spawn_escalation_standin("plain");
+        let (repository, _authority) = starting_repository(&standin);
+        let root = repository.path();
+        let pid = standin.child.id();
+        assert!(!repo_daemon_pid_path(root).exists());
+        assert_eq!(local_worker_for_stop(root).unwrap(), LocalWorker::Pid(pid));
+
+        let mut steps = Vec::new();
+        // Linux hashes this large debug fixture before each signal, so there
+        // the escalation gets the fixture's image budget; elsewhere the whole
+        // production stop runs.
+        #[cfg(target_os = "linux")]
+        let outcome = escalate_to_recorded_pid(
+            &attributed_worker_identity(root, pid)
+                .unwrap()
+                .expect("the starting daemon is attributed"),
+            ESCALATION_SIGTERM_WAIT,
+            STANDIN_IMAGE_BUDGET,
+            &mut steps,
+        )
+        .expect("the starting daemon's own record authorizes the signal");
+        #[cfg(not(target_os = "linux"))]
+        let outcome = {
+            let outcome =
+                stop_worker_at(root, pid, Duration::from_secs(30), None, &mut steps).unwrap();
+            assert!(
+                steps.iter().any(|step| step.contains(STILL_STARTING)),
+                "{steps:?}"
+            );
+            outcome
+        };
+        assert_eq!(outcome, StopOutcome::Stopped, "{steps:?}");
+        assert!(
+            steps.iter().any(|step| step.contains("sent SIGTERM")),
+            "{steps:?}"
+        );
+        assert!(!process_identity_is_current(&standin.target).unwrap());
+    }
+
+    /// A starting daemon attributed before it published, which then publishes
+    /// its own endpoint mid-stop, is still signalled: its record and its
+    /// endpoint name one incarnation. A successor's endpoint landing instead
+    /// withdraws the authority, and nothing is signalled.
+    #[cfg(unix)]
+    #[test]
+    fn an_endpoint_published_mid_stop_keeps_only_its_own_incarnation_signalable() {
+        let successor = spawn_escalation_standin("plain");
+        let standin = spawn_escalation_standin("plain");
+        let (repository, _authority) = starting_repository(&standin);
+        let root = repository.path();
+        let pid = standin.child.id();
+        let target = attributed_worker_identity(root, pid)
+            .unwrap()
+            .expect("the starting daemon is attributed");
+        assert!(target.is_starting());
+
+        // A different live incarnation publishes: no signal may follow.
+        let publish = |owner: &EndpointOwnerRecord| {
+            std::fs::write(
+                root.join("daemon.owner"),
+                serde_json::to_string(owner).unwrap(),
+            )
+            .unwrap();
+            std::fs::write(root.join("daemon.pid"), owner.identity().pid().to_string()).unwrap();
+            std::fs::write(root.join("daemon.port"), "1").unwrap();
+        };
+        publish(&successor.target.owner);
+        let mut steps = Vec::new();
+        let refused = try_escalate_to_recorded_pid_until(
+            &target,
+            Duration::from_secs(1),
+            Instant::now() + Duration::from_secs(20),
+            &mut steps,
+        );
+        assert_eq!(refused, None, "{steps:?}");
+        assert!(
+            steps.iter().any(|step| step.contains("did not signal")),
+            "{steps:?}"
+        );
+        assert!(process_identity_is_current(&standin.target).unwrap());
+        assert!(process_identity_is_current(&successor.target).unwrap());
+
+        // The daemon itself publishes: the same stop goes through.
+        publish(&standin.target.owner);
+        let mut steps = Vec::new();
+        #[cfg(target_os = "linux")]
+        let outcome = escalate_to_recorded_pid(
+            &target,
+            ESCALATION_SIGTERM_WAIT,
+            STANDIN_IMAGE_BUDGET,
+            &mut steps,
+        )
+        .expect("the daemon's own endpoint keeps its signal authority");
+        #[cfg(not(target_os = "linux"))]
+        let outcome = escalate_if_unstopped(
+            &target,
+            StopOutcome::SignalFailed(STILL_STARTING.to_string()),
+            &mut steps,
+        );
+        assert_eq!(outcome, StopOutcome::Stopped, "{steps:?}");
+        assert!(!process_identity_is_current(&standin.target).unwrap());
+        assert!(process_identity_is_current(&successor.target).unwrap());
+    }
+
+    /// Once attributed, a starting daemon is signalled only while it still
+    /// holds the repository under the same record. A changed owner, or a
+    /// released lock, withdraws the authority before any signal.
+    #[cfg(unix)]
+    #[test]
+    fn a_changed_or_released_startup_owner_is_never_signalled() {
+        let standin = spawn_escalation_standin("plain");
+        let other = spawn_escalation_standin("plain");
+        let (repository, authority) = starting_repository(&standin);
+        let root = repository.path();
+        let target = attributed_worker_identity(root, standin.child.id())
+            .unwrap()
+            .expect("the starting daemon is attributed");
+
+        crate::daemon_client::stand_in_as_starting_daemon_for_test(root, &other.target.owner);
+        assert!(attributed_worker_identity(root, standin.child.id()).is_err());
+        let mut steps = Vec::new();
+        let refused = try_escalate_to_recorded_pid_until(
+            &target,
+            Duration::from_secs(1),
+            Instant::now() + Duration::from_secs(20),
+            &mut steps,
+        );
+        assert_eq!(refused, None, "{steps:?}");
+
+        crate::daemon_client::stand_in_as_starting_daemon_for_test(root, &standin.target.owner);
+        drop(authority);
+        crate::daemon_client::stand_in_as_starting_daemon_for_test(root, &standin.target.owner);
+        assert_eq!(local_worker_for_stop(root).unwrap(), LocalWorker::None);
+        let mut steps = Vec::new();
+        let refused = try_escalate_to_recorded_pid_until(
+            &target,
+            Duration::from_secs(1),
+            Instant::now() + Duration::from_secs(20),
+            &mut steps,
+        );
+        assert_eq!(refused, None, "{steps:?}");
+        assert!(process_identity_is_current(&standin.target).unwrap());
+        assert!(process_identity_is_current(&other.target).unwrap());
+    }
+
+    /// A maintenance command such as `kin upgrade` holds the same lock with a
+    /// live stamp and no daemon record. The stop reports the repository busy,
+    /// fails, and signals nothing, including this test process, the holder.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_maintenance_command_holding_the_repository_is_busy_and_never_signalled() {
+        let directory = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(directory.path()).unwrap();
+        let root = initialized.layout.root().to_path_buf();
+        let _maintenance = crate::daemon_client::acquire_repository_runtime_authority(&root)
+            .unwrap()
+            .expect("take the runtime authority as maintenance does");
+        assert!(matches!(
+            local_worker_for_stop(&root).unwrap(),
+            LocalWorker::Busy { pid: Some(pid), .. } if pid == std::process::id()
+        ));
+
+        // The operator's stop reports it and fails.
+        let error = stop_current_repo_outcome(false, false, Some(&root), StopMode::Now)
+            .await
+            .expect_err("a busy repository is never a stopped daemon");
+        assert!(format!("{error:#}").contains("busy"), "{error:#}");
+        // A quiet caller, such as `kin upgrade` before it takes the authority
+        // itself, gets the busy answer back to judge, never a stopped daemon.
+        for mode in [StopMode::Now, StopMode::WhenUnused] {
+            let answered = stop_current_repo_outcome(false, true, Some(&root), mode)
+                .await
+                .unwrap();
+            assert!(
+                matches!(answered, Some(StopOutcome::Busy(_))),
+                "{answered:?}"
+            );
+        }
+        stop_current_repo_quiet(&root).await.unwrap();
+    }
+
+    /// A busy report is a failure that names no pid it does not know.
+    #[test]
+    fn a_busy_report_fails_the_stop_and_is_never_all_stopped() {
+        let report = LocalWorker::busy_report(None, "held".to_string(), "repo".to_string());
+        assert_eq!(report.pid, UNKNOWN_PID);
+        assert!(!report.outcome.is_success());
+        assert!(!report.outcome.is_settled());
+        let error = finish_stop_with_output(
+            "current-repo",
+            &[report],
+            false,
+            true,
+            &StopDisclosure::default(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("pid unknown"), "{error}");
+        let mut steps = Vec::new();
+        assert_eq!(
+            escalate_if_unstopped(
+                &AttributedStopTarget::published(EndpointOwnerRecord::for_identity(
+                    crate::daemon_client::current_process_identity().unwrap()
+                )),
+                StopOutcome::Busy("held".into()),
+                &mut steps,
+            ),
+            StopOutcome::Busy("held".into())
+        );
+        assert!(steps.is_empty(), "{steps:?}");
     }
 }

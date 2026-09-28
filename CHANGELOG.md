@@ -7,6 +7,298 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-09-27
+
+### Added
+
+- Graph status exposes atomic per-artifact enrichment metadata through MCP and
+  CLI, with exact dependency selection, whole-row continuation pages, and
+  explicit stale, unsupported, missing-source and historical-scope states.
+  Large inventories retain aggregate status and explicitly report when full
+  detail exceeds the inspection limit. Dependency queries collect only their
+  selected detail while retaining repository-wide proof and debt readings.
+
+- Repository status and MCP graph status disclose live staged transactions
+  separately from graph proof and workspace dirtiness, preserving unknown
+  creation age for legacy transactions and whole-row MCP continuation.
+
+### Changed
+
+- `find_references` rows and `kin refs` rows no longer give file lines. A row
+  addresses its caller by entity id and each usage inside that caller: `sites`
+  lists each one as `line_in_entity`, counted from 0 at the caller's first
+  line, and `callee`, the text at the site read from the caller's own body,
+  the way call-site rows already do. When that text cannot be read, `callee` is
+  null and `callee_unavailable` says why. The caller's file is served only as
+  `projection.path`. `file_path`, `start_line`, `reference_lines`,
+  `reference_line_count`, `reference_lines_absent_reason` and
+  `reference_lines_partial_reason` are gone from these rows, replaced by
+  `projection`, `sites`, `site_count`, `sites_absent_reason` and
+  `sites_partial_reason`. A client that read a caller's file line from a row
+  now reads the caller by its id. `kin refs` prints each caller as its id and
+  `projection:` path, and each site as `+N` with the text at it, and names the
+  focal the same way in its header. External-symbol rows carry `projection` in
+  place of `file_path` and drop `start_line` too. The Go interface
+  implementation candidates that `find_references` and `graph_neighborhood`
+  list under `interface_implementations` drop `line` and carry `projection` in
+  place of `file_path`, and `kin refs --kind dispatch` names each one by its id.
+  Every other entity a `find_references` reply names is addressed the same way:
+  `focal_entity`, each of `focal_resolution.other_candidates` and each entry of
+  `unsectioned_candidates` carry `projection` in place of `file_path`, and each
+  `call_sites.candidates` row carries `projection` in place of `caller_file`.
+- `kin refs` leads every answer with its call-site disclosure: the summary,
+  every clause that leaves the answer unsettled, and the unproven call sites
+  that could still be calls to the entity come before the callers, in the
+  complete listing `--all`, `--json` and a pipe read as well as at a terminal.
+- `kin refs` at a terminal lays its answer out for a person. The callers are
+  grouped under the file each is projected into, name first with each site as
+  `+N` and the text there, and every line fits the terminal's width without
+  breaking a word. At most 20 callers are listed, and
+  a closing line counts the rest. `--all` lists every caller in full, `--json`
+  prints the complete answer, and output that is not a terminal stays complete.
+- `kin agent run` no longer adds file positions from `find_references` rows to
+  a run's final answer, because the rows no longer carry any. It still adds
+  the `ANSWER` marker, and the run record keeps every row with its sites.
+- Setup asks one question at a time, with keyboard navigation, backtracking,
+  terminal resizing and a plain numbered prompt for basic terminals. The
+  completion shows the work performed, any remaining action and a command
+  to try. Local-only setup leaves unselected AI-client repairs in the full
+  health report.
+- Reference, impact and review answers explain gaps in their selected source
+  and call evidence. An unmeasured or stale calling domain cannot support a
+  claim that no callers exist. Review starts with its summary; detailed
+  relation records remain available on request.
+- Size-limited reference answers and traces page through their records with
+  continuation cursors. Pages preserve all caller rows and safety readings
+  under one captured source authority; a partial page never proves absence.
+  Every page retains that repository and selected revision, including any
+  client-folder warning, within the response budget.
+  Historical traces keep the source bodies of the selected revision, and a
+  path reached through a guessed call remains unproven.
+- Persisted proof-context validation uses snapshot versions 27 and 28 and
+  authority frame version 9. Kin 0.8.1 refuses these newer records; stores
+  without them retain their earlier format.
+
+### Fixed
+
+- A store whose binding history is unchecked but whose every head and
+  workspace already hold exactly what this build derives, as a clone or a pull
+  from a peer of the same release leaves it, is checked automatically the next
+  time a daemon starts on it. The daemon runs the same verified re-derivation
+  `kin upgrade` runs, before it opens the store, and commits only a
+  re-derivation the verifier proves. It records no change and moves no head,
+  so the store is never left ahead of its remote. Startup reports each step
+  while it runs, through readiness and the startup phase a waiting command or
+  MCP client prints. A store serving state another build derived, such as one
+  an earlier release wrote, is left as it is, and `kin status` now says its
+  binding history is unchecked and names `kin upgrade`, which re-derives it.
+  So are a store whose semantics are behind, a store holding more than its own
+  workspace or an open merge, a repository with no commit author, and a
+  repository lock held past the start's wait.
+- Branch create, delete and replay, and tag writes, carry a store's checked
+  binding history across instead of ending it, so the next daemon start has
+  nothing to re-qualify.
+- An upgraded store no longer reports every answer degraded after its first
+  language-server sweep. The sweep retires the name-only call guesses its
+  language server contradicts, and the relation census read that fall in
+  `Calls` as lost relation ground. It then held the store below the upgrade's
+  baseline for good and set `relation_census_loss` on every answer, across
+  restarts. The census now credits relations that exact language-server proof
+  retired, so a fall no larger than those retirements advances the baseline.
+  A fall beyond them still holds the census and still marks answers degraded.
+- A partial trace or reference page names its partiality as a single verdict
+  clause. The clause used to contain the separator that divides clauses, so a
+  reader splitting the limiting factor saw an unlabelled fragment.
+- `kin daemon stop` finds and stops a daemon that is still starting, never
+  reports every daemon stopped while one runs, and reports a maintenance
+  command holding the repository as busy.
+- Slow language-server type queries take their bounded retries during the
+  current analysis pass instead of waiting several minutes for its final
+  attempt. An exhausted limit or failed server still leaves the work owed.
+- Re-derivation preserves exact source-sealed withdrawals of inferred calls.
+  Previously reintroduced guesses request reanalysis even when their other
+  completion records are current; debt alone does not cause a retry loop.
+- Exact validated callee evidence can settle an old inferred-call obligation
+  when it corrects the guessed target. Publication and recovery update the
+  durable and live debt together while preserving newer source or proof changes.
+- Independently resolved exact named imports remain admissible after an earlier
+  inferred binding was withdrawn. Unchanged weak guesses remain suppressed.
+- Binding settlement identifies the exact owning declaration by its source
+  occurrence, so same-named getters and setters do not leave proved obligations
+  outstanding. Ambiguous ownership still requires further proof.
+- Immutable scalar declarations narrow possible-callable candidates only when
+  their source-bound proof remains valid. Assignments, escapes and unsupported
+  cases retain uncertainty.
+- Language-server readiness probes share observations for the same identified
+  executable and environment without reusing a changed launch configuration.
+  A readiness check still in progress remains unknown until it finishes,
+  rather than reporting the server absent. Reference and impact warnings retain
+  specific source and binding limitations alongside readiness signals.
+- A daemon with language-server enrichment switched off records that as a
+  completed readiness finding, so its reference answers certify from graph
+  coverage again instead of reading `reference_enrichment_unknown` for the life
+  of the daemon. A server that is not installed reads as absent whether a
+  readiness probe or an analysis pass asked first.
+- Analysis toolchain downloads use exclusive attempt ownership and verify the
+  disk bytes again before extraction. Incompatible case-insensitive destinations
+  fail with repair guidance and bounded diagnostics instead of publishing a
+  partial toolchain.
+- Enrichment completion markers bind complete published proof inputs rather
+  than only record IDs. Older markers remain readable but require successful
+  reanalysis before they attest current completion. Completed analysis,
+  settled call-site proof and outstanding binding obligations remain separate.
+- Editing a Python file and then reverting it no longer leaves the workspace
+  reading as changed when the file declares `@overload` stubs above a
+  function that calls itself. A live edit bound that call to the first stub
+  as well as to the implementation, while `kin init` bound only the
+  implementation. So an exact revert kept the extra edge as an uncommitted
+  change, and `kin status` reported the workspace dirty with its tree equal to
+  its base. Every path now binds a call among same-named declarations in one
+  file to the one the linker binds: the last in source order, which is the
+  definition Python keeps.
+- A clean workspace no longer reads as changed after a language-server pass.
+  The records a pass keeps in the workspace, such as the note that a server
+  could not start, counted as uncommitted work: `kin rollback` refused a
+  freshly initialized repository, `kin stash push` sealed an empty stash, and
+  `kin status` reported the workspace dirty. Rollback, stash push, pop and
+  list, following a moved branch, carrying work across a switch, and
+  `kin status` now use the same authored-work check as merge. Retired binding
+  records remain automatic when a current source-sealed obligation accounts
+  for them, or when every original parser-certified occurrence is bound to the
+  current body, call-site ledger and validated proof context. Manual changes,
+  changed source, malformed proof and unaccounted removals still count as
+  uncommitted work.
+- Setup and initialization explain a missing author identity before the first
+  change, with separate copyable repair commands. Invalid configuration keeps
+  its specific repair advice, and admission refuses before opening a session.
+- Successful language-server queries keep a long enrichment pass alive even
+  when they discover no new relationships. A stalled worker retries with fresh
+  servers within a bounded budget, retaining unfinished work across a full queue.
+- Replacing a proof context checks the successor ledgers in the same
+  transaction. Publication also collects obsolete, unreferenced resolver nodes
+  from the live graph before restoring its exact binding-history witness.
+- An explicit-call sweep retains older property-call evidence it did not
+  measure. The retained evidence keeps its prior context; only a definite new
+  answer can replace it. Completing the sweep no longer discards that evidence
+  and invalidates the repository's binding-history witness.
+- Refreshing an unchanged binding under the current validated proof context
+  preserves its history witness, including implicit property calls. Changed
+  bodies, targets, occurrences and unverified contexts still require proof.
+- Language-server refreshes preserve binding history when prior occurrences
+  remain supported, including evidence refinements and canonical relation IDs.
+  Withdrawn bindings that cannot be independently resolved become durable
+  obligations, including when source parsing is incomplete. Publication and
+  retries preserve those obligations without overwriting newer state.
+- Durable entity and relation counts follow a successfully finalized authority
+  publication, including when that publication removes obsolete relationships.
+- Admission reports current embedding coverage and names `kin embed` as the
+  action to finish indexing, without assuming a background worker is active.
+- MCP sessions renew an idle lease while in use and release it when they end.
+  Cold daemon startup has a configurable readiness budget and emits progress
+  notifications to clients that request them.
+- Setup and search report when the serving daemon has paused automatic
+  indexing, with an explicit command to build the index.
+- External symbol IDs retain their meaning in reference queries, trace
+  targets and work scopes. Mutation requests refuse external endpoints
+  before staging or changing repository relationships.
+- An embedding pass refused for memory keeps its daemon available for a
+  bounded recovery window. The daemon can release an unused model while it
+  waits, and search explains an unfinished index and when work can resume.
+- TypeScript overload references name the same implementation as their call
+  proof, instead of retaining a reference to the containing module.
+- A cold Python sweep acknowledges its own proof-context publication without
+  accepting an unrelated writer's change. Empty package files no longer
+  make the sweep restart indefinitely.
+- Repository commands reuse the daemon's held authority only while its
+  publication record still matches. History imports avoid a duplicate
+  derivation pass, and streamed transaction hashing reuses the validated
+  byte count while checking the final encoded stream.
+- Hosted storage keeps a live process-wide transport driver across synchronous
+  and asynchronous calls. Lease renewal checks the stored owner, fence and
+  expiration after an ambiguous conditional-write response.
+- Proof-context validation survives persistence and reopening. Changed server
+  identities invalidate prior call proofs, and incomplete source inventories
+  remain explicit gaps.
+- `kin init` derives a Python history faster. Hashing each entity's behavior
+  class scanned the whole file's imports and bindings once for every entity
+  in it, which grew with the square of the file's size and repeated for every
+  version of the file in the history. The scan now runs once per file. On a
+  full Flask history the derive stage took 801 s instead of 2,128 s on the
+  same loaded machine.
+- `kin init`'s bootstrap commit proves each body a Git history names once,
+  through one verified batch. It used to read most bodies twice, as the new
+  side of one change and the old side of the next, and reopen the store's
+  root, re-confirm its lock and resolve its path for every read. On a full
+  Flask history that part of the commit took 56 s instead of 207 s.
+- A `kin init` stopped by SIGINT, SIGTERM or SIGHUP exits within about two
+  seconds. It used to remove its whole Git capture directory first, tens of
+  thousands of files on an ordinary history, which kept a stopped init alive
+  for most of a minute on a busy disk. What two seconds do not remove stays
+  with its lease, the next `kin init` removes it, and the stopped init says
+  on standard error which it did.
+- A sweep over a store whose files are all finished now checks that their
+  call proofs were made by the language server this host would start now,
+  before it skips them. It used to learn which server was current only by
+  starting one for a file it had to ask about, so on a store with nothing
+  left to ask it never established the current proof context, and proofs made
+  by an older server, workspace or configuration were kept. A proof context now records the server's
+  executable by content (a binary's bytes, or a Node package's entry and its
+  `package.json`), so the check needs no server when the one this host would
+  start is the one that made the proofs. When it is not, or it runs through a
+  shim that picks its program later, one server start settles which proofs
+  are current, and files proven by another are asked about again. Existing
+  stores are asked about once, because their proof contexts carry no
+  executable identity.
+- A TypeScript store copied or moved to another path keeps its call proofs.
+  The workspace file Kin writes for tsserver is named after the repository's
+  absolute path, and that path was part of each proof's context, so every
+  copy of a store re-proved its TypeScript calls. The context now records
+  what the file says, with its paths relative to the repository.
+- A TypeScript call whose receiver may be a union is no longer served as
+  proof when the receiver is a call's result, an element or a parenthesized
+  expression, as in `getDriver().run()`. Such a receiver has no name to ask
+  the type of, so Kin asks the type of the member itself, which names every
+  constituent's declaration when the receiver is a union. Before, only a
+  named receiver or a cast to a union was checked.
+- A language-server edge between two entities in the repository keeps the
+  same id in every process and under every Rust toolchain. Its id came from
+  the standard library's default hasher, whose algorithm can change between
+  Rust releases, so a daemon built with a newer toolchain could give the same
+  edge a new id and leave the old one beside it. The id is now SHA-256 over a
+  versioned domain and the edge's origin, kind and two ends, each written
+  with its length. A store enriched by an earlier build holds its edges under
+  the old ids. When a file is proven again, every language-server edge from
+  or to an entity in it is held once, under its new id, with the sites the
+  old record carried, and the old id leaves repository authority at the next
+  publication. The parser's edges between the same entities are untouched.
+- The tools that take a scope answer a symbol outside the repository by what
+  it is. The work, annotation, review, intent and traffic tools, and their
+  `kin work`, `kin note`, `kin review`, `kin intent` and `kin traffic`
+  commands, refuse a scope naming one, by its `external_reference` address, as
+  `entity:<uuid>` or by its bare uuid, with `external_symbol_not_served`
+  before anything is stored. The address was refused as an unrecognised
+  spelling, and the uuid was stored as an entity that no read resolves.
+- `kin_mutate`, `kin_transaction_stage` and `kin_transaction_commit` refuse a
+  relation whose end names a symbol outside the repository, to add it or to
+  remove it, where a bare uuid was written as an edge to an entity that does
+  not exist. An edge into such a symbol exists only where a language server
+  proved the call.
+- `trace_data_flow` refuses a `target` naming a symbol outside the
+  repository, which it reported as a target that resolved to nothing.
+- A `find_references` `query` and a `kin refs` name reach a symbol outside the
+  repository by the name a reader writes, such as `Array.map`, by its SCIP
+  descriptor chain or whole SCIP symbol, or by its id, where they answered
+  that no entity matched. A name several such symbols share lists each one by
+  its id, on both surfaces.
+
+### Known limitations
+
+- A finished language-server sweep can leave specific local binding
+  obligations unresolved. These remain visible even when binding history is
+  verified: accounting for earlier evidence does not resolve every call.
+  Positive references and named candidates remain available; affected answers
+  cannot establish completeness or absence.
+
 ## [0.8.1] - 2026-09-26
 
 ### Added

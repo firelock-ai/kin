@@ -1307,8 +1307,9 @@ pub struct HealthResponse {
     /// merely whether the opt-in environment variable was present.
     #[serde(default)]
     pub filesystem_reconcile_disabled: bool,
-    /// Whether an operator turned the automatic background embedding pass off
-    /// (`KIN_DAEMON_AUTO_EMBED` falsy). Distinct from
+    /// Whether the automatic background embedding pass is off: an operator
+    /// turned it off (`KIN_DAEMON_AUTO_EMBED` falsy), or `kin setup` declined
+    /// the embedding model download and the model is not cached. Distinct from
     /// `embed_persistence_unavailable`, which is the daemon refusing because it
     /// cannot durably persist a sidecar. Deferred, not disabled: an explicit
     /// embed request still runs. Does not drive `status: "attention"`, because
@@ -1407,6 +1408,12 @@ pub struct ReadinessResponse {
     /// false only in the first.
     #[serde(default)]
     pub warming: bool,
+    /// What an opening daemon is doing before it can serve, when it is doing
+    /// more than reading its state: a re-qualification of the store it runs
+    /// before the open reports each step here. Absent otherwise, so a reader
+    /// that predates it reads the same body it always did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<String>,
 }
 
 /// JSON-friendly intent payload for CLI and adapter consumers.
@@ -1453,7 +1460,7 @@ struct StartSessionRequest {
     capabilities: Option<SessionCapabilities>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct McpToolCallRequest {
     name: String,
     #[serde(default)]
@@ -1519,11 +1526,9 @@ const REPO_SCOPED_LOCATE_SOURCE_READ_CAP: usize = 12;
 const REPO_SCOPED_CONTEXT_MAX_DEPTH: u64 = 8;
 const REPO_SCOPED_CONTEXT_MAX_TOKEN_BUDGET: u64 = 32_000;
 const REPO_SCOPED_TRACE_MAX_SELECTOR_CHARS: usize = 4 * 1024;
-const REPO_SCOPED_TRACE_BODY_READ_UNIT_CHARS: usize = 8_000;
 const REPO_SCOPED_TRACE_BODY_READ_CAP: usize = 8;
-/// Room for source provenance, cap disclosure and repository authority fields
-/// added after the trace's body-free shape is measured.
-const REPO_SCOPED_TRACE_BODY_METADATA_RESERVE_CHARS: usize = 2_000;
+/// Structural excerpt bound, independent of response page size.
+const REPO_SCOPED_TRACE_BODY_MAX_CHARS: usize = 32 * 1024;
 /// How many bytes of immutable source one hosted call may materialize for every
 /// character of response budget it is served under.
 ///
@@ -2529,6 +2534,7 @@ fn api_routes() -> Router<Arc<DaemonState>> {
     Router::new()
         .route("/health", get(health))
         .route("/idle-timeout", get(idle_timeout).post(raise_idle_timeout))
+        .route("/idle-timeout/release", post(release_idle_floor))
         .route("/shutdown", post(request_daemon_shutdown))
         .route("/retire", post(request_daemon_retirement))
         .route("/readiness", get(readiness))
@@ -3374,6 +3380,14 @@ impl GraphStatusSettledCache {
         let Ok(mut slot) = self.slot(scope).lock() else {
             return;
         };
+        if observation.details.is_none()
+            && slot.as_ref().is_some_and(|previous| {
+                previous.observation.details.is_some()
+                    && std::ptr::eq(previous.graph.as_ptr(), Arc::as_ptr(graph))
+            })
+        {
+            return;
+        }
         *slot = Some(SettledGraphStatus {
             graph: Arc::downgrade(graph),
             observation,
@@ -3390,14 +3404,25 @@ impl GraphStatusSettledCache {
         &self,
         scope: kin_mcp::handlers::entities::GraphStatusScope,
         graph: &Arc<kin_db::InMemoryGraph>,
+        requested: &[kin_model::RepoPath],
     ) -> Option<(
         kin_mcp::handlers::entities::GraphStatusObservation,
         Duration,
     )> {
         let slot = self.slot(scope).lock().ok()?;
         let settled = slot.as_ref()?;
-        (std::ptr::eq(settled.graph.as_ptr(), Arc::as_ptr(graph)))
-            .then(|| (settled.observation, settled.at.elapsed()))
+        let recorded = settled
+            .observation
+            .details
+            .as_ref()
+            .and_then(|details| details["enrichment"]["requested_dependencies"].as_array());
+        let requested = serde_json::to_value(requested).ok()?;
+        let same_query = match recorded {
+            Some(recorded) => Some(recorded) == requested.as_array(),
+            None => requested.as_array().is_some_and(Vec::is_empty),
+        };
+        (same_query && std::ptr::eq(settled.graph.as_ptr(), Arc::as_ptr(graph)))
+            .then(|| (settled.observation.clone(), settled.at.elapsed()))
     }
 }
 
@@ -3429,6 +3454,7 @@ pub(crate) struct XrefSettledHead {
 #[derive(Clone)]
 struct XrefCertifiedHead {
     root: String,
+    currency: XrefHeadCurrency,
     head_version: u64,
     at: Instant,
 }
@@ -3437,12 +3463,14 @@ impl XrefSettledHead {
     /// Keep what a certified read answered from. A session-scope read carries
     /// no HEAD version and is not kept, because the replay compares HEAD.
     fn record(&self, attempt: &XrefGraphReadAttempt) {
-        let Some(head_version) = attempt.head_version else {
+        let (Some(head_version), Some(currency)) = (attempt.head_version, attempt.head_currency)
+        else {
             return;
         };
         if let Ok(mut last) = self.last.lock() {
             *last = Some(XrefCertifiedHead {
                 root: attempt.root.clone(),
+                currency,
                 head_version,
                 at: Instant::now(),
             });
@@ -3483,12 +3511,212 @@ pub(crate) fn selected_graph_index_population(_graph: &kin_db::InMemoryGraph) ->
     None
 }
 
-async fn mcp_graph_status_with_stable_authority(
+fn graph_status_epoch_current(
     state: &DaemonState,
+    authority: RequestGraphAuthority,
+    epoch: u64,
+) -> bool {
+    match authority {
+        RequestGraphAuthority::Head => state.settled_read_epoch_is_current(epoch),
+        RequestGraphAuthority::SessionScope => state.graph_authority_epoch_is_current(epoch),
+    }
+}
+
+fn graph_status_publication_current(
+    state: &DaemonState,
+    publication: Option<&LocalPublicationIdentity>,
+) -> bool {
+    let Some(publication) = publication else {
+        return true;
+    };
+    let Some(backend) = state.local_repository_backend() else {
+        return false;
+    };
+    let Ok(binding) = state.local_repository_authority_binding() else {
+        return false;
+    };
+    confirm_pinned_projection_namespace(&backend, binding.repository_id()).is_ok()
+        && read_local_publication_identity(&backend, binding.repository_id())
+            .is_ok_and(|current| &current == publication)
+}
+
+/// One immutable graph metadata observation. No worker-side progress, readiness
+/// cache or working-copy content can certify the selected proof context.
+fn capture_graph_status_details(
+    state: &DaemonState,
+    graph: &kin_db::InMemoryGraph,
+    source_scope: Option<kin_mcp::handlers::common::EntitySourceScope>,
+    truth: u64,
+    requested: &[kin_model::RepoPath],
+) -> Result<(serde_json::Value, Option<LocalPublicationIdentity>), String> {
+    use kin_mcp::handlers::common::EntitySourceScope;
+    let source_scope = source_scope.ok_or("selected source scope changed during status capture")?;
+    let held = matches!(source_scope, EntitySourceScope::WorkspaceHead)
+        .then(|| held_projection_authority(state));
+    let (publication, authority) = match held {
+        Some(Ok((publication, authority))) => (Some(publication), Some(authority)),
+        // A synthetic/unavailable authority cannot supply completion marks. The
+        // graph's independently recorded ledgers still have an honest reading.
+        _ => (None, None),
+    };
+    let lease = authority
+        .as_ref()
+        .map(|authority| authority.manager.read_authority());
+    let marks = authority
+        .as_ref()
+        .zip(lease.as_ref())
+        .map(|(authority, lease)| lease.workspace_enrichment_marks(&authority.workspace_id));
+    let facts = graph.enrichment_status_facts(
+        requested,
+        marks,
+        crate::daemon::enrichment_version_still_covers,
+    );
+    let scope = match source_scope {
+        EntitySourceScope::WorkspaceHead => json!({"kind":"workspace_head"}),
+        EntitySourceScope::At(change) => {
+            json!({"kind":"committed_graph", "change":change.to_string()})
+        }
+    };
+    let identity = json!({
+        "daemon_instance": state.repo_semantic_instance_id,
+        "repository": state.local_repository_authority_binding().ok().map(|binding| binding.repository_id().to_string()),
+        "scope":scope,
+        "graph_identity":graph as *const kin_db::InMemoryGraph as usize,
+        "truth_epoch":truth,
+        "authority_generation":lease.as_ref().map(|lease|lease.roots().generation),
+        "publication":publication.as_ref().map(|publication|match publication {
+            LocalPublicationIdentity::Unpublished=>"unpublished".to_owned(),
+            LocalPublicationIdentity::Published(hash)=>hex::encode(hash),
+        }),
+    });
+    let facts = match facts {
+        Ok(facts) => facts,
+        Err(error @ kin_db::EnrichmentStatusError::Limit { .. }) => {
+            let kin_db::EnrichmentStatusError::Limit { kind, limit } = &error else {
+                unreachable!()
+            };
+            // A bounded detail scan cannot erase the independently captured
+            // counters. The caller still revalidates the exact selected graph,
+            // source publication and truth epoch before exposing either reading.
+            let mut enrichment = json!({
+                "schema":"kin.enrichment-status.v1",
+                "current":true,
+                "scope":scope,
+                "truth_epoch":truth,
+                "authority_generation":lease.as_ref().map(|lease|lease.roots().generation),
+                "proof_scope":"recorded_call_site_census",
+                "all_relationships_attested":false,
+                "requested_dependencies":requested,
+                "files":[],
+                "status":"bounded",
+                "limitation":kin_mcp::status_pages::metadata_limit_clause(&error.to_string()),
+                "unavailable":{"reason":error.to_string(),"limit_kind":kind,"limit":limit},
+            });
+            enrichment["snapshot_id"] = json!(kin_blobs::digest(
+                &serde_json::to_vec(&(identity, &enrichment)).map_err(|error| error.to_string())?
+            )
+            .to_string());
+            return Ok((json!({"enrichment":enrichment}), publication));
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    let mut call_sites =
+        kin_mcp::call_sites::block_json(&facts.tally, kin_mcp::call_sites::STORE_SCOPE);
+    call_sites["census"] = json!(facts.tally.sites);
+    call_sites["callers_owed"] = json!(facts.tally.callers_owed());
+    call_sites["shares"] = json!(kin_model::call_site_reading::SiteStateKind::ALL
+        .iter()
+        .filter(|kind| !kind.is_uncounted())
+        .map(|kind| (
+            kind.wire().to_owned(),
+            json!({"sites":facts.tally.count(*kind),"share":facts.tally.share(*kind)})
+        ))
+        .collect::<serde_json::Map<String, serde_json::Value>>());
+    let owed = facts
+        .owed_files
+        .iter()
+        .map(|(file, callers)| json!({"file":file,"callers":callers}))
+        .collect::<Vec<_>>();
+    call_sites["owed_file_count"] = json!(owed.len());
+    call_sites["owed_files"] = json!(owed
+        .iter()
+        .take(kin_mcp::call_sites::OWED_FILES_MAX)
+        .collect::<Vec<_>>());
+    if owed.len() > kin_mcp::call_sites::OWED_FILES_MAX {
+        call_sites["owed_files_withheld"] = json!(owed.len() - kin_mcp::call_sites::OWED_FILES_MAX);
+    }
+    let mut enrichment = json!({
+        "schema":"kin.enrichment-status.v1",
+        "current":true,
+        "scope":scope,
+        "truth_epoch":truth,
+        "authority_generation":lease.as_ref().map(|lease|lease.roots().generation),
+        "marker_authority":if marks.is_some(){"selected_workspace"}else{"unavailable_in_selected_scope"},
+        "completion_proof_version":kin_model::ENRICHMENT_PROOF_MARK_VERSION,
+        "proof_scope":"recorded_call_site_census",
+        "all_relationships_attested":false,
+        "requested_dependencies":requested,
+        "files":facts.files,
+    });
+    let snapshot_id = kin_blobs::digest(
+        &serde_json::to_vec(&(identity, &enrichment)).map_err(|e| e.to_string())?,
+    )
+    .to_string();
+    enrichment["snapshot_id"] = json!(snapshot_id);
+    Ok((
+        json!({"enrichment":enrichment,"call_sites":call_sites}),
+        publication,
+    ))
+}
+
+#[cfg(test)]
+async fn mcp_graph_status_with_stable_authority(
+    state: &Arc<DaemonState>,
     session_id: Option<&SessionId>,
     selected_graph: &Arc<kin_db::InMemoryGraph>,
     authority: RequestGraphAuthority,
     scope: kin_mcp::handlers::entities::GraphStatusScope,
+) -> kin_mcp::Result<kin_mcp::ToolCallResult> {
+    mcp_graph_status_snapshot(
+        state,
+        session_id,
+        selected_graph,
+        authority,
+        scope,
+        &kin_mcp::status_pages::StatusRequest::default(),
+    )
+    .await
+}
+
+async fn mcp_graph_status_snapshot(
+    state: &Arc<DaemonState>,
+    session_id: Option<&SessionId>,
+    selected_graph: &Arc<kin_db::InMemoryGraph>,
+    authority: RequestGraphAuthority,
+    scope: kin_mcp::handlers::entities::GraphStatusScope,
+    request: &kin_mcp::status_pages::StatusRequest,
+) -> kin_mcp::Result<kin_mcp::ToolCallResult> {
+    mcp_graph_status_snapshot_after_capture(
+        state,
+        session_id,
+        selected_graph,
+        authority,
+        scope,
+        request,
+        |_| {},
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn mcp_graph_status_snapshot_after_capture(
+    state: &Arc<DaemonState>,
+    session_id: Option<&SessionId>,
+    selected_graph: &Arc<kin_db::InMemoryGraph>,
+    authority: RequestGraphAuthority,
+    scope: kin_mcp::handlers::entities::GraphStatusScope,
+    request: &kin_mcp::status_pages::StatusRequest,
+    after_capture: impl Fn(usize),
 ) -> kin_mcp::Result<kin_mcp::ToolCallResult> {
     // Set on every path that leaves the loop without an answer, so the reply
     // names the state that blocked the last attempt.
@@ -3505,7 +3733,10 @@ async fn mcp_graph_status_with_stable_authority(
         // reading this sample becomes is a claim that authority records the
         // working copy, and working-copy changes the reconcile loop has picked
         // up and not yet published are on their way into the graph this reads.
-        let Some(authority_epoch) = state.settled_read_epoch() else {
+        let Some(authority_epoch) = (match authority {
+            RequestGraphAuthority::Head => state.settled_read_epoch(),
+            RequestGraphAuthority::SessionScope => state.stable_graph_authority_epoch(),
+        }) else {
             blocked = GraphStatusBlocked::SelectedGraphChanging;
             if graph_status_wait_out_authority(state, deadline).await {
                 continue;
@@ -3517,10 +3748,15 @@ async fn mcp_graph_status_with_stable_authority(
         // awaited: the guard is a `std::sync::MutexGuard`, so letting the match
         // scrutinee live across the backoff below would make this future
         // non-Send and the route would stop compiling.
+        let truth = selected_graph.truth_epoch();
+        let source_scope = state
+            .source_scope_for_selected_graph(session_id, selected_graph, authority)
+            .await;
         let sampled = match state.embedding_work.try_lock() {
             Ok(_embedding_guard) => Some({
                 let embeddings = selected_graph.embedding_status();
                 kin_mcp::handlers::entities::GraphStatusObservation {
+                    details: None,
                     authority_epoch,
                     entity_count: selected_graph.entity_count(),
                     relation_count: selected_graph.relation_count(),
@@ -3540,12 +3776,16 @@ async fn mcp_graph_status_with_stable_authority(
                     // (FIR-2421). The daemon levels this with authority only at
                     // open and at commit, and neither can run while this fence
                     // is held.
-                    durable_entity_count: state.durable_entity_count(),
+                    durable_entity_count: matches!(authority, RequestGraphAuthority::Head)
+                        .then(|| state.durable_entity_count())
+                        .flatten(),
                     // The relation half, under that same fence and levelled at
                     // those same two moments. Without it the block built from
                     // this observation certifies an entity layer and says
                     // nothing about the edges answering beside it (FIR-3202).
-                    durable_relation_count: state.durable_relation_count(),
+                    durable_relation_count: matches!(authority, RequestGraphAuthority::Head)
+                        .then(|| state.durable_relation_count())
+                        .flatten(),
                 }
             }),
             Err(std::sync::TryLockError::WouldBlock) => None,
@@ -3555,7 +3795,7 @@ async fn mcp_graph_status_with_stable_authority(
                 ));
             }
         };
-        let Some(observation) = sampled else {
+        let Some(mut observation) = sampled else {
             // Spend the attempt rather than the caller's round trip. Before
             // FIR-2135 this arm returned at the first contended try, so a store
             // mid-embed never reached the second attempt and the caller was
@@ -3569,7 +3809,47 @@ async fn mcp_graph_status_with_stable_authority(
             continue;
         };
 
-        if !state.settled_read_epoch_is_current(authority_epoch) {
+        if source_scope.is_none() {
+            blocked = GraphStatusBlocked::SelectedGraphChanging;
+            if graph_status_wait_out_authority(state, deadline).await {
+                continue;
+            }
+            break;
+        }
+        let captured_state = Arc::clone(state);
+        let captured_graph = Arc::clone(selected_graph);
+        let requested = request.paths().map_err(kin_mcp::McpError::Other)?;
+        let captured_scope = source_scope;
+        let (details, publication) = tokio::task::spawn_blocking(move || {
+            capture_graph_status_details(
+                &captured_state,
+                &captured_graph,
+                captured_scope,
+                truth,
+                &requested,
+            )
+        })
+        .await
+        .map_err(|error| kin_mcp::McpError::Other(error.to_string()))?
+        .map_err(kin_mcp::McpError::Other)?;
+        observation.details = Some(Arc::new(details));
+        after_capture(attempts);
+        if selected_graph.truth_epoch() != truth
+            || source_scope.is_none()
+            || state
+                .source_scope_for_selected_graph(session_id, selected_graph, authority)
+                .await
+                != source_scope
+            || !graph_status_publication_current(state, publication.as_ref())
+        {
+            blocked = GraphStatusBlocked::SelectedGraphChanging;
+            if graph_status_wait_out_authority(state, deadline).await {
+                continue;
+            }
+            break;
+        }
+
+        if !graph_status_epoch_current(state, authority, authority_epoch) {
             blocked = GraphStatusBlocked::SelectedGraphChanging;
             if graph_status_wait_out_authority(state, deadline).await {
                 continue;
@@ -3590,7 +3870,14 @@ async fn mcp_graph_status_with_stable_authority(
             graph_status_attempt_backoff(brief_retries - 1).await;
             continue;
         }
-        if !state.settled_read_epoch_is_current(authority_epoch) {
+        let final_scope = state
+            .source_scope_for_selected_graph(session_id, selected_graph, authority)
+            .await;
+        if final_scope != source_scope
+            || selected_graph.truth_epoch() != truth
+            || !graph_status_epoch_current(state, authority, authority_epoch)
+            || !graph_status_publication_current(state, publication.as_ref())
+        {
             blocked = GraphStatusBlocked::SelectedGraphChanging;
             if graph_status_wait_out_authority(state, deadline).await {
                 continue;
@@ -3603,7 +3890,7 @@ async fn mcp_graph_status_with_stable_authority(
         // reading that was true at one instant rather than a torn one.
         state
             .graph_status_settled
-            .record(scope, selected_graph, observation);
+            .record(scope, selected_graph, observation.clone());
         // Same event as the record above, deliberately at the same site: a
         // reading that survived revalidation IS this daemon answering a live
         // question about itself, so the streak clears exactly when that is true
@@ -3632,7 +3919,12 @@ async fn mcp_graph_status_with_stable_authority(
     }
     let attempts = u32::try_from(attempts).unwrap_or(u32::MAX);
     let observed_authority_epoch = state.stable_graph_authority_epoch();
-    let Some((observation, age)) = state.graph_status_settled.get(scope, selected_graph) else {
+    let requested = request.paths().map_err(kin_mcp::McpError::Other)?;
+    let Some((observation, age)) =
+        state
+            .graph_status_settled
+            .get(scope, selected_graph, &requested)
+    else {
         // The one case with no honest reading to publish: this daemon has never
         // completed a live sample of this selected graph. Say what was tried and
         // what state blocked it, and name the condition that changes the answer,
@@ -3646,6 +3938,31 @@ async fn mcp_graph_status_with_stable_authority(
         )));
     };
 
+    // A temporal binding may change while retaining the same graph allocation.
+    // Pointer identity alone must not replay another selected revision's proof
+    // metadata. HEAD's older counter-only seed remains a valid stale reading.
+    let source_scope = state
+        .source_scope_for_selected_graph(session_id, selected_graph, authority)
+        .await;
+    let recorded_scope = observation
+        .details
+        .as_ref()
+        .map(|details| &details["enrichment"]["scope"]);
+    let source_matches = match source_scope {
+        Some(kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead) => {
+            recorded_scope.is_none_or(|recorded| recorded["kind"] == "workspace_head")
+        }
+        Some(kin_mcp::handlers::common::EntitySourceScope::At(change)) => recorded_scope
+            .is_some_and(|recorded| {
+                recorded["kind"] == "committed_graph" && recorded["change"] == change.to_string()
+            }),
+        None => false,
+    };
+    if !source_matches {
+        return Ok(kin_mcp::ToolCallResult::error(
+            "kin_graph_status has no settled reading for the current selected source scope",
+        ));
+    }
     let age_ms = u64::try_from(age.as_millis()).unwrap_or(u64::MAX);
     kin_mcp::handlers::entities::handle_daemon_graph_status_stale_observation(
         scope,
@@ -3769,6 +4086,7 @@ async fn graph_status_attempt_backoff(attempt: usize) {
 /// version. Session-scope graphs do not participate in that HEAD version, so
 /// their selected graph pointer and exact live root are revalidated instead.
 struct XrefGraphReadAttempt {
+    truth_epoch: u64,
     graph: Arc<kin_db::InMemoryGraph>,
     root: String,
     head_version: Option<u64>,
@@ -3997,6 +4315,7 @@ fn prepare_xref_graph_read_with_rebuild(
                         return Err(XrefUnprepared::Moved(mutation_epoch));
                     }
                     return Ok(XrefGraphReadAttempt {
+                        truth_epoch: currency.truth_epoch,
                         graph,
                         root,
                         head_version: Some(currency.version),
@@ -4037,6 +4356,7 @@ fn prepare_xref_graph_read_with_rebuild(
                 });
             }
             Ok(XrefGraphReadAttempt {
+                truth_epoch: currency.truth_epoch,
                 graph,
                 root,
                 head_version: Some(currency.version),
@@ -4051,15 +4371,18 @@ fn prepare_xref_graph_read_with_rebuild(
             // private session mutation cannot interleave the handler's entity
             // and relation reads. A live-root check below still rejects a
             // snapshot that was already superseded before the attempt began.
+            let truth_epoch = selected_graph.truth_epoch();
             let snapshot = selected_graph.to_snapshot();
             let root_hash = kin_db::compute_graph_root_hash(&snapshot);
             let root = hex::encode(root_hash);
             if root != hex::encode(selected_graph.compute_root_hash())
+                || truth_epoch != selected_graph.truth_epoch()
                 || !state.graph_authority_epoch_is_current(mutation_epoch)
             {
                 return Err(XrefUnprepared::Moved(mutation_epoch));
             }
             Ok(XrefGraphReadAttempt {
+                truth_epoch,
                 graph: Arc::new(rebuild(snapshot, root_hash).map_err(XrefUnprepared::Unreadable)?),
                 root,
                 head_version: None,
@@ -4107,6 +4430,7 @@ async fn xref_graph_read_is_still_current(
         }
         RequestGraphAuthority::SessionScope => {
             if hex::encode(selected_graph.compute_root_hash()) != attempt.root
+                || selected_graph.truth_epoch() != attempt.truth_epoch
                 || !state
                     .graph_authority_is_current(session_id, selected_graph, authority)
                     .await
@@ -4472,6 +4796,26 @@ struct NameReadWait {
     live: bool,
 }
 
+/// An analysis and its ledger disclosure must observe the same selected graph,
+/// including scoped graphs whose writes do not publish a HEAD version.
+struct AnalysisReadEpoch {
+    authority: RequestGraphAuthority,
+    writer: Option<u64>,
+    truth: u64,
+}
+
+impl AnalysisReadEpoch {
+    fn is_current(&self, state: &DaemonState, graph: &kin_db::InMemoryGraph) -> bool {
+        graph.truth_epoch() == self.truth
+            && self.writer.is_some_and(|epoch| match self.authority {
+                RequestGraphAuthority::Head => state.settled_read_epoch_is_current(epoch),
+                RequestGraphAuthority::SessionScope => {
+                    state.graph_authority_epoch_is_current(epoch)
+                }
+            })
+    }
+}
+
 impl NameReadWait {
     /// The wait for one read of `graph`, the graph the request selected.
     fn begin(state: &DaemonState, graph: &kin_db::InMemoryGraph) -> Self {
@@ -4489,6 +4833,24 @@ impl NameReadWait {
     fn sample(&mut self, state: &DaemonState) -> Option<u64> {
         self.attempts += 1;
         state.settled_read_epoch()
+    }
+
+    fn sample_analysis(
+        &mut self,
+        state: &DaemonState,
+        graph: &kin_db::InMemoryGraph,
+        authority: RequestGraphAuthority,
+    ) -> AnalysisReadEpoch {
+        self.attempts += 1;
+        let writer = match authority {
+            RequestGraphAuthority::Head => state.settled_read_epoch(),
+            RequestGraphAuthority::SessionScope => state.stable_graph_authority_epoch(),
+        };
+        AnalysisReadEpoch {
+            authority,
+            writer,
+            truth: graph.truth_epoch(),
+        }
     }
 
     /// Whether an answer read since `epoch` was sampled may claim an absence:
@@ -4573,6 +4935,10 @@ fn find_references_answer_claims_absence(
     let Ok(answer) = result else {
         return false;
     };
+    reference_result_claims_absence(answer)
+}
+
+fn reference_result_claims_absence(answer: &kin_mcp::ToolCallResult) -> bool {
     let Some(kin_mcp::ContentBlock::Text { text }) = answer.content.first() else {
         return false;
     };
@@ -4994,7 +5360,12 @@ fn prepare_settled_xref_replay(
     state: &DaemonState,
     selected_graph: &Arc<kin_db::InMemoryGraph>,
     authority: RequestGraphAuthority,
-) -> Option<(Arc<kin_db::InMemoryGraph>, String, Duration)> {
+) -> Option<(
+    Arc<kin_db::InMemoryGraph>,
+    String,
+    Duration,
+    XrefHeadCurrency,
+)> {
     if !matches!(authority, RequestGraphAuthority::Head) {
         return None;
     }
@@ -5021,7 +5392,12 @@ fn prepare_settled_xref_replay(
         rebuilt
     };
     match rebuilt {
-        Ok(graph) => Some((Arc::new(graph), certified.root, certified.at.elapsed())),
+        Ok(graph) => Some((
+            Arc::new(graph),
+            certified.root,
+            certified.at.elapsed(),
+            certified.currency,
+        )),
         Err(error) => {
             tracing::debug!(
                 %error,
@@ -5246,7 +5622,31 @@ async fn mcp_find_references_with_stable_authority<F>(
     selected_graph: Arc<kin_db::InMemoryGraph>,
     authority: RequestGraphAuthority,
     arguments: &HashMap<String, serde_json::Value>,
+    after_root: F,
+) -> kin_mcp::Result<kin_mcp::ToolCallResult>
+where
+    F: FnMut(usize),
+{
+    mcp_find_references_with_captured_authority(
+        state,
+        session_id,
+        selected_graph,
+        authority,
+        arguments,
+        after_root,
+        &mut None,
+    )
+    .await
+}
+
+async fn mcp_find_references_with_captured_authority<F>(
+    state: &Arc<DaemonState>,
+    session_id: Option<&SessionId>,
+    selected_graph: Arc<kin_db::InMemoryGraph>,
+    authority: RequestGraphAuthority,
+    arguments: &HashMap<String, serde_json::Value>,
     mut after_root: F,
+    captured: &mut Option<CapturedReferenceRead>,
 ) -> kin_mcp::Result<kin_mcp::ToolCallResult>
 where
     F: FnMut(usize),
@@ -5286,6 +5686,7 @@ where
             spine_deferral.as_deref(),
         );
         let mut superseded = None;
+        let mut superseded_capture = None;
         let mut writer_seen = false;
         // Set when an answer claimed an absence while the reconcile loop held
         // working-copy changes it had picked up; see command xref.
@@ -5308,6 +5709,15 @@ where
                     settle_graph_authority_writer(round_attempt, XREF_CURRENCY_ATTEMPTS).await;
                     continue;
                 }
+            };
+            let read = CapturedReferenceRead {
+                graph: Arc::clone(&attempt.graph),
+                root: attempt.root.clone(),
+                source_scope,
+                truth_epoch: attempt.truth_epoch,
+                mutation_epoch: attempt.mutation_epoch,
+                head_version: attempt.head_version,
+                generation: attempt.head_currency.map(|currency| currency.generation),
             };
             after_root(attempt_number);
             let result = kin_mcp::handlers::entities::handle_find_references_with_authority_at(
@@ -5354,6 +5764,7 @@ where
                 // only because an earlier one was thrown away. That is the fact
                 // this return used to swallow.
                 state.xref_settled.record(&attempt);
+                *captured = Some(read);
                 return disclose_graph_authority_retry(result, attempt_number, wait);
             }
             tracing::warn!(
@@ -5362,6 +5773,7 @@ where
             );
             note_superseded_attempt(state, &attempt, &mut writer_seen, &mut wait);
             superseded = Some(result);
+            superseded_capture = Some(read);
             settle_graph_authority_writer(round_attempt, XREF_CURRENCY_ATTEMPTS).await;
         }
         attempts_made += attempts_in_round;
@@ -5374,7 +5786,7 @@ where
             // read once more and served if it is still the one last certified. A
             // replay that cannot be served falls through to the wait below.
             if superseded.is_none() {
-                if let Some((graph, root, certified_age)) =
+                if let Some((graph, root, certified_age, currency)) =
                     prepare_settled_xref_replay(state, &selected_graph, authority)
                 {
                     let result =
@@ -5407,12 +5819,22 @@ where
                         attempts_made,
                         wait,
                     ) {
+                        *captured = Some(CapturedReferenceRead {
+                            graph,
+                            root,
+                            source_scope,
+                            truth_epoch: currency.truth_epoch,
+                            mutation_epoch: currency.mutation_epoch,
+                            head_version: Some(currency.version),
+                            generation: Some(currency.generation),
+                        });
                         return served;
                     }
                     wait.replay_discarded = true;
                 }
             }
             if let Some(served) = servable_superseded_xref_answer(superseded, state) {
+                *captured = superseded_capture;
                 return served;
             }
         }
@@ -5724,7 +6146,7 @@ where
         if !withheld {
             // The same replay `find_references` takes, for the same reason.
             if superseded.is_none() {
-                if let Some((graph, root, certified_age)) =
+                if let Some((graph, root, certified_age, _currency)) =
                     prepare_settled_xref_replay(state, &selected_graph, authority)
                 {
                     let result =
@@ -5783,6 +6205,17 @@ struct RaiseIdleTimeoutRequest {
     /// reaches a log field.
     #[serde(default)]
     client: Option<String>,
+    /// The session's lease id. When present the floor is held for as long as
+    /// the session renews it and released when it ends, instead of raising
+    /// the daemon's own window for the rest of its life. See
+    /// [`crate::idle_floor`].
+    #[serde(default)]
+    lease: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReleaseIdleFloorRequest {
+    lease: String,
 }
 
 /// Report the idle window this daemon is running with.
@@ -5790,9 +6223,92 @@ async fn idle_timeout(State(state): State<Arc<DaemonState>>) -> impl IntoRespons
     let effective_secs = state.idle_timeout().map_or(0, |window| window.as_secs());
     Json(json!({
         "effective_secs": effective_secs,
+        "own_secs": state.own_idle_timeout().map_or(0, |window| window.as_secs()),
+        "floor_leases": state.idle_floor_leases_live(),
         "idles_out": effective_secs > 0,
         "max_attached_secs": crate::state::MAX_ATTACHED_IDLE_TIMEOUT_SECS,
     }))
+}
+
+/// Hold or renew an attached session's idle floor, the lease form of
+/// [`raise_idle_timeout`].
+fn hold_idle_floor_lease(
+    state: &DaemonState,
+    lease: &str,
+    at_least_secs: u64,
+    client: &str,
+) -> Response {
+    let own = state.own_idle_timeout();
+    match state.hold_idle_floor(lease, Duration::from_secs(at_least_secs), client) {
+        Ok(held) => {
+            let effective_secs = state.idle_timeout().map_or(0, |window| window.as_secs());
+            let own_secs = own.map_or(0, |window| window.as_secs());
+            if held.created {
+                info!(
+                    client,
+                    lease,
+                    floor_secs = held.floor.as_secs(),
+                    own_secs,
+                    effective_secs,
+                    "an attached session holds an idle floor over the daemon window"
+                );
+            } else {
+                tracing::debug!(
+                    client,
+                    lease,
+                    floor_secs = held.floor.as_secs(),
+                    effective_secs,
+                    "an attached session renewed its idle floor"
+                );
+            }
+            Json(json!({
+                "effective_secs": effective_secs,
+                "own_secs": own_secs,
+                "raised": own.is_some_and(|own| held.floor > own),
+                "idles_out": effective_secs > 0,
+                "lease": {
+                    "id": lease,
+                    "floor_secs": held.floor.as_secs(),
+                    "expires_in_secs": held.expires_in.as_secs(),
+                },
+            }))
+            .into_response()
+        }
+        Err(refusal) => {
+            let status = match refusal {
+                crate::idle_floor::LeaseRefusal::TooManyLeases => StatusCode::TOO_MANY_REQUESTS,
+                _ => StatusCode::BAD_REQUEST,
+            };
+            (status, Json(json!({ "error": refusal.message() }))).into_response()
+        }
+    }
+}
+
+/// End an attached session's idle floor, so the daemon returns to its own idle
+/// policy. Releasing a lease that is not held is not an error: the session
+/// may have expired it already, and the outcome the caller wants holds either
+/// way.
+async fn release_idle_floor(
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<ReleaseIdleFloorRequest>,
+) -> Response {
+    let released = state.release_idle_floor(&request.lease);
+    let effective_secs = state.idle_timeout().map_or(0, |window| window.as_secs());
+    if let Some(client) = released.as_deref() {
+        info!(
+            client,
+            lease = %request.lease,
+            effective_secs,
+            "an attached session released its idle floor"
+        );
+    }
+    Json(json!({
+        "released": released.is_some(),
+        "effective_secs": effective_secs,
+        "own_secs": state.own_idle_timeout().map_or(0, |window| window.as_secs()),
+        "idles_out": effective_secs > 0,
+    }))
+    .into_response()
 }
 
 /// Grow this daemon's idle window to cover a client whose session outlasts it.
@@ -5806,6 +6322,12 @@ async fn idle_timeout(State(state): State<Arc<DaemonState>>) -> impl IntoRespons
 ///
 /// Growth only. This cannot shorten another client's window and cannot switch
 /// idle shutdown off; see [`crate::state::resolve_idle_timeout_floor`].
+///
+/// A request that names a `lease` is held for that session only, through
+/// [`hold_idle_floor_lease`], and the daemon returns to its own window when the
+/// session releases it or stops renewing it. A request without one grows the
+/// daemon's own window for good, which is what clients that predate leases
+/// asked for and still get.
 async fn raise_idle_timeout(
     State(state): State<Arc<DaemonState>>,
     Json(request): Json<RaiseIdleTimeoutRequest>,
@@ -5819,8 +6341,11 @@ async fn raise_idle_timeout(
         )
             .into_response();
     }
-    let outcome = state.raise_idle_timeout(Duration::from_secs(request.at_least_secs));
     let client = request.client.as_deref().unwrap_or("unnamed client");
+    if let Some(lease) = request.lease.as_deref() {
+        return hold_idle_floor_lease(&state, lease, request.at_least_secs, client);
+    }
+    let outcome = state.raise_idle_timeout(Duration::from_secs(request.at_least_secs));
     let effective_secs = outcome.effective_secs();
     match outcome.raised_from {
         Some(previous) => info!(
@@ -6013,7 +6538,7 @@ async fn health(
         vector_index_discarded,
         vector_index_salvage,
         filesystem_reconcile_disabled: state.filesystem_reconcile_disabled(),
-        background_embed_deferred: !crate::daemon::auto_embed_enabled(),
+        background_embed_deferred: !crate::daemon::background_embed_runs(),
         graph_generation: DaemonState::read_generation_marker(&state.layout),
         behavior_env: kin_core::behavior_env::snapshot_from_process(),
         coordination: Some(
@@ -6106,6 +6631,7 @@ async fn readiness(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
             Json(ReadinessResponse {
                 ready: true,
                 warming,
+                progress: None,
             }),
         )
     } else {
@@ -6159,6 +6685,7 @@ async fn readiness(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
             Json(ReadinessResponse {
                 ready: false,
                 warming,
+                progress: None,
             }),
         )
     }
@@ -6773,12 +7300,13 @@ async fn command_status(
     // vary inside one publication.
     let repository_authority = command_repository_authority(&state)?;
     let embedding_coverage = live_embedding_coverage(&state).await;
-    let report = kin_cli::commands::status::inspect_at(
+    let mut report = kin_cli::commands::status::inspect_at(
         &state.layout,
         &repository_authority,
         embedding_coverage,
     )
     .map_err(internal_error)?;
+    report.repository.open_transactions = Some(open_staged_transaction_observation(&state)?);
     let daemon_build = kin_buildinfo::get();
     let build = kin_cli::commands::status::BuildStatus {
         cli_sha: request
@@ -6797,7 +7325,9 @@ async fn command_status(
     // a binding that would open the whole store again for each of them.
     let merge = kin_cli::commands::status::merge_in_progress_at(&repository_authority);
     let workspace_tip = kin_cli::commands::status::workspace_tip_at(&repository_authority);
-    let response = kin_cli::commands::status::build_command_status_response(
+    let binding_history_checked =
+        kin_cli::commands::status::binding_history_checked_at(&repository_authority);
+    let mut response = kin_cli::commands::status::build_command_status_response(
         report,
         request.json,
         Some(build),
@@ -6832,6 +7362,7 @@ async fn command_status(
         Some(&workspace_tip),
     )
     .map_err(internal_error)?;
+    response.binding_history_checked = Some(binding_history_checked);
     Ok(Json(response))
 }
 
@@ -6872,6 +7403,7 @@ async fn command_resources(
         embed_worker_failed: state
             .embed_worker_failed
             .load(std::sync::atomic::Ordering::Relaxed),
+        background_embed_paused: state.background_embed_paused(),
         embedding_work_busy: state.embedding_work.try_lock().is_err(),
         embeddings_indexed: embed_status.indexed,
         embeddings_pending: embed_status.pending,
@@ -6883,6 +7415,7 @@ async fn command_resources(
         deferred_vector_checkpoint: state.deferred_vector_checkpoint(),
         embedding_coverage_ever_complete: state.embedding_coverage_ever_complete(),
         embed_persistence_unavailable: !state.can_persist_embed_progress_locally(),
+        embed_held_for_memory: crate::daemon::embed_held_for_memory_now(&state),
         model_fetch: kin_cli::embed_model::EmbedModelFetch::probe(embed_pass_is_working(&state)),
     };
 
@@ -7023,7 +7556,9 @@ async fn command_graph(
     }
 
     let session_id = extract_session_id_from_headers(&headers)?;
-    let graph = resolve_session_graph(&state, session_id.as_ref()).await;
+    let (graph, graph_authority) = state
+        .graph_for_request_with_authority(session_id.as_ref())
+        .await;
     // Through the cache rather than the bare binding. `graph status` reads
     // durable repository state, and an open re-verifies every persisted body
     // against its content address, so opening per request made it cost the
@@ -7066,9 +7601,26 @@ async fn command_graph(
     // conversion-source reading that found no entity. Every other answer is
     // served as it always was.
     let mut settle = NameReadWait::begin(&state, &graph);
+    let status_request = match &request {
+        kin_cli::commands::graph::GraphCommandRequest::Status => {
+            Some(kin_mcp::status_pages::StatusRequest::default())
+        }
+        kin_cli::commands::graph::GraphCommandRequest::StatusDetailed { request } => {
+            Some(request.clone())
+        }
+        _ => None,
+    };
     let response = loop {
-        let epoch = settle.sample(&state);
-        let response = kin_cli::commands::graph::execute_graph_command_for_store(
+        let epoch = if status_request.is_some() {
+            match graph_authority {
+                RequestGraphAuthority::Head => state.settled_read_epoch(),
+                RequestGraphAuthority::SessionScope => state.stable_graph_authority_epoch(),
+            }
+        } else {
+            settle.sample(&state)
+        };
+        let truth = graph.truth_epoch();
+        let mut response = kin_cli::commands::graph::execute_graph_command_for_store(
             &repository_authority,
             graph.as_ref(),
             &request,
@@ -7081,6 +7633,67 @@ async fn command_graph(
             host.surface(),
         )
         .map_err(internal_error)?;
+        if let Some(status_request) = &status_request {
+            let scope = match graph_authority {
+                RequestGraphAuthority::Head => kin_mcp::handlers::entities::GraphStatusScope::Head,
+                RequestGraphAuthority::SessionScope => {
+                    kin_mcp::handlers::entities::GraphStatusScope::TemporalSession
+                }
+            };
+            let result = mcp_graph_status_snapshot(
+                &state,
+                session_id.as_ref(),
+                &graph,
+                graph_authority,
+                scope,
+                status_request,
+            )
+            .await
+            .map_err(internal_error)?;
+            let result = kin_mcp::status_pages::page(
+                result,
+                status_request,
+                &state.repo_semantic_cursor_secret,
+            )
+            .map_err(|message| (StatusCode::CONFLICT, message))?;
+            if let Some(kin_mcp::types::ContentBlock::Text { text }) = result.content.first() {
+                if result.is_error == Some(true) {
+                    return Err((StatusCode::SERVICE_UNAVAILABLE, text.clone()));
+                }
+                let report: kin_mcp::handlers::entities::GraphStatusReport =
+                    serde_json::from_str(text).map_err(internal_error)?;
+                response.with_call_site_observation(report.call_sites);
+                response.enrichment = report.enrichment;
+                if let Some(enrichment) = &response.enrichment {
+                    if let Some(reason) = enrichment["unavailable"]["reason"].as_str() {
+                        response.lines.push(format!("Enrichment detail unavailable: {reason}. Aggregate counts do not attest dependency completion."));
+                    } else {
+                        let count = enrichment["page"]["returned"].as_u64().unwrap_or(0);
+                        let total = enrichment["page"]["total"].as_u64().unwrap_or(0);
+                        response.lines.push(format!("Enrichment evidence: {count} of {total} source observations; scope is the recorded call-site census."));
+                    }
+                    response.lines.push("Recorded completion and proof settlement are separate; neither attests every relationship or safe absence.".into());
+                    if let Some(cursor) = enrichment["page"]["next_cursor"].as_str() {
+                        response.lines.push(format!(
+                            "Continue with the same dependencies and --cursor {cursor}"
+                        ));
+                    }
+                    if report.stale.is_some() {
+                        response.lines.push("Enrichment observation is cached and cannot attest current dependency completion.".into());
+                    }
+                }
+            }
+            if truth != graph.truth_epoch()
+                || !epoch
+                    .is_some_and(|epoch| graph_status_epoch_current(&state, graph_authority, epoch))
+            {
+                settle
+                    .wait_out(&state, "command graph status")
+                    .await
+                    .map_err(|message| (StatusCode::SERVICE_UNAVAILABLE, message))?;
+                continue;
+            }
+        }
         if !graph_command_claims_absence(&request, &response) || settle.settled(&state, epoch) {
             break response;
         }
@@ -7119,7 +7732,9 @@ fn graph_command_claims_absence(
                 .as_ref()
                 .is_some_and(|report| report.total == 0)
         }
-        GraphCommandRequest::Status | GraphCommandRequest::Validate => false,
+        GraphCommandRequest::Status
+        | GraphCommandRequest::StatusDetailed { .. }
+        | GraphCommandRequest::Validate => false,
     }
 }
 
@@ -7279,88 +7894,48 @@ async fn command_trace_data_flow(
     State(state): State<Arc<DaemonState>>,
     Json(request): Json<kin_cli::commands::trace_data_flow::TraceDataFlowRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    if !state
-        .is_initialized
-        .load(std::sync::atomic::Ordering::Relaxed)
-    {
+    let arguments = serde_json::to_value(&request)
+        .map_err(internal_error)?
+        .as_object()
+        .expect("trace request is an object")
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    let result = trace_tools_page(
+        headers,
+        state,
+        McpToolCallRequest {
+            name: "trace_data_flow".into(),
+            arguments,
+        },
+    )
+    .await?;
+    let Some(kin_mcp::ContentBlock::Text { text }) = result.content.first() else {
         return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "daemon not fully initialized".to_string(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "trace response has no payload".into(),
         ));
-    }
-
-    let session_id = extract_session_id_from_headers(&headers)?;
-    let graph = resolve_session_graph(&state, session_id.as_ref()).await;
-    // A focal naming a symbol outside the repository is one the graph holds
-    // and the walk does not serve, never a focal it lacks.
-    if let Some(node) =
-        kin_mcp::handlers::external_symbols::lookup_external_symbol(graph.as_ref(), &request.focal)
-            .map_err(internal_error)?
-    {
-        let refusal = kin_mcp::handlers::external_symbols::external_not_served_text(
-            graph.as_ref(),
-            &node,
-            "trace_data_flow",
-            "focal",
-            kin_mcp::handlers::entities::TRACE_EXTERNAL_WHY,
-        )
-        .map_err(internal_error)?;
-        return Err((StatusCode::UNPROCESSABLE_ENTITY, refusal));
-    }
-    // A focal or a target that resolved to nothing, and a walk with no step,
-    // is served only from a read no writer spanned, for the reason
-    // `NameReadWait` gives. A walk with steps toward a resolved target is
-    // served as it always was.
-    let mut settle = NameReadWait::begin(&state, &graph);
-    let response = loop {
-        let epoch = settle.sample(&state);
-        // Same short-circuit the MCP route takes, for the same reason: the
-        // authority resolved below verifies the whole store to project step
-        // bodies no walk will produce.
-        if kin_core::name_resolution_certainly_misses(graph.as_ref(), &request.focal)
-            .unwrap_or(false)
-        {
-            if settle.settled(&state, epoch) {
-                return Err(internal_error(
-                    kin_cli::commands::trace_data_flow::focal_not_found_error(&request.focal),
-                ));
-            }
-        } else {
-            let repository_authority = shared_command_authority(
-                state
-                    .local_repository_authority_binding()
-                    .map_err(repository_authority_error)?,
-                command_repository_authority(&state)?,
-            );
-            let walked = run_trace_data_flow_off_runtime(
-                repository_authority,
-                Arc::clone(&graph),
-                request.clone(),
-            )
-            .await;
-            if !trace_claims_absence(&walked, &request.focal) || settle.settled(&state, epoch) {
-                // A walk whose smallest retained form cannot fit the caller's
-                // `max_response_chars` is refused because of that parameter, so
-                // it answers 400 with the same message. Every other failure
-                // keeps its 500.
-                break walked.map_err(|error| {
-                    if error
-                        .downcast_ref::<kin_cli::commands::trace_data_flow::TraceBelowFloor>()
-                        .is_some()
-                    {
-                        (StatusCode::BAD_REQUEST, error.to_string())
-                    } else {
-                        internal_error(error)
-                    }
-                })?;
-            }
-        }
-        settle
-            .wait_out(&state, "trace_data_flow")
-            .await
-            .map_err(|refusal| (StatusCode::SERVICE_UNAVAILABLE, refusal))?;
     };
-    Ok(Json(response))
+    if result.is_error == Some(true) {
+        let external = serde_json::from_str::<serde_json::Value>(text)
+            .ok()
+            .is_some_and(|payload| {
+                payload
+                    .pointer("/error/code")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(kin_mcp::handlers::external_symbols::EXTERNAL_SYMBOL_NOT_SERVED)
+            });
+        let status = if external {
+            StatusCode::UNPROCESSABLE_ENTITY
+        } else if request.cursor.is_some() {
+            StatusCode::BAD_REQUEST
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        };
+        return Err((status, text.clone()));
+    }
+    let payload: serde_json::Value = serde_json::from_str(text).map_err(internal_error)?;
+    Ok(Json(payload))
 }
 
 /// Run one trace walk on the blocking pool instead of on a Tokio worker.
@@ -7391,6 +7966,7 @@ async fn run_trace_data_flow_off_runtime(
     repository_authority: kin_cli::commands::repository_authority::RequestRepositoryAuthority,
     graph: Arc<kin_db::InMemoryGraph>,
     request: kin_cli::commands::trace_data_flow::TraceDataFlowRequest,
+    source_scope: kin_mcp::handlers::common::EntitySourceScope,
 ) -> anyhow::Result<kin_cli::commands::trace_data_flow::TraceDataFlowResponse> {
     let cancel = kin_cli::commands::trace_data_flow::TraceCancel::new();
     // Dropping a `spawn_blocking` handle does not stop the thread, so the guard
@@ -7400,11 +7976,12 @@ async fn run_trace_data_flow_off_runtime(
     let _abandon = CancelOnDrop(cancel.clone());
     let budget = kin_cli::commands::trace_data_flow::TraceBudget::cancellable(cancel);
     tokio::task::spawn_blocking(move || {
-        kin_cli::commands::trace_data_flow::build_trace_data_flow_response_within(
+        kin_cli::commands::trace_data_flow::build_trace_data_flow_response_unpaged_at_within(
             &repository_authority,
             graph.as_ref(),
             &request,
             budget,
+            source_scope,
         )
     })
     .await
@@ -7553,8 +8130,14 @@ impl Drop for PathCancelOnDrop {
 async fn command_refs(
     headers: axum::http::HeaderMap,
     State(state): State<Arc<DaemonState>>,
-    Json(request): Json<kin_cli::commands::refs::RefsRequest>,
+    Json(command): Json<kin_cli::commands::refs::RefsCommandRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    // A plain request, from a client that predates views, reads as one with no
+    // view: the complete listing.
+    let kin_cli::commands::refs::RefsCommandRequest {
+        request,
+        view: refs_view,
+    } = command;
     if !state
         .is_initialized
         .load(std::sync::atomic::Ordering::Relaxed)
@@ -7566,7 +8149,18 @@ async fn command_refs(
     }
 
     let session_id = extract_session_id_from_headers(&headers)?;
-    let graph = resolve_session_graph(&state, session_id.as_ref()).await;
+    let (graph, graph_authority) = state
+        .graph_for_request_with_authority(session_id.as_ref())
+        .await;
+    let selected_scope = state
+        .source_scope_for_selected_graph(session_id.as_ref(), &graph, graph_authority)
+        .await;
+    // The authority the store-wide reading of the focal's possible callers
+    // reads caller text and takes its escape census through, bound to this
+    // daemon's shared per-publication load as `find_references` binds it.
+    let call_site_authority = require_mcp_local_repository_binding(&state)
+        .ok()
+        .map(|binding| shared_authority_source(&state, binding));
     // An absence is served only from a read no writer spanned, for the reason
     // `NameReadWait` gives.
     let mut settle = NameReadWait::begin(&state, &graph);
@@ -7578,15 +8172,52 @@ async fn command_refs(
         // on exactly the degraded daemon nobody exercises. Taken per attempt,
         // so an answer read after a wait carries the state it was read in.
         let census_hold = kin_core::relation_census::CensusHold::read(state.layout.root());
-        let envelope = kin_mcp::Envelope::daemon()
+        let mut envelope = kin_mcp::Envelope::daemon()
             .with_health(&daemon_health_snapshot(&state).await)
             .with_relation_census_loss(census_hold.as_ref());
+        // The same graph-owned derivation input MCP uses. Sample it within
+        // this read epoch so enrichment cannot leave CLI absence more certain
+        // than MCP while the local binding history is unproven.
+        use kin_mcp::handlers::common::EntitySourceScope;
+        use kin_mcp::source_derivation::SourceDerivationObservation;
+        let mut source_observation = match selected_scope {
+            Some(EntitySourceScope::At(_)) => SourceDerivationObservation::historical(),
+            Some(EntitySourceScope::WorkspaceHead) => {
+                observe_live_refs_sources_off_runtime(
+                    Arc::clone(&state),
+                    Arc::clone(&graph),
+                    request.clone(),
+                )
+                .await?
+            }
+            None => SourceDerivationObservation::unavailable("selected_authority_changed"),
+        };
+        source_observation.sampled = "selected_graph_before_query".into();
+        envelope.source_derivation = Some(source_observation);
         // The spine read the reference tools take, so an empty answer is graded
         // on the cross-repo authority `find_references` weighs. Held for this
         // attempt only, and let go before any wait below.
         let spine_authority = state.acquire_spine_read_authority().await;
         let spine_deferral = state.spine_initialization_deferral();
-        let response = kin_cli::commands::refs::build_refs_response_with_spine(
+        // The text at each site is cut from its caller's own body through the
+        // held authority and at the source scope `find_references` reads at,
+        // so the two surfaces quote a site alike. Authority opens only when a
+        // row has a site to quote; with none to open, or a scope this read
+        // could not settle, each site says its text is unavailable.
+        let source_authority = mcp_repository_authority_source(&state).ok().flatten();
+        let held = kin_mcp::handlers::common::HeldSourceAuthority::new(
+            graph.as_ref(),
+            source_authority.as_ref(),
+        );
+        let held_text;
+        let site_text: &dyn kin_mcp::handlers::external_symbols::SiteText = match selected_scope {
+            Some(scope) => {
+                held_text = kin_mcp::handlers::common::HeldCallerText::new(&held, scope);
+                &held_text
+            }
+            None => &kin_mcp::handlers::common::NoCallerText,
+        };
+        let response = kin_cli::commands::refs::build_refs_response_quoted(
             &state.layout,
             graph.as_ref(),
             &request,
@@ -7599,10 +8230,24 @@ async fn command_refs(
                         .map(|authority| authority.backend()),
                     spine_deferral.as_deref(),
                 ),
+                call_site_sources: call_site_authority.as_ref().zip(selected_scope),
             },
+            site_text,
+            refs_view,
         )
         .map_err(internal_error)?;
         drop(spine_authority);
+        if state
+            .source_scope_for_selected_graph(session_id.as_ref(), &graph, graph_authority)
+            .await
+            != selected_scope
+        {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "selected graph authority changed while reading references; retry the request"
+                    .into(),
+            ));
+        }
         if !refs_response_claims_absence(&response) || settle.settled(&state, epoch) {
             break response;
         }
@@ -8928,8 +9573,13 @@ async fn command_commit(
         let context =
             crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(&state)
                 .map_err(repository_commit_error)?;
-        crate::repository_commit::validate_native_amend_head(&context, expected_head)
-            .map_err(repository_commit_error)?;
+        let authority = held_repository_authority(&state)?;
+        crate::repository_commit::validate_native_amend_head_from(
+            &authority,
+            context.workspace_id(),
+            expected_head,
+        )
+        .map_err(repository_commit_error)?;
     }
     // The admission derives the exact tree from the working copy but does not
     // publish it. This commit's own transaction carries that tree transition
@@ -9088,45 +9738,65 @@ fn command_commit_after_admission(
     let authority_context =
         crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(state)
             .map_err(repository_commit_error)?;
+    // The plan reads, and the publication below commits, through the authority
+    // this daemon holds for the current publication, the way an MCP commit does.
+    // This route used to open the store for itself, which decodes the whole
+    // persisted authority and re-verifies every body in repository CAS, once per
+    // commit, for a publication the daemon already held. A record another writer
+    // moved is loaded fresh here, and the storage compare-and-swap at
+    // publication still refuses a head that moved after this read.
+    let held = crate::mcp_commit::timed_commit_phase("resolve_held_authority", || {
+        held_repository_authority(state)
+    })
+    .map_err(CommitAttempt::Refused)?;
     let planned = crate::mcp_commit::timed_commit_phase("plan_transaction", || {
         if let (Some(authored), None) = (authored, request.expected_head) {
             let subject = request.message.clone().unwrap_or_default();
-            crate::repository_commit::plan_native_commit_declaring_carry(
+            crate::repository_commit::plan_command_commit(
                 graph,
                 state.blobs.as_ref(),
                 &authority_context,
+                held,
                 request.operation_id,
                 request.timestamp,
                 request.author.clone(),
-                authored,
+                Some(authored),
                 &|carried| exec_commit_message(&subject, carried),
+                None,
             )
         } else if let Some(expected_head) = request.expected_head {
-            crate::repository_commit::plan_native_amend(
+            crate::repository_commit::plan_command_commit(
                 graph,
                 state.blobs.as_ref(),
                 &authority_context,
+                held,
                 request.operation_id,
                 request.timestamp,
                 request.author,
-                &crate::repository_commit::NativeAmend {
+                None,
+                &|_| String::new(),
+                Some(&crate::repository_commit::NativeAmend {
                     expected_head,
                     message: request.message,
-                },
+                }),
             )
         } else {
-            crate::repository_commit::plan_native_commit(
+            let message = request.message.ok_or_else(|| {
+                crate::error::DaemonError::IncompatibleRepo(
+                    "native commit message must not be empty".to_string(),
+                )
+            })?;
+            crate::repository_commit::plan_command_commit(
                 graph,
                 state.blobs.as_ref(),
                 &authority_context,
+                held,
                 request.operation_id,
                 request.timestamp,
                 request.author,
-                request.message.ok_or_else(|| {
-                    crate::error::DaemonError::IncompatibleRepo(
-                        "native commit message must not be empty".to_string(),
-                    )
-                })?,
+                None,
+                &|_| message.clone(),
+                None,
             )
         }
     });
@@ -9233,6 +9903,13 @@ fn command_commit_after_admission(
         )
     }
     .map_err(repository_commit_error)?;
+    // The publication went through the daemon's held authority, which now holds
+    // the successor it wrote. While `authority.json` is still exactly the record
+    // that commit installed, the label moves with it, so the binding-history
+    // restore below, the flush after this route and every reader after them keep
+    // that authority instead of reopening the store to load the state it
+    // already holds.
+    relabel_held_authority_after_own_commit(state);
     state
         .record_repository_authority_commit(committed.receipt.generation)
         .map_err(repository_commit_error)?;
@@ -9260,7 +9937,7 @@ fn command_commit_after_admission(
     // is: a plan carries the size of its delta and this is a census of the
     // whole graph.
     crate::background_work::record_relation_census(
-        &state.layout,
+        state,
         graph,
         kin_core::relation_census::CensusSource::Commit,
     );
@@ -9620,6 +10297,16 @@ async fn register_intent(
         }
         scope_values.push(request.scope);
     }
+    if let Some(refusal) = kin_mcp::handlers::external_symbols::external_scope_refusal(
+        state.graph.as_ref(),
+        &serde_json::json!(scope_values),
+        "kin_register_intent",
+        "scopes",
+    )
+    .map_err(internal_error)?
+    {
+        return Err((StatusCode::BAD_REQUEST, refusal));
+    }
     let scopes = scope_values
         .iter()
         .map(|scope| parse_scope(scope))
@@ -9812,6 +10499,16 @@ async fn traffic(
     Path(scope): Path<String>,
     State(state): State<Arc<DaemonState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if let Some(refusal) = kin_mcp::handlers::external_symbols::external_scope_refusal(
+        state.graph.as_ref(),
+        &serde_json::json!(scope),
+        "kin_check_traffic",
+        "scopes",
+    )
+    .map_err(internal_error)?
+    {
+        return Err((StatusCode::BAD_REQUEST, refusal));
+    }
     let scope = parse_scope(&scope)?;
     let mut reports = state
         .coordinator
@@ -11460,6 +12157,7 @@ async fn daemon_health_snapshot(state: &Arc<DaemonState>) -> serde_json::Value {
     // the entity layer alone (FIR-3202).
     let relation_count = state.graph.relation_count();
     serde_json::json!({
+        "repo_root": state.layout.working_dir().display().to_string(),
         "initialized": state
             .is_initialized
             .load(std::sync::atomic::Ordering::Relaxed),
@@ -11501,7 +12199,18 @@ async fn impact(
     }
 
     let session_id = extract_session_id_from_headers(&headers)?;
-    let graph = resolve_session_graph(&state, session_id.as_ref()).await;
+    let (graph, graph_authority) = state
+        .graph_for_request_with_authority(session_id.as_ref())
+        .await;
+    let source_scope = state
+        .source_scope_for_selected_graph(session_id.as_ref(), &graph, graph_authority)
+        .await
+        .ok_or_else(|| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "selected source scope expired or was replaced".to_string(),
+            )
+        })?;
     // The CLI's absence qualifier is the MCP verdict rendered as prose, so it
     // needs the same substrate reading the MCP path gets (FIR-2524). Built here
     // because only the daemon holds it: `build_impact_response` sees a graph and
@@ -11513,24 +12222,39 @@ async fn impact(
     // degraded daemon nobody exercises, and every test written against a healthy
     // one would pass.
     //
-    // A name that resolved to no one entity, and an entity with no dependents,
-    // is served only from a read no writer spanned, for the reason
-    // `NameReadWait` gives. The envelope is taken per attempt, so an answer
-    // read after a wait carries the state it was read in.
+    // The walk and its repository-wide ledger observation must describe one
+    // graph epoch, including populated answers. The envelope is sampled in
+    // that same attempt.
     let mut settle = NameReadWait::begin(&state, &graph);
     let result = loop {
-        let epoch = settle.sample(&state);
+        let epoch = settle.sample_analysis(&state, &graph, graph_authority);
+        let source_authority = mcp_repository_authority_source(&state)
+            .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error.to_string()))?;
         let envelope =
             kin_mcp::Envelope::daemon().with_health(&daemon_health_snapshot(&state).await);
-        let result = kin_cli::commands::impact::build_impact_response(
+        let result = kin_cli::commands::impact::build_impact_response_with_source(
             &state.layout,
             graph.as_ref(),
             &req,
             &envelope,
+            source_authority.as_ref(),
+            source_scope,
         )
         .await
         .map_err(internal_error)?;
-        if !impact_response_claims_absence(&result) || settle.settled(&state, epoch) {
+        if state
+            .source_scope_for_selected_graph(session_id.as_ref(), &graph, graph_authority)
+            .await
+            != Some(source_scope)
+        {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "selected source scope changed while reading impact; retry the request".into(),
+            ));
+        }
+        if !(impact_response_claims_absence(&result) || result.enrichment.is_some())
+            || epoch.is_current(&state, &graph)
+        {
             break result;
         }
         settle
@@ -11580,23 +12304,53 @@ async fn review(
             .map_err(review_write_refusal)?;
         return Ok(Json(answer));
     }
-    let graph = resolve_session_graph(&state, session_id.as_ref()).await;
+    let (graph, graph_authority) = state
+        .graph_for_request_with_authority(session_id.as_ref())
+        .await;
+    let source_scope = state
+        .source_scope_for_selected_graph(session_id.as_ref(), &graph, graph_authority)
+        .await
+        .ok_or_else(|| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "selected source scope expired or was replaced".to_string(),
+            )
+        })?;
     let repository_authority = state
         .local_repository_authority_binding()
         .map_err(repository_authority_error)?;
-    // A files review whose files resolved to no entity is served only from a
-    // read no writer spanned, for the reason `NameReadWait` gives. Every other
-    // review read is served as it always was.
+    // A review and its persisted enrichment limits must describe one graph
+    // epoch. Non-analysis reads retain their existing behavior.
     let mut settle = NameReadWait::begin(&state, &graph);
     let execution = loop {
-        let epoch = settle.sample(&state);
-        let outcome = kin_cli::commands::review::execute_review_request(
+        let epoch = settle.sample_analysis(&state, &graph, graph_authority);
+        let source_authority = mcp_repository_authority_source(&state)
+            .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error.to_string()))?;
+        let outcome = kin_cli::commands::review::execute_review_request_with_source(
             &repository_authority,
             graph.as_ref(),
             req.clone(),
+            source_authority.as_ref(),
+            source_scope,
         )
         .await;
-        if !review_run_claims_absence(&req, &outcome) || settle.settled(&state, epoch) {
+        if state
+            .source_scope_for_selected_graph(session_id.as_ref(), &graph, graph_authority)
+            .await
+            != Some(source_scope)
+        {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "selected source scope changed while reading review; retry the request".into(),
+            ));
+        }
+        let analysis = matches!(req, kin_cli::commands::review::ReviewRequest::Run { .. });
+        let settled = if analysis {
+            epoch.is_current(&state, &graph)
+        } else {
+            settle.settled(&state, epoch.writer)
+        };
+        if !(analysis || review_run_claims_absence(&req, &outcome)) || settled {
             break outcome.map_err(|error| {
                 if kin_cli::commands::ref_lookup::is_ref_resolution_error(&error) {
                     (StatusCode::BAD_REQUEST, crate::error::cause_first(&error))
@@ -12391,6 +13145,25 @@ fn mcp_tool_mutates_graph(name: &str) -> bool {
             // must never run against a session's read-only temporal view.
             | "kin_transaction_commit"
     )
+}
+
+/// A live operational reading. It neither expires transactions nor reads or
+/// changes repository authority, and is never cached with graph counters.
+pub(crate) fn open_staged_transaction_observation(
+    state: &DaemonState,
+) -> Result<kin_mcp::session::OpenTransactionObservation, (StatusCode, String)> {
+    // Hold transaction membership and payloads fixed while sampling live owners.
+    // This gives the operational reading one instant even if a session ends.
+    let transactions = lock_recover(&state.mcp_transactions);
+    let sessions = state.coordinator.list_sessions().map_err(internal_error)?;
+    Ok(kin_mcp::session::OpenTransactionObservation::capture(
+        kin_model::Timestamp::now(),
+        sessions
+            .into_iter()
+            .filter(|session| session.capabilities.can_write)
+            .map(|session| session.session_id.to_string()),
+        transactions.values(),
+    ))
 }
 
 pub(crate) fn mcp_session_registry_snapshot(
@@ -15500,6 +16273,22 @@ impl HostedSemanticRequest {
         }
     }
 
+    /// Paging changes transport size, never how much semantic source the
+    /// initial trace admits. Keep the hosted work limits explicit and fixed.
+    fn for_trace(view: Arc<HostedRepositoryMcpView>) -> Self {
+        let source_authority = view
+            .repository_authority
+            .with_hosted_source_projection_budget(
+                REPO_SCOPED_SOURCE_MAX_BLOB_BYTES,
+                kin_mcp::handlers::HOSTED_SEMANTIC_SOURCE_BLOB_MAX_BYTES,
+                REPO_SCOPED_TRACE_BODY_READ_CAP,
+            );
+        Self {
+            view,
+            source_authority,
+        }
+    }
+
     fn view(&self) -> &HostedRepositoryMcpView {
         self.view.as_ref()
     }
@@ -16333,6 +17122,34 @@ mod hosted_view_hydration_test_hooks {
         with(repo_id, |hook| {
             hook.gate = Some(Arc::new((Mutex::new(false), Condvar::new())))
         });
+    }
+
+    /// Release a blocking test gate even when a caller assertion unwinds.
+    pub(super) struct GateRelease(String);
+
+    impl Drop for GateRelease {
+        fn drop(&mut self) {
+            open_gate(&self.0);
+        }
+    }
+
+    pub(super) fn hold_gate(repo_id: &str) -> GateRelease {
+        close_gate(repo_id);
+        GateRelease(repo_id.to_string())
+    }
+
+    #[test]
+    fn a_hydration_gate_is_released_when_its_owner_unwinds() {
+        let repo_id = format!("gate-unwind-{}", uuid::Uuid::new_v4());
+        let release = hold_gate(&repo_id);
+        let gate = with(&repo_id, |hook| hook.gate.clone().unwrap());
+        let unwound = std::panic::catch_unwind(|| {
+            let _release = release;
+            panic!("exercise gate cleanup after a failed assertion");
+        });
+        assert!(unwound.is_err());
+        assert!(*gate.0.lock().unwrap());
+        assert!(with(&repo_id, |hook| hook.gate.is_none()));
     }
 
     pub(super) fn open_gate(repo_id: &str) {
@@ -17465,6 +18282,7 @@ fn validate_repo_scoped_tool_arguments(
             reject_unknown_repo_scoped_arguments(
                 arguments,
                 &[
+                    "cursor",
                     "focal",
                     "depth",
                     "direction",
@@ -17477,6 +18295,10 @@ fn validate_repo_scoped_tool_arguments(
                     "max_response_chars",
                 ],
             )?;
+            if let Some(cursor) = validate_optional_string(arguments, "cursor", false)? {
+                kin_mcp::trace_pages::validate_cursor_syntax(&cursor)
+                    .map_err(invalid_repo_scoped_call)?;
+            }
             let focal = validate_optional_string(arguments, "focal", false)?
                 .ok_or_else(|| invalid_repo_scoped_call("trace_data_flow requires 'focal'"))?;
             if focal.chars().count() > REPO_SCOPED_TRACE_MAX_SELECTOR_CHARS {
@@ -17515,6 +18337,7 @@ fn validate_repo_scoped_tool_arguments(
 }
 
 async fn repo_mcp_tools_call(
+    headers: axum::http::HeaderMap,
     Path(repo_id): Path<String>,
     State(state): State<Arc<DaemonState>>,
     request: std::result::Result<
@@ -17598,18 +18421,26 @@ async fn repo_mcp_tools_call(
         tool = %request.name,
         "repo-scoped semantic call started"
     );
-    if request.name != "semantic_locate" && request.arguments.contains_key("cursor") {
+    if !matches!(request.name.as_str(), "semantic_locate" | "trace_data_flow")
+        && request.arguments.contains_key("cursor")
+    {
         return repo_scoped_mcp_error(
             &repo_id,
-            invalid_repo_scoped_call("semantic cursors are valid only for semantic_locate"),
+            invalid_repo_scoped_call(
+                "semantic cursors are valid only for semantic_locate and trace_data_flow",
+            ),
         );
     }
     if let Err(failure) = validate_repo_scoped_tool_arguments(&request.name, &request.arguments) {
         return repo_scoped_mcp_error(&repo_id, failure);
     }
-    let prepared_cursor = match prepare_repo_semantic_cursor(&state, &repo_id, &request.arguments) {
-        Ok(cursor) => cursor,
-        Err(failure) => return repo_scoped_mcp_error(&repo_id, failure),
+    let prepared_cursor = if request.name == "semantic_locate" {
+        match prepare_repo_semantic_cursor(&state, &repo_id, &request.arguments) {
+            Ok(cursor) => cursor,
+            Err(failure) => return repo_scoped_mcp_error(&repo_id, failure),
+        }
+    } else {
+        None
     };
     let view = match load_hosted_repository_mcp_view(&state, &repo_id).await {
         Ok(view) => view,
@@ -17622,14 +18453,45 @@ async fn repo_mcp_tools_call(
         return repo_scoped_mcp_error(&repo_id, failure);
     }
 
-    // Resolved BEFORE dispatch, not after it. The budget bounds what ships, and
-    // the source allowance derived from it is what makes it bound what is READ:
-    // a projection allocates whole blobs and clips excerpts out of them, so a
-    // ceiling applied only to the assembled payload leaves the reads unbounded.
-    // One allowance is shared by every query variant this call fans out to.
     let budget =
         kin_mcp::budget::ResponseBudget::from_arguments(&arguments).less_envelope_reserve();
-    let hosted = HostedSemanticRequest::new(Arc::clone(&view), &budget);
+    let hosted = if request.name == "trace_data_flow" {
+        HostedSemanticRequest::for_trace(Arc::clone(&view))
+    } else {
+        HostedSemanticRequest::new(Arc::clone(&view), &budget)
+    };
+    let trace_authority = hosted_trace_authority(&state, &headers, view.as_ref());
+    let trace_context = kin_mcp::trace_pages::Context::from_arguments(&arguments, &trace_authority);
+    let trace_max_bytes = kin_mcp::budget::ResponseBudget::from_arguments(&arguments).max_chars;
+    if request.name == "trace_data_flow" {
+        if let Some(cursor) = arguments.get("cursor").and_then(serde_json::Value::as_str) {
+            let payload =
+                match kin_mcp::trace_pages::resume(cursor, &trace_context, trace_max_bytes) {
+                    Ok(payload) => payload,
+                    Err(message) => {
+                        return repo_scoped_mcp_error(
+                            &repo_id,
+                            RepoScopedMcpFailure::new(
+                                StatusCode::CONFLICT,
+                                "invalid_trace_cursor",
+                                message,
+                                false,
+                            ),
+                        )
+                    }
+                };
+            if let Err(failure) =
+                validate_hosted_trace_authority(&state, view.as_ref(), &trace_authority).await
+            {
+                return repo_scoped_mcp_error(&repo_id, failure);
+            }
+            return repo_scoped_mcp_success(
+                view.as_ref(),
+                request.name,
+                kin_mcp::ToolCallResult::text(payload.to_string()),
+            );
+        }
+    }
 
     // Hosted semantic calls have no repository-scoped session authority yet.
     // The daemon-wide coordinator is not a safe substitute: entity IDs are
@@ -17715,6 +18577,20 @@ async fn repo_mcp_tools_call(
             return repo_scoped_mcp_error(&repo_id, failure);
         }
     }
+    if request.name == "trace_data_flow" {
+        let result = kin_mcp::trace_pages::finalize(
+            result,
+            kin_mcp::Envelope::daemon(),
+            trace_context,
+            trace_max_bytes,
+        );
+        if let Err(failure) =
+            validate_hosted_trace_authority(&state, view.as_ref(), &trace_authority).await
+        {
+            return repo_scoped_mcp_error(&repo_id, failure);
+        }
+        return repo_scoped_mcp_success(view.as_ref(), request.name, result);
+    }
     let result = bound_mcp_tool_result(result, &request.name, &budget);
     // The hosted route is NOT disclosed here, deliberately, and the reason is
     // ordering rather than scope. Its handlers finalize their own envelope
@@ -17724,6 +18600,74 @@ async fn repo_mcp_tools_call(
     // `kin_mcp::verdict` exists to end. Disclosing it needs the verdict
     // recomputed on this route, which is its own change.
     repo_scoped_mcp_success(view.as_ref(), request.name, result)
+}
+
+/// Bind retained semantic pages to the selected hosted publication and the
+/// credential authenticated by the route middleware. No daemon session or
+/// coordinator state grants authority over a hosted repository.
+fn hosted_trace_authority(
+    state: &DaemonState,
+    headers: &axum::http::HeaderMap,
+    view: &HostedRepositoryMcpView,
+) -> serde_json::Value {
+    let credential = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim)
+        .unwrap_or("");
+    json!({
+        "repository": view.repository_id.to_string(),
+        "snapshot": view.snapshot_identity(),
+        "selected_change": view.selected_change_id.to_string(),
+        "truth_epoch": view.graph.truth_epoch(),
+        "daemon_instance": state.repo_semantic_instance_id,
+        "authorization_scope": hex::encode(Sha256::digest(credential.as_bytes())),
+    })
+}
+
+/// Loading the current view checks authority before a page. Probe again after
+/// the walk or cache read, so a concurrent publication never leaves as a page
+/// claiming the earlier publication is current.
+async fn validate_hosted_trace_authority(
+    state: &DaemonState,
+    view: &HostedRepositoryMcpView,
+    authority: &serde_json::Value,
+) -> std::result::Result<(), RepoScopedMcpFailure> {
+    let backend = state.storage_backend.as_ref().ok_or_else(|| {
+        RepoScopedMcpFailure::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "hosted_authority_required",
+            "hosted trace repository authority is unavailable",
+            false,
+        )
+    })?;
+    let current = tokio::time::timeout(
+        HOSTED_VIEW_CALLER_WAIT,
+        hosted_snapshot_cursor(backend, view.repository_id.as_str()),
+    )
+    .await
+    .map_err(|_| {
+        RepoScopedMcpFailure::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "repo_authority_unavailable",
+            "hosted trace authority probe timed out; retry",
+            true,
+        )
+    })??;
+    if current != Some(view.snapshot_cursor)
+        || authority["truth_epoch"].as_u64() != Some(view.graph.truth_epoch())
+        || !state.serves_repo_id(view.repository_id.as_str())
+        || state.derived_views_stale.read().await.is_some()
+    {
+        return Err(RepoScopedMcpFailure::new(
+            StatusCode::CONFLICT,
+            "cursor_stale",
+            "hosted trace authority changed; restart without cursor",
+            false,
+        ));
+    }
+    Ok(())
 }
 
 fn enrich_hosted_trace_record(
@@ -17785,30 +18729,13 @@ fn hosted_trace_record_entity_id(record: &serde_json::Value) -> Option<EntityId>
         .map(EntityId)
 }
 
-fn hosted_trace_source_read_budget(
-    payload: &serde_json::Value,
-    response_budget: &kin_mcp::budget::ResponseBudget,
-) -> (usize, usize) {
-    let remaining_chars = response_budget
-        .max_chars
-        .saturating_sub(kin_mcp::budget::measure(payload))
-        .saturating_sub(REPO_SCOPED_TRACE_BODY_METADATA_RESERVE_CHARS);
-    if remaining_chars < 512 {
-        return (0, 0);
-    }
-    let read_cap = (remaining_chars / REPO_SCOPED_TRACE_BODY_READ_UNIT_CHARS)
-        .clamp(1, REPO_SCOPED_TRACE_BODY_READ_CAP);
-    let max_chars_per_body = (remaining_chars / read_cap).min(32 * 1024);
-    (read_cap, max_chars_per_body)
-}
-
 fn hosted_trace_data_flow_result(
     request: &HostedSemanticRequest,
     arguments: &HashMap<String, serde_json::Value>,
 ) -> std::result::Result<kin_mcp::ToolCallResult, RepoScopedMcpFailure> {
     let view = request.view();
     let mut result =
-        kin_mcp::handlers::entities::handle_trace_data_flow(arguments, view.graph.as_ref())
+        kin_mcp::handlers::entities::handle_trace_data_flow_unpaged(arguments, view.graph.as_ref())
             .map_err(repo_scoped_handler_failure)?;
     if result.is_error == Some(true) {
         return Ok(result);
@@ -17823,8 +18750,6 @@ fn hosted_trace_data_flow_result(
                 .map(|compact| !compact)
         })
         .unwrap_or(true);
-    let response_budget =
-        kin_mcp::budget::ResponseBudget::from_arguments(arguments).less_envelope_reserve();
     let mut remaining_body_reads = REPO_SCOPED_TRACE_BODY_READ_CAP;
     for block in &mut result.content {
         let kin_mcp::ContentBlock::Text { text } = block;
@@ -17856,9 +18781,8 @@ fn hosted_trace_data_flow_result(
         } else {
             0
         };
-        let (payload_body_read_cap, max_chars_per_body) =
-            hosted_trace_source_read_budget(&payload, &response_budget);
-        let mut payload_body_reads_remaining = remaining_body_reads.min(payload_body_read_cap);
+        let max_chars_per_body = REPO_SCOPED_TRACE_BODY_MAX_CHARS;
+        let mut payload_body_reads_remaining = remaining_body_reads;
         let mut body_reads = 0usize;
         if include_body {
             let held = kin_mcp::handlers::common::HeldSourceAuthority::new(
@@ -17907,15 +18831,21 @@ fn hosted_trace_data_flow_result(
         payload["bodies_included"] = json!(bodies_included > 0);
         payload["source_reads_attempted"] = json!(body_reads);
         payload["source_read_eligible_records"] = json!(source_read_eligible_records);
+        payload["source_read_limits"] = json!({
+            "records": REPO_SCOPED_TRACE_BODY_READ_CAP,
+            "excerpt_chars_per_entity": REPO_SCOPED_TRACE_BODY_MAX_CHARS,
+            "blob_bytes": REPO_SCOPED_SOURCE_MAX_BLOB_BYTES,
+            "request_bytes": kin_mcp::handlers::HOSTED_SEMANTIC_SOURCE_BLOB_MAX_BYTES,
+            "independent_of_response_page": true,
+        });
         if source_reads_withheld > 0 {
             payload["source_reads_capped"] = json!(true);
             payload["source_reads_withheld"] = json!(source_reads_withheld);
             let disclosure = json!({
                 "component": "entity_source",
-                "reason": "response_budget_source_reads_capped",
+                "reason": "hosted_source_reads_capped",
                 "detail": format!(
-                    "the hosted trace attempted source projection for {body_reads} of {source_read_eligible_records} eligible entity records before response assembly under its {}-character budget; eligibility does not claim that every record has a source body",
-                    response_budget.max_chars
+                    "the hosted trace attempted source projection for {body_reads} of {source_read_eligible_records} eligible entity records under its {REPO_SCOPED_TRACE_BODY_READ_CAP}-record work limit; eligibility does not claim that every record has a source body, and response page size does not change this limit"
                 ),
                 "remediation": "request include_body: false for chain shape, narrow depth or limit_per_step, or make targeted get_context_pack calls for omitted entities"
             });
@@ -18277,6 +19207,25 @@ async fn mcp_tools_call(
     // Bound the WORK before the call runs, and record what was cut so the
     // answer can say so. Applied after canonicalization, because the clamps are
     // keyed on the registered tool name like everything else on this route.
+    // Trace pages own their complete envelope and byte bound. Running the
+    // generic truncation ladder first would irreversibly drop semantic hops.
+    if request.name == "trace_data_flow" {
+        return trace_tools_page(headers, state, request).await.map(Json);
+    }
+    if request.name == "kin_graph_status" {
+        let budget = kin_mcp::status_pages::StatusRequest::from_arguments(&request.arguments)
+            .map_err(|message| (StatusCode::BAD_REQUEST, message))?
+            .ceiling();
+        let result = mcp_tools_call_inner(headers, State(state), Json(request))
+            .await?
+            .0;
+        return Ok(Json(kin_mcp::status_pages::enforce_ceiling(result, budget)));
+    }
+    if request.name == "find_references" {
+        return reference_tools_page(headers, state, request)
+            .await
+            .map(Json);
+    }
     let clamps = clamp_mcp_local_call_arguments(&request.name, &mut request.arguments);
     let budget =
         kin_mcp::budget::ResponseBudget::from_arguments(&request.arguments).less_envelope_reserve();
@@ -18318,6 +19267,611 @@ async fn mcp_tools_call(
     // Enforce the ceiling again against the complete emitted payload.
     let disclosed = disclose_outside_graph(graph.as_deref(), question.as_deref(), disclosed);
     Ok(Json(bound_mcp_tool_result(disclosed, &tool, &budget)))
+}
+
+/// Capture the repository standing that stdio used to append after forwarding.
+/// A frozen trace must carry it before pagination, and a continuation must
+/// reject changed standing even when no entity or relationship changed.
+async fn trace_standing_observation(
+    state: &Arc<DaemonState>,
+    graph: &Arc<kin_db::InMemoryGraph>,
+) -> (serde_json::Value, kin_mcp::Envelope) {
+    use kin_core::memory_pressure::{EmbeddingCoverage, HeavyWork, PressureRefusal};
+    let root = state.layout.root();
+    let suspended = kin_daemon_spawn::SuspendedSweep::read(root);
+    let hydration = kin_core::hydration_semantics::standing(&state.layout);
+    let shortfall = kin_daemon_spawn::RefusedEnrichment::read(root);
+    let census = kin_core::relation_census::CensusHold::read(root);
+    let mut refusals = PressureRefusal::read_all(root);
+    let observed_at = chrono::Utc::now().timestamp().max(0) as u64;
+    let embed_work = HeavyWork::EmbedBatch.id();
+    let mut pressure = refusals
+        .iter()
+        .rev()
+        .find(|refusal| refusal.work != embed_work)
+        .or_else(|| refusals.last())
+        .cloned();
+    if pressure
+        .as_ref()
+        .is_some_and(|refusal| refusal.work == embed_work)
+    {
+        let sample_state = Arc::clone(state);
+        let selected_graph = Arc::clone(graph);
+        // The selected graph, including a historical session graph, owns this
+        // tuple. Never substitute HEAD coverage to clear its refusal.
+        let coverage = tokio::task::spawn_blocking(move || {
+            let _guard = sample_state.embedding_work.try_lock().ok()?;
+            match kin_cli::commands::status::observe_embedding_coverage(&selected_graph) {
+                kin_cli::commands::status::EmbeddingCoverage::Observed {
+                    indexed,
+                    pending,
+                    total,
+                    ..
+                } => Some(EmbeddingCoverage {
+                    indexed,
+                    pending,
+                    total,
+                }),
+                kin_cli::commands::status::EmbeddingCoverage::Unobserved { .. } => None,
+            }
+        })
+        .await
+        .ok()
+        .flatten();
+        let current = PressureRefusal::read_all(root);
+        if current == refusals {
+            if let (Some(refusal), Some(coverage)) = (&pressure, coverage) {
+                // A same-second rewrite cannot be distinguished by the record
+                // timestamp, so it stays visible until a later observation.
+                if refusal.at_unix < observed_at && !refusal.describes_outstanding_work(coverage) {
+                    pressure = None;
+                }
+            }
+        } else {
+            pressure = current
+                .iter()
+                .rev()
+                .find(|refusal| refusal.work != embed_work)
+                .or_else(|| current.last())
+                .cloned()
+                .or(pressure);
+            refusals = current;
+        }
+    }
+    let envelope = kin_mcp::Envelope::daemon()
+        .with_suspended_sweep(suspended.as_ref())
+        .with_memory_pressure(pressure.as_ref())
+        .with_hydration_semantics_observation(Some(&hydration))
+        .with_enrichment_shortfall(shortfall.as_ref())
+        .with_relation_census_loss(census.as_ref());
+    let identity = json!({
+        "sweep_interruptions": suspended.map(|value| value.interruptions),
+        "pressure_records": refusals,
+        "outstanding_pressure": pressure,
+        "hydration": envelope.hydration_semantics,
+        "enrichment_shortfall": shortfall,
+        "relation_census": census,
+    });
+    (identity, envelope)
+}
+
+/// The snapshot that actually answered a reference request. This travels out of
+/// the stable reader rather than sampling HEAD before its retries or after a
+/// qualified replay. The live graph's truth epoch is not the rebuilt graph's.
+struct CapturedReferenceRead {
+    graph: Arc<kin_db::InMemoryGraph>,
+    root: String,
+    source_scope: kin_mcp::handlers::common::EntitySourceScope,
+    truth_epoch: u64,
+    mutation_epoch: u64,
+    head_version: Option<u64>,
+    generation: Option<u64>,
+}
+
+impl CapturedReferenceRead {
+    fn stamp(
+        &self,
+        state: &DaemonState,
+        session_id: Option<&SessionId>,
+        selected_graph: &Arc<kin_db::InMemoryGraph>,
+    ) -> serde_json::Value {
+        use kin_mcp::handlers::common::EntitySourceScope;
+        let scope = match self.source_scope {
+            EntitySourceScope::WorkspaceHead => json!({"kind":"workspace_head"}),
+            EntitySourceScope::At(change) => {
+                json!({"kind":"committed_graph", "change":change.to_string()})
+            }
+        };
+        json!({
+            "repository":state.layout.root(),
+            "session":session_id.map(ToString::to_string),
+            "scope":scope,
+            "graph":Arc::as_ptr(selected_graph) as usize,
+            "root":self.root,
+            "truth_epoch":self.truth_epoch,
+            "mutation_epoch":self.mutation_epoch,
+            "head_version":self.head_version,
+            "generation":self.generation,
+        })
+    }
+
+    async fn is_current(
+        &self,
+        state: &DaemonState,
+        session_id: Option<&SessionId>,
+        selected_graph: &Arc<kin_db::InMemoryGraph>,
+        authority: RequestGraphAuthority,
+    ) -> bool {
+        state.graph_authority_epoch_is_current(self.mutation_epoch)
+            && state
+                .source_scope_for_selected_graph(session_id, selected_graph, authority)
+                .await
+                == Some(self.source_scope)
+            && selected_graph.truth_epoch() == self.truth_epoch
+            && hex::encode(selected_graph.compute_root_hash()) == self.root
+            && self.head_version.is_none_or(|version| {
+                version == state.vfs_version.load(std::sync::atomic::Ordering::SeqCst)
+            })
+            && self.generation.is_none_or(|generation| {
+                generation
+                    == state
+                        .snapshot_generation
+                        .load(std::sync::atomic::Ordering::SeqCst)
+            })
+            && state.graph_authority_epoch_is_current(self.mutation_epoch)
+    }
+}
+
+async fn reference_tools_page(
+    headers: axum::http::HeaderMap,
+    state: Arc<DaemonState>,
+    request: McpToolCallRequest,
+) -> Result<kin_mcp::ToolCallResult, (StatusCode, String)> {
+    reference_tools_page_after_root(headers, state, request, |_| {}).await
+}
+
+/// First pages retain the stable reader's qualified positive fallback. Resumes
+/// require stable authority and compare it to the original capture, including
+/// the writer epoch, even when a writer has not changed graph truth yet.
+async fn reference_tools_page_after_root<F: FnMut(usize)>(
+    headers: axum::http::HeaderMap,
+    state: Arc<DaemonState>,
+    request: McpToolCallRequest,
+    after_root: F,
+) -> Result<kin_mcp::ToolCallResult, (StatusCode, String)> {
+    reference_tools_page_with_hooks(headers, state, request, after_root, || {}).await
+}
+
+async fn reference_tools_page_with_hooks<F: FnMut(usize), G: FnOnce()>(
+    headers: axum::http::HeaderMap,
+    state: Arc<DaemonState>,
+    mut request: McpToolCallRequest,
+    after_root: F,
+    after_read: G,
+) -> Result<kin_mcp::ToolCallResult, (StatusCode, String)> {
+    if !state
+        .is_initialized
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon not fully initialized".into(),
+        ));
+    }
+    let cursor = match request.arguments.get("cursor") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(value)) => Some(value.clone()),
+        Some(_) => {
+            return Ok(kin_mcp::ToolCallResult::error(
+                "reference cursor must be a string",
+            ))
+        }
+    };
+    let session_id = extract_session_id_from_headers(&headers)?;
+    let _active_call = state.coordinator.begin_call_for(session_id.as_ref());
+    touch_session_liveness(&state, session_id.as_ref());
+    let (selected_graph, authority) = state
+        .graph_for_request_with_authority(session_id.as_ref())
+        .await;
+    let clamps = clamp_mcp_local_call_arguments(&request.name, &mut request.arguments);
+    let budget = kin_mcp::budget::ResponseBudget::from_arguments(&request.arguments);
+    // The stdio transport supplies its actual canonical client folder before
+    // paging. Retain it in the frozen identity instead of appending a warning
+    // after the response has already met its byte budget.
+    let client_root = request
+        .arguments
+        .get("__kin_client_root")
+        .and_then(serde_json::Value::as_str)
+        .map(std::path::PathBuf::from);
+    if let Some(cursor) = cursor {
+        let Some(epoch) = (match authority {
+            RequestGraphAuthority::Head => state.settled_read_epoch(),
+            RequestGraphAuthority::SessionScope => state.stable_graph_authority_epoch(),
+        }) else {
+            return Ok(kin_mcp::ToolCallResult::error(
+                "reference authority has an active writer or pending admission; restart without cursor once it settles",
+            ));
+        };
+        let Some(source_scope) = state
+            .source_scope_for_selected_graph(session_id.as_ref(), &selected_graph, authority)
+            .await
+        else {
+            return Ok(kin_mcp::ToolCallResult::error(xref_scope_replaced_message(
+                "find_references",
+            )));
+        };
+        let current = CapturedReferenceRead {
+            graph: Arc::clone(&selected_graph),
+            root: hex::encode(selected_graph.compute_root_hash()),
+            source_scope,
+            truth_epoch: selected_graph.truth_epoch(),
+            mutation_epoch: epoch,
+            head_version: matches!(authority, RequestGraphAuthority::Head)
+                .then(|| state.vfs_version.load(std::sync::atomic::Ordering::SeqCst)),
+            generation: matches!(authority, RequestGraphAuthority::Head).then(|| {
+                state
+                    .snapshot_generation
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            }),
+        };
+        let standing = trace_standing_observation(&state, &selected_graph).await.0;
+        let context = kin_mcp::reference_pages::context(
+            &request.arguments,
+            &json!({
+                "graph":current.stamp(&state, session_id.as_ref(), &selected_graph), "standing":standing,
+            }),
+        );
+        let page = kin_mcp::reference_pages::resume(&cursor, &context, budget.max_chars);
+        if !current
+            .is_current(&state, session_id.as_ref(), &selected_graph, authority)
+            .await
+            || trace_standing_observation(&state, &selected_graph).await.0 != standing
+            || !current
+                .is_current(&state, session_id.as_ref(), &selected_graph, authority)
+                .await
+            || !trace_read_epoch_current(&state, authority, epoch)
+        {
+            return Ok(kin_mcp::ToolCallResult::error("reference graph, authority or standing changed while resuming; restart without cursor"));
+        }
+        return Ok(page
+            .map(|page| kin_mcp::ToolCallResult::text(page.to_string()))
+            .unwrap_or_else(kin_mcp::ToolCallResult::error));
+    }
+
+    let mut captured = None;
+    let raw = match mcp_find_references_with_captured_authority(
+        &state,
+        session_id.as_ref(),
+        Arc::clone(&selected_graph),
+        authority,
+        &request.arguments,
+        after_root,
+        &mut captured,
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => return Ok(kin_mcp::ToolCallResult::error(error.to_string())),
+    };
+    after_read();
+    if raw.is_error == Some(true) {
+        return Ok(raw);
+    }
+    let Some(read) = captured else {
+        return Ok(kin_mcp::ToolCallResult::error(
+            "reference reader returned no captured authority",
+        ));
+    };
+    let (standing, standing_envelope) = trace_standing_observation(&state, &selected_graph).await;
+    let context = kin_mcp::reference_pages::context(
+        &request.arguments,
+        &json!({
+            "graph":read.stamp(&state, session_id.as_ref(), &selected_graph), "standing":standing,
+        }),
+    );
+    use kin_mcp::handlers::common::EntitySourceScope;
+    use kin_mcp::source_derivation::SourceDerivationObservation;
+    let (raw, observation) = match read.source_scope {
+        EntitySourceScope::At(_) => (raw, SourceDerivationObservation::historical()),
+        EntitySourceScope::WorkspaceHead => {
+            observe_live_answer_sources_off_runtime(
+                Arc::clone(&state),
+                Arc::clone(&read.graph),
+                "find_references".into(),
+                raw,
+            )
+            .await?
+        }
+    };
+    let raw = kin_mcp::source_derivation::disclose(raw, &observation);
+    let raw = disclose_mcp_local_clamps(raw, "find_references", &clamps);
+    let raw = disclose_outside_graph(
+        Some(&read.graph),
+        kin_mcp::outside_graph::question_argument(&request.arguments),
+        raw,
+    );
+    let health = daemon_health_snapshot(&state).await;
+    if trace_standing_observation(&state, &selected_graph).await.0 != standing
+        || state
+            .source_scope_for_selected_graph(session_id.as_ref(), &selected_graph, authority)
+            .await
+            != Some(read.source_scope)
+    {
+        return Ok(kin_mcp::ToolCallResult::error(
+            "reference source scope or standing changed while reading; restart without cursor",
+        ));
+    }
+    let current = read
+        .is_current(&state, session_id.as_ref(), &selected_graph, authority)
+        .await;
+    if matches!(authority, RequestGraphAuthority::Head)
+        && reference_result_claims_absence(&raw)
+        && !state.settled_read_epoch_is_current(read.mutation_epoch)
+    {
+        return Ok(kin_mcp::ToolCallResult::error(
+            "reference absence was withheld because working-copy admission or a writer became pending while reading; restart once it settles",
+        ));
+    }
+    // Live health counts/generation belong to this result only when the exact
+    // captured HEAD is still current. A historical or qualified replay keeps
+    // its own source identity rather than borrowing the writer's new counts.
+    let mut envelope =
+        if current && matches!(read.source_scope, EntitySourceScope::WorkspaceHead) {
+            standing_envelope.with_health(&health)
+        } else {
+            standing_envelope.with_working_copy_health(&health)
+        }
+        .with_repository(
+            &health,
+            client_root.as_deref(),
+            std::path::Path::to_path_buf,
+        );
+    envelope.graph_as_of = Some(match read.source_scope {
+        EntitySourceScope::At(change) => json!({"change_id":change.to_string()}),
+        EntitySourceScope::WorkspaceHead => {
+            json!({"generation":read.generation, "graph_root":read.root})
+        }
+    });
+    let raw = if current {
+        raw
+    } else {
+        // A writer may start after the inner reader returned. Keep its positive
+        // rows available, but do not certify their currency or any absence.
+        match disclose_mutation_in_flight(raw, &state) {
+            Some(result) => result,
+            None => {
+                return Ok(kin_mcp::ToolCallResult::error(
+                    "reference authority changed while reading; restart without cursor",
+                ))
+            }
+        }
+    };
+    Ok(kin_mcp::reference_pages::finalize(
+        raw, envelope, context, &budget,
+    ))
+}
+
+/// Identity of the exact graph and source scope a trace page belongs to.
+/// Pointer identity is hashed inside the process-local cursor context; it is
+/// never exposed in a reply. The truth epoch also covers proof-only changes.
+async fn trace_page_authority(
+    state: &DaemonState,
+    session_id: Option<&SessionId>,
+    graph: &Arc<kin_db::InMemoryGraph>,
+    authority: RequestGraphAuthority,
+) -> Result<serde_json::Value, String> {
+    trace_page_binding(state, session_id, graph, authority)
+        .await
+        .map(|(stamp, _)| stamp)
+}
+
+/// Capture the cursor stamp and body scope from one selection. A session
+/// rebind cannot put another revision's bodies under the stamp we sampled.
+async fn trace_page_binding(
+    state: &DaemonState,
+    session_id: Option<&SessionId>,
+    graph: &Arc<kin_db::InMemoryGraph>,
+    authority: RequestGraphAuthority,
+) -> Result<
+    (
+        serde_json::Value,
+        kin_mcp::handlers::common::EntitySourceScope,
+    ),
+    String,
+> {
+    use kin_mcp::handlers::common::EntitySourceScope;
+    let source_scope = state
+        .source_scope_for_selected_graph(session_id, graph, authority)
+        .await
+        .ok_or_else(|| "trace authority changed; restart without cursor".to_owned())?;
+    let scope = match source_scope {
+        EntitySourceScope::WorkspaceHead => serde_json::json!({"kind": "workspace_head"}),
+        EntitySourceScope::At(change) => serde_json::json!({
+            "kind": "committed_graph", "change": change.to_string(),
+        }),
+    };
+    Ok((
+        serde_json::json!({
+            "repository": state.layout.root(),
+            "session": session_id.map(ToString::to_string),
+            "scope": scope,
+            "graph": Arc::as_ptr(graph) as usize,
+            "truth_epoch": graph.truth_epoch(),
+        }),
+        source_scope,
+    ))
+}
+
+/// Build and freeze a trace only after its complete trust reading is known.
+/// Continuations read the frozen semantic records without repeating the walk.
+/// A graph or scope change invalidates the cursor, including changes while
+/// this request was running. All trace transports share this final boundary.
+async fn trace_tools_page(
+    headers: axum::http::HeaderMap,
+    state: Arc<DaemonState>,
+    mut request: McpToolCallRequest,
+) -> Result<kin_mcp::ToolCallResult, (StatusCode, String)> {
+    if !state
+        .is_initialized
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon not fully initialized".into(),
+        ));
+    }
+    let session_id = extract_session_id_from_headers(&headers)?;
+    let _active_call = state.coordinator.begin_call_for(session_id.as_ref());
+    touch_session_liveness(&state, session_id.as_ref());
+    let (graph, authority) = state
+        .graph_for_request_with_authority(session_id.as_ref())
+        .await;
+    let mut settle = NameReadWait::begin(&state, &graph);
+    let epoch = loop {
+        // Session graphs can be written too. Do not use NameReadWait's
+        // historical-scope exemption to certify a multi-read snapshot.
+        let epoch = match authority {
+            RequestGraphAuthority::Head => state.settled_read_epoch(),
+            RequestGraphAuthority::SessionScope => state.stable_graph_authority_epoch(),
+        };
+        if let Some(epoch) = epoch {
+            break epoch;
+        }
+        settle
+            .wait_out(&state, "trace page")
+            .await
+            .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error))?;
+    };
+    let (stamp, source_scope) = trace_page_binding(&state, session_id.as_ref(), &graph, authority)
+        .await
+        .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error))?;
+    let clamps = clamp_mcp_local_call_arguments(&request.name, &mut request.arguments);
+    let budget = kin_mcp::budget::ResponseBudget::from_arguments(&request.arguments);
+    // The stdio transport supplies its actual canonical client folder before
+    // paging. Retain it in the frozen identity instead of appending a warning
+    // after the response has already met its byte budget.
+    let client_root = request
+        .arguments
+        .get("__kin_client_root")
+        .and_then(serde_json::Value::as_str)
+        .map(std::path::PathBuf::from);
+    let (standing, standing_envelope) = trace_standing_observation(&state, &graph).await;
+    let context = kin_mcp::trace_pages::Context::from_arguments(
+        &request.arguments,
+        &json!({"graph": stamp, "standing": standing}),
+    );
+    let cursor = match request.arguments.get("cursor") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(cursor)) => Some(cursor.clone()),
+        Some(_) => {
+            return Ok(kin_mcp::ToolCallResult::error(
+                "trace cursor must be a string",
+            ))
+        }
+    };
+    let result = if let Some(cursor) = cursor {
+        match kin_mcp::trace_pages::resume(&cursor, &context, budget.max_chars) {
+            Ok(page) => kin_mcp::ToolCallResult::text(page.to_string()),
+            Err(error) => kin_mcp::ToolCallResult::error(error),
+        }
+    } else {
+        let question =
+            kin_mcp::outside_graph::question_argument(&request.arguments).map(str::to_string);
+        // Dispatch with the graph we stamped. Resolving the session again
+        // would permit an A -> B -> A rebind to cache B's result as A's.
+        let raw = mcp_tools_call_selected(
+            Arc::clone(&state),
+            request,
+            session_id,
+            Arc::clone(&graph),
+            authority,
+            Some(source_scope),
+            false,
+            budget,
+        )
+        .await?
+        .0;
+        if raw.is_error == Some(true) {
+            // Plain validation errors have no semantic page to preserve.
+            return Ok(raw);
+        }
+        use kin_mcp::handlers::common::EntitySourceScope;
+        use kin_mcp::source_derivation::SourceDerivationObservation;
+        let (raw, observation) = match source_scope {
+            EntitySourceScope::At(_) => (raw, SourceDerivationObservation::historical()),
+            EntitySourceScope::WorkspaceHead => {
+                observe_live_answer_sources_off_runtime(
+                    Arc::clone(&state),
+                    Arc::clone(&graph),
+                    "trace_data_flow".into(),
+                    raw,
+                )
+                .await?
+            }
+        };
+        let raw = kin_mcp::source_derivation::disclose(raw, &observation);
+        let disclosed = disclose_mcp_local_clamps(raw, "trace_data_flow", &clamps);
+        let disclosed =
+            disclose_outside_graph(Some(graph.as_ref()), question.as_deref(), disclosed);
+        let health = daemon_health_snapshot(&state).await;
+        let envelope = match source_scope {
+            EntitySourceScope::WorkspaceHead => standing_envelope.with_health(&health),
+            EntitySourceScope::At(change) => {
+                // Health's graph counts and generation describe HEAD. Keep
+                // working-copy caveats and backend capability without naming
+                // that unrelated graph as the historical answer's authority.
+                let mut envelope = standing_envelope.with_working_copy_health(&health);
+                envelope.graph_as_of = Some(json!({"change_id": change.to_string()}));
+                if let Some(unavailable) = health
+                    .get("embed_persistence_unavailable")
+                    .and_then(serde_json::Value::as_bool)
+                {
+                    envelope = envelope.with_embed_persistence_unavailable(unavailable);
+                }
+                envelope
+            }
+        }
+        .with_repository(
+            &health,
+            client_root.as_deref(),
+            std::path::Path::to_path_buf,
+        );
+        // Check before caching so a failed observation never leaves an
+        // apparently valid continuation in the bounded snapshot cache.
+        let current_standing = trace_standing_observation(&state, &graph).await.0;
+        let current = trace_page_authority(&state, session_id.as_ref(), &graph, authority).await;
+        if current.as_ref() != Ok(&stamp)
+            || current_standing != standing
+            || !trace_read_epoch_current(&state, authority, epoch)
+        {
+            return Ok(kin_mcp::ToolCallResult::error(
+                "trace graph, authority or standing changed while reading; restart without cursor",
+            ));
+        }
+        kin_mcp::trace_pages::finalize(disclosed, envelope, context, budget.max_chars)
+    };
+    let current_standing = trace_standing_observation(&state, &graph).await.0;
+    let current = trace_page_authority(&state, session_id.as_ref(), &graph, authority).await;
+    if current.as_ref() != Ok(&stamp)
+        || current_standing != standing
+        || !trace_read_epoch_current(&state, authority, epoch)
+    {
+        return Ok(kin_mcp::ToolCallResult::error(
+            "trace graph, authority or standing changed while reading; restart without cursor",
+        ));
+    }
+    Ok(result)
+}
+
+fn trace_read_epoch_current(
+    state: &DaemonState,
+    authority: RequestGraphAuthority,
+    epoch: u64,
+) -> bool {
+    match authority {
+        RequestGraphAuthority::Head => state.settled_read_epoch_is_current(epoch),
+        RequestGraphAuthority::SessionScope => state.graph_authority_epoch_is_current(epoch),
+    }
 }
 
 /// Disclose an identifier the question named that this graph holds no
@@ -18651,47 +20205,61 @@ async fn mcp_tools_call_dispatch(
 
     let observe_sources =
         !mutates && kin_mcp::source_derivation::observes_sources(&request.name, &request.arguments);
-    let selected_scope = if observe_sources {
+    let selected_scope = if observe_sources || request.name == "trace_data_flow" {
         state
             .source_scope_for_selected_graph(session_id.as_ref(), &graph, graph_authority)
             .await
     } else {
         None
     };
-    let result = mcp_tools_call_selected(
-        Arc::clone(&state),
-        request,
-        session_id,
-        Arc::clone(&graph),
-        graph_authority,
-        mutates,
-        response_budget,
-    )
-    .await?;
+    // An impact walk and its ledger disclosure form one observation. Retry
+    // populated answers too when a graph writer spanned either read.
+    let stable_analysis = matches!(request.name.as_str(), "impact_analysis" | "semantic_review");
+    let mut settle = NameReadWait::begin(&state, &graph);
+    let result = loop {
+        let epoch = settle.sample_analysis(&state, &graph, graph_authority);
+        let result = mcp_tools_call_selected(
+            Arc::clone(&state),
+            request.clone(),
+            session_id,
+            Arc::clone(&graph),
+            graph_authority,
+            selected_scope,
+            mutates,
+            response_budget,
+        )
+        .await?;
+        if !stable_analysis || epoch.is_current(&state, &graph) {
+            break result;
+        }
+        settle
+            .wait_out(&state, &request.name)
+            .await
+            .map_err(|refusal| (StatusCode::SERVICE_UNAVAILABLE, refusal))?;
+    };
     if !observe_sources {
         return Ok(result);
     }
     use kin_mcp::handlers::common::EntitySourceScope;
-    use kin_mcp::source_derivation::{SourceDerivationObservation, SourceObservationScope};
+    use kin_mcp::source_derivation::SourceDerivationObservation;
     let current_scope = state
         .source_scope_for_selected_graph(session_id.as_ref(), &graph, graph_authority)
         .await;
-    let mut observation = if selected_scope != current_scope || selected_scope.is_none() {
-        SourceDerivationObservation {
-            scope: SourceObservationScope::SelectedScopeUnavailable,
-            checked_scope: "selected_authority_unavailable".into(),
-            sampled: "selected_graph_after_query".into(),
-            report: Some(
-                kin_review::source_derivation::SourceDerivationReport::unproven(
-                    "selected_authority_changed",
-                ),
-            ),
-            admission_failure: None,
-        }
+    let (result, mut observation) = if selected_scope != current_scope || selected_scope.is_none() {
+        (
+            result.0,
+            SourceDerivationObservation::unavailable("selected_authority_changed"),
+        )
     } else if matches!(selected_scope, Some(EntitySourceScope::At(_))) {
-        SourceDerivationObservation::historical()
+        (result.0, SourceDerivationObservation::historical())
     } else {
-        observe_live_head_sources_off_runtime(Arc::clone(&state), Arc::clone(&graph), None).await?
+        observe_live_answer_sources_off_runtime(
+            Arc::clone(&state),
+            Arc::clone(&graph),
+            request.name.clone(),
+            result.0,
+        )
+        .await?
     };
     if state
         .source_scope_for_selected_graph(session_id.as_ref(), &graph, graph_authority)
@@ -18701,7 +20269,7 @@ async fn mcp_tools_call_dispatch(
         observation = SourceDerivationObservation::unavailable("selected_authority_changed");
     }
     Ok(Json(kin_mcp::source_derivation::disclose(
-        result.0,
+        result,
         &observation,
     )))
 }
@@ -18752,6 +20320,7 @@ fn observe_live_head_sources(
         sampled: "selected_graph_after_query".into(),
         report: Some(report),
         admission_failure: failure,
+        local_binding_requirement: kin_mcp::source_derivation::LocalBindingRequirement::Required,
     }
 }
 
@@ -18761,13 +20330,30 @@ fn observe_live_head_sources(
 /// a runtime worker must not be the thread that waits: every other request,
 /// heartbeat and event stream is served from those workers. On the blocking
 /// pool a long write delays this one answer and nothing else.
-async fn observe_live_head_sources_off_runtime(
+async fn observe_live_refs_sources_off_runtime(
     state: Arc<DaemonState>,
     graph: Arc<kin_db::InMemoryGraph>,
-    selected_paths: Option<Vec<RepoPath>>,
+    request: kin_cli::commands::refs::RefsRequest,
 ) -> Result<kin_mcp::source_derivation::SourceDerivationObservation, (StatusCode, String)> {
     match tokio::task::spawn_blocking(move || {
-        observe_live_head_sources(&state, &graph, selected_paths.as_deref())
+        let mut observation = observe_live_head_sources(&state, &graph, None);
+        if matches!(
+            request.kind.trim().to_ascii_lowercase().as_str(),
+            "calls" | "call"
+        ) {
+            // Resolve with the same identity rules as the CLI renderer. Shared
+            // names and unresolved focals cannot qualify a different answer.
+            if let Ok(resolution) = kin_cli::entity_identity::resolve_entity(
+                graph.as_ref(),
+                &request.entity,
+                &kin_cli::entity_identity::IdentityQualifiers::default(),
+            ) {
+                if let [focal] = resolution.candidates.as_slice() {
+                    observation.qualify_current_calls(graph.as_ref(), focal);
+                }
+            }
+        }
+        observation
     })
     .await
     {
@@ -18780,14 +20366,49 @@ async fn observe_live_head_sources_off_runtime(
     }
 }
 
+/// Inspect exactly the graph-owned paths of a bounded answer. Broad queries
+/// retain inventory scope; their returned rows cannot narrow their claim.
+/// Moving the result through the blocking pool avoids cloning source bodies.
+async fn observe_live_answer_sources_off_runtime(
+    state: Arc<DaemonState>,
+    graph: Arc<kin_db::InMemoryGraph>,
+    tool: String,
+    result: kin_mcp::ToolCallResult,
+) -> Result<
+    (
+        kin_mcp::ToolCallResult,
+        kin_mcp::source_derivation::SourceDerivationObservation,
+    ),
+    (StatusCode, String),
+> {
+    match tokio::task::spawn_blocking(move || {
+        let paths =
+            kin_mcp::source_derivation::selected_answer_paths(&tool, &result, graph.as_ref());
+        let mut observation = observe_live_head_sources(&state, &graph, paths.as_deref());
+        observation.qualify_for_answer(&tool, &result, graph.as_ref());
+        (result, observation)
+    })
+    .await
+    {
+        Ok(answer) => Ok(answer),
+        Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+        Err(error) => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("the answer source observation did not run: {error}"),
+        )),
+    }
+}
+
 /// Dispatch against the exact graph/authority pair chosen by the outer request.
 /// The wrapper observes that same graph after every successful return path.
+#[allow(clippy::too_many_arguments)]
 async fn mcp_tools_call_selected(
     state: Arc<DaemonState>,
     request: McpToolCallRequest,
     session_id: Option<SessionId>,
     graph: Arc<kin_db::InMemoryGraph>,
     graph_authority: RequestGraphAuthority,
+    source_scope: Option<kin_mcp::handlers::common::EntitySourceScope>,
     mutates: bool,
     response_budget: kin_mcp::budget::ResponseBudget,
 ) -> Result<Json<kin_mcp::ToolCallResult>, (StatusCode, String)> {
@@ -18950,6 +20571,7 @@ async fn mcp_tools_call_selected(
             .map(|s| s.to_string());
         let req = kin_cli::commands::trace_data_flow::TraceDataFlowRequest {
             focal: focal.clone(),
+            cursor: None,
             depth,
             direction: parsed_direction,
             limit_per_step,
@@ -18975,6 +20597,22 @@ async fn mcp_tools_call_selected(
             }
             Ok(None) => {}
             Err(error) => return Ok(Json(kin_mcp::ToolCallResult::error(error.to_string()))),
+        }
+        // A target naming one is refused the same way, and an address naming
+        // nothing held is the absence, both before the walk rather than as a
+        // walk the daemon would wait out as a miss.
+        if let Some(target) = req.target.as_deref() {
+            match kin_mcp::handlers::external_symbols::external_id_refusal(
+                graph.as_ref(),
+                target.trim(),
+                "trace_data_flow",
+                "target",
+                kin_mcp::handlers::entities::TRACE_TARGET_EXTERNAL_WHY,
+            ) {
+                Ok(Some(refusal)) => return Ok(Json(refusal)),
+                Ok(None) => {}
+                Err(error) => return Ok(Json(kin_mcp::ToolCallResult::error(error.to_string()))),
+            }
         }
         // A focal or a target that resolved to nothing, and a walk with no
         // step, is served only from a read no writer spanned, for the reason
@@ -19008,6 +20646,14 @@ async fn mcp_tools_call_selected(
                     repository_authority,
                     Arc::clone(&graph),
                     req.clone(),
+                    match source_scope {
+                        Some(scope) => scope,
+                        None => {
+                            return Ok(Json(kin_mcp::ToolCallResult::error(
+                                "selected trace source scope expired or was replaced",
+                            )))
+                        }
+                    },
                 )
                 .await;
                 if !mcp_trace_claims_absence(&walked, &focal) || settle.settled(&state, epoch) {
@@ -19030,10 +20676,9 @@ async fn mcp_tools_call_selected(
             Err(error) => match error
                 .downcast_ref::<kin_cli::commands::trace_data_flow::SharedMemberFocal>()
             {
-                Some(shared) => kin_mcp::handlers::entities::trace_name_candidates_reply(
+                Some(shared) => kin_mcp::handlers::entities::trace_name_candidates_unpaged_reply(
                     &shared.query,
                     &shared.candidates,
-                    kin_mcp::handlers::common::trace_response_budget(max_response_chars),
                 )
                 .unwrap_or_else(|error| kin_mcp::ToolCallResult::error(error.to_string())),
                 // Below the walk's floor this surface answers with the smallest
@@ -19491,41 +21136,52 @@ async fn mcp_tools_call_selected(
             )
             .await
         } else if request.name == "kin_graph_status" {
+            let status_request =
+                kin_mcp::status_pages::StatusRequest::from_arguments(&request.arguments)
+                    .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
             let scope = match graph_authority {
                 RequestGraphAuthority::Head => kin_mcp::handlers::entities::GraphStatusScope::Head,
                 RequestGraphAuthority::SessionScope => {
                     kin_mcp::handlers::entities::GraphStatusScope::TemporalSession
                 }
             };
-            let status = mcp_graph_status_with_stable_authority(
+            let status = mcp_graph_status_snapshot(
                 &state,
                 session_id.as_ref(),
                 &graph,
                 graph_authority,
                 scope,
+                &status_request,
             )
-            .await
-            // Every call site's state across the graph this status reads, by
-            // the one reading every surface shares.
-            .map(|result| {
-                kin_mcp::handlers::entities::with_call_site_status(result, graph.as_ref())
-            });
-            if scope == kin_mcp::handlers::entities::GraphStatusScope::Head {
-                // Status is where a caller reads the base for its next
-                // unit-addressed write; a session-scoped graph is not HEAD.
-                let base = {
-                    let state = Arc::clone(&state);
-                    tokio::task::spawn_blocking(move || {
-                        crate::unit_lifecycle::current_repository_base(&state)
-                    })
-                    .await
-                    .ok()
-                    .flatten()
-                };
+            .await;
+            // Operational work is observed anew even when graph counters and
+            // proof metadata came from the last settled sample.
+            let transactions = open_staged_transaction_observation(&state)?;
+            let status = kin_mcp::status_pages::with_open_transactions(
+                status.unwrap_or_else(|error| kin_mcp::ToolCallResult::error(error.to_string())),
+                &transactions,
+                &json!({"daemon":state.repo_semantic_instance_id,"repository":state.cached_repo_id}),
+            ).map_err(kin_mcp::McpError::Other);
+            let status = if scope == kin_mcp::handlers::entities::GraphStatusScope::Head {
+                let state = Arc::clone(&state);
+                let base = tokio::task::spawn_blocking(move || {
+                    crate::unit_lifecycle::current_repository_base(&state)
+                })
+                .await
+                .ok()
+                .flatten();
                 status.map(|result| kin_mcp::handlers::entities::with_repository_base(result, base))
             } else {
                 status
-            }
+            };
+            status.and_then(|result| {
+                kin_mcp::status_pages::page(
+                    result,
+                    &status_request,
+                    &state.repo_semantic_cursor_secret,
+                )
+                .map_err(kin_mcp::McpError::Other)
+            })
         } else if kin_mcp::handlers::review::is_review_mutation(&request.name) {
             // Review writes are repository authority: planned against the live
             // graph and committed by the daemon's one review writer before the
@@ -19557,8 +21213,15 @@ async fn mcp_tools_call_selected(
             let mut settle = NameReadWait::begin(&state, &graph);
             loop {
                 let epoch = settle.sample(&state);
-                let (answer, focal_miss) =
-                    mcp_handler_answer(&state, &request, &graph, &sessions).await;
+                let (answer, focal_miss) = mcp_handler_answer(
+                    &state,
+                    &request,
+                    &graph,
+                    &sessions,
+                    session_id.as_ref(),
+                    graph_authority,
+                )
+                .await;
                 let claims_absence = focal_miss.claims_absence_of(&answer)
                     || mcp_handler_answer_claims_absence(&request.name, &answer);
                 if !claims_absence || settle.settled(&state, epoch) {
@@ -19569,9 +21232,16 @@ async fn mcp_tools_call_selected(
                 }
             }
         } else {
-            mcp_handler_answer(&state, &request, &graph, &sessions)
-                .await
-                .0
+            mcp_handler_answer(
+                &state,
+                &request,
+                &graph,
+                &sessions,
+                session_id.as_ref(),
+                graph_authority,
+            )
+            .await
+            .0
         };
         match handled {
             Ok(result) => result,
@@ -19698,6 +21368,50 @@ async fn mcp_handler_answer(
     request: &McpToolCallRequest,
     graph: &Arc<kin_db::InMemoryGraph>,
     sessions: &kin_mcp::SessionRegistry,
+    session_id: Option<&SessionId>,
+    graph_authority: RequestGraphAuthority,
+) -> (kin_mcp::Result<kin_mcp::ToolCallResult>, ContextFocalMiss) {
+    // Mutations have already selected the live writer graph, independently of
+    // a session's historical read scope. Preserve that explicit writer target.
+    let scope_session = if mcp_tool_mutates_graph(&request.name) {
+        None
+    } else {
+        session_id
+    };
+    let Some(source_scope) = state
+        .source_scope_for_selected_graph(scope_session, graph, graph_authority)
+        .await
+    else {
+        return (
+            Err(mcp_authority_gap(
+                "selected source scope expired or was replaced",
+            )),
+            ContextFocalMiss::default(),
+        );
+    };
+    let answer = mcp_handler_answer_at(state, request, graph, sessions, source_scope).await;
+    if state
+        .source_scope_for_selected_graph(scope_session, graph, graph_authority)
+        .await
+        != Some(source_scope)
+    {
+        return (
+            Err(mcp_authority_gap(
+                "selected source scope changed during the tool read",
+            )),
+            ContextFocalMiss::default(),
+        );
+    }
+    answer
+}
+
+/// The handler reads source under the scope captured for this graph selection.
+async fn mcp_handler_answer_at(
+    state: &Arc<DaemonState>,
+    request: &McpToolCallRequest,
+    graph: &Arc<kin_db::InMemoryGraph>,
+    sessions: &kin_mcp::SessionRegistry,
+    source_scope: kin_mcp::handlers::common::EntitySourceScope,
 ) -> (kin_mcp::Result<kin_mcp::ToolCallResult>, ContextFocalMiss) {
     let repository_authority = mcp_repository_authority_source(state);
     // Resolved once per answer, so the two `handle_tool_call` arms below cannot
@@ -19719,7 +21433,7 @@ async fn mcp_handler_answer(
                 .and_then(serde_json::Value::as_array)
                 .is_some_and(|entities| !entities.is_empty()));
     if !asks_by_name_or_question {
-        let answer = kin_mcp::handlers::handle_tool_call(
+        let answer = kin_mcp::handlers::handle_tool_call_at(
             &request.name,
             &request.arguments,
             graph.as_ref(),
@@ -19727,6 +21441,7 @@ async fn mcp_handler_answer(
             kin_mcp::SessionAuthorityMode::OfflineFallback,
             repository_authority.as_ref(),
             host.surface(),
+            source_scope,
         )
         .await;
         return (answer, ContextFocalMiss::default());
@@ -19752,7 +21467,7 @@ async fn mcp_handler_answer(
         return (answer, ContextFocalMiss::default());
     }
     let (arguments, focal_miss) = resolve_context_pack_focals(graph.as_ref(), &request.arguments);
-    let answer = kin_mcp::handlers::handle_tool_call(
+    let answer = kin_mcp::handlers::handle_tool_call_at(
         &request.name,
         &arguments,
         graph.as_ref(),
@@ -19760,6 +21475,7 @@ async fn mcp_handler_answer(
         kin_mcp::SessionAuthorityMode::OfflineFallback,
         repository_authority.as_ref(),
         host.surface(),
+        source_scope,
     )
     .await;
     (answer, focal_miss)
@@ -23260,12 +24976,14 @@ async fn lsp_sweep_status(State(state): State<Arc<DaemonState>>) -> impl IntoRes
         })
         .unwrap_or_default();
     let pending = state.lsp_work.pending.load(Ordering::SeqCst);
+    let failed_items = state.lsp_work.failed_items();
     let total = state.lsp_sweep_files_total.load(Ordering::SeqCst);
     let done = state.lsp_sweep_files_done.load(Ordering::SeqCst);
     Json(json!({
         "running": state.lsp_sweep_running.load(Ordering::SeqCst),
         "pending_work": pending,
-        "failed_work": state.lsp_work.failed.load(Ordering::SeqCst),
+        "failed_work": failed_items.len(),
+        "failed_items": failed_items,
         // Language-server query errors on the incremental path. Separate from
         // `failed_work` on purpose: the pass that saw one did complete, its
         // relations are in the graph and nothing requeues the file, so gating
@@ -24582,14 +26300,54 @@ pub fn bind_api_listener_pair(
 /// alive for recovery traffic but cannot receive authority traffic.
 pub async fn serve_warming_until(
     listener: tokio::net::TcpListener,
+    ready_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    serve_warming_with_progress_until(listener, ready_rx, WarmingProgress::default()).await
+}
+
+/// What a daemon that has bound its socket and not yet opened its state is
+/// doing, for the warming surface to report while it does it.
+///
+/// Written by the step the open is running and read by every warming answer,
+/// so a client polling readiness through a long step is told what it is
+/// waiting for rather than only that it is waiting.
+#[derive(Debug, Clone, Default)]
+pub struct WarmingProgress(Arc<std::sync::Mutex<Option<String>>>);
+
+impl WarmingProgress {
+    /// Report `line` as what the opening daemon is doing now.
+    pub fn report(&self, line: &str) {
+        if let Ok(mut current) = self.0.lock() {
+            *current = Some(line.to_string());
+        }
+    }
+
+    /// Report nothing beyond the open itself.
+    pub fn clear(&self) {
+        if let Ok(mut current) = self.0.lock() {
+            *current = None;
+        }
+    }
+
+    /// What the opening daemon reported last, if anything.
+    pub fn current(&self) -> Option<String> {
+        self.0.lock().ok().and_then(|current| current.clone())
+    }
+}
+
+/// [`serve_warming_until`], reporting what `progress` says the open is doing.
+pub async fn serve_warming_with_progress_until(
+    listener: tokio::net::TcpListener,
     mut ready_rx: tokio::sync::watch::Receiver<bool>,
+    progress: WarmingProgress,
 ) {
     let app = Router::new()
         .route("/health", get(warming_health))
         .route("/v2/health", get(warming_health))
         .route("/ready", get(warming_readiness))
         .route("/readiness", get(warming_readiness))
-        .fallback(warming_unavailable);
+        .fallback(warming_unavailable)
+        .with_state(progress);
     let served = axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             while !*ready_rx.borrow() {
@@ -24607,28 +26365,31 @@ pub async fn serve_warming_until(
     }
 }
 
-/// `GET /readiness` while opening: the not-ready verdict clients already poll.
-async fn warming_readiness() -> impl IntoResponse {
+/// `GET /readiness` while opening: the not-ready verdict clients already poll,
+/// with what the open is doing when it reported anything.
+async fn warming_readiness(State(progress): State<WarmingProgress>) -> impl IntoResponse {
     (
         StatusCode::SERVICE_UNAVAILABLE,
         Json(ReadinessResponse {
             ready: false,
             warming: true,
+            progress: progress.current(),
         }),
     )
 }
 
-async fn warming_health() -> impl IntoResponse {
-    (
-        StatusCode::OK,
-        Json(json!({
-            "status": "warming",
-            "process_alive": true,
-            "reader_admitted": false,
-            "ready": false,
-            "warming": true,
-        })),
-    )
+async fn warming_health(State(progress): State<WarmingProgress>) -> impl IntoResponse {
+    let mut body = json!({
+        "status": "warming",
+        "process_alive": true,
+        "reader_admitted": false,
+        "ready": false,
+        "warming": true,
+    });
+    if let Some(progress) = progress.current() {
+        body["progress"] = json!(progress);
+    }
+    (StatusCode::OK, Json(body))
 }
 
 async fn warming_unavailable() -> impl IntoResponse {
@@ -25346,6 +27107,110 @@ pub(crate) mod tests {
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body["effective_secs"], 1800);
         assert_eq!(body["idles_out"], true);
+    }
+
+    /// A session's floor is a lease: it raises the window while held, and
+    /// releasing it returns the daemon to its own window, which the permanent
+    /// raise above never does.
+    #[tokio::test]
+    async fn an_idle_floor_lease_holds_the_window_until_its_session_releases_it() {
+        async fn post(
+            app: Router,
+            uri: &str,
+            body: serde_json::Value,
+        ) -> (StatusCode, serde_json::Value) {
+            let response = tower::ServiceExt::oneshot(
+                app,
+                Request::post(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            (status, serde_json::from_slice(&bytes).unwrap())
+        }
+
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let state = Arc::new(DaemonState::open(initialized.layout).unwrap());
+        state.install_idle_timeout(Some(Duration::from_secs(60)));
+        let app = api_routes().with_state(Arc::clone(&state));
+
+        let (status, body) = post(
+            app.clone(),
+            "/idle-timeout",
+            json!({"at_least_secs": 1800, "client": "kin mcp", "lease": "session-a"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["effective_secs"], 1800);
+        assert_eq!(body["own_secs"], 60);
+        assert_eq!(body["raised"], true);
+        assert_eq!(body["lease"]["floor_secs"], 1800);
+        assert_eq!(body["lease"]["expires_in_secs"], 1800);
+        assert_eq!(state.idle_timeout(), Some(Duration::from_secs(1800)));
+        assert_eq!(
+            state.own_idle_timeout(),
+            Some(Duration::from_secs(60)),
+            "a lease must not change the daemon's own window"
+        );
+
+        // Renewing is idempotent and keeps one lease.
+        let (status, _) = post(
+            app.clone(),
+            "/idle-timeout",
+            json!({"at_least_secs": 1800, "client": "kin mcp", "lease": "session-a"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(state.idle_floor_leases_live(), 1);
+
+        let (status, body) = post(
+            app.clone(),
+            "/idle-timeout/release",
+            json!({"lease": "session-a"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["released"], true);
+        assert_eq!(body["effective_secs"], 60);
+        assert_eq!(
+            state.idle_timeout(),
+            Some(Duration::from_secs(60)),
+            "a released session must hand the daemon back its own idle policy"
+        );
+
+        // Releasing again is not an error; the outcome the caller wants holds.
+        let (status, body) = post(
+            app.clone(),
+            "/idle-timeout/release",
+            json!({"lease": "session-a"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["released"], false);
+
+        // A zero floor and a malformed lease id are refused.
+        let (status, _) = post(
+            app.clone(),
+            "/idle-timeout",
+            json!({"at_least_secs": 0, "lease": "session-b"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = post(
+            app,
+            "/idle-timeout",
+            json!({"at_least_secs": 1800, "lease": "has space"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(state.idle_timeout(), Some(Duration::from_secs(60)));
     }
 
     #[test]
@@ -29681,10 +31546,14 @@ pub(crate) mod tests {
             "the refs read after a publication still returns the pre-commit head, so the slot \
              is pinned rather than keyed on the publication"
         );
+        // The commit installs the authority it wrote in the daemon's held slot,
+        // so the read after it answers from the new publication (asserted above)
+        // through that authority instead of opening the store again.
         assert_eq!(
             state.projection_authority.loads(),
-            after_commit + 1,
-            "the refs read after a publication must itself reload the authority exactly once"
+            after_commit,
+            "the refs read after a publication must answer from the authority the commit \
+             installed, without opening the durable authority again"
         );
     }
 
@@ -31660,6 +33529,34 @@ pub(crate) mod tests {
             "an oversized body must be bounded before authority is read: {response}"
         );
 
+        // A well-formed token is not proof of a held snapshot. Admission must
+        // leave repository authority and freshness checks to the serving path.
+        let cursor = URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&json!({
+                "v": 1, "snapshot": Uuid::nil(), "record": 0,
+                "field": 0, "byte": 0,
+            }))
+            .unwrap(),
+        );
+        let (status, control) = call_repo_mcp_raw(
+            app.clone(),
+            &repo_id,
+            json!({
+                "schema_version": 1,
+                "name": "trace_data_flow",
+                "arguments": { "focal": "bounded", "cursor": cursor }
+            })
+            .to_string(),
+            Some("application/json"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{control}");
+        assert!(
+            control.to_string().contains(BACKEND_FAULT_TEXT),
+            "a syntactically valid cursor must reach authority validation: {control}"
+        );
+
         let (status, control) = call_repo_mcp_raw(
             app,
             &repo_id,
@@ -32144,7 +34041,7 @@ pub(crate) mod tests {
     /// A read that arrives while a repository is still warming is answered at
     /// once with a named, retryable refusal and a `Retry-After`, rather than
     /// being held until its caller's own deadline.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test]
     async fn a_read_arriving_mid_warm_is_answered_warming_at_once() {
         let repo_id = format!("repo-hydration-warming-{}", Uuid::new_v4());
         let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
@@ -32161,7 +34058,7 @@ pub(crate) mod tests {
                 "fn warming_symbol() {}\n",
             )],
         );
-        hosted_view_hydration_test_hooks::close_gate(&repo_id);
+        let _gate_release = hosted_view_hydration_test_hooks::hold_gate(&repo_id);
         let leader = tokio::spawn({
             let state = Arc::clone(&state);
             let repo_id = repo_id.clone();
@@ -32172,12 +34069,49 @@ pub(crate) mod tests {
         });
         until_hosted_hook(|| hosted_view_hydration_test_hooks::hydrations(&repo_id) == 1).await;
 
+        // A warmed leader does not mean this follower's own storage probe has
+        // answered. Freeze only the caller deadline while the real probe runs,
+        // then resume its original 100 ms wait after this caller reaches the
+        // shared flight. Otherwise host load can correctly produce the separate
+        // repo_authority_unavailable refusal before this scenario is established.
+        tokio::time::pause();
+        let follower =
+            load_hosted_repository_mcp_view_within(&state, &repo_id, Duration::from_millis(100));
+        tokio::pin!(follower);
+        let probe_deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            // Poll on this current-thread runtime through the existing join
+            // observation. With no join gate or cache writer, a pending poll
+            // after that observation is waiting on the held flight's answer.
+            std::future::poll_fn(|cx| {
+                assert!(
+                    std::future::Future::poll(follower.as_mut(), cx).is_pending(),
+                    "the held hydration must not answer before its caller deadline"
+                );
+                std::task::Poll::Ready(())
+            })
+            .await;
+            if hosted_view_hydration_test_hooks::join_arrivals(&repo_id) == 2 {
+                break;
+            }
+            assert!(
+                Instant::now() < probe_deadline,
+                "the follower's real publication probe did not reach the flight within 20 s"
+            );
+            // Keep the test runnable so paused time cannot auto-advance while
+            // the blocking publication probe is still queued or reading.
+            tokio::task::yield_now().await;
+        }
         let asked = Instant::now();
-        let warming =
-            load_hosted_repository_mcp_view_within(&state, &repo_id, Duration::from_millis(100))
-                .await
-                .err()
-                .expect("a read during warm-up must be refused, not held");
+        // Resume before awaiting: a live blocking hydration intentionally
+        // prevents automatic paused-clock advancement, and the timer driver
+        // rounds a deadline up to its next tick. Let that original deadline
+        // expire normally instead of stopping at its unrounded instant.
+        tokio::time::resume();
+        let warming = follower
+            .await
+            .err()
+            .expect("a read during warm-up must be refused, not held");
         assert!(asked.elapsed() < Duration::from_secs(2));
         assert_eq!(warming.status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(warming.code, "repo_view_warming");
@@ -32388,6 +34322,9 @@ pub(crate) mod tests {
         ));
 
         // Storage recovers and a later caller proceeds.
+        // The short budget only forces the stalled flight above to time out;
+        // healthy recovery runs under the ordinary admission budget.
+        hosted_view_hydration_test_hooks::clear_budget(&repo_id);
         allowed.store(usize::MAX, Ordering::SeqCst);
         {
             let (released, changed) = &*release;
@@ -33178,11 +35115,8 @@ pub(crate) mod tests {
         let eligible = result["source_read_eligible_records"].as_u64().unwrap();
         let withheld = result["source_reads_withheld"].as_u64().unwrap();
         assert!(
-            attempted > 0
-                && attempted as usize
-                    <= (45_000 / REPO_SCOPED_TRACE_BODY_READ_UNIT_CHARS)
-                        .clamp(1, REPO_SCOPED_TRACE_BODY_READ_CAP),
-            "the hosted trace must budget source reads from the remaining pre-assembly room: {result}"
+            attempted == REPO_SCOPED_TRACE_BODY_READ_CAP as u64,
+            "the hosted trace must retain its structural read cap independently of page bytes: {result}"
         );
         assert!(
             eligible > attempted,
@@ -33193,59 +35127,225 @@ pub(crate) mod tests {
         assert!(
             result["degradations"]
                 .as_array()
-                .is_some_and(|degradations| degradations.iter().any(|degradation| {
-                    degradation["reason"] == "response_budget_source_reads_capped"
-                })),
+                .is_some_and(|degradations| degradations
+                    .iter()
+                    .any(|degradation| { degradation["reason"] == "hosted_source_reads_capped" })),
             "the response must disclose pre-assembly source-read elision: {result}"
         );
     }
 
-    #[test]
-    fn repo_scoped_trace_source_reads_are_charged_after_the_body_free_payload() {
-        let arguments = HashMap::from([("max_chars".to_string(), json!(45_000))]);
-        let budget = kin_mcp::budget::ResponseBudget::from_arguments(&arguments);
-        let roomy = json!({ "chain": [] });
-        let crowded = json!({ "chain": [], "diagnostics": "x".repeat(41_000) });
-        let (roomy_reads, roomy_chars) = hosted_trace_source_read_budget(&roomy, &budget);
-        let (crowded_reads, crowded_chars) = hosted_trace_source_read_budget(&crowded, &budget);
-
-        assert!(
-            roomy_reads > crowded_reads,
-            "roomy={roomy_reads}, crowded={crowded_reads}"
+    #[tokio::test]
+    async fn hosted_trace_pages_preserve_entity_body_and_pin_repo_query_auth_and_truth() {
+        let repo_a = format!("hosted-trace-pages-a-{}", Uuid::new_v4());
+        let repo_b = format!("hosted-trace-pages-b-{}", Uuid::new_v4());
+        let repository_a = RepositoryId::new(repo_a.clone()).unwrap();
+        let repository_b = RepositoryId::new(repo_b.clone()).unwrap();
+        let (state, _working, storage) = replica_state(&repo_a);
+        // Publish the exact entity body. A trailing file line separator is
+        // outside the line excerpt, so it is not part of the expected body.
+        let body = format!(
+            "fn page_target() {{ let text = \"{}\"; }}",
+            "αβ".repeat(2_000)
         );
-        assert!(
-            roomy_chars > crowded_chars,
-            "roomy={roomy_chars}, crowded={crowded_chars}"
+        let (head, entities) = publish_hosted_semantic_change(
+            storage.path(),
+            &repository_a,
+            None,
+            0x8f21,
+            "publish hosted trace pages fixture",
+            &[("page_target", "src/page.rs", &body)],
         );
-        assert_eq!(crowded_reads, 1);
-        assert!(crowded_chars <= 2_000, "crowded={crowded_chars}");
-    }
-
-    #[test]
-    fn repo_scoped_trace_body_claim_follows_the_common_budget_cut() {
-        let result = kin_mcp::ToolCallResult::text(
-            json!({
-                "focal_entity": {
-                    "entity_id": Uuid::new_v4().to_string(),
-                    "body": "x".repeat(8_000)
-                },
-                "chain": [],
-                "bodies_included": true
-            })
-            .to_string(),
+        publish_hosted_semantic_change(
+            storage.path(),
+            &repository_b,
+            None,
+            0x8f22,
+            "publish separate hosted trace pages fixture",
+            &[("other", "src/other.rs", "fn other() {}\n")],
         );
-        let arguments = HashMap::from([("max_chars".to_string(), json!(2_000))]);
-        let budget = kin_mcp::budget::ResponseBudget::from_arguments(&arguments);
-        let bounded = bound_mcp_tool_result(result, "trace_data_flow", &budget);
-        let text = match bounded.content.first().unwrap() {
-            kin_mcp::ContentBlock::Text { text } => text,
+        let view = load_hosted_repository_mcp_view(&state, &repo_a)
+            .await
+            .unwrap();
+        let arguments = json!({
+            "focal": entities[0].to_string(), "direction": "calls", "depth": 1,
+            "include_body": true, "max_chars": 2_000,
+        });
+        // The same semantic source is admitted for a narrow page and a wide
+        // one. Only the transport pager decides how much of it ships at once.
+        let mut narrow_arguments: HashMap<String, serde_json::Value> =
+            serde_json::from_value(arguments.clone()).unwrap();
+        let narrow = hosted_trace_data_flow_result(
+            &HostedSemanticRequest::for_trace(Arc::clone(&view)),
+            &narrow_arguments,
+        )
+        .unwrap();
+        narrow_arguments.insert("max_chars".into(), json!(45_000));
+        let wide = hosted_trace_data_flow_result(
+            &HostedSemanticRequest::for_trace(Arc::clone(&view)),
+            &narrow_arguments,
+        )
+        .unwrap();
+        assert_eq!(narrow.is_error, wide.is_error);
+        let semantic_payload = |result: kin_mcp::ToolCallResult, requested_budget: usize| {
+            assert_ne!(result.is_error, Some(true));
+            assert_eq!(result.content.len(), 1);
+            let kin_mcp::ContentBlock::Text { text } = &result.content[0];
+            let mut payload: serde_json::Value = serde_json::from_str(text).unwrap();
+            // The unpaged result echoes the requested transport ceiling, but
+            // every body and proof record must be independent of that ceiling.
+            assert_eq!(
+                payload
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("max_response_chars"),
+                Some(json!(requested_budget))
+            );
+            payload
         };
-        let payload: serde_json::Value = serde_json::from_str(text).unwrap();
-        assert!(payload["focal_entity"]["body"].is_null(), "{payload}");
-        assert_eq!(
-            payload["bodies_included"], false,
-            "the post-budget response must not claim a body the ladder removed: {payload}"
+        assert!(
+            semantic_payload(narrow, 2_000) == semantic_payload(wide, 45_000),
+            "changing only the page budget must preserve every semantic body and proof record"
         );
+
+        let app = router_with_auth(Arc::clone(&state), Some("first-trace-token".into()));
+        let (status, _, first) = call_repo_mcp_tool(
+            app.clone(),
+            &repo_a,
+            "trace_data_flow",
+            arguments.clone(),
+            Some("first-trace-token"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{first}");
+        let expected_repository = json!({
+            "repo_id": repo_a,
+            "snapshot_identity": view.snapshot_identity(),
+            "graph_root": view.graph_root,
+            "selected_change_id": view.selected_change_id.to_string(),
+        });
+        assert_eq!(first["repository"], expected_repository);
+        let mut page = successful_repo_mcp_payload(first);
+        // Hosted repositories are identified by their selected publication,
+        // never by the local working directory of the serving daemon.
+        assert!(page["_kin"]["repository"].is_null());
+        let first_cursor = page["next_cursor"]
+            .as_str()
+            .expect("body forces paging")
+            .to_string();
+        let mut reconstructed_body = String::new();
+        let mut saw_body = false;
+        for _ in 0..100 {
+            assert!(
+                page.to_string().len() <= 2_000,
+                "{}",
+                page.to_string().len()
+            );
+            assert_eq!(page["_kin"]["page"]["version"], 1);
+            if let Some(rows) = page["readings"].as_array() {
+                for row in rows {
+                    if row["key"] == "focal_entity" {
+                        if let Some(body) = row["value"]["body"].as_str() {
+                            reconstructed_body.push_str(body);
+                            saw_body = true;
+                        }
+                    }
+                }
+            }
+            let fragment = &page["record_fragment"];
+            if fragment["key"] == "focal_entity" && fragment["field"] == "body" {
+                assert_eq!(fragment["encoding"], "utf8");
+                assert_eq!(
+                    fragment["byte_offset"].as_u64(),
+                    Some(reconstructed_body.len() as u64)
+                );
+                reconstructed_body.push_str(fragment["text"].as_str().unwrap());
+                saw_body = true;
+            }
+            let Some(cursor) = page["next_cursor"].as_str() else {
+                break;
+            };
+            let mut next = arguments.clone();
+            next["cursor"] = json!(cursor);
+            let (status, _, response) = call_repo_mcp_tool(
+                app.clone(),
+                &repo_a,
+                "trace_data_flow",
+                next,
+                Some("first-trace-token"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{response}");
+            assert_eq!(response["repository"], expected_repository);
+            page = successful_repo_mcp_payload(response);
+            assert!(page["_kin"]["repository"].is_null());
+        }
+        assert!(page["next_cursor"].is_null(), "all pages must terminate");
+        assert!(saw_body);
+        assert_eq!(
+            reconstructed_body, body,
+            "paging retains the targeted entity body byte for byte"
+        );
+
+        let mut resume = arguments.clone();
+        resume["cursor"] = json!(first_cursor);
+        let mut changed_query = resume.clone();
+        changed_query["depth"] = json!(2);
+        for (route, repo, args, token) in [
+            (
+                app.clone(),
+                repo_a.as_str(),
+                changed_query,
+                "first-trace-token",
+            ),
+            (
+                app.clone(),
+                repo_b.as_str(),
+                resume.clone(),
+                "first-trace-token",
+            ),
+            (
+                router_with_auth(Arc::clone(&state), Some("second-trace-token".into())),
+                repo_a.as_str(),
+                resume.clone(),
+                "second-trace-token",
+            ),
+        ] {
+            let (status, _, response) =
+                call_repo_mcp_tool(route, repo, "trace_data_flow", args, Some(token)).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{response}");
+            assert_eq!(response["error"]["code"], "invalid_trace_cursor");
+        }
+        let mut changed = view.graph.get_entity(&entities[0]).unwrap().unwrap();
+        changed.name = "changed_truth".into();
+        view.graph.upsert_entity(&changed).unwrap();
+        let (status, _, response) = call_repo_mcp_tool(
+            app.clone(),
+            &repo_a,
+            "trace_data_flow",
+            resume.clone(),
+            Some("first-trace-token"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{response}");
+        assert_eq!(response["error"]["code"], "invalid_trace_cursor");
+        publish_hosted_semantic_change(
+            storage.path(),
+            &repository_a,
+            Some(head),
+            0x8f23,
+            "advance hosted trace publication",
+            &[("new_head", "src/new.rs", "fn new_head() {}\n")],
+        );
+        let (status, _, response) = call_repo_mcp_tool(
+            app,
+            &repo_a,
+            "trace_data_flow",
+            resume,
+            Some("first-trace-token"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{response}");
+        assert_eq!(response["error"]["code"], "invalid_trace_cursor");
     }
 
     #[tokio::test]
@@ -38588,9 +40688,9 @@ pub(crate) mod tests {
 
     /// FIR-2672, second finding: two independent reasons, both named. The graph
     /// links only its calls, so the import and reference classes are short and
-    /// decide the state, and the embedding worker has died as well. The line
+    /// decide the state, and a mass deletion is blocked as well. The line
     /// that named only the winner sent a reader to fix the edge gap and never
-    /// told them about the worker, a second thing wrong with the same answer.
+    /// told them about the blocked change, a second thing bounding the answer.
     /// Drop either sentence from the rendering and this goes red.
     #[tokio::test]
     async fn a_degraded_daemon_with_short_coverage_renders_both_reasons() {
@@ -38606,7 +40706,7 @@ pub(crate) mod tests {
             .is_initialized
             .store(true, std::sync::atomic::Ordering::Relaxed);
         state
-            .embed_worker_failed
+            .mass_deletion_blocked
             .store(true, std::sync::atomic::Ordering::Relaxed);
 
         let response = router(Arc::clone(&state))
@@ -38631,8 +40731,8 @@ pub(crate) mod tests {
         let class_gap = rendered
             .find("holds no cross-file import or reference edges")
             .unwrap_or_else(|| panic!("the short classes decide and must be named: {rendered}"));
-        let worker = rendered.find("embed_worker_failed").unwrap_or_else(|| {
-            panic!("the failed worker must stay named beside the class gap: {rendered}")
+        let worker = rendered.find("mass_deletion_blocked").unwrap_or_else(|| {
+            panic!("the blocked mass deletion must stay named beside the class gap: {rendered}")
         });
         assert!(
             class_gap < worker,
@@ -39491,6 +41591,373 @@ pub(crate) mod tests {
         );
         let (status, _) = post_branch_request(hosted, &request, None).await;
         assert_eq!(status, StatusCode::CONFLICT);
+    }
+
+    /// A ref-only transaction that creates `name` at `target`, as a writer
+    /// outside this daemon would build it from its own lease.
+    fn external_ref_transaction(
+        repository_id: &kin_model::RepositoryId,
+        roots: kin_model::RootBundle,
+        name: kin_model::RefName,
+        target: kin_model::RefTarget,
+    ) -> kin_model::RepositoryTransaction {
+        kin_model::RepositoryTransaction {
+            schema_version: kin_model::REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+            operation_id: kin_model::OperationId::new(),
+            repository_id: repository_id.clone(),
+            expected_generation: roots.generation,
+            expected_roots: roots,
+            actor: AuthorId::new("external-authority-test"),
+            reason: "advance outside daemon".to_string(),
+            external_objects: Vec::new(),
+            git_authority_delta: None,
+            changes: Vec::new(),
+            aliases: Vec::new(),
+            ref_mutations: vec![kin_model::RefMutation {
+                name,
+                expected: kin_model::RefExpectation::MustNotExist,
+                new_target: Some(target),
+                policy: kin_model::RefUpdatePolicy::FastForwardOnly,
+            }],
+            default_ref_mutation: None,
+            workspace_mutation: None,
+            local_overlay_delta: None,
+            merge_transaction_delta: None,
+            sealed_observation: None,
+            collaboration_delta: None,
+        }
+    }
+
+    /// Publish one ref beside the daemon through a manager of its own, the way
+    /// the CLI or a second daemon writes, and answer the generation it landed.
+    fn publish_ref_as_another_writer(state: &DaemonState, name: &[u8]) -> u64 {
+        let external =
+            crate::local_repository_authority::ActiveLocalRepositoryAuthority::open(state).unwrap();
+        let transaction = {
+            let lease = external.manager.read_authority();
+            let target = lease
+                .metadata()
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.workspace_id == external.workspace_id)
+                .and_then(|workspace| workspace.base_target.clone())
+                .expect("the fixture workspace has a base to point a ref at");
+            external_ref_transaction(
+                &external.repository_id,
+                lease.roots().clone(),
+                kin_model::RefName::branch(name).unwrap(),
+                target,
+            )
+        };
+        let receipt = external
+            .manager
+            .commit_repository_transaction(transaction)
+            .unwrap();
+        receipt.generation
+    }
+
+    fn durable_ref_names(state: &DaemonState) -> Vec<kin_model::RefName> {
+        let authority =
+            crate::local_repository_authority::ActiveLocalRepositoryAuthority::open(state).unwrap();
+        let lease = authority.manager.read_authority();
+        lease
+            .metadata()
+            .ref_state
+            .refs
+            .iter()
+            .map(|repository_ref| repository_ref.name.clone())
+            .collect()
+    }
+
+    /// Branch commands commit through the authority the daemon holds, and the
+    /// daemon keeps holding what each one wrote.
+    ///
+    /// Every branch command used to open the store for itself, which decodes the
+    /// whole persisted authority and re-verifies every body in repository CAS: on
+    /// a converted Flask store of 26,353 Git objects that open was most of a
+    /// 640-second `kin branch create`. Create, switch away, switch back and
+    /// delete, in a row, now open nothing, and the reader after them borrows the
+    /// authority the last one left behind.
+    ///
+    /// A publication another writer makes between two commands is still found:
+    /// the next command pays exactly one fresh load for it, which is also the
+    /// positive control that this thread's counter sees an open at all, and then
+    /// refuses exactly as a daemon that opened per command refused, over a cursor
+    /// behind the authority it loaded, without writing anything.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn branch_commands_borrow_the_held_authority_until_another_writer_publishes() {
+        use kin_cli::commands::branch::{BranchRequest, BranchResponse};
+
+        let (state, _layout, repository, _main, _feature) =
+            universal_branch_test_state("branch-held-authority");
+        let actor = AuthorId::new("branch-held-authority-test");
+        let generation_before = state
+            .snapshot_generation
+            .load(std::sync::atomic::Ordering::SeqCst);
+        crate::api::held_repository_authority(&state).expect("the fixture must hold an authority");
+
+        let scratch = kin_model::RefName::branch(b"held-scratch").unwrap();
+        let requests = [
+            BranchRequest::Create {
+                name: scratch.clone(),
+                operation_id: kin_model::OperationId::new(),
+                actor: actor.clone(),
+            },
+            BranchRequest::Switch {
+                name: kin_model::RefName::branch(b"feature").unwrap(),
+                operation_id: kin_model::OperationId::new(),
+                actor: actor.clone(),
+            },
+            BranchRequest::Switch {
+                name: kin_model::RefName::branch(b"main").unwrap(),
+                operation_id: kin_model::OperationId::new(),
+                actor: actor.clone(),
+            },
+            BranchRequest::Delete {
+                name: scratch.clone(),
+                operation_id: kin_model::OperationId::new(),
+                actor: actor.clone(),
+            },
+        ];
+        let before = kin_core::authority_opens();
+        for (step, request) in requests.iter().enumerate() {
+            let (status, body) = post_branch_request(Arc::clone(&state), request, None).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "step {step}: {}",
+                String::from_utf8_lossy(&body)
+            );
+            let response: BranchResponse = serde_json::from_slice(&body).unwrap();
+            assert!(response.mutated, "step {step} must publish");
+            assert_eq!(
+                response.authority_generation,
+                Some(generation_before + step as u64 + 1),
+                "step {step}"
+            );
+        }
+        assert_eq!(
+            std::fs::read(repository.join("selected/compose.yaml")).unwrap(),
+            b"services:\n  api:\n    image: main\n",
+            "the two switches must have moved the working tree there and back"
+        );
+        let held = crate::api::held_repository_authority(&state).unwrap();
+        assert_eq!(
+            held.read_authority().roots().generation,
+            generation_before + 4,
+            "the reader after the commands must hold what the last one wrote"
+        );
+        assert_eq!(
+            kin_core::authority_opens() - before,
+            0,
+            "four branch commands and the reader after them must borrow the authority the \
+             daemon holds; any open here re-verified a store this daemon had already verified"
+        );
+
+        let external_generation = publish_ref_as_another_writer(&state, b"external-advance");
+        assert_eq!(external_generation, generation_before + 5);
+
+        let refused = kin_model::RefName::branch(b"after-external").unwrap();
+        let before = kin_core::authority_opens();
+        let (status, body) = post_branch_request(
+            Arc::clone(&state),
+            &BranchRequest::Create {
+                name: refused.clone(),
+                operation_id: kin_model::OperationId::new(),
+                actor,
+            },
+            None,
+        )
+        .await;
+        let body = String::from_utf8_lossy(&body).to_string();
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(
+            body.contains(&format!(
+                "the authority for creating a branch is at generation {external_generation}"
+            )),
+            "the command must have judged the other writer's publication, not the authority it \
+             held before it: {body}"
+        );
+        assert_eq!(
+            kin_core::authority_opens() - before,
+            1,
+            "another writer's publication must cost the next command exactly one fresh load"
+        );
+        let held = crate::api::held_repository_authority(&state).unwrap();
+        assert_eq!(
+            held.read_authority().roots().generation,
+            external_generation
+        );
+        assert_eq!(
+            kin_core::authority_opens() - before,
+            1,
+            "and the reader after it borrows that load"
+        );
+        let refs = durable_ref_names(&state);
+        assert!(refs.contains(&kin_model::RefName::branch(b"external-advance").unwrap()));
+        assert!(
+            !refs.contains(&refused),
+            "a refused command must write nothing"
+        );
+    }
+
+    /// A publication that lands after a command bound the held authority, and
+    /// before it committed, cannot be overwritten through it.
+    ///
+    /// The label read at bind time does not guard that window. The commit's own
+    /// compare-and-swap does: the successor the held manager prepares names the
+    /// durable head it was built on, and the store refuses it under the
+    /// exclusive repository lock once another writer has moved that head. The
+    /// next reader then loads the other writer's publication, not the attempt.
+    #[tokio::test]
+    async fn a_held_authority_another_writer_passed_cannot_publish_over_it() {
+        let state = committed_test_state();
+        let held = crate::api::held_repository_authority(&state).unwrap();
+        let (repository_id, roots, target) = {
+            let lease = held.read_authority();
+            let workspace_id = state.local_repository_workspace_id().unwrap();
+            let target = lease
+                .metadata()
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.workspace_id == workspace_id)
+                .and_then(|workspace| workspace.base_target.clone())
+                .unwrap();
+            (
+                RepositoryId::new(state.cached_repo_id.clone()).unwrap(),
+                lease.roots().clone(),
+                target,
+            )
+        };
+
+        let external_generation = publish_ref_as_another_writer(&state, b"landed-first");
+        assert_eq!(external_generation, roots.generation + 1);
+
+        let stale = kin_model::RefName::branch(b"built-on-a-passed-head").unwrap();
+        let attempt = held.commit_repository_transaction_and_freeze(external_ref_transaction(
+            &repository_id,
+            roots,
+            stale.clone(),
+            target,
+        ));
+        assert!(
+            attempt.is_err(),
+            "a held manager whose head another writer passed published over that writer"
+        );
+        drop(attempt);
+
+        let refs = durable_ref_names(&state);
+        assert!(refs.contains(&kin_model::RefName::branch(b"landed-first").unwrap()));
+        assert!(!refs.contains(&stale));
+        let next = crate::api::held_repository_authority(&state).unwrap();
+        assert!(
+            !Arc::ptr_eq(&held, &next),
+            "the next reader must load the other writer's publication, not keep the manager \
+             whose attempt was refused"
+        );
+        assert_eq!(
+            next.read_authority().roots().generation,
+            external_generation
+        );
+    }
+
+    async fn post_command_commit(state: &Arc<DaemonState>, message: &str) -> serde_json::Value {
+        let response = router(Arc::clone(state))
+            .oneshot(
+                Request::post("/commands/commit")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "operation_id": kin_model::OperationId::new(),
+                            "timestamp": kin_model::Timestamp::now(),
+                            "author": "Test Author <test@example.invalid>",
+                            "message": message,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{message}: {}",
+            String::from_utf8_lossy(&body)
+        );
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    /// `kin commit` plans and publishes through the authority the daemon holds.
+    ///
+    /// The route used to open the store to plan and again to restore binding
+    /// history after publishing, each a decode of the whole persisted authority
+    /// and a re-verification of every body in repository CAS. A warm commit now
+    /// opens nothing and a reader after it borrows what it wrote. A commit after
+    /// another writer's publication pays exactly one fresh load, the positive
+    /// control for the counter, and lands on top of that publication.
+    #[tokio::test]
+    async fn command_commit_borrows_the_held_authority_until_another_writer_publishes() {
+        let state = test_state();
+        let root = state.layout.working_dir().to_path_buf();
+        std::fs::create_dir_all(root.join("notes")).unwrap();
+        std::fs::write(root.join("notes/first.txt"), b"first\n").unwrap();
+        post_command_commit(&state, "warm the held authority").await;
+
+        std::fs::write(root.join("notes/second.txt"), b"second\n").unwrap();
+        let before = kin_core::authority_opens();
+        post_command_commit(&state, "commit through the held authority").await;
+        let warm_generation = crate::api::held_repository_authority(&state)
+            .unwrap()
+            .read_authority()
+            .roots()
+            .generation;
+        assert_eq!(
+            kin_core::authority_opens() - before,
+            0,
+            "a commit and the reader after it must borrow the authority the daemon holds"
+        );
+
+        let external_generation = publish_ref_as_another_writer(&state, b"external-advance");
+        assert_eq!(external_generation, warm_generation + 1);
+
+        std::fs::write(root.join("notes/third.txt"), b"third\n").unwrap();
+        let before = kin_core::authority_opens();
+        let committed = post_command_commit(&state, "commit after another writer").await;
+        let held = crate::api::held_repository_authority(&state).unwrap();
+        assert_eq!(
+            kin_core::authority_opens() - before,
+            1,
+            "another writer's publication must cost the next commit exactly one fresh load, \
+             shared by the reader after it"
+        );
+        let lease = held.read_authority();
+        assert_eq!(
+            lease.roots().generation,
+            external_generation + 1,
+            "the commit must land on the other writer's publication"
+        );
+        let committed_change = committed["change_id"].as_str().unwrap().to_string();
+        let workspace_id = state.local_repository_workspace_id().unwrap();
+        let base = lease
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == workspace_id)
+            .and_then(|workspace| workspace.base_target.clone())
+            .unwrap();
+        assert!(
+            matches!(&base, kin_model::RefTarget::Change { change_id } if change_id.to_string() == committed_change),
+            "the workspace must stand on the commit it just made, found {base:?}"
+        );
+        drop(lease);
+        assert!(durable_ref_names(&state)
+            .contains(&kin_model::RefName::branch(b"external-advance").unwrap()));
     }
 
     #[tokio::test]
@@ -41939,6 +44406,37 @@ pub(crate) mod tests {
             "the count must reach the text surface, not only the JSON: {}",
             resources.text
         );
+    }
+
+    #[tokio::test]
+    async fn resources_report_the_daemons_actual_indexing_pause_and_resume() {
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        for paused in [true, false] {
+            if paused {
+                state.pause_background_embed();
+            } else {
+                state.resume_background_embed();
+            }
+            let response = router(Arc::clone(&state))
+                .oneshot(
+                    Request::post("/commands/resources")
+                        .header("content-type", "application/json")
+                        .body(Body::from(json!({ "json": false }).to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), 512 * 1024)
+                .await
+                .unwrap();
+            let resources: kin_cli::commands::resources::CommandResourcesResponse =
+                serde_json::from_slice(&body).unwrap();
+            assert_eq!(resources.embed_runtime.background_embed_paused, paused);
+        }
     }
 
     /// A daemon that has started no background pass discloses that honestly,
@@ -50336,6 +52834,51 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn lsp_failed_work_status_names_unretried_files_and_clears_completed_retry() {
+        let state = test_state();
+        let failed = crate::state::LspWorkItem::file("src/owed.py", 3);
+        drop(state.lsp_work.reserve_for(failed.clone()));
+        async fn status(state: &Arc<DaemonState>) -> serde_json::Value {
+            let response = router(Arc::clone(state))
+                .oneshot(
+                    Request::get("/lsp/sweep/status")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), 65536)
+                .await
+                .unwrap();
+            serde_json::from_slice(&body).unwrap()
+        }
+        let before = status(&state).await;
+        assert_eq!(before["pending_work"], 0);
+        assert_eq!(before["failed_work"], 1);
+        assert_eq!(
+            before["failed_items"],
+            serde_json::json!([{
+                "kind": "file", "file": "src/owed.py", "source_generation": 3,
+            }])
+        );
+        // Current-source completion supersedes an obsolete generation without
+        // needing this daemon to restart or its counters to be reset.
+        let mut retry = state
+            .lsp_work
+            .reserve_for(crate::state::LspWorkItem::file("src/owed.py", 4));
+        let during = status(&state).await;
+        assert_eq!(during["pending_work"], 1);
+        assert_eq!(during["failed_work"], 1);
+        retry.resolve_completed();
+        drop(retry);
+        let after = status(&state).await;
+        assert_eq!(after["pending_work"], 0);
+        assert_eq!(after["failed_work"], 0);
+        assert_eq!(after["failed_items"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
     async fn graph_only_lsp_sweep_fails_closed() {
         let state = test_state();
         state
@@ -51524,6 +54067,7 @@ pub(crate) mod tests {
                 state: state_name.to_string(),
                 staged_operations: Vec::new(),
                 commit_payload_hash: None,
+                created_at: None,
                 last_activity_at: at,
             }
         }
@@ -51757,6 +54301,7 @@ pub(crate) mod tests {
     include!("api/tests/transaction_owner_revocation.rs");
     include!("api/tests/read_only_session_writes.rs");
     include!("api/tests/hard_index_freshness.rs");
+    include!("api/tests/graph_status_metadata_limits.rs");
     include!("api/tests/mcp_mutate_durability.rs");
     include!("api/tests/mcp_source_base.rs");
     include!("api/tests/entity_source_patch.rs");
@@ -51767,6 +54312,8 @@ pub(crate) mod tests {
     include!("api/tests/same_file_rename_sites.rs");
     include!("api/tests/unchanged_importer_recovery.rs");
     include!("api/tests/local_binding_disclosure.rs");
+    include!("api/tests/refs_source_observation.rs");
+    include!("api/tests/refs_site_parity.rs");
     include!("api/tests/source_observation_determinism.rs");
     include!("api/tests/coherent_source_batch.rs");
     include!("api/tests/lsp_publication_admission.rs");
@@ -53502,6 +56049,19 @@ pub(crate) mod tests {
         assert_eq!(report.embeddings_indexed, scoped_embeddings.indexed);
         assert_eq!(report.embeddings_pending, scoped_embeddings.pending);
         assert_eq!(report.embeddings_total, scoped_embeddings.total);
+        let enrichment = report.enrichment.as_ref().unwrap();
+        assert_eq!(enrichment["scope"]["kind"], "committed_graph");
+        assert_eq!(
+            enrichment["marker_authority"],
+            "unavailable_in_selected_scope"
+        );
+        assert!(enrichment["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|file| file["current_completion"] == "unavailable_in_selected_scope"));
+        assert!(report.durable_entity_count.is_none());
+        assert!(report.durable_relation_count.is_none());
 
         // Scope comes from the graph resolver, not merely from the presence of
         // a header. An unknown session therefore reports the actual HEAD view.
@@ -53522,7 +56082,7 @@ pub(crate) mod tests {
     }
 
     async fn head_graph_status(
-        state: &DaemonState,
+        state: &Arc<DaemonState>,
         graph: &Arc<kin_db::InMemoryGraph>,
     ) -> kin_mcp::ToolCallResult {
         mcp_graph_status_with_stable_authority(
@@ -53650,6 +56210,291 @@ pub(crate) mod tests {
     ) -> kin_mcp::handlers::entities::GraphStatusReport {
         serde_json::from_str(&mcp_result_text(result))
             .unwrap_or_else(|error| panic!("status is not a valid report: {error}: {result:?}"))
+    }
+
+    #[tokio::test]
+    async fn enrichment_status_retries_a_context_payload_write_during_capture() {
+        let state =
+            test_state_with_committed_sources(&[("src/lib.py", "def caller():\n    return 1\n")]);
+        let graph = Arc::clone(&state.graph);
+        let calls = std::cell::Cell::new(0);
+        let validation =
+            kin_model::ResolutionRecord::ContextValidation(kin_model::ContextValidation {
+                language: kin_model::LanguageId::Python,
+                state: kin_model::ContextValidationState::Unverified {
+                    reason: "changed while observing".into(),
+                },
+            });
+        let result = mcp_graph_status_snapshot_after_capture(
+            &state,
+            None,
+            &graph,
+            RequestGraphAuthority::Head,
+            kin_mcp::handlers::entities::GraphStatusScope::Head,
+            &Default::default(),
+            |_| {
+                calls.set(calls.get() + 1);
+                if calls.get() == 1 {
+                    graph
+                        .apply_resolution_record_deltas(&[
+                            kin_model::ResolutionRecordDelta::Added {
+                                new: validation.clone(),
+                            },
+                        ])
+                        .unwrap();
+                }
+            },
+        )
+        .await
+        .unwrap();
+        let report = parse_graph_status(&result);
+        assert!(
+            calls.get() >= 2,
+            "DB truth mutations must force a full new observation"
+        );
+        let enrichment = report.enrichment.unwrap();
+        assert_eq!(enrichment["truth_epoch"], json!(graph.truth_epoch()));
+        assert_eq!(
+            enrichment["files"][0]["contexts"][0]["reason"],
+            "changed while observing"
+        );
+        assert!(!report.completion_attested);
+    }
+
+    #[tokio::test]
+    async fn enrichment_status_cache_keeps_the_whole_observation_and_discloses_replay() {
+        let state =
+            test_state_with_committed_sources(&[("src/lib.py", "def caller():\n    return 1\n")]);
+        let graph = Arc::clone(&state.graph);
+        let settled = parse_graph_status(&head_graph_status(&state, &graph).await);
+        let (mut seed, _) = state
+            .graph_status_settled
+            .get(
+                kin_mcp::handlers::entities::GraphStatusScope::Head,
+                &graph,
+                &[],
+            )
+            .unwrap();
+        seed.details = None;
+        seed.entity_count = 999;
+        state.graph_status_settled.record(
+            kin_mcp::handlers::entities::GraphStatusScope::Head,
+            &graph,
+            seed,
+        );
+        let _guard = state.embedding_work.lock().unwrap();
+        graph
+            .upsert_entity(&test_entity("later", "src/later.py"))
+            .unwrap();
+        let replay = parse_graph_status(&head_graph_status(&state, &graph).await);
+        assert!(replay.stale.is_some());
+        assert_eq!(replay.entity_count, settled.entity_count);
+        assert_eq!(replay.call_sites, settled.call_sites);
+        let mut expected = settled.enrichment.unwrap();
+        expected["current"] = json!(false);
+        assert_eq!(
+            replay.enrichment.unwrap(),
+            expected,
+            "no fresh ledger rows beside cached counts"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_staged_status_is_live_beside_cached_graph_and_cli_observes_owner_liveness() {
+        async fn cli_status(app: Router) -> kin_cli::commands::status::CommandStatusResponse {
+            let response = app
+                .oneshot(
+                    Request::post("/commands/status")
+                        .header("content-type", "application/json")
+                        .body(Body::from(json!({"json":true}).to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), 200_000)
+                .await
+                .unwrap();
+            serde_json::from_slice(&bytes).unwrap()
+        }
+        let state =
+            test_state_with_committed_sources(&[("src/lib.py", "def caller():\n    return 1\n")]);
+        let app = router(Arc::clone(&state));
+        let before = cli_status(app.clone()).await;
+        let settled = mcp_call(app.clone(), "kin_graph_status", json!({"max_chars":60000})).await;
+        assert!(
+            parse_graph_status(&settled).open_transactions.unwrap()["items"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let owner = mcp_test_session(&state);
+        let begin = mcp_call(
+            app.clone(),
+            "kin_transaction_begin",
+            json!({"session_id":owner,"scope":"selected-entity"}),
+        )
+        .await;
+        assert_ne!(begin.is_error, Some(true), "{}", mcp_result_text(&begin));
+        let begin: serde_json::Value = serde_json::from_str(&mcp_result_text(&begin)).unwrap();
+        let transaction = begin["transaction_id"].as_str().unwrap().to_owned();
+        let source = entity_patch_read(&state, &json!("caller")).await;
+        let staged = mcp_call(
+            app.clone(),
+            "kin_transaction_stage",
+            json!({"transaction_id":transaction,"session_id":owner,
+                "operations":[entity_patch_operation(&source,
+                    &[("    return 1\n", "    return 2 # private staged content\n")])]}),
+        )
+        .await;
+        assert_ne!(staged.is_error, Some(true), "{}", mcp_result_text(&staged));
+        {
+            let _embedding = state.embedding_work.lock().unwrap();
+            let replay =
+                mcp_call(app.clone(), "kin_graph_status", json!({"max_chars":60000})).await;
+            let report = parse_graph_status(&replay);
+            assert!(report.stale.is_some());
+            assert_eq!(
+                report.open_transactions.unwrap()["items"][0]["transaction_id"],
+                transaction
+            );
+            assert!(!mcp_result_text(&replay).contains("private staged content"));
+        }
+        let current = cli_status(app.clone()).await;
+        assert_eq!(
+            current.report.workspace.dirty,
+            before.report.workspace.dirty
+        );
+        assert_eq!(
+            current
+                .report
+                .repository
+                .open_transactions
+                .as_ref()
+                .unwrap()
+                .items[0]
+                .transaction_id,
+            transaction
+        );
+        assert!(current.text.contains(&transaction));
+        let ended = app
+            .clone()
+            .oneshot(
+                Request::delete(format!("/session/{owner}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ended.status(), StatusCode::OK);
+        let held = lock_recover(&state.mcp_transactions).len();
+        let after = cli_status(app.clone()).await;
+        assert!(after
+            .report
+            .repository
+            .open_transactions
+            .unwrap()
+            .items
+            .is_empty());
+        let graph = mcp_call(app, "kin_graph_status", json!({"max_chars":60000})).await;
+        assert!(
+            parse_graph_status(&graph).open_transactions.unwrap()["items"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            lock_recover(&state.mcp_transactions).len(),
+            held,
+            "status must not expire orphaned transactions"
+        );
+    }
+
+    #[tokio::test]
+    async fn enrichment_status_cached_revision_cannot_follow_a_same_graph_scope_rebind() {
+        let state = test_state();
+        let graph = Arc::new(kin_db::InMemoryGraph::new());
+        graph
+            .upsert_entity(&test_entity("historical", "src/old.py"))
+            .unwrap();
+        let session = SessionId::new();
+        let old = SemanticChangeId::from_hash(Hash256::from_bytes([0x61; 32]));
+        let new = SemanticChangeId::from_hash(Hash256::from_bytes([0x62; 32]));
+        state
+            .set_session_scope(&session, old.to_string(), old, Arc::clone(&graph))
+            .await;
+        let sample = mcp_graph_status_with_stable_authority(
+            &state,
+            Some(&session),
+            &graph,
+            RequestGraphAuthority::SessionScope,
+            kin_mcp::handlers::entities::GraphStatusScope::TemporalSession,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            parse_graph_status(&sample).enrichment.unwrap()["scope"]["change"],
+            old.to_string()
+        );
+        let _embedding = state.embedding_work.lock().unwrap();
+        let replay = mcp_graph_status_with_stable_authority(
+            &state,
+            Some(&session),
+            &graph,
+            RequestGraphAuthority::SessionScope,
+            kin_mcp::handlers::entities::GraphStatusScope::TemporalSession,
+        )
+        .await
+        .unwrap();
+        assert!(parse_graph_status(&replay).stale.is_some());
+        state
+            .set_session_scope(&session, new.to_string(), new, Arc::clone(&graph))
+            .await;
+        let refused = mcp_graph_status_with_stable_authority(
+            &state,
+            Some(&session),
+            &graph,
+            RequestGraphAuthority::SessionScope,
+            kin_mcp::handlers::entities::GraphStatusScope::TemporalSession,
+        )
+        .await
+        .unwrap();
+        assert_eq!(refused.is_error, Some(true));
+        assert!(mcp_result_text(&refused).contains("selected source scope"));
+    }
+
+    #[tokio::test]
+    async fn enrichment_status_cli_and_mcp_share_admitted_and_missing_dependency_rows() {
+        let state =
+            test_state_with_committed_sources(&[("src/lib.py", "def caller():\n    return 1\n")]);
+        let app = router(Arc::clone(&state));
+        let args = json!({"dependencies":["src/lib.py","missing.py"],"max_chars":60000});
+        let mcp = mcp_call(app.clone(), "kin_graph_status", args.clone()).await;
+        let expected = parse_graph_status(&mcp);
+        let response=app.oneshot(Request::post("/commands/graph").header("content-type","application/json")
+            .body(Body::from(json!({"command":"status_detailed","dependencies":args["dependencies"],"max_chars":60000}).to_string())).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 60000)
+            .await
+            .unwrap();
+        let cli: kin_cli::commands::graph::GraphCommandResponse =
+            serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(cli.enrichment, expected.enrichment);
+        assert_eq!(cli.call_sites, expected.call_sites);
+        let files = cli.enrichment.as_ref().unwrap()["files"]
+            .as_array()
+            .unwrap();
+        assert_eq!(files.len(), 2);
+        let missing = files
+            .iter()
+            .find(|file| {
+                file["projection_path"]
+                    == json!(kin_model::RepoPath::from_utf8("missing.py").unwrap())
+            })
+            .unwrap();
+        assert_eq!(missing["admitted"], false);
+        assert_eq!(missing["proof"], "unverified");
+        assert_eq!(missing["source_reason"], "not_admitted");
     }
 
     /// FIR-2135: a status call that cannot take a live sample answers with the
@@ -55211,21 +58056,16 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn refs_endpoint_tracks_census_hold_without_qualifying_populated_answers() {
-        let state = test_state();
-        seed_cross_file_call_witness(&state);
-        state
-            .graph
-            .upsert_entity(&test_entity("unused_probe", "src/unused.py"))
-            .unwrap();
-        state
-            .is_initialized
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let _readiness = kin_mcp::edge_coverage::test_support::scoped_language_servers(&[
+            kin_model::LanguageId::Python,
+        ]);
+        let (_repo, state) = refs_source_observation_fixture().await;
         let app = router(Arc::clone(&state));
         let hold_path = kin_core::relation_census::census_hold_path(state.layout.root());
         for (held, query, empty) in [
             (false, "unused_probe", true),
             (true, "unused_probe", true),
-            (true, "witness_callee", false),
+            (true, "work", false),
             (false, "unused_probe", true),
         ] {
             if held {
@@ -55248,7 +58088,7 @@ pub(crate) mod tests {
                     Request::post("/commands/refs")
                         .header("content-type", "application/json")
                         .body(Body::from(
-                            json!({"entity": query, "kind": "all"}).to_string(),
+                            json!({"entity": query, "kind": "calls"}).to_string(),
                         ))
                         .unwrap(),
                 )
@@ -55286,7 +58126,7 @@ pub(crate) mod tests {
                 );
             } else {
                 assert!(text.contains("referenced by"), "{text}");
-                assert!(text.contains("witness_caller"), "{text}");
+                assert!(text.contains("run"), "{text}");
                 assert!(result.negative.is_none());
             }
         }
@@ -56036,7 +58876,7 @@ pub(crate) mod tests {
             .is_initialized
             .store(true, std::sync::atomic::Ordering::Relaxed);
         state
-            .embed_worker_failed
+            .mass_deletion_blocked
             .store(true, std::sync::atomic::Ordering::Relaxed);
 
         let response = router(Arc::clone(&state))
@@ -56088,7 +58928,7 @@ pub(crate) mod tests {
              thinner snapshot leaves this empty: {qualifier:?}"
         );
         assert!(
-            qualifier.contains("embed_worker_failed"),
+            qualifier.contains("mass_deletion_blocked"),
             "the line names the signal the verdict disclosed rather than inventing a cause: \
              {qualifier:?}"
         );
@@ -56126,7 +58966,7 @@ pub(crate) mod tests {
             .is_initialized
             .store(true, std::sync::atomic::Ordering::Relaxed);
         state
-            .embed_worker_failed
+            .mass_deletion_blocked
             .store(true, std::sync::atomic::Ordering::Relaxed);
 
         let response = router(Arc::clone(&state))
@@ -56164,7 +59004,7 @@ pub(crate) mod tests {
             "a row that matched nothing by name must not silence the degradation: {qualifier:?}"
         );
         assert!(
-            qualifier.contains("embed_worker_failed"),
+            qualifier.contains("mass_deletion_blocked"),
             "the line names the signal the verdict disclosed: {qualifier:?}"
         );
     }
@@ -56246,7 +59086,7 @@ pub(crate) mod tests {
             .is_initialized
             .store(true, std::sync::atomic::Ordering::Relaxed);
         state
-            .embed_worker_failed
+            .mass_deletion_blocked
             .store(true, std::sync::atomic::Ordering::Relaxed);
 
         let rendered = trace_lines_through_route(&state, "orphan").await;
@@ -56257,7 +59097,7 @@ pub(crate) mod tests {
              nothing at all before: {rendered}"
         );
         assert!(
-            rendered.contains("embed_worker_failed"),
+            rendered.contains("mass_deletion_blocked"),
             "the line names the signal the verdict disclosed rather than inventing a cause: \
              {rendered}"
         );
@@ -56407,16 +59247,124 @@ pub(crate) mod tests {
     /// divergence this ticket closes.
     #[tokio::test]
     async fn a_degraded_daemon_reaches_the_impact_cli_through_the_route() {
+        let _readiness = kin_mcp::edge_coverage::test_support::scoped_language_servers(&[
+            kin_model::LanguageId::Python,
+        ]);
         let state = test_state();
-        // Coverage healthy on purpose, so the degradation is the only reason
-        // left to refuse and the assertion cannot pass for the wrong cause.
-        let caller = test_entity("caller", "src/a.py");
-        let callee = test_entity("callee", "src/b.py");
-        let orphan = test_entity("orphan", "src/orphan.py");
-        for entity in [&caller, &callee, &orphan] {
-            state.graph.upsert_entity(entity).unwrap();
+        // Admit source that actually witnesses all three cross-file classes,
+        // and record the call it makes under the selected proof context.
+        let callee = install_trace_fixture_file(&state, "callee", "src/b.py");
+        let caller_source = "from b import callee\n\ndef caller():\n    return callee()\n";
+        install_repository_file(&state, "src/a.py", caller_source.as_bytes());
+        install_working_copy_file(&state, "src/a.py", caller_source.as_bytes(), false);
+        let caller = derived_entity(&state, "src/a.py", "caller", EntityKind::Function);
+        let caller_module = derived_entity(&state, "src/a.py", "a", EntityKind::Module);
+        let orphan = install_trace_fixture_file(&state, "orphan", "src/unused.py");
+        let call_start = caller_source.rfind("callee()").unwrap();
+        let import_start = caller_source.find("callee").unwrap();
+        for (kind, src, start, line, col) in [
+            (kin_model::RelationKind::Calls, &caller, call_start, 4, 11),
+            (
+                kin_model::RelationKind::References,
+                &caller,
+                call_start,
+                4,
+                11,
+            ),
+            (
+                kin_model::RelationKind::Imports,
+                &caller_module,
+                import_start,
+                1,
+                14,
+            ),
+        ] {
+            state
+                .graph
+                .upsert_relation(&kin_model::Relation {
+                    id: kin_model::RelationId::new(),
+                    kind,
+                    src: kin_model::GraphNodeId::Entity(src.id),
+                    dst: kin_model::GraphNodeId::Entity(callee.id),
+                    confidence: 1.0,
+                    origin: kin_model::RelationOrigin::Lsp,
+                    created_in: None,
+                    import_source: None,
+                    evidence: vec![kin_model::RelationEvidence {
+                        source_span: Some(kin_model::SourceSpan {
+                            file: kin_model::FilePathId::new("src/a.py"),
+                            start_byte: start,
+                            end_byte: start + "callee".len(),
+                            start_line: line,
+                            start_col: col,
+                            end_line: line,
+                            end_col: col + "callee".len() as u32,
+                        }),
+                        parser_rule: Some("lsp_definition".into()),
+                        token: Some("callee".into()),
+                        source_path: Some("b".into()),
+                        resolved_path: Some("src/b.py".into()),
+                        ..Default::default()
+                    }],
+                })
+                .unwrap();
         }
-        link_every_class(&state, &caller, &callee);
+        let context = kin_model::ProofContext {
+            language: kin_model::LanguageId::Python,
+            resolver: "lsp:fixture".into(),
+            resolver_version: "1".into(),
+            configuration_hash: kin_model::Hash256::from_bytes([1; 32]),
+            environment_hash: kin_model::Hash256::from_bytes([2; 32]),
+            environment_summary: String::new(),
+        };
+        let proof = kin_model::ResolutionRecord::ProofContext(context.clone());
+        let mut records = vec![
+            proof.clone(),
+            kin_model::ResolutionRecord::ContextValidation(kin_model::ContextValidation {
+                language: kin_model::LanguageId::Python,
+                state: kin_model::ContextValidationState::Validated { context },
+            }),
+        ];
+        for entity in state.graph.list_all_entities().unwrap() {
+            let Some(span) = entity.span.as_ref() else {
+                continue;
+            };
+            let source = std::fs::read(state.layout.working_dir().join(&span.file.0)).unwrap();
+            let body = &source[span.start_byte as usize..span.end_byte as usize];
+            records.push(kin_model::ResolutionRecord::CallSites(
+                kin_model::CallSiteLedger {
+                    caller: entity.id,
+                    behavior_hash: entity.fingerprint.behavior_hash,
+                    body_hash: kin_blobs::digest(body),
+                    context: proof.id(),
+                    census: u32::from(entity.id == caller.id),
+                    sites: if entity.id == caller.id {
+                        vec![kin_model::CallSite {
+                            offset: (call_start - span.start_byte) as u32,
+                            length: "callee".len() as u32,
+                            state: kin_model::CallSiteState::ProvenTarget { target: callee.id },
+                        }]
+                    } else {
+                        Vec::new()
+                    },
+                },
+            ));
+        }
+        state
+            .graph
+            .apply_transaction_delta(&kin_model::TransactionDelta {
+                resolution_record_deltas: records
+                    .into_iter()
+                    .map(|new| kin_model::ResolutionRecordDelta::Added { new })
+                    .collect(),
+                ..Default::default()
+            })
+            .unwrap();
+        let calls = kin_mcp::call_sites::calls_evidence_for(state.graph.as_ref(), &orphan).unwrap();
+        assert!(
+            calls.settled,
+            "the fixture must have complete call evidence: {calls:?}"
+        );
         state
             .is_initialized
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -56506,6 +59454,113 @@ pub(crate) mod tests {
                 .as_array()
                 .is_some_and(|signals| signals.contains(&serde_json::json!("embed_worker_failed"))),
             "the flag stays disclosed where it does not bound: {verdict}"
+        );
+    }
+
+    #[test]
+    fn analysis_epochs_require_both_selected_truth_and_settled_writer_authority() {
+        let state = test_state();
+        let scoped = kin_db::InMemoryGraph::from_snapshot(state.graph.to_snapshot()).unwrap();
+        let mut settle = NameReadWait::begin(&state, &scoped);
+        let before = settle.sample_analysis(&state, &scoped, RequestGraphAuthority::SessionScope);
+        assert!(before.is_current(&state, &scoped));
+
+        let writer = state.begin_graph_authority_mutation();
+        assert_eq!(scoped.truth_epoch(), before.truth);
+        assert!(!before.is_current(&state, &scoped));
+        let during = settle.sample_analysis(&state, &scoped, RequestGraphAuthority::SessionScope);
+        assert!(!during.is_current(&state, &scoped));
+        drop(writer);
+        assert!(!before.is_current(&state, &scoped));
+        assert!(!during.is_current(&state, &scoped));
+
+        let after = settle.sample_analysis(&state, &scoped, RequestGraphAuthority::SessionScope);
+        let writer_epoch = state.stable_graph_authority_epoch();
+        scoped
+            .upsert_entity(&test_entity("scoped_only", "src/scoped.py"))
+            .unwrap();
+        assert_eq!(state.stable_graph_authority_epoch(), writer_epoch);
+        assert!(!after.is_current(&state, &scoped));
+
+        let pending = state.begin_pending_admission();
+        let scoped_epoch =
+            settle.sample_analysis(&state, &scoped, RequestGraphAuthority::SessionScope);
+        assert!(scoped_epoch.is_current(&state, &scoped));
+        let head_epoch = settle.sample_analysis(&state, &state.graph, RequestGraphAuthority::Head);
+        assert!(!head_epoch.is_current(&state, &state.graph));
+        drop(pending);
+    }
+
+    #[tokio::test]
+    async fn populated_scoped_impact_waits_for_writer_and_reobserves_ledger() {
+        let state = test_state();
+        let caller = test_entity("caller", "src/caller.py");
+        let callee = test_entity("callee", "src/callee.py");
+        state.graph.upsert_entity(&caller).unwrap();
+        state.graph.upsert_entity(&callee).unwrap();
+        link_every_class(&state, &caller, &callee);
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        state.set_xref_writer_drain_ceiling_for_test(Duration::from_secs(5));
+        let scoped =
+            Arc::new(kin_db::InMemoryGraph::from_snapshot(state.graph.to_snapshot()).unwrap());
+        let session = SessionId::new();
+        let revision = SemanticChangeId::from_hash(Hash256::from_bytes([93; 32]));
+        state
+            .set_session_scope(
+                &session,
+                revision.to_string(),
+                revision,
+                Arc::clone(&scoped),
+            )
+            .await;
+        let writer = state.begin_graph_authority_mutation();
+        let response = router(Arc::clone(&state)).oneshot(
+            Request::post("/impact")
+                .header("content-type", "application/json")
+                .header("X-Kin-Session", session.to_string())
+                .body(Body::from(
+                    json!({"entity": "callee", "depth": 2}).to_string(),
+                ))
+                .unwrap(),
+        );
+        tokio::pin!(response);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut response)
+                .await
+                .is_err(),
+            "a populated scoped answer must not escape an active writer"
+        );
+
+        let mut pending = test_entity("new_pending", "src/pending.py");
+        pending.span.as_mut().unwrap().end_byte = 3;
+        scoped.upsert_entity(&pending).unwrap();
+        drop(writer);
+        let response = tokio::time::timeout(Duration::from_secs(5), response)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let result: kin_cli::commands::impact::ImpactResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert!(result
+            .lines
+            .iter()
+            .any(|line| line.contains("1 local entities impacted")));
+        assert!(result.lines.iter().any(|line| line.contains("caller")));
+        let enrichment = result
+            .enrichment
+            .expect("populated impact carries its ledger observation");
+        assert!(
+            enrichment
+                .pending_entities
+                .iter()
+                .any(|entity| entity.entity_id == pending.id),
+            "the retried walk must disclose the ledger added before the writer finished"
         );
     }
 
@@ -63282,11 +66337,20 @@ pub(crate) mod tests {
             body["cross_repo"]["authority_roots"][provider_repo_id.as_str()],
             provider_root
         );
-        assert!(body["references"].as_array().is_some_and(|references| {
-            references.iter().any(|reference| {
-                reference["name"] == "run_task" && reference["file_path"] == "[consumer] src/app.rs"
-            })
-        }));
+        // A federated row is addressed by the repo-qualified projection of the
+        // other repository's entity; it carries no local id, file path or line.
+        assert!(
+            body["references"].as_array().is_some_and(|references| {
+                references.iter().any(|reference| {
+                    reference["name"] == "run_task"
+                        && reference["projection"]["path"] == "[consumer] src/app.rs"
+                        && reference.get("file_path").is_none()
+                        && reference.get("start_line").is_none()
+                        && reference.get("reference_lines").is_none()
+                })
+            }),
+            "{body}"
+        );
 
         server.abort();
     }
@@ -63359,6 +66423,9 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn daemon_mcp_bulk_absence_accepts_admitted_source_with_complete_federation() {
+        let _readiness = kin_mcp::edge_coverage::test_support::scoped_language_servers(&[
+            kin_model::LanguageId::Python,
+        ]);
         let state = test_state();
         install_admitted_query_sources(&state, &[
             ("src/target.py", "def target(value):\n    return value\n"),
@@ -64062,6 +67129,191 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn selected_trace_keeps_pinned_source_scope_through_same_graph_rebind() {
+        let old_body = "def target():\n    return 41\n";
+        let state = test_state_with_committed_sources(&[("lib.py", old_body)]);
+        let binding = state.local_repository_authority_binding().unwrap();
+        let old = kin_cli::commands::ref_lookup::resolve_ref(
+            state.graph.as_ref(),
+            &binding,
+            Some("HEAD"),
+        )
+        .unwrap();
+        let app = router(Arc::clone(&state));
+        install_working_copy_file(&state, "lib.py", b"def target():\n    return 99\n", false);
+        let current = commit_through_api(
+            &app,
+            kin_model::OperationId::new(),
+            "change current source before pinning trace",
+        )
+        .await;
+        assert_ne!(current, old);
+        let authority = projection_repository_authority(&state).unwrap();
+        let historical = Arc::new(kin_core::build_graph_at_ref(&authority.manager, &old).unwrap());
+        let target = historical
+            .query_entities(&kin_model::EntityFilter {
+                name_pattern: Some("target".into()),
+                ..Default::default()
+            })
+            .unwrap()
+            .into_iter()
+            .find(|entity| entity.name == "target")
+            .unwrap();
+        let span = target.span.unwrap();
+        let expected_body = &old_body[span.start_byte..span.end_byte];
+        let session = SessionId::new();
+        state
+            .set_session_scope(&session, old.to_string(), old, Arc::clone(&historical))
+            .await;
+        let (stamp, source_scope) = trace_page_binding(
+            &state,
+            Some(&session),
+            &historical,
+            RequestGraphAuthority::SessionScope,
+        )
+        .await
+        .unwrap();
+        state
+            .set_session_scope(
+                &session,
+                current.to_string(),
+                current,
+                Arc::clone(&historical),
+            )
+            .await;
+        let arguments: HashMap<String, serde_json::Value> = serde_json::from_value(json!({
+            "focal": "target", "depth": 1, "include_body": true, "max_chars": 200_000,
+        }))
+        .unwrap();
+        let budget = kin_mcp::budget::ResponseBudget::from_arguments(&arguments);
+        let result = mcp_tools_call_selected(
+            Arc::clone(&state),
+            McpToolCallRequest {
+                name: "trace_data_flow".into(),
+                arguments,
+            },
+            Some(session),
+            Arc::clone(&historical),
+            RequestGraphAuthority::SessionScope,
+            Some(source_scope),
+            false,
+            budget,
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_ne!(result.is_error, Some(true), "{}", mcp_result_text(&result));
+        let trace: serde_json::Value = serde_json::from_str(&mcp_result_text(&result)).unwrap();
+        assert_eq!(trace["source_change_id"], old.to_string(), "{trace}");
+        assert_eq!(trace["focal_entity"]["body"], expected_body, "{trace}");
+        assert!(!trace.to_string().contains("return 99"), "{trace}");
+        // An A -> B -> A rebind can leave the same final stamp. The worker
+        // must therefore use its held scope rather than resample mid-read.
+        state
+            .set_session_scope(&session, old.to_string(), old, Arc::clone(&historical))
+            .await;
+        assert_eq!(
+            trace_page_authority(
+                &state,
+                Some(&session),
+                &historical,
+                RequestGraphAuthority::SessionScope,
+            )
+            .await
+            .unwrap(),
+            stamp
+        );
+    }
+
+    #[tokio::test]
+    async fn historical_trace_keeps_committed_bodies_after_source_changes_and_deletion() {
+        let old_body = "def target():\n    return 41\n\ndef caller():\n    return target() + 1\n";
+        let new_body = "# shifted current source\n\ndef target():\n    return 99\n\ndef caller():\n    return target() + 2\n";
+        let state = test_state_with_committed_sources(&[("lib.py", old_body)]);
+        let binding = state.local_repository_authority_binding().unwrap();
+        let old = kin_cli::commands::ref_lookup::resolve_ref(
+            state.graph.as_ref(),
+            &binding,
+            Some("HEAD"),
+        )
+        .unwrap();
+        let authority = projection_repository_authority(&state).unwrap();
+        let historical = Arc::new(kin_core::build_graph_at_ref(&authority.manager, &old).unwrap());
+        let expected_body = |name: &str| {
+            let entity = historical
+                .query_entities(&kin_model::EntityFilter {
+                    name_pattern: Some(name.to_owned()),
+                    ..Default::default()
+                })
+                .unwrap()
+                .into_iter()
+                .find(|entity| entity.name == name)
+                .unwrap();
+            let span = entity.span.unwrap();
+            old_body[span.start_byte..span.end_byte].to_owned()
+        };
+        let target_body = expected_body("target");
+        let caller_body = expected_body("caller");
+        let session = SessionId::new();
+        state
+            .set_session_scope(&session, old.to_string(), old, historical)
+            .await;
+        let app = router(Arc::clone(&state));
+        let query = json!({
+            "focal": "target", "direction": "callers", "depth": 1,
+            "include_body": true, "max_chars": 200_000,
+        });
+        for deleted in [false, true] {
+            if deleted {
+                std::fs::remove_file(state.layout.working_dir().join("lib.py")).unwrap();
+            } else {
+                install_working_copy_file(&state, "lib.py", new_body.as_bytes(), false);
+            }
+            let current = commit_through_api(
+                &app,
+                kin_model::OperationId::new(),
+                if deleted {
+                    "delete current source"
+                } else {
+                    "change current source"
+                },
+            )
+            .await;
+            assert_ne!(current, old);
+            let result = mcp_call_as(app.clone(), "trace_data_flow", query.clone(), session).await;
+            assert_ne!(result.is_error, Some(true), "{}", mcp_result_text(&result));
+            let trace: serde_json::Value = serde_json::from_str(&mcp_result_text(&result)).unwrap();
+            assert_eq!(trace["source_change_id"], old.to_string(), "{trace}");
+            assert_eq!(
+                trace["_kin"]["graph_as_of"],
+                json!({"change_id": old.to_string()})
+            );
+            assert!(trace["_kin"]["graph_state"]["entity_count"].is_null());
+            assert!(trace["_kin"]["durability"].is_null());
+            assert_eq!(trace["focal_entity"]["body"], target_body, "{trace}");
+            assert_eq!(
+                trace["focal_entity"]["span_coherence"],
+                "coherent_by_construction"
+            );
+            let callers = trace["chain"].as_array().unwrap();
+            let caller = callers
+                .iter()
+                .find(|step| step["entity_name"] == "caller")
+                .expect("the old committed caller remains in the trace");
+            assert_eq!(caller["body"], caller_body, "{trace}");
+            assert_eq!(caller["span_coherence"], "coherent_by_construction");
+            assert!(!trace.to_string().contains("return 99"), "{trace}");
+            assert!(!trace.to_string().contains("target() + 2"), "{trace}");
+            // The held historical projection reuses the daemon's validated
+            // authority. Another trace at this publication cannot reopen it.
+            let loads = state.projection_authority.loads();
+            let repeat = mcp_call_as(app.clone(), "trace_data_flow", query.clone(), session).await;
+            assert_ne!(repeat.is_error, Some(true), "{}", mcp_result_text(&repeat));
+            assert_eq!(state.projection_authority.loads(), loads);
+        }
+    }
+
+    #[tokio::test]
     async fn historical_reference_source_uses_selected_revision_with_and_without_snippets() {
         let old_body = "def target():\n    return 41\n\ndef caller():\n    return target() + 1\n";
         let new_body = "# shifted current source\n\ndef target():\n    return 99\n\ndef caller():\n    return target() + 2\n";
@@ -64212,6 +67464,94 @@ pub(crate) mod tests {
             mcp_result_text(&current_result)
         );
         assert!(mcp_result_text(&current_result).contains("target() + 2"));
+    }
+
+    #[tokio::test]
+    async fn mcp_handler_rejects_lost_selected_source_scope_before_dispatch() {
+        let state = test_state();
+        let session = SessionId::new();
+        let selected = Arc::new(kin_db::InMemoryGraph::new());
+        let revision = SemanticChangeId::from_hash(Hash256::from_bytes([0x49; 32]));
+        let sessions = kin_mcp::SessionRegistry::new();
+        // Reaching ToolNotFound proves the valid-scope control dispatched. A
+        // lost scope must instead refuse before a handler can use HEAD source.
+        let request = McpToolCallRequest {
+            name: "test_unknown_source_scope_tool".into(),
+            arguments: HashMap::new(),
+        };
+        state
+            .set_session_scope(
+                &session,
+                revision.to_string(),
+                revision,
+                Arc::clone(&selected),
+            )
+            .await;
+        let (valid, _) = mcp_handler_answer(
+            &state,
+            &request,
+            &selected,
+            &sessions,
+            Some(&session),
+            RequestGraphAuthority::SessionScope,
+        )
+        .await;
+        assert!(matches!(valid, Err(kin_mcp::McpError::ToolNotFound(_))));
+
+        let (wrong_head, _) = mcp_handler_answer(
+            &state,
+            &request,
+            &state.graph,
+            &sessions,
+            Some(&session),
+            RequestGraphAuthority::Head,
+        )
+        .await;
+        assert!(wrong_head
+            .unwrap_err()
+            .to_string()
+            .contains("selected source scope expired or was replaced"));
+        state
+            .session_scopes
+            .write()
+            .await
+            .get_mut(&session)
+            .unwrap()
+            .ttl = Duration::ZERO;
+        let (expired, _) = mcp_handler_answer(
+            &state,
+            &request,
+            &selected,
+            &sessions,
+            Some(&session),
+            RequestGraphAuthority::SessionScope,
+        )
+        .await;
+        assert!(expired
+            .unwrap_err()
+            .to_string()
+            .contains("selected source scope expired or was replaced"));
+        state
+            .set_session_scope(
+                &session,
+                revision.to_string(),
+                revision,
+                Arc::new(kin_db::InMemoryGraph::new()),
+            )
+            .await;
+        let (replaced, _) = mcp_handler_answer(
+            &state,
+            &request,
+            &selected,
+            &sessions,
+            Some(&session),
+            RequestGraphAuthority::SessionScope,
+        )
+        .await;
+        assert!(replaced
+            .unwrap_err()
+            .to_string()
+            .contains("selected source scope expired or was replaced"));
     }
 
     #[tokio::test]
@@ -64848,6 +68188,46 @@ pub(crate) mod tests {
         );
     }
 
+    /// The production wait must span the measured 37,158 ms publication,
+    /// not only the short admission used by the route regression. Pause only
+    /// the writer window so this covers its full duration without making the
+    /// suite wait for it in real time.
+    #[tokio::test]
+    async fn a_reference_read_waits_through_the_measured_publication_window() {
+        let (state, target) = reference_fixture();
+        let arguments = find_references_arguments(&target);
+        let writer = state.begin_graph_authority_mutation();
+        tokio::time::pause();
+        let read = mcp_find_references_with_stable_authority(
+            &state,
+            None,
+            Arc::clone(&state.graph),
+            RequestGraphAuthority::Head,
+            &arguments,
+            |_| {},
+        );
+        tokio::pin!(read);
+        tokio::select! {
+            result = &mut read => panic!(
+                "the reference read returned while the measured publication still held authority: {result:?}"
+            ),
+            _ = tokio::time::sleep(Duration::from_millis(37_158)) => {}
+        }
+        drop(writer);
+        tokio::time::resume();
+
+        let answer = read
+            .await
+            .expect("the read answers once publication finishes");
+        assert_ne!(answer.is_error, Some(true));
+        let body: serde_json::Value = serde_json::from_str(&mcp_result_text(&answer)).unwrap();
+        assert_eq!(body["focal_entity"]["id"], json!(target.id.to_string()));
+        assert!(
+            degradation_labels(&body).contains(&"graph_authority:retry".to_string()),
+            "the answer must disclose that it waited for the writer: {body}"
+        );
+    }
+
     /// A name read under writer churn naps between attempts, and the nap never
     /// authorizes an attempt once the read's limit has passed.
     ///
@@ -65013,11 +68393,23 @@ pub(crate) mod tests {
             environment_hash: kin_model::Hash256::from_bytes([2; 32]),
             environment_summary: String::new(),
         });
-        let mut deltas = Vec::new();
-        if state.graph.get_resolution_record(&context.id()).is_none() {
-            deltas.push(kin_model::ResolutionRecordDelta::Added {
-                new: context.clone(),
+        // The selected graph validates the context the ledgers name, as a sweep
+        // that proved under it records, or every ledger reads as proven under an
+        // unverified context.
+        let validation =
+            kin_model::ResolutionRecord::ContextValidation(kin_model::ContextValidation {
+                language: kin_model::LanguageId::Python,
+                state: kin_model::ContextValidationState::Validated {
+                    context: context.as_proof_context().unwrap().clone(),
+                },
             });
+        let mut deltas = Vec::new();
+        for record in [&context, &validation] {
+            if state.graph.get_resolution_record(&record.id()).is_none() {
+                deltas.push(kin_model::ResolutionRecordDelta::Added {
+                    new: record.clone(),
+                });
+            }
         }
         for entity in state.graph.list_all_entities().unwrap() {
             if entity.span.is_none() {
@@ -65046,6 +68438,345 @@ pub(crate) mod tests {
 
     fn find_references_arguments(target: &Entity) -> HashMap<String, serde_json::Value> {
         serde_json::from_value(json!({ "entity_id": target.id.to_string() })).unwrap()
+    }
+
+    fn reference_page_request(
+        target: &Entity,
+        cursor: Option<&str>,
+        max_chars: usize,
+    ) -> McpToolCallRequest {
+        let mut arguments = find_references_arguments(target);
+        arguments.insert("max_chars".into(), json!(max_chars));
+        if let Some(cursor) = cursor {
+            arguments.insert("cursor".into(), json!(cursor));
+        }
+        McpToolCallRequest {
+            name: "find_references".into(),
+            arguments,
+        }
+    }
+
+    fn reference_page_body(result: kin_mcp::ToolCallResult) -> serde_json::Value {
+        assert_ne!(result.is_error, Some(true), "{}", mcp_result_text(&result));
+        serde_json::from_str(&mcp_result_text(&result)).unwrap()
+    }
+
+    /// Repository identity is part of the frozen answer, including when the
+    /// response fits without paging. The same root serves committed session
+    /// graphs, but their revision must never be replaced by HEAD's generation.
+    #[tokio::test]
+    async fn reference_and_trace_pages_keep_repository_and_selected_graph_identity() {
+        let state = test_state();
+        let ids = install_trace_chain(&state, 2).await;
+        let binding = state.local_repository_authority_binding().unwrap();
+        let revision = kin_cli::commands::ref_lookup::resolve_ref(
+            state.graph.as_ref(),
+            &binding,
+            Some("HEAD"),
+        )
+        .unwrap();
+        let session = SessionId::new();
+        state
+            .set_session_scope(
+                &session,
+                revision.to_string(),
+                revision,
+                Arc::new(kin_db::InMemoryGraph::from_snapshot(state.graph.to_snapshot()).unwrap()),
+            )
+            .await;
+        let root = state.layout.working_dir().canonicalize().unwrap();
+        assert_eq!(
+            daemon_health_snapshot(&state).await["repo_root"],
+            root.display().to_string(),
+            "the health source used to capture page identity names the resolved repository"
+        );
+        let client_root = std::path::Path::new("/a-different-client-workspace");
+        let expected_repository = serde_json::to_value(
+            kin_mcp::first_contact::repository_identity(&root, Some(client_root)),
+        )
+        .unwrap();
+        let app = router(Arc::clone(&state));
+        let mut saw_continuation = false;
+        let mut checked_client_binding = std::collections::HashSet::new();
+        for selected_session in [None, Some(session)] {
+            for (tool, focal, rows, empty) in [
+                ("find_references", ids[1], "references", false),
+                ("find_references", ids[0], "references", true),
+                ("trace_data_flow", ids[0], "chain", false),
+                ("trace_data_flow", ids[1], "chain", true),
+            ] {
+                let call = |arguments| {
+                    let app = app.clone();
+                    async move {
+                        let result = match selected_session {
+                            Some(session) => mcp_call_as(app, tool, arguments, session).await,
+                            None => call_mcp_tool_result(app, tool, arguments).await,
+                        };
+                        reference_page_body(result)
+                    }
+                };
+                let mut query = if tool == "find_references" {
+                    json!({"entity_id": focal.to_string(), "max_chars": 60_000})
+                } else {
+                    json!({"focal": focal.to_string(), "direction": "calls",
+                        "depth": 1, "max_chars": 60_000})
+                };
+                query["__kin_client_root"] = json!(client_root);
+                let full = call(query.clone()).await;
+                assert_eq!(full["_kin"]["page"]["complete"], true, "{full}");
+                assert_eq!(full[rows].as_array().unwrap().is_empty(), empty, "{full}");
+                assert_eq!(full["_kin"]["repository"], expected_repository, "{full}");
+                let graph_as_of = full["_kin"]["graph_as_of"].clone();
+                assert!(graph_as_of.is_object(), "{full}");
+                if selected_session.is_some() {
+                    assert_eq!(graph_as_of, json!({"change_id": revision.to_string()}));
+                }
+                query["max_chars"] = json!(2_000);
+                let mut page = call(query.clone()).await;
+                for _ in 0..200 {
+                    assert!(page.to_string().len() <= 2_000, "{page}");
+                    assert_eq!(page["_kin"]["repository"], expected_repository, "{page}");
+                    assert_eq!(page["_kin"]["graph_as_of"], graph_as_of, "{page}");
+                    let Some(cursor) = page["next_cursor"].as_str() else {
+                        break;
+                    };
+                    saw_continuation = true;
+                    query["cursor"] = json!(cursor);
+                    if checked_client_binding.insert(tool) {
+                        let mut changed_client = query.clone();
+                        changed_client["__kin_client_root"] = json!("/another-client");
+                        let refused = match selected_session {
+                            Some(session) => {
+                                mcp_call_as(app.clone(), tool, changed_client, session).await
+                            }
+                            None => call_mcp_tool_result(app.clone(), tool, changed_client).await,
+                        };
+                        assert_eq!(
+                            refused.is_error,
+                            Some(true),
+                            "a cursor binds its client identity"
+                        );
+                    }
+                    page = call(query.clone()).await;
+                }
+                assert!(
+                    page["next_cursor"].is_null(),
+                    "the bounded fixture must finish"
+                );
+            }
+        }
+        assert!(
+            saw_continuation,
+            "the contract must exercise retained pages"
+        );
+    }
+
+    #[tokio::test]
+    async fn reference_pages_capture_the_successful_retry_not_the_first_attempt() {
+        let (state, target) = reference_fixture();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let first_truth = state.graph.truth_epoch();
+        let mut attempts = 0;
+        let result = reference_tools_page_after_root(
+            axum::http::HeaderMap::new(),
+            Arc::clone(&state),
+            reference_page_request(&target, None, 2000),
+            |attempt| {
+                attempts += 1;
+                if attempt == 0 {
+                    let _writer = state.begin_graph_authority_mutation();
+                    state
+                        .graph
+                        .upsert_entity(&test_entity("newly_admitted", "src/new.py"))
+                        .unwrap();
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(attempts, 2, "the first read must have been discarded");
+        assert_ne!(state.graph.truth_epoch(), first_truth);
+        let mut page = reference_page_body(result);
+        assert!(page["next_cursor"].is_string(), "fixture must page: {page}");
+        let mut callers = Vec::new();
+        for _ in 0..100 {
+            callers.extend(page["references"].as_array().into_iter().flatten().cloned());
+            let Some(cursor) = page["next_cursor"].as_str() else {
+                break;
+            };
+            page = reference_page_body(
+                reference_tools_page(
+                    axum::http::HeaderMap::new(),
+                    Arc::clone(&state),
+                    reference_page_request(&target, Some(cursor), 2000),
+                )
+                .await
+                .unwrap(),
+            );
+        }
+        assert!(page["next_cursor"].is_null(), "all pages must terminate");
+        assert_eq!(callers.len(), 1);
+        assert_eq!(callers[0]["name"], "sweep_caller");
+    }
+
+    #[tokio::test]
+    async fn reference_cursor_refuses_a_held_writer_before_truth_changes_and_after_aba() {
+        let (state, target) = reference_fixture();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let first = reference_page_body(
+            reference_tools_page(
+                axum::http::HeaderMap::new(),
+                Arc::clone(&state),
+                reference_page_request(&target, None, 2000),
+            )
+            .await
+            .unwrap(),
+        );
+        let cursor = first["next_cursor"].as_str().expect("fixture must page");
+        let truth = state.graph.truth_epoch();
+        let writer = state.begin_graph_authority_mutation();
+        let held = reference_tools_page(
+            axum::http::HeaderMap::new(),
+            Arc::clone(&state),
+            reference_page_request(&target, Some(cursor), 2000),
+        )
+        .await
+        .unwrap();
+        assert_eq!(state.graph.truth_epoch(), truth);
+        assert_eq!(held.is_error, Some(true));
+        assert!(mcp_result_text(&held).contains("active writer"));
+        drop(writer);
+        let moved = reference_tools_page(
+            axum::http::HeaderMap::new(),
+            Arc::clone(&state),
+            reference_page_request(&target, Some(cursor), 2000),
+        )
+        .await
+        .unwrap();
+        assert_eq!(state.graph.truth_epoch(), truth);
+        assert_eq!(moved.is_error, Some(true));
+        assert!(mcp_result_text(&moved).contains("authority scope changed"));
+        reference_page_body(
+            reference_tools_page(
+                axum::http::HeaderMap::new(),
+                Arc::clone(&state),
+                reference_page_request(&target, None, 2000),
+            )
+            .await
+            .unwrap(),
+        );
+    }
+
+    #[tokio::test]
+    async fn reference_pages_never_relabel_a_superseded_answer_with_the_new_head_version() {
+        let (state, target) = reference_fixture();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let result = reference_tools_page_after_root(
+            axum::http::HeaderMap::new(),
+            Arc::clone(&state),
+            reference_page_request(&target, None, 2000),
+            supersede_every_attempt(&state),
+        )
+        .await
+        .unwrap();
+        let first = reference_page_body(result);
+        let cursor = first["next_cursor"].as_str().expect("fixture must page");
+        let resumed = reference_tools_page(
+            axum::http::HeaderMap::new(),
+            Arc::clone(&state),
+            reference_page_request(&target, Some(cursor), 2000),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resumed.is_error, Some(true));
+        assert!(mcp_result_text(&resumed).contains("authority scope changed"));
+    }
+
+    #[tokio::test]
+    async fn reference_first_page_rechecks_pending_admission_for_absences_only() {
+        for empty in [true, false] {
+            let (state, target) = reference_fixture();
+            state
+                .is_initialized
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            let focal = if empty {
+                state
+                    .graph
+                    .list_all_entities()
+                    .unwrap()
+                    .into_iter()
+                    .find(|entity| entity.name == "sweep_caller")
+                    .unwrap()
+            } else {
+                target
+            };
+            let epoch = state.settled_read_epoch().unwrap();
+            let mut pending = None;
+            let result = reference_tools_page_with_hooks(
+                axum::http::HeaderMap::new(),
+                Arc::clone(&state),
+                reference_page_request(&focal, None, 60000),
+                |_| {},
+                || {
+                    pending = Some(state.begin_pending_admission());
+                },
+            )
+            .await
+            .unwrap();
+            assert!(pending.is_some());
+            assert!(
+                state.graph_authority_epoch_is_current(epoch),
+                "no writer moved the graph"
+            );
+            assert!(!state.settled_read_epoch_is_current(epoch));
+            if empty {
+                assert_eq!(result.is_error, Some(true));
+                assert!(mcp_result_text(&result).contains("absence was withheld"));
+            } else {
+                let body = reference_page_body(result);
+                assert_eq!(body["total_upstream"], 1);
+                assert_eq!(body["references"].as_array().unwrap().len(), 1);
+            }
+            drop(pending);
+        }
+    }
+
+    #[tokio::test]
+    async fn reference_first_page_preserves_a_qualified_settled_replay() {
+        let (state, target) = reference_fixture();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let first = reference_page_body(
+            reference_tools_page(
+                axum::http::HeaderMap::new(),
+                Arc::clone(&state),
+                reference_page_request(&target, None, 60000),
+            )
+            .await
+            .unwrap(),
+        );
+        let writer = state.begin_graph_authority_mutation();
+        let replay = reference_page_body(
+            reference_tools_page(
+                axum::http::HeaderMap::new(),
+                Arc::clone(&state),
+                reference_page_request(&target, None, 60000),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(replay["references"], first["references"]);
+        assert_eq!(replay["total_upstream"], 1);
+        assert_eq!(replay["negative"]["safe_to_conclude_absent"], false);
+        assert!(degradation_labels(&replay).contains(&"graph_authority:settled_replay".to_string()));
+        drop(writer);
     }
 
     #[tokio::test]
@@ -65306,6 +69037,9 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn an_uncontended_find_references_answer_carries_no_mutation_disclosure() {
+        let _readiness = kin_mcp::edge_coverage::test_support::scoped_language_servers(&[
+            kin_model::LanguageId::Python,
+        ]);
         // The control for the test above. A disclosure emitted unconditionally
         // would pass every assertion there and would make every settled answer
         // inconclusive, which is the failure mode that costs the most: an agent
@@ -66479,6 +70213,94 @@ pub(crate) mod tests {
     // -----------------------------------------------------------------------
     // Scope parsing
     // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn intent_and_traffic_external_scopes_are_refused_before_coordination_writes() {
+        let state = test_state();
+        let node = kin_model::ExternalSymbol::new(
+            kin_model::ScipPackage::new("npm", "example", "1.0.0").unwrap(),
+            vec![kin_model::ScipDescriptor::method("external")],
+        )
+        .unwrap()
+        .to_reference()
+        .unwrap();
+        state
+            .graph
+            .apply_transaction_delta(&kin_model::TransactionDelta {
+                external_reference_deltas: vec![kin_model::ExternalReferenceDelta::Added {
+                    new: node.clone(),
+                }],
+                ..Default::default()
+            })
+            .unwrap();
+        let address = format!("external_reference:{}", node.id);
+        // Opening a daemon creates its reconcile session before any request.
+        // Refusals must preserve that baseline and create no agent or intent.
+        let initial_sessions = state.coordinator.list_sessions().unwrap();
+        assert!(initial_sessions
+            .iter()
+            .any(|session| session.vendor == "kin-daemon"));
+        let initial_ids: std::collections::HashSet<_> = initial_sessions
+            .iter()
+            .map(|session| session.session_id)
+            .collect();
+        for id in &initial_ids {
+            assert!(state.coordinator.list_intents(id).unwrap().is_empty());
+        }
+        let app = router(Arc::clone(&state));
+        for scope in [
+            address.clone(),
+            node.id.to_string(),
+            format!("entity:{}", node.id),
+        ] {
+            let response = app.clone().oneshot(Request::post("/intent/register")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({
+                    "scopes":["file:src/allowed.rs", scope], "lock_type":"soft", "task_description":"refused scope",
+                }).to_string())).unwrap()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(value["error"]["code"], "external_symbol_not_served");
+            assert_eq!(value["error"]["tool"], "kin_register_intent");
+            assert_eq!(value["error"]["id"], address);
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::get(format!("/traffic/{scope}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(value["error"]["code"], "external_symbol_not_served");
+            assert_eq!(value["error"]["tool"], "kin_check_traffic");
+        }
+        let remaining_ids: std::collections::HashSet<_> = state
+            .coordinator
+            .list_sessions()
+            .unwrap()
+            .into_iter()
+            .map(|session| session.session_id)
+            .collect();
+        assert_eq!(
+            remaining_ids, initial_ids,
+            "refusal precedes implicit session creation"
+        );
+        for id in remaining_ids {
+            assert!(
+                state.coordinator.list_intents(&id).unwrap().is_empty(),
+                "a refused mixed scope registers no intent"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn register_intent_entity_scope() {
@@ -69394,12 +73216,24 @@ pub(crate) mod tests {
             shape["focal"].is_null() && shape["focal_entity"]["start_line"].as_u64().is_some(),
             "the focal is a body too, and its span outlives it: {compact}"
         );
+        // The complete trust envelope is shared overhead on both answers.
+        // Compare the actual source bytes removed, rather than requiring an
+        // arbitrary ratio that changes when the safety reading gains detail.
+        let body_bytes = full["chain"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|step| step["body"].as_str().map_or(0, str::len))
+            .sum::<usize>()
+            + full["focal"]["body"].as_str().map_or(0, str::len)
+            + full["focal_entity"]["body"].as_str().map_or(0, str::len);
         assert!(
-            compact.len() * 3 < with_bodies.len(),
-            "a shape query must be a fraction of the size: {} vs {} chars; payload={compact}",
-            compact.len(),
-            with_bodies.len()
+            body_bytes > 5_000,
+            "the fixture must carry substantial source"
         );
+        assert!(with_bodies.len().saturating_sub(compact.len()) >= body_bytes,
+            "shape response must save every omitted body byte: {} vs {} bytes, {body_bytes} source bytes",
+            compact.len(), with_bodies.len());
     }
 
     /// `compact: true` is the same request as `include_body: false`.
@@ -69443,144 +73277,346 @@ pub(crate) mod tests {
         assert_eq!(conflicting["bodies_included"], json!(true));
     }
 
-    /// The tool bounds its own payload, and cuts bodies before edges.
-    ///
-    /// This is the defect end to end: a walk inside every work bound whose
-    /// RESULT does not fit. The response now measures itself and returns a
-    /// complete chain without source rather than a full chain the caller never
-    /// receives.
     #[tokio::test]
-    async fn a_trace_over_its_budget_drops_bodies_and_keeps_every_edge() {
-        const ORIGINAL_BUDGET: usize = 6_000;
+    async fn trace_pages_preserve_standing_caveats_and_reject_changed_standing() {
+        use kin_core::memory_pressure::{HeavyWork, PressureLevel, PressureRefusal};
+        let state = test_state();
+        let ids = install_trace_chain(&state, 2).await;
+        let root = state.layout.root();
+        kin_daemon_spawn::write_sweep_interruptions(
+            root,
+            kin_daemon_spawn::SWEEP_INTERRUPTION_LIMIT,
+        );
+        PressureRefusal::record(
+            root,
+            HeavyWork::LspSweep,
+            PressureLevel::Critical,
+            "fixture enrichment work is held",
+            false,
+        );
+        kin_daemon_spawn::RefusedEnrichment::record(root, 1, 3, 0);
+        kin_core::hydration_semantics::write(
+            &state.layout,
+            &kin_core::hydration_semantics::HydrationSemanticsStamp::new(0, chrono::Utc::now()),
+        )
+        .unwrap();
+        assert!(kin_core::hydration_semantics::standing(&state.layout).is_gap());
+        let hold = kin_core::relation_census::CensusHold {
+            held_at: chrono::Utc::now(),
+            held_source: "trace fixture".into(),
+            losses: vec!["one admitted relation is missing".into()],
+            settled: Default::default(),
+        };
+        std::fs::write(
+            kin_core::relation_census::census_hold_path(root),
+            serde_json::to_vec(&hold).unwrap(),
+        )
+        .unwrap();
+        let app = router(Arc::clone(&state));
+        let mut query = json!({"focal": ids[0].to_string(), "depth":1,
+            "direction":"calls", "include_body":false, "max_chars":60_000});
+        let full = call_mcp_tool(app.clone(), "trace_data_flow", query.clone()).await;
+        assert_eq!(
+            full["_kin"]["page"]["complete"], true,
+            "fixture must fit as one answer"
+        );
+        for key in [
+            "sweep_suspended",
+            "memory_pressure",
+            "hydration_semantics_stale",
+            "enrichment_shortfall",
+            "relation_census_loss",
+        ] {
+            assert_eq!(
+                full["_kin"]["degraded"][key], true,
+                "standing caveat {key} must precede freeze"
+            );
+        }
+        assert_eq!(full["negative"]["safe_to_conclude_absent"], false);
+        query["max_chars"] = json!(2000);
+        let mut page = call_mcp_tool(app.clone(), "trace_data_flow", query.clone()).await;
+        let first_cursor = page["next_cursor"]
+            .as_str()
+            .expect("standing forces pages")
+            .to_string();
+        let mut recovered = serde_json::Map::new();
+        let mut pending = String::new();
+        for _ in 0..300 {
+            assert!(page.to_string().len() <= 2000);
+            assert_eq!(page["negative"]["safe_to_conclude_absent"], false);
+            assert_eq!(page["_kin"]["verdict"]["safe_to_conclude_absent"], false);
+            for reading in page["readings"].as_array().into_iter().flatten() {
+                if reading["key"] == "_kin" {
+                    recovered = reading["value"].as_object().unwrap().clone();
+                }
+            }
+            let fragment = &page["record_fragment"];
+            if fragment["key"] == "_kin" {
+                assert_eq!(fragment["byte_offset"].as_u64(), Some(pending.len() as u64));
+                pending.push_str(fragment["text"].as_str().unwrap());
+                if fragment["field_complete"] == true {
+                    let value = if fragment["encoding"] == "utf8" {
+                        json!(pending)
+                    } else {
+                        serde_json::from_str(&pending).unwrap()
+                    };
+                    recovered.insert(fragment["field"].as_str().unwrap().to_string(), value);
+                    pending.clear();
+                }
+            }
+            let Some(cursor) = page["next_cursor"].as_str() else {
+                break;
+            };
+            let mut next = query.clone();
+            next["cursor"] = json!(cursor);
+            page = call_mcp_tool(app.clone(), "trace_data_flow", next).await;
+        }
+        assert!(page["next_cursor"].is_null() && pending.is_empty());
+        assert_eq!(recovered["degraded"], full["_kin"]["degraded"]);
+        assert_eq!(
+            recovered["hydration_semantics"],
+            full["_kin"]["hydration_semantics"]
+        );
+        let graph_epoch = state.graph.truth_epoch();
+        kin_daemon_spawn::write_sweep_interruptions(root, 0);
+        assert_eq!(
+            state.graph.truth_epoch(),
+            graph_epoch,
+            "standing can move without graph truth"
+        );
+        query["cursor"] = json!(first_cursor);
+        let refused = call_mcp_tool_result(app, "trace_data_flow", query).await;
+        assert_eq!(refused.is_error, Some(true));
+        let kin_mcp::ContentBlock::Text { text } = &refused.content[0];
+        assert!(text.contains("restart without cursor"), "{text}");
+    }
+
+    /// Response pages preserve the full bounded semantic walk. A small page
+    /// never turns a missing body or omitted hop into an apparently complete
+    /// answer, and continuing it does not reopen repository authority.
+    #[tokio::test]
+    async fn trace_pages_preserve_bodies_steps_and_proof_without_rewalking() {
+        const PAGE_BYTES: usize = 6_000;
         let state = test_state();
         let ids = install_trace_chain(&state, 6).await;
-        // The admitted chain supplies its own import/value/call evidence; no
-        // synthetic side graph is used to manufacture a complete verdict.
         let app = router(Arc::clone(&state));
-
-        let unbounded = call_mcp_tool_text(
-            app.clone(),
-            "trace_data_flow",
-            json!({ "focal": ids[0].to_string(), "depth": 5, "direction": "calls" }),
-        )
-        .await;
-
-        // Keep the original 6k fixture load-bearing after the trace step gained
-        // its two uniform call-site fields. The old shape still has to fit the
-        // exact target this ladder used before the call-site contract. Only the serialized
-        // cost of those two fields is added back to the exercised budget, and
-        // that increment has its own ceiling, so unrelated per-step growth
-        // cannot hide inside a raised magic number.
-        let compact = call_mcp_tool_text(
-            app.clone(),
-            "trace_data_flow",
-            json!({
-                "focal": ids[0].to_string(),
-                "depth": 5,
-                "direction": "calls",
-                "include_body": false,
-            }),
-        )
-        .await;
-        let mut without_site_contract: serde_json::Value = serde_json::from_str(&compact).unwrap();
-        for step in without_site_contract["chain"].as_array_mut().unwrap() {
-            let row = step.as_object_mut().unwrap();
-            row.remove("reference_lines");
-            row.remove("reference_lines_absent_reason");
-        }
-        // The shape route now emits compact JSON with every proof field kept.
-        // Measure that actual wire representation, at the original target.
-        assert_eq!(
-            compact,
-            serde_json::to_string(&serde_json::from_str::<serde_json::Value>(&compact).unwrap())
-                .unwrap()
-        );
-        let old_shape_chars = serde_json::to_string(&without_site_contract).unwrap().len();
-        let original_target =
-            ORIGINAL_BUDGET.saturating_sub(kin_mcp::budget::RESPONSE_DISCLOSURE_RESERVE_CHARS);
-        assert!(
-            old_shape_chars <= original_target,
-            "the pre-call-site shape must still fit the original ladder target: {old_shape_chars} \
-             chars against {original_target}; payload={compact}"
-        );
-        let site_contract_chars = compact.len().saturating_sub(old_shape_chars);
-        assert!(
-            (1..1_000).contains(&site_contract_chars),
-            "the two uniform site fields added {site_contract_chars} chars to this five-step chain"
-        );
-        let budget = ORIGINAL_BUDGET + site_contract_chars;
-        assert!(
-            unbounded.len() > budget,
-            "the fixture must exceed the budget under test or this proves nothing: {} chars",
-            unbounded.len()
-        );
-        let full: serde_json::Value = serde_json::from_str(&unbounded).unwrap();
-
-        let bounded = call_mcp_tool_text(
-            app,
-            "trace_data_flow",
-            json!({
-                "focal": ids[0].to_string(),
-                "depth": 5,
-                "direction": "calls",
-                "max_response_chars": budget,
-            }),
-        )
-        .await;
-        let cut: serde_json::Value = serde_json::from_str(&bounded).unwrap();
-
-        assert!(
-            bounded.len() <= budget,
-            "the tool must return what it promised to fit: {} chars against {budget}",
-            bounded.len()
-        );
-        assert_eq!(
-            cut["total_steps"], full["total_steps"],
-            "bodies are cut before edges, so the chain survives a cut its source does not: {bounded}"
-        );
-        assert_eq!(cut["bodies_included"], json!(false));
-        assert!(cut["bodies_omitted"].as_u64().unwrap_or(0) > 0);
-        // Compared against the UNBOUNDED run rather than against a literal
-        // `false`. This fixture walks six hops at `depth: 5`, so its last hop
-        // sits at the requested depth and was never expanded, which the walk
-        // now reports as `terminal: "bound_reached"` and counts in
-        // `truncated`. Asserting `false` here would assert that a depth bound
-        // goes unreported, which is the FIR-2542 defect wearing this test's
-        // name. What this test is about is narrower and still holds: dropping
-        // bodies must not move the flag in either direction.
-        assert_eq!(
-            full["terminal_bound_steps"],
-            json!(1),
-            "the fixture must end at its depth bound, or the comparisons below hold for the \
-             uninteresting reason that both runs report nothing"
-        );
-        assert_eq!(
-            cut["truncated"], full["truncated"],
-            "a chain that lost only bodies is truncated exactly as much as it was before"
-        );
-        assert_eq!(
-            cut["steps_omitted"].as_u64().unwrap_or(0),
-            0,
-            "no edge was dropped, so nothing about the chain's own length changed"
-        );
-        assert_eq!(
-            cut["terminal_bound_steps"], full["terminal_bound_steps"],
-            "the depth bound is what this chain's truncation reports, and the budget did not touch it"
-        );
-        let disclosure = cut["degradations"]
+        let query = json!({
+            "focal": ids[0].to_string(), "depth": 5, "direction": "calls",
+            "max_chars": 200_000,
+        });
+        let full = call_mcp_tool(app.clone(), "trace_data_flow", query.clone()).await;
+        assert!(full["chain"].as_array().unwrap().len() >= 5);
+        assert!(full["chain"]
             .as_array()
-            .expect("a cut must be disclosed")
+            .unwrap()
             .iter()
-            .find(|entry| entry["component"] == json!("response_budget"))
-            .expect("the cut must name itself");
-        assert_eq!(disclosure["reason"], json!("bodies_omitted"));
+            .all(|step| step["body"].as_str().is_some_and(|body| body.len() > 500)));
+        let mut paged_query = query;
+        paged_query["max_chars"] = json!(PAGE_BYTES);
+        let first = call_mcp_tool(app.clone(), "trace_data_flow", paged_query.clone()).await;
         assert!(
-            disclosure["remediation"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("include_body"),
-            "the remediation must name the parameter that avoids the cut: {disclosure}"
+            first["next_cursor"].is_string(),
+            "fixture must require continuation: {first}"
         );
+        let loads = state.projection_authority.loads();
+        let mut page = first;
+        let mut chain = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        loop {
+            assert!(page.to_string().len() <= PAGE_BYTES, "{page}");
+            assert_eq!(page["_kin"]["verdict"]["safe_to_conclude_absent"], false);
+            assert_eq!(page["negative"]["safe_to_conclude_absent"], false);
+            chain.extend(page["chain"].as_array().unwrap().iter().cloned());
+            let Some(cursor) = page["next_cursor"].as_str().map(str::to_owned) else {
+                break;
+            };
+            assert!(seen.insert(cursor.clone()), "continuation must advance");
+            assert!(seen.len() < 100, "the bounded fixture must finish");
+            paged_query["cursor"] = json!(cursor);
+            page = call_mcp_tool(app.clone(), "trace_data_flow", paged_query.clone()).await;
+        }
+        assert_eq!(
+            chain,
+            *full["chain"].as_array().unwrap(),
+            "all bodies, absolute step/parent identities and weakest-path proof must survive"
+        );
+        assert_eq!(
+            state.projection_authority.loads(),
+            loads,
+            "continuations only read the frozen snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn trace_cli_and_mcp_cursors_share_pages_and_reject_changed_truth() {
+        let state = test_state();
+        let ids = install_trace_chain(&state, 4).await;
+        let app = router(Arc::clone(&state));
+        let mut query = json!({
+            "focal": ids[0].to_string(), "depth": 3, "direction": "calls",
+            "max_response_chars": 2_000,
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/commands/trace-data-flow")
+                    .header("content-type", "application/json")
+                    .body(Body::from(query.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 16_000)
+            .await
+            .unwrap();
+        assert!(bytes.len() <= 2_000);
+        let first: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        query["cursor"] = first["next_cursor"].clone();
+        assert!(query["cursor"].is_string());
+        let second = call_mcp_tool(app.clone(), "trace_data_flow", query.clone()).await;
+        assert!(second.to_string().len() <= 2_000);
+        assert_ne!(second["next_cursor"], first["next_cursor"]);
+        let expected_repository = json!({
+            "root": state.layout.working_dir().canonicalize().unwrap().display().to_string(),
+        });
+        assert_eq!(first["_kin"]["repository"], expected_repository);
+        assert_eq!(second["_kin"]["repository"], expected_repository);
+        assert!(first["_kin"]["graph_as_of"].is_object());
+        assert_eq!(second["_kin"]["graph_as_of"], first["_kin"]["graph_as_of"]);
+
+        let mut changed = query.clone();
+        changed["focal"] = json!(ids[1].to_string());
+        let refused = trace_tools_page(
+            axum::http::HeaderMap::new(),
+            Arc::clone(&state),
+            McpToolCallRequest {
+                name: "trace_data_flow".into(),
+                arguments: serde_json::from_value(changed).unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(refused.is_error, Some(true));
+        assert!(mcp_result_text(&refused).contains("query changed"));
+
+        let mut focal = state.graph.get_entity(&ids[0]).unwrap().unwrap();
+        focal.doc_summary = Some("changed semantic truth".into());
+        state.graph.upsert_entity(&focal).unwrap();
+        let refused = trace_tools_page(
+            axum::http::HeaderMap::new(),
+            Arc::clone(&state),
+            McpToolCallRequest {
+                name: "trace_data_flow".into(),
+                arguments: serde_json::from_value(query).unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(refused.is_error, Some(true));
+        assert!(mcp_result_text(&refused).contains("authority scope changed"));
+    }
+
+    #[tokio::test]
+    async fn trace_session_cursor_rejects_a_rebound_revision_on_the_same_graph() {
+        let state = test_state();
+        let ids = install_trace_chain(&state, 4).await;
+        let binding = state.local_repository_authority_binding().unwrap();
+        let revision = kin_cli::commands::ref_lookup::resolve_ref(
+            state.graph.as_ref(),
+            &binding,
+            Some("HEAD"),
+        )
+        .unwrap();
+        let scoped =
+            Arc::new(kin_db::InMemoryGraph::from_snapshot(state.graph.to_snapshot()).unwrap());
+        let session = SessionId::new();
+        state
+            .set_session_scope(
+                &session,
+                revision.to_string(),
+                revision,
+                Arc::clone(&scoped),
+            )
+            .await;
+        let app = router(Arc::clone(&state));
+        let mut query = json!({
+            "focal": ids[0].to_string(), "depth": 3, "direction": "calls",
+            "max_chars": 2_000,
+        });
+        let first = mcp_call_as(app.clone(), "trace_data_flow", query.clone(), session).await;
+        assert_ne!(first.is_error, Some(true), "{}", mcp_result_text(&first));
+        let payload: serde_json::Value = serde_json::from_str(&mcp_result_text(&first)).unwrap();
+        query["cursor"] = payload["next_cursor"].clone();
+        assert!(query["cursor"].is_string(), "fixture must page: {payload}");
+
+        let continued = mcp_call_as(app.clone(), "trace_data_flow", query.clone(), session).await;
+        assert_ne!(
+            continued.is_error,
+            Some(true),
+            "{}",
+            mcp_result_text(&continued)
+        );
+        let truth = scoped.truth_epoch();
+        let replacement = SemanticChangeId::from_hash(Hash256::from_bytes([91; 32]));
+        assert_ne!(replacement, revision);
+        // Keep the exact Arc and truth epoch. Only the scope's revision changes,
+        // so a pointer-only continuation check would accept the old snapshot.
+        state
+            .set_session_scope(
+                &session,
+                replacement.to_string(),
+                replacement,
+                Arc::clone(&scoped),
+            )
+            .await;
+        assert_eq!(scoped.truth_epoch(), truth);
+        assert!(Arc::ptr_eq(
+            &state.graph_for_session(&session).await,
+            &scoped
+        ));
+        let refused = mcp_call_as(app, "trace_data_flow", query, session).await;
+        assert_eq!(refused.is_error, Some(true));
+        assert!(mcp_result_text(&refused).contains("authority scope changed"));
+    }
+
+    #[test]
+    fn trace_session_reads_fence_active_and_completed_writer_batches() {
+        let state = test_state();
+        let before = state.stable_graph_authority_epoch().unwrap();
+        assert!(trace_read_epoch_current(
+            &state,
+            RequestGraphAuthority::SessionScope,
+            before
+        ));
+        let writer = state.begin_graph_authority_mutation();
+        assert_eq!(state.stable_graph_authority_epoch(), None);
+        assert!(
+            !trace_read_epoch_current(&state, RequestGraphAuthority::SessionScope, before),
+            "a scoped read cannot certify an intermediate writer state"
+        );
+        drop(writer);
+        assert!(
+            !trace_read_epoch_current(&state, RequestGraphAuthority::SessionScope, before),
+            "finishing a writer cannot make the prior read current again"
+        );
+        let after = state.stable_graph_authority_epoch().unwrap();
+        assert!(trace_read_epoch_current(
+            &state,
+            RequestGraphAuthority::SessionScope,
+            after
+        ));
+        let pending = state.begin_pending_admission();
+        assert!(
+            trace_read_epoch_current(&state, RequestGraphAuthority::SessionScope, after),
+            "unadmitted HEAD files do not change a selected session revision"
+        );
+        assert!(!trace_read_epoch_current(
+            &state,
+            RequestGraphAuthority::Head,
+            after
+        ));
+        drop(pending);
     }
 
     /// A publication boundary forces a fresh, fully validating load on this

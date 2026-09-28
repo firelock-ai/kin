@@ -36,6 +36,11 @@ use crate::vector::VectorIndex;
 use super::index::IndexSet;
 use super::traverse;
 
+mod enrichment_status;
+pub use enrichment_status::{
+    EnrichmentContextStatus, EnrichmentStatusError, EnrichmentStatusFacts, FileEnrichmentStatus,
+};
+
 mod source_derivation;
 pub use source_derivation::{
     SourceDerivationFacts, SourceDerivationLimit, SourceDerivationLimits,
@@ -4656,9 +4661,12 @@ impl InMemoryGraph {
             // CURRENT_VERSION here would build a snapshot `to_bytes` refuses.
             // The version a snapshot carries is a statement about its own
             // contents, not about the binary that built it: v13, v23 when the
-            // graph holds resolution records, or v25 when one of them is a
-            // call-site ledger.
-            version: GraphSnapshot::graph_only_version(ent.resolution_records.records().values()),
+            // graph holds resolution records, v25 for ledgers, or v27 for
+            // context validations, including records retained only in history.
+            version: GraphSnapshot::graph_only_version_with_history(
+                ent.resolution_records.records().values(),
+                &chg.changes,
+            ),
             entities: ent.entities.into_iter().collect(),
             entity_revisions: ent.entity_revisions.into_iter().collect(),
             relations: ent.relations.into_iter().collect(),
@@ -4858,6 +4866,180 @@ impl InMemoryGraph {
             let target = self.entities_write();
             install(target, &source)
         }
+    }
+
+    /// Mirror an admitted publication's collection of unused resolver nodes.
+    ///
+    /// The capture must still be the complete live semantic state. Holding the
+    /// truth lock across that check and the removals prevents a new ledger or
+    /// edge from losing a node it just began to use. These removals are already
+    /// durable, so they do not enqueue another authority write. A later exact
+    /// authority restore, not this cleanup, may restore the binding witness.
+    pub fn retire_published_resolution_nodes(
+        &self,
+        observed: &GraphSnapshot,
+        references: &[kin_model::ExternalReference],
+        records: &[kin_model::ResolutionRecord],
+    ) -> Result<bool, KinDbError> {
+        self.mirror_published_artifact_relations_and_resolution_cleanup(
+            observed,
+            &[],
+            references,
+            records,
+        )
+    }
+
+    /// Mirror already-admitted artifact bookkeeping and unused resolver-node
+    /// collection under one exact live capture. Only artifact self-relations
+    /// are accepted; source entities and resolver inputs cannot be rewritten.
+    /// Nothing here mints a witness or queues another persistence operation.
+    pub fn mirror_published_artifact_relations_and_resolution_cleanup(
+        &self,
+        observed: &GraphSnapshot,
+        relations: &[Relation],
+        references: &[kin_model::ExternalReference],
+        records: &[kin_model::ResolutionRecord],
+    ) -> Result<bool, KinDbError> {
+        self.mirror_published_artifact_relations_and_resolution_cleanup_with_retirements(
+            observed,
+            relations,
+            &[],
+            references,
+            records,
+        )
+    }
+
+    /// As above, with exact already-admitted artifact relation retirements.
+    /// Replacements and retirements share one capture and one truth lock.
+    pub fn mirror_published_artifact_relations_and_resolution_cleanup_with_retirements(
+        &self,
+        observed: &GraphSnapshot,
+        relations: &[Relation],
+        retired_relations: &[Relation],
+        references: &[kin_model::ExternalReference],
+        records: &[kin_model::ResolutionRecord],
+    ) -> Result<bool, KinDbError> {
+        if relations.is_empty()
+            && retired_relations.is_empty()
+            && references.is_empty()
+            && records.is_empty()
+        {
+            return Ok(true);
+        }
+        let mut ent = self.entities_write();
+        if ent.entities.len() != observed.entities.len()
+            || ent
+                .entities
+                .iter()
+                .any(|(id, entity)| observed.entities.get(id) != Some(entity))
+            || ent.relations.len() != observed.relations.len()
+            || ent
+                .relations
+                .iter()
+                .any(|(id, relation)| observed.relations.get(id) != Some(relation))
+            || ent.external_references.len() != observed.external_references.len()
+            || ent
+                .external_references
+                .iter()
+                .any(|(id, reference)| observed.external_references.get(id) != Some(reference))
+            || ent.resolution_records.records() != &observed.resolution_records
+            || ent.resolved_tree != observed.resolved_tree
+        {
+            return Ok(false);
+        }
+        if references.iter().any(|reference| {
+            reference.resolution_namespace != kin_model::EXTERNAL_SYMBOL_NAMESPACE
+                || ent.external_references.get(&reference.id) != Some(reference)
+        }) || records.iter().any(|record| {
+            record.as_proof_context().is_none()
+                || ent.resolution_records.get(&record.id()) != Some(record)
+        }) {
+            return Ok(false);
+        }
+        let mut retired_ids = HashSet::new();
+        for old in retired_relations {
+            if !matches!(old.src, GraphNodeId::Artifact(_))
+                || old.src != old.dst
+                || !retired_ids.insert(old.id)
+                || ent.relations.get(&old.id) != Some(old)
+            {
+                return Ok(false);
+            }
+        }
+        let mut relation_ids = HashSet::new();
+        for relation in relations {
+            if !matches!(relation.src, GraphNodeId::Artifact(_))
+                || relation.src != relation.dst
+                || !relation_ids.insert(relation.id)
+            {
+                return Ok(false);
+            }
+            self.require_admitted_relation_endpoints(&ent, relation)?;
+            if ent.relations.get(&relation.id).is_some_and(|old| {
+                old.src != relation.src || old.dst != relation.dst || old.kind != relation.kind
+            }) {
+                return Ok(false);
+            }
+        }
+        let reference_ids: HashSet<_> = references.iter().map(|reference| reference.id).collect();
+        let record_ids: HashSet<_> = records
+            .iter()
+            .map(kin_model::ResolutionRecord::id)
+            .collect();
+        let removed_node = |node: GraphNodeId| matches!(node, GraphNodeId::ExternalReference(id) if reference_ids.contains(&id));
+        if ent
+            .relations
+            .values()
+            .filter(|relation| !retired_ids.contains(&relation.id))
+            .chain(relations)
+            .any(|relation| {
+                removed_node(relation.src)
+                    || removed_node(relation.dst)
+                    || relation.evidence.iter().any(|evidence| {
+                        evidence
+                            .token
+                            .as_deref()
+                            .and_then(kin_model::ResolutionRecordId::from_context_token)
+                            .is_some_and(|id| record_ids.contains(&id))
+                    })
+            })
+            || ent.resolution_records.records().values().any(|record| {
+                record.named_nodes().into_iter().any(removed_node)
+                    || record
+                        .referenced_records()
+                        .iter()
+                        .any(|id| record_ids.contains(id))
+            })
+        {
+            return Ok(false);
+        }
+        let deltas: Vec<_> = records
+            .iter()
+            .cloned()
+            .map(|old| kin_model::ResolutionRecordDelta::Removed { old })
+            .collect();
+        let plan = ent
+            .resolution_records
+            .plan_parts(&[], &[], &deltas)
+            .map_err(|error| {
+                KinDbError::StorageError(format!("published resolution cleanup: {error}"))
+            })?;
+        ent.resolution_records.apply(&plan);
+        for reference in references {
+            ent.external_references.remove(&reference.id);
+        }
+        for old in retired_relations {
+            ent.relations.remove(&old.id);
+            remove_relation_indexes(&mut ent, old);
+        }
+        for relation in relations {
+            if let Some(old) = ent.relations.remove(&relation.id) {
+                remove_relation_indexes(&mut ent, &old);
+            }
+            insert_relation_indexes(&mut ent, relation);
+            ent.relations.insert(relation.id, relation.clone());
+        }
+        Ok(true)
     }
 
     /// Number of relations in the graph.
@@ -5772,6 +5954,32 @@ impl InMemoryGraph {
             .lock()
             .as_ref()
             .map(|index| index.descriptor())
+    }
+
+    /// Let go of the embedding model when nothing is using it.
+    ///
+    /// The model loads lazily on the first batch or semantic query, and loads
+    /// again the same way after this. Returns whether it was released: `false`
+    /// when none is loaded, or when another holder (a batch in flight, a query
+    /// embedding its text, a session graph sharing it) still has it, because
+    /// dropping this reference then would free nothing and the next use would
+    /// load a second copy beside the first.
+    #[cfg(feature = "embeddings")]
+    pub fn release_embedder(&self) -> bool {
+        let mut guard = self.embedder.lock();
+        match guard.as_ref() {
+            Some(embedder) if Arc::strong_count(embedder) == 1 => {
+                *guard = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Without the embedder feature there is never a model to release.
+    #[cfg(not(feature = "embeddings"))]
+    pub fn release_embedder(&self) -> bool {
+        false
     }
 
     #[cfg(feature = "embeddings")]
@@ -6734,6 +6942,17 @@ impl InMemoryGraph {
     /// Returns the number of items successfully embedded.
     #[cfg(all(feature = "embeddings", feature = "vector"))]
     pub fn process_embedding_queue(&self, batch_size: usize) -> Result<usize, KinDbError> {
+        self.process_embedding_queue_observed(batch_size, &())
+    }
+
+    /// Process a batch with per-call compute progress and safe cancellation.
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    pub fn process_embedding_queue_observed(
+        &self,
+        batch_size: usize,
+        work: &dyn crate::embed::EmbeddingWork,
+    ) -> Result<usize, KinDbError> {
+        work.checkpoint()?;
         let _span =
             tracing::info_span!("kindb.process_embedding_queue", batch_size = batch_size).entered();
 
@@ -6744,8 +6963,14 @@ impl InMemoryGraph {
         if prepared.is_empty() {
             return Ok(0);
         }
-        let embedded = self.embed_prepared_batch(&prepared)?;
-        self.persist_produced_embedding_batch(embedded, &prepared)
+        let embedded = self.embed_prepared_batch_observed(&prepared, work)?;
+        let published = work.publish(Box::new(|| {
+            self.persist_produced_embedding_batch(embedded, &prepared)
+        }));
+        if matches!(&published, Err(KinDbError::EmbeddingCancelled)) {
+            self.requeue_embedding_keys(prepared.recency.keys().copied(), &prepared.recency);
+        }
+        published
     }
 
     /// Stage 1 of the embed pipeline: drain a deterministic, priority-ordered
@@ -6943,6 +7168,19 @@ impl InMemoryGraph {
         &self,
         prepared: &PreparedEmbedBatch,
     ) -> Result<ProducedRetrievalBatch, KinDbError> {
+        self.embed_prepared_batch_observed(prepared, &())
+    }
+
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    fn embed_prepared_batch_observed(
+        &self,
+        prepared: &PreparedEmbedBatch,
+        work: &dyn crate::embed::EmbeddingWork,
+    ) -> Result<ProducedRetrievalBatch, KinDbError> {
+        if let Err(error) = work.checkpoint() {
+            self.requeue_embedding_keys(prepared.recency.keys().copied(), &prepared.recency);
+            return Err(error);
+        }
         if prepared.keys.is_empty() {
             return Ok(ProducedRetrievalBatch::empty());
         }
@@ -6964,12 +7202,12 @@ impl InMemoryGraph {
         let forward_result = self
             .embed_stage_timings
             .time(crate::embed::EmbedStage::Forward, || {
-                embedder.embed_batch_with_producers(&prepared.texts)
+                embedder.embed_batch_with_producers_observed(&prepared.texts, work)
             });
         let produced = match forward_result {
             Ok(produced) => produced,
             Err(err) => {
-                self.requeue_embedding_keys(prepared.keys.iter().copied(), &prepared.recency);
+                self.requeue_embedding_keys(prepared.recency.keys().copied(), &prepared.recency);
                 return Err(err);
             }
         };
@@ -7127,6 +7365,18 @@ impl InMemoryGraph {
     /// Process up to `batch_size` artifacts from the embedding queue.
     #[cfg(all(feature = "embeddings", feature = "vector"))]
     pub fn process_artifact_embedding_queue(&self, batch_size: usize) -> Result<usize, KinDbError> {
+        self.process_artifact_embedding_queue_observed(batch_size, &())
+    }
+
+    /// Artifact counterpart of the observed entity queue, with the same
+    /// cancellation and publication boundary.
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    pub fn process_artifact_embedding_queue_observed(
+        &self,
+        batch_size: usize,
+        work: &dyn crate::embed::EmbeddingWork,
+    ) -> Result<usize, KinDbError> {
+        work.checkpoint()?;
         let _span = tracing::info_span!(
             "kindb.process_artifact_embedding_queue",
             batch_size = batch_size
@@ -7209,7 +7459,7 @@ impl InMemoryGraph {
         let mut count = 0usize;
         for (chunk_idx, chunk) in docs.chunks(embed_batch_size).enumerate() {
             let texts: Vec<String> = chunk.iter().map(|(_, _, text)| text.clone()).collect();
-            let produced = match embedder.embed_batch_with_producers(&texts) {
+            let produced = match embedder.embed_batch_with_producers_observed(&texts, work) {
                 Ok(produced) => produced,
                 Err(err) => {
                     let remaining_ids: Vec<ArtifactId> = docs[chunk_idx * embed_batch_size..]
@@ -7221,25 +7471,38 @@ impl InMemoryGraph {
                 }
             };
 
-            for (item_idx, ((_, key, _), vector)) in
-                chunk.iter().zip(produced.vectors.iter()).enumerate()
-            {
-                if let Err(err) =
-                    vi.upsert_retrievable_with_producers(*key, vector, &produced.producers)
+            let published = work.publish(Box::new(|| {
+                let mut published_count = 0;
+                for (item_idx, ((_, key, _), vector)) in
+                    chunk.iter().zip(produced.vectors.iter()).enumerate()
                 {
-                    let mut remaining_ids: Vec<ArtifactId> = chunk[item_idx..]
-                        .iter()
-                        .map(|(artifact_id, _, _)| *artifact_id)
-                        .collect();
-                    remaining_ids.extend(
-                        docs[(chunk_idx + 1) * embed_batch_size..]
+                    if let Err(err) =
+                        vi.upsert_retrievable_with_producers(*key, vector, &produced.producers)
+                    {
+                        let mut remaining_ids: Vec<ArtifactId> = chunk[item_idx..]
                             .iter()
-                            .map(|(artifact_id, _, _)| *artifact_id),
-                    );
-                    requeue(&remaining_ids);
-                    return Err(err);
+                            .map(|(artifact_id, _, _)| *artifact_id)
+                            .collect();
+                        remaining_ids.extend(
+                            docs[(chunk_idx + 1) * embed_batch_size..]
+                                .iter()
+                                .map(|(artifact_id, _, _)| *artifact_id),
+                        );
+                        requeue(&remaining_ids);
+                        return Err(err);
+                    }
+                    published_count += 1;
                 }
-                count += 1;
+                Ok(published_count)
+            }));
+            match published {
+                Ok(published_count) => count += published_count,
+                Err(error) => {
+                    if matches!(&error, KinDbError::EmbeddingCancelled) {
+                        requeue(&ids);
+                    }
+                    return Err(error);
+                }
             }
         }
 
@@ -7251,6 +7514,26 @@ impl InMemoryGraph {
         &self,
         _batch_size: usize,
     ) -> Result<usize, KinDbError> {
+        Ok(0)
+    }
+
+    #[cfg(not(all(feature = "embeddings", feature = "vector")))]
+    pub fn process_embedding_queue_observed(
+        &self,
+        _batch_size: usize,
+        work: &dyn crate::embed::EmbeddingWork,
+    ) -> Result<usize, KinDbError> {
+        work.checkpoint()?;
+        Ok(0)
+    }
+
+    #[cfg(not(all(feature = "embeddings", feature = "vector")))]
+    pub fn process_artifact_embedding_queue_observed(
+        &self,
+        _batch_size: usize,
+        work: &dyn crate::embed::EmbeddingWork,
+    ) -> Result<usize, KinDbError> {
+        work.checkpoint()?;
         Ok(0)
     }
 
@@ -8727,6 +9010,10 @@ impl EntityStore for InMemoryGraph {
         id: &ExternalReferenceId,
     ) -> Result<Option<ExternalReference>, KinDbError> {
         Ok(self.get_external_reference(id))
+    }
+
+    fn external_references(&self) -> Result<Vec<ExternalReference>, KinDbError> {
+        Ok(self.list_external_references())
     }
 
     fn get_external_relations_for_entity(
@@ -12828,6 +13115,265 @@ mod tests {
         // Adding what the graph already holds is refused too.
         assert!(direct.apply_resolution_record_deltas(&records).is_err());
         direct.apply_resolution_record_deltas(&[]).unwrap();
+    }
+
+    #[test]
+    fn published_resolution_cleanup_preserves_new_readers_and_requires_exact_capture() {
+        let graph = InMemoryGraph::new();
+        let caller = unplaced_entity("caller");
+        graph.upsert_entity(&caller).unwrap();
+        let reference =
+            ExternalReference::new_resolved("kin-scip-v1", "cargo std 1.90.0", "vec/Vec#push().")
+                .unwrap();
+        let context = records_context();
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                external_reference_deltas: vec![ExternalReferenceDelta::Added {
+                    new: reference.clone(),
+                }],
+                resolution_record_deltas: vec![kin_model::ResolutionRecordDelta::Added {
+                    new: context.clone(),
+                }],
+                ..Default::default()
+            })
+            .unwrap();
+        let observed = graph.semantic_observation();
+        let ledger = records_ledger(
+            caller.id,
+            kin_model::CallSiteState::ProvenExternal {
+                target: reference.id,
+            },
+            context.id(),
+        );
+        graph
+            .apply_resolution_record_deltas(&[kin_model::ResolutionRecordDelta::Added {
+                new: ledger.clone(),
+            }])
+            .unwrap();
+        assert!(
+            !graph
+                .retire_published_resolution_nodes(
+                    &observed,
+                    std::slice::from_ref(&reference),
+                    std::slice::from_ref(&context)
+                )
+                .unwrap(),
+            "a later ledger invalidates the publication capture"
+        );
+        assert!(
+            !graph
+                .retire_published_resolution_nodes(
+                    &graph.semantic_observation(),
+                    std::slice::from_ref(&reference),
+                    std::slice::from_ref(&context)
+                )
+                .unwrap(),
+            "even a current capture cannot remove nodes a surviving ledger needs"
+        );
+        graph
+            .apply_resolution_record_deltas(&[kin_model::ResolutionRecordDelta::Removed {
+                old: ledger,
+            }])
+            .unwrap();
+        let edge = Relation {
+            id: RelationId::new(),
+            kind: RelationKind::Calls,
+            src: GraphNodeId::Entity(caller.id),
+            dst: GraphNodeId::ExternalReference(reference.id),
+            confidence: 0.95,
+            origin: kin_model::RelationOrigin::Lsp,
+            created_in: None,
+            import_source: None,
+            evidence: vec![kin_model::RelationEvidence {
+                token: Some(context.id().context_token()),
+                ..Default::default()
+            }],
+        };
+        graph.upsert_relation(&edge).unwrap();
+        assert!(
+            !graph
+                .retire_published_resolution_nodes(
+                    &graph.semantic_observation(),
+                    std::slice::from_ref(&reference),
+                    std::slice::from_ref(&context)
+                )
+                .unwrap(),
+            "a retained proof edge also keeps its symbol and context"
+        );
+        graph.remove_relation(&edge.id).unwrap();
+        assert!(graph
+            .retire_published_resolution_nodes(
+                &graph.semantic_observation(),
+                std::slice::from_ref(&reference),
+                std::slice::from_ref(&context)
+            )
+            .unwrap());
+        assert!(graph.get_resolution_record(&context.id()).is_none());
+        assert!(graph.get_external_reference(&reference.id).is_none());
+        assert_eq!(
+            graph.binding_history_observation(),
+            kin_model::BindingHistoryObservation::Unproven,
+            "cleanup alone cannot mint a checked authority witness"
+        );
+    }
+
+    #[test]
+    fn published_artifact_retirements_require_exact_old_and_atomic_capture() {
+        let graph = InMemoryGraph::new();
+        let artifact = graph.admit_artifact_for_test("caller.py", regular_tree_entry(7));
+        let mut old = test_relation(EntityId::new(), EntityId::new(), RelationKind::DependsOn);
+        old.src = GraphNodeId::Artifact(artifact);
+        old.dst = old.src;
+        old.evidence.clear();
+        graph.upsert_relation(&old).unwrap();
+        graph.clear_pending_delta();
+        let captured = graph.semantic_observation();
+        let mut forged = old.clone();
+        forged.confidence = 0.25;
+        assert!(!graph
+            .mirror_published_artifact_relations_and_resolution_cleanup_with_retirements(
+                &captured,
+                &[],
+                &[forged],
+                &[],
+                &[]
+            )
+            .unwrap());
+        assert_eq!(graph.get_relation_by_id(&old.id), Some(old.clone()));
+        graph
+            .upsert_entity(&unplaced_entity("intervening"))
+            .unwrap();
+        assert!(!graph
+            .mirror_published_artifact_relations_and_resolution_cleanup_with_retirements(
+                &captured,
+                &[],
+                std::slice::from_ref(&old),
+                &[],
+                &[]
+            )
+            .unwrap());
+        assert_eq!(graph.get_relation_by_id(&old.id), Some(old.clone()));
+        graph.clear_pending_delta();
+        let mut replacement = old.clone();
+        replacement.confidence = 0.75;
+        assert!(graph
+            .mirror_published_artifact_relations_and_resolution_cleanup_with_retirements(
+                &graph.semantic_observation(),
+                std::slice::from_ref(&replacement),
+                std::slice::from_ref(&old),
+                &[],
+                &[]
+            )
+            .unwrap());
+        assert_eq!(graph.get_relation_by_id(&old.id), Some(replacement.clone()));
+        assert!(graph
+            .mirror_published_artifact_relations_and_resolution_cleanup_with_retirements(
+                &graph.semantic_observation(),
+                &[],
+                &[replacement],
+                &[],
+                &[]
+            )
+            .unwrap());
+        assert!(graph.get_relation_by_id(&old.id).is_none());
+        assert!(graph
+            .get_all_relations_for_node(&GraphNodeId::Artifact(artifact))
+            .unwrap()
+            .is_empty());
+        assert!(
+            graph.pending_delta_snapshot(7).is_none(),
+            "already-durable retirement must not enqueue a new publication"
+        );
+        assert_eq!(
+            graph.binding_history_observation(),
+            kin_model::BindingHistoryObservation::Unproven,
+            "bookkeeping alone never mints an authority witness"
+        );
+    }
+
+    #[test]
+    fn published_artifact_bookkeeping_and_cleanup_share_one_capture() {
+        let graph = InMemoryGraph::new();
+        let artifact = graph.admit_artifact_for_test("caller.py", regular_tree_entry(7));
+        let context = records_context();
+        graph
+            .apply_resolution_record_deltas(&[kin_model::ResolutionRecordDelta::Added {
+                new: context.clone(),
+            }])
+            .unwrap();
+        let mut relation = test_relation(EntityId::new(), EntityId::new(), RelationKind::DependsOn);
+        relation.src = GraphNodeId::Artifact(artifact);
+        relation.dst = relation.src;
+        relation.evidence.clear();
+        let observed = graph.semantic_observation();
+        graph
+            .upsert_entity(&unplaced_entity("intervening"))
+            .unwrap();
+        assert!(
+            !graph
+                .mirror_published_artifact_relations_and_resolution_cleanup(
+                    &observed,
+                    std::slice::from_ref(&relation),
+                    &[],
+                    std::slice::from_ref(&context),
+                )
+                .unwrap(),
+            "a stale capture writes neither bookkeeping nor cleanup"
+        );
+        assert!(graph.get_relation_by_id(&relation.id).is_none());
+        assert!(graph.get_resolution_record(&context.id()).is_some());
+
+        let observed = graph.semantic_observation();
+        let mut referencing = relation.clone();
+        referencing.evidence.push(kin_model::RelationEvidence {
+            token: Some(context.id().context_token()),
+            ..Default::default()
+        });
+        assert!(
+            !graph
+                .mirror_published_artifact_relations_and_resolution_cleanup(
+                    &observed,
+                    &[referencing],
+                    &[],
+                    std::slice::from_ref(&context),
+                )
+                .unwrap(),
+            "new bookkeeping cannot name a node this batch retires"
+        );
+        assert!(graph.get_relation_by_id(&relation.id).is_none());
+        assert!(graph.get_resolution_record(&context.id()).is_some());
+
+        graph.clear_pending_delta();
+        assert!(graph
+            .mirror_published_artifact_relations_and_resolution_cleanup(
+                &observed,
+                std::slice::from_ref(&relation),
+                &[],
+                std::slice::from_ref(&context),
+            )
+            .unwrap());
+        assert_eq!(
+            graph.get_relation_by_id(&relation.id),
+            Some(relation.clone())
+        );
+        assert!(graph.get_resolution_record(&context.id()).is_none());
+        assert!(
+            graph.pending_delta_snapshot(7).is_none(),
+            "already-durable bookkeeping is not re-enqueued"
+        );
+        assert!(
+            graph
+                .get_all_relations_for_node(&GraphNodeId::Artifact(artifact))
+                .unwrap()
+                .iter()
+                .any(|held| held.id == relation.id),
+            "the artifact relation index is updated"
+        );
+        assert_eq!(
+            graph.binding_history_observation(),
+            kin_model::BindingHistoryObservation::Unproven,
+            "mirroring is not qualification"
+        );
     }
 
     #[test]
@@ -21519,6 +22065,149 @@ mod tests {
             crate::storage::SnapshotManager::save_vector_index_for_graph(&snapshot, &graph, None)
                 .is_err()
         );
+    }
+
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    #[derive(Default)]
+    struct CancelEmbeddingWork {
+        cancelled: std::sync::atomic::AtomicBool,
+        completed: std::sync::atomic::AtomicUsize,
+        cancel_on_completion: bool,
+        cancel_on_publish: bool,
+    }
+
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    impl crate::embed::EmbeddingWork for CancelEmbeddingWork {
+        fn cancelled(&self) -> bool {
+            self.cancelled.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn completed_chunk(&self, vectors: usize) {
+            self.completed
+                .fetch_add(vectors, std::sync::atomic::Ordering::SeqCst);
+            if self.cancel_on_completion {
+                self.cancelled
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        fn publish(
+            &self,
+            publish: Box<dyn FnOnce() -> Result<usize, KinDbError> + '_>,
+        ) -> Result<usize, KinDbError> {
+            if self.cancel_on_publish {
+                self.cancelled
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            self.checkpoint()?;
+            publish()
+        }
+    }
+
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    #[test]
+    fn embedding_progress_cancellation_requeues_entity_and_artifact_work_before_publication() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        for artifact in [false, true] {
+            for checkpoint in 0..4 {
+                let dir = tempfile::tempdir().unwrap();
+                let graph = InMemoryGraph::new();
+                let entity = test_entity("queued", "src/queued.rs");
+                let key = if artifact {
+                    let record = StructuredArtifact {
+                        file_id: FilePathId::new("Makefile"),
+                        kind: ArtifactKind::Makefile,
+                        content_hash: Hash256::from_bytes([81; 32]),
+                        text_preview: Some("build test".into()),
+                    };
+                    let id = admit_enrichment(&graph, &record.file_id, record.content_hash);
+                    graph.upsert_structured_artifact(&record).unwrap();
+                    RetrievalKey::Artifact(id)
+                } else {
+                    graph.upsert_entity(&entity).unwrap();
+                    RetrievalKey::Entity(entity.id)
+                };
+                *graph.embedder.lock() = Some(Arc::new(CodeEmbedder::test_local_success(
+                    2,
+                    dir.path().to_path_buf(),
+                    kin_infer::gpu::GpuBackend::Cpu,
+                    vec![1.0, 0.0],
+                )));
+                let work = CancelEmbeddingWork {
+                    cancelled: AtomicBool::new(checkpoint == 0),
+                    cancel_on_completion: checkpoint == 1,
+                    cancel_on_publish: checkpoint == 2,
+                    ..Default::default()
+                };
+                let result = if artifact {
+                    graph.process_artifact_embedding_queue_observed(8, &work)
+                } else {
+                    graph.process_embedding_queue_observed(8, &work)
+                };
+                if checkpoint < 3 {
+                    assert!(matches!(result, Err(KinDbError::EmbeddingCancelled)));
+                    assert_eq!(graph.embedding_status().indexed, 0);
+                    assert_eq!(
+                        graph.pending_embeddings() + graph.pending_artifact_embeddings(),
+                        1
+                    );
+                    assert_eq!(
+                        work.completed.load(Ordering::SeqCst),
+                        usize::from(checkpoint != 0)
+                    );
+                } else {
+                    assert_eq!(result.unwrap(), 1);
+                    assert_eq!(graph.embedding_status().indexed, 1);
+                    assert!(graph
+                        .vector_index
+                        .lock()
+                        .as_ref()
+                        .unwrap()
+                        .contains_retrievable(&key));
+                    assert_eq!(work.completed.load(Ordering::SeqCst), 1);
+                }
+            }
+        }
+    }
+
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    #[test]
+    fn embedding_progress_cancellation_preserves_all_prepared_key_kinds_and_recency() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = InMemoryGraph::new();
+        *graph.embedder.lock() = Some(Arc::new(CodeEmbedder::test_local_success(
+            2,
+            dir.path().to_path_buf(),
+            kin_infer::gpu::GpuBackend::Cpu,
+            vec![1.0, 0.0],
+        )));
+        let entity = RetrievalKey::Entity(EntityId::new());
+        let revision = RetrievalKey::EntityRevision(EntityRevisionId::from_hash(
+            Hash256::from_bytes([82; 32]),
+        ));
+        let artifact = RetrievalKey::Artifact(ArtifactId::new());
+        let carried = RetrievalKey::EntityRevision(EntityRevisionId::from_hash(
+            Hash256::from_bytes([83; 32]),
+        ));
+        let prepared = PreparedEmbedBatch {
+            keys: vec![entity, revision, artifact],
+            texts: vec!["entity".into(), "revision".into(), "artifact".into()],
+            carried: vec![(carried, entity)],
+            recency: [entity, revision, artifact, carried]
+                .into_iter()
+                .map(|key| (key, EmbedRecency::ChangedThisSync))
+                .collect(),
+        };
+        let work = CancelEmbeddingWork {
+            cancel_on_completion: true,
+            ..Default::default()
+        };
+        assert!(matches!(
+            graph.embed_prepared_batch_observed(&prepared, &work),
+            Err(KinDbError::EmbeddingCancelled)
+        ));
+        assert_eq!(graph.vector_index.lock().as_ref().unwrap().len(), 0);
+        let requeued = graph.prepare_pending_embedding_batch(8);
+        assert_eq!(requeued.recency, prepared.recency,
+            "cancelled inference must restore every drained key, including carried revisions, with its priority");
     }
 
     #[cfg(all(feature = "embeddings", feature = "vector"))]

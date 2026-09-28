@@ -181,6 +181,64 @@ def total_by(entries, key):
 '''
 
 
+# BEGIN failure evidence excerpt
+# Every suite carries this block byte for byte, because a suite is also copied
+# out and run as a single file. test_failure_excerpt.py keeps the copies equal.
+EVIDENCE_LIMIT = 4000
+EVIDENCE_LINE_LIMIT = 600
+EVIDENCE_PANICS = ("panicked at", "has overflowed its stack")
+EVIDENCE_ESCAPES = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+EVIDENCE_ERROR = re.compile(r"^(?:[\w./-]+:\s*)?(?:error|fatal)\b", re.IGNORECASE)
+EVIDENCE_LOG_ERROR = re.compile(r"\sERROR\s")
+
+
+def failure_excerpt(text, limit=EVIDENCE_LIMIT):
+    """Bounded evidence from a command's output that still says why it failed.
+
+    Output that fits is returned whole. Longer output keeps its opening and its
+    end, and between them every line that carries a Rust panic, with the
+    message line under it, and the last error line, wherever they fall. A
+    warning printed around the error cannot push it out, and a long log cannot
+    cut the panic out. `limit` only ever raises the bound, never lowers it.
+    """
+    text = (text or "").strip()
+    limit = max(int(limit), EVIDENCE_LIMIT)
+    if len(text) <= limit:
+        return text
+    head_end = limit // 4
+    tail_start = len(text) - limit // 2
+    lines = text.split("\n")
+    starts, offset = [], 0
+    panics, errors = [], []
+    for index, line in enumerate(lines):
+        starts.append(offset)
+        offset += len(line) + 1
+        plain = EVIDENCE_ESCAPES.sub("", line).strip()
+        if any(marker in plain for marker in EVIDENCE_PANICS):
+            panics.extend((index, index + 1))
+        if EVIDENCE_ERROR.match(plain) or EVIDENCE_LOG_ERROR.search(plain):
+            errors.append(index)
+    # The first panic and its message, then the last error line, then any
+    # later panics, for as long as the middle's share of the bound lasts.
+    order = panics[:2] + errors[-1:] + panics[2:]
+    budget, kept = limit // 4, set()
+    for index in order:
+        if index >= len(lines) or index in kept:
+            continue
+        start, end = starts[index], starts[index] + len(lines[index])
+        if end <= head_end or start >= tail_start:
+            continue
+        cost = min(len(lines[index]), EVIDENCE_LINE_LIMIT) + 1
+        if cost > budget:
+            continue
+        kept.add(index)
+        budget -= cost
+    middle = [lines[index][:EVIDENCE_LINE_LIMIT] for index in sorted(kept)]
+    parts = [text[:head_end], "[...]"] + middle + (["[...]"] if middle else [])
+    return "\n".join(parts + [text[tail_start:]])
+# END failure evidence excerpt
+
+
 def run(cmd, cwd=None, env=None, timeout=600):
     process = subprocess.Popen(
         cmd, cwd=cwd, env=env,
@@ -513,12 +571,12 @@ class Suite(object):
         # written into it, which is also the order the stranger used.
         rc, out, err = run([self.kin, "init"], cwd=path, env=self.env, timeout=600)
         if rc != 0:
-            raise RuntimeError("kin init failed: %s" % ((err or out)[-400:]))
+            raise RuntimeError("kin init failed: %s" % failure_excerpt(err or out))
         self._write(path, TRACKED_MODULE, MODULE_BEFORE)
         self._write(path, "ledger/__init__.py", '"""A tiny expense ledger."""\n')
         rc, out, err = self.kin_run(["commit", "-m", "Report totals grouped by key"])
         if rc != 0:
-            raise RuntimeError("the seeding commit failed: %s" % ((err or out)[-400:]))
+            raise RuntimeError("the seeding commit failed: %s" % failure_excerpt(err or out))
         return path
 
     @staticmethod
@@ -576,7 +634,7 @@ def check_held_merge(suite):
         if rc != 0:
             return Result("held_merge", UNREADABLE,
                           "%s `kin %s` exited %s: %s"
-                          % (TICKET, " ".join(args), rc, (err or out)[-200:]))
+                          % (TICKET, " ".join(args), rc, failure_excerpt(err or out)))
     # Same declaration, two different bodies, one on each branch. That is the
     # shape that conflicts; two different files would merge clean and grade
     # nothing.
@@ -584,17 +642,17 @@ def check_held_merge(suite):
     rc, out, err = suite.kin_run(["commit", "-m", "round on the sideline"])
     if rc != 0:
         return Result("held_merge", UNREADABLE,
-                      "%s the sideline commit failed: %s" % (TICKET, (err or out)[-200:]))
+                      "%s the sideline commit failed: %s" % (TICKET, failure_excerpt(err or out)))
     for args in (["branch", "switch", "main"],):
         rc, out, err = suite.kin_run(args)
         if rc != 0:
             return Result("held_merge", UNREADABLE,
-                          "%s switching back failed: %s" % (TICKET, (err or out)[-200:]))
+                          "%s switching back failed: %s" % (TICKET, failure_excerpt(err or out)))
     suite.write_tracked_module(MODULE_MAINLINE)
     rc, out, err = suite.kin_run(["commit", "-m", "round on main"])
     if rc != 0:
         return Result("held_merge", UNREADABLE,
-                      "%s the mainline commit failed: %s" % (TICKET, (err or out)[-200:]))
+                      "%s the mainline commit failed: %s" % (TICKET, failure_excerpt(err or out)))
     # kin merge exits 0 on a conflicted merge today (a separate finding), so the
     # exit code is not the signal here and kin conflicts is.
     suite.kin_run(["merge", "sideline"])
@@ -609,7 +667,7 @@ def check_unadmitted(suite):
     rc, out, err = suite.kin_run(["daemon", "stop"])
     if rc != 0:
         return Result("unadmitted", UNREADABLE,
-                      "%s the daemon would not stop: %s" % (TICKET, (err or out)[-200:]))
+                      "%s the daemon would not stop: %s" % (TICKET, failure_excerpt(err or out)))
     status, detail = grade_verdict_without_an_admission_says_so(suite.status_text())
     return Result("unadmitted", status, "%s %s" % (TICKET, detail))
 
@@ -642,7 +700,7 @@ def check_diff_scope(suite):
     rc, out, err = suite.kin_run(["diff", "HEAD", "WORKSPACE"])
     if rc != 0:
         return Result("diff_scope", UNREADABLE,
-                      "%s kin diff exited %s: %s" % (TICKET, rc, (err or out)[-200:]))
+                      "%s kin diff exited %s: %s" % (TICKET, rc, failure_excerpt(err or out)))
     status, detail = grade_diff_discloses_its_semantic_scope(out)
     return Result("diff_scope", status, "%s %s" % (TICKET, detail))
 
@@ -666,7 +724,7 @@ def check_content(suite):
     rc, out, err = suite.kin_run(["admit"])
     if rc != 0:
         return Result("content", UNREADABLE,
-                      "%s kin admit exited %s: %s" % (TICKET, rc, (err or out)[-200:]))
+                      "%s kin admit exited %s: %s" % (TICKET, rc, failure_excerpt(err or out)))
     status, detail = grade_admit_left_the_graph_holding_the_edit(before, suite.status_text())
     return Result("content", status, "%s %s" % (TICKET, detail))
 
@@ -675,7 +733,7 @@ def check_settled(suite):
     rc, out, err = suite.kin_run(["admit"])
     if rc != 0:
         return Result("settled", UNREADABLE,
-                      "%s the control's kin admit exited %s: %s" % (TICKET, rc, (err or out)[-200:]))
+                      "%s the control's kin admit exited %s: %s" % (TICKET, rc, failure_excerpt(err or out)))
     status, detail = grade_admit_still_reports_a_true_no_op(out)
     return Result("settled", status, "%s %s" % (TICKET, detail))
 

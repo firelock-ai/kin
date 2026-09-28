@@ -113,6 +113,9 @@ pub(crate) fn execute(
             new_generation: execution.receipt.generation,
         });
     }
+    // Committed through the daemon's held authority, so the label follows its
+    // own record and the next reader does not reopen the store to load it.
+    crate::api::relabel_held_authority_after_own_commit(state);
 
     drop(persistence);
     drop(graph_mutation);
@@ -493,12 +496,18 @@ fn replay(
     })
 }
 
+/// Commit a tag ref transaction and hold its successor frozen, through the
+/// local binding-history verifier so a checked lineage carries across the
+/// ref-only transition instead of ending at it, as a branch ref commit does.
 fn commit_and_freeze_exact(
     manager: &RepositoryAuthorityManager<LocalFileBackend>,
     transaction: RepositoryTransaction,
 ) -> Result<(RepositoryCommitReceipt, LocalRepositoryAuthorityFreeze)> {
     manager
-        .commit_repository_transaction_and_freeze(transaction)
+        .commit_repository_transaction_with_binding_history_and_freeze(
+            transaction,
+            &kin_index::binding_history::LocalBindingHistoryVerifier,
+        )
         .map_err(anyhow::Error::new)
 }
 

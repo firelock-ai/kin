@@ -32,7 +32,9 @@ pub mod init_attempt;
 pub mod init_budget;
 pub mod init_disk;
 mod init_progress;
-pub use init_progress::report_admission_progress;
+pub use init_progress::{
+    compact_admission_progress, report_admission_progress, AdmissionStepObserver,
+};
 mod init_staging;
 pub mod last_admission;
 pub mod layout;

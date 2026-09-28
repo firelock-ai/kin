@@ -196,6 +196,9 @@ pub(crate) fn execute(
             }
         }
     }
+    // Committed through the daemon's held authority, so the label follows its
+    // own record and the next reader does not reopen the store to load it.
+    crate::api::relabel_held_authority_after_own_commit(state);
     drop(persistence);
     drop(graph_mutation);
     Ok(response)

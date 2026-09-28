@@ -1,26 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-//! The response-budget contract `trace_data_flow` keeps on the MCP route.
-//!
-//! `max_chars` (or `max_response_chars`) is the size the walk cuts toward, not a
-//! promise about the bytes that ship. Every cut keeps at least one step, and the
-//! parts of a reply the budget never trims can exceed a small ceiling on their
-//! own: the focal's identity, the disclosures a cut requires, and on MCP the
-//! `_kin` envelope and the `negative` object. Below that floor the MCP route
-//! answers with the smallest walk it can retain and says it is over, under
-//! `response_over_budget`, while the CLI route refuses the same walk. A focal
-//! or a named `target` that several owners share is the exception on MCP: its
-//! candidate listing is held to the ceiling, and a reply that cannot fit it is
-//! refused rather than shipped over.
-//!
-//! One walk is driven through the daemon's real `/mcp/tools/call` and
-//! `/commands/trace-data-flow` routes, then through the envelope pass the stdio
-//! server applies to every daemon answer, at each boundary: below the parameter
-//! floor, at it, at a ceiling the smallest walk fits under, at the registered
-//! default and at the `agent-default` default. The advertised schema is read in
-//! the same test, so the words a caller sizes a request on and the behaviour it
-//! gets are graded together.
+//! Trace response pages preserve the complete bounded semantic walk. Each raw
+//! page fits its byte ceiling, survives stdio finalization unchanged and stays
+//! non-certifying until callers reconstruct all semantic records and readings.
+//! Graph fanout, provenance and spine limits remain independent of page size.
 
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
@@ -29,13 +13,16 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use kin_daemon::DaemonState;
 use kin_mcp::budget::{
-    ResponseBudget, OVER_BUDGET_REASON, RESPONSE_DEFAULT_MAX_CHARS,
-    RESPONSE_ENVELOPE_RESERVE_CHARS, RESPONSE_MAX_MAX_CHARS, RESPONSE_MIN_MAX_CHARS,
+    ResponseBudget, RESPONSE_DEFAULT_MAX_CHARS, RESPONSE_MAX_MAX_CHARS, RESPONSE_MIN_MAX_CHARS,
 };
 use kin_mcp::envelope::{finalize_bounded, Envelope};
 use kin_mcp::{ContentBlock, ToolCallResult};
 use serde_json::{json, Value};
 use tower::ServiceExt;
+
+#[path = "support/trace_pages.rs"]
+mod trace_page_test_support;
+use trace_page_test_support::TraceAssembly;
 
 const TOOL: &str = "trace_data_flow";
 
@@ -262,7 +249,7 @@ fn arguments(value: &Value) -> HashMap<String, Value> {
 
 /// The answer a stdio client receives: the daemon's result, then the envelope
 /// pass `kin mcp start` applies under the budget read from the same arguments.
-async fn served(
+async fn served_page(
     state: &Arc<DaemonState>,
     arguments_json: &Value,
 ) -> (ToolCallResult, ToolCallResult) {
@@ -272,29 +259,41 @@ async fn served(
     (daemon, client)
 }
 
-fn reasons(payload: &Value) -> Vec<String> {
-    payload["degradations"]
-        .as_array()
-        .map(|entries| {
-            entries
-                .iter()
-                .filter_map(|entry| entry["reason"].as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn over_budget_ceilings(payload: &Value) -> Vec<u64> {
-    payload["degradations"]
-        .as_array()
-        .map(|entries| {
-            entries
-                .iter()
-                .filter(|entry| entry["reason"] == OVER_BUDGET_REASON)
-                .filter_map(|entry| entry["max_chars"].as_u64())
-                .collect()
-        })
-        .unwrap_or_default()
+async fn served(state: &Arc<DaemonState>, query: &Value) -> (ToolCallResult, ToolCallResult) {
+    let mut args = query.clone();
+    let ceiling = ResponseBudget::from_arguments(&arguments(query)).max_chars;
+    let mut assembly = TraceAssembly::default();
+    let mut seen = std::collections::BTreeSet::new();
+    loop {
+        let (daemon, client) = served_page(state, &args).await;
+        if client.is_error == Some(true) {
+            return (daemon, client);
+        }
+        assert_eq!(
+            text(&daemon),
+            text(&client),
+            "stdio must not mutate a frozen page"
+        );
+        let page = payload(&client);
+        assert_eq!(page["_kin"]["page"]["version"], 1);
+        if page["_kin"]["page"]["complete"] == true {
+            assert!(text(&client).len() <= ceiling);
+            assert_eq!(
+                page["_kin"]["response"]["chars_after_budget"],
+                text(&client).len()
+            );
+            return (daemon, client);
+        }
+        assembly.add(&page, text(&client), ceiling);
+        if let Some(cursor) = page["next_cursor"].as_str() {
+            assert!(seen.insert(cursor.to_string()), "cursor must advance");
+            assert!(seen.len() < 10000);
+            args["cursor"] = json!(cursor);
+        } else {
+            let result = ToolCallResult::text(assembly.finish().to_string());
+            return (result.clone(), result);
+        }
+    }
 }
 
 fn step_ids(payload: &Value) -> Vec<String> {
@@ -304,25 +303,6 @@ fn step_ids(payload: &Value) -> Vec<String> {
         .iter()
         .map(|step| step["entity_id"].as_str().unwrap_or_default().to_string())
         .collect()
-}
-
-/// A cut chain keeps at least one step, and `elisions.chain` accounts for
-/// every step the walk reached.
-fn assert_cut_but_never_emptied(payload: &Value, arm: &str) {
-    let kept = step_ids(payload).len();
-    assert!(kept >= 1, "{arm}: a cut chain keeps a step: {payload}");
-    let elision = &payload["elisions"]["chain"];
-    assert_eq!(elision["kept"], json!(kept), "{arm}: {elision}");
-    assert_eq!(
-        elision["total"],
-        json!(WALK_STEPS),
-        "{arm}: the elision accounts for the whole walk: {elision}"
-    );
-    assert_eq!(
-        elision["elided"],
-        json!(WALK_STEPS - kept),
-        "{arm}: {elision}"
-    );
 }
 
 async fn fixture() -> (tempfile::TempDir, Arc<DaemonState>) {
@@ -395,281 +375,114 @@ fn walk_with(budget: Option<(&str, usize)>) -> Value {
 }
 
 #[tokio::test]
-async fn mcp_trace_ships_its_smallest_walk_over_a_ceiling_it_cannot_reach_and_says_so() {
+async fn mcp_trace_pages_fit_the_floor_and_preserve_ambiguity() {
     let (_dir, state) = fixture().await;
-
-    // At the parameter floor. The smallest walk this fixture can retain, with
-    // its identity, its disclosures and the envelope, measures above 2,000, so
-    // the route answers with it, cut and over, and says so.
-    let at_floor = walk_with(Some(("max_chars", RESPONSE_MIN_MAX_CHARS)));
-    let (daemon, client) = served(&state, &at_floor).await;
-    for (arm, result) in [("daemon route", &daemon), ("stdio client", &client)] {
-        assert_ne!(
-            result.is_error,
-            Some(true),
-            "{arm}: a walk below its floor is answered over MCP, not refused: {}",
-            text(result)
-        );
-        let answer = payload(result);
-        assert_cut_but_never_emptied(&answer, arm);
-        assert_eq!(answer["max_response_chars"], json!(RESPONSE_MIN_MAX_CHARS));
-        assert_eq!(answer["steps_omitted"], json!(WALK_STEPS - 1), "{arm}");
-        assert!(
-            text(result).len() > RESPONSE_MIN_MAX_CHARS,
-            "{arm}: the arm proves nothing unless the answer is really over its ceiling"
-        );
-        assert_eq!(
-            over_budget_ceilings(&answer),
-            vec![RESPONSE_MIN_MAX_CHARS as u64],
-            "{arm}: one overrun note naming the ceiling it missed: {:?}",
-            reasons(&answer)
-        );
-    }
-    let answer = payload(&client);
-    assert_eq!(
-        answer["_kin"]["response"]["max_chars"],
-        json!(RESPONSE_MIN_MAX_CHARS)
-    );
-    let shipped = answer["_kin"]["response"]["chars_after_budget"]
-        .as_u64()
-        .expect("the accounting reports the size that ships");
-    assert!(
-        shipped > RESPONSE_MIN_MAX_CHARS as u64,
-        "the accounting reports the overrun rather than the ceiling: {shipped}"
-    );
-    let floor_steps = step_ids(&answer);
-
-    // Below the parameter floor, under either spelling, the budget is clamped
-    // to the floor rather than refused, so the answer is the one above.
-    for (key, value) in [
-        ("max_chars", 0),
-        ("max_chars", RESPONSE_MIN_MAX_CHARS - 1),
-        ("max_response_chars", 0),
+    let (_, whole) = served(
+        &state,
+        &walk_with(Some(("max_chars", RESPONSE_MAX_MAX_CHARS))),
+    )
+    .await;
+    let expected = payload(&whole)["chain"].clone();
+    for ceiling in [
+        0,
+        RESPONSE_MIN_MAX_CHARS - 1,
+        RESPONSE_MIN_MAX_CHARS,
+        6000,
+        12000,
+        RESPONSE_DEFAULT_MAX_CHARS,
     ] {
-        let (daemon, client) = served(&state, &walk_with(Some((key, value)))).await;
-        let arm = format!("{key}={value}");
-        assert_ne!(daemon.is_error, Some(true), "{arm}: {}", text(&daemon));
-        assert_ne!(client.is_error, Some(true), "{arm}: {}", text(&client));
-        let answer = payload(&client);
+        for key in ["max_chars", "max_response_chars"] {
+            let query = walk_with(Some((key, ceiling)));
+            let (_, result) = served(&state, &query).await;
+            assert_ne!(result.is_error, Some(true), "{}", text(&result));
+            assert_eq!(payload(&result)["chain"], expected);
+        }
+    }
+    let query = walk_with(Some(("max_response_chars", RESPONSE_MIN_MAX_CHARS)));
+    let (daemon, _) = served_page(&state, &query).await;
+    let (status, body) = post(&state, "/commands/trace-data-flow", query).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let command: Value = serde_json::from_str(&body).unwrap();
+    assert!(body.len() <= RESPONSE_MIN_MAX_CHARS);
+    assert_eq!(command["chain"], payload(&daemon)["chain"]);
+    assert_eq!(
+        command["record_fragment"],
+        payload(&daemon)["record_fragment"]
+    );
+    for query in [
+        json!({"focal":"get", "include_body":false, "max_chars":2000}),
+        json!({"focal":"start", "target":"get", "direction":"calls", "depth":4,
+               "include_body":false, "max_chars":2000}),
+    ] {
+        let (_, result) = served(&state, &query).await;
+        assert_ne!(result.is_error, Some(true), "{}", text(&result));
+        let answer = payload(&result);
+        let focal_ambiguous = query.get("target").is_none();
+        let listing = if focal_ambiguous {
+            assert_eq!(answer["ambiguous_focal"], true);
+            assert!(answer["chain"].as_array().is_none_or(Vec::is_empty));
+            for selected in ["focal", "focal_entity", "focal_id", "body", "source_base"] {
+                assert!(
+                    answer.get(selected).is_none(),
+                    "an ambiguous focal selected {selected}: {answer}"
+                );
+            }
+            &answer
+        } else {
+            // A successful unselected target is disclosed under target_ambiguity;
+            // ambiguous_target was the legacy budget-refusal representation.
+            assert!(answer["target_ambiguity"].is_object());
+            assert!(answer.get("target_name").is_none());
+            assert!(!answer["chain"].as_array().unwrap().is_empty());
+            assert!(answer["degradations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["component"] == "target_reachability"
+                    && entry["reason"] == "target_ambiguous"));
+            &answer["target_ambiguity"]
+        };
+        assert_eq!(listing["candidate_count"], OWNERS);
+        assert_eq!(listing["resolution"], "shared_member_name");
+        assert_eq!(listing["omitted_candidates"].as_u64().unwrap_or(0), 0);
+        assert_eq!(listing["candidates"].as_array().unwrap().len(), OWNERS);
+        if focal_ambiguous {
+            // No focal was selected and no chain was queried, so the full
+            // answer makes no absence claim. Its verdict still qualifies the
+            // ambiguity, independently of each page's non-certifying guard.
+            assert!(answer.get("negative").is_none());
+        } else {
+            assert_eq!(answer["negative"]["safe_to_conclude_absent"], false);
+        }
+        assert_eq!(answer["_kin"]["verdict"]["safe_to_conclude_absent"], false);
+        assert_eq!(answer["_kin"]["verdict"]["state"], "inconclusive");
         assert_eq!(
-            answer["max_response_chars"],
-            json!(RESPONSE_MIN_MAX_CHARS),
-            "{arm}"
-        );
-        assert_eq!(
-            answer["_kin"]["response"]["max_chars"],
-            json!(RESPONSE_MIN_MAX_CHARS),
-            "{arm}"
-        );
-        assert_eq!(step_ids(&answer), floor_steps, "{arm}");
-        assert_eq!(
-            over_budget_ceilings(&answer),
-            vec![RESPONSE_MIN_MAX_CHARS as u64],
-            "{arm}"
+            answer["_kin"]["verdict"]["inputs"]["degradations"],
+            "inconclusive"
         );
     }
-
-    // The CLI route refuses the same walk at the same ceiling: what it prints is
-    // exactly what its caller reads, so a bound it cannot keep is a refusal. The
-    // caller's own `max_response_chars` caused it, so it is a 400 rather than
-    // the 500 that says the daemon failed.
-    let cli = walk_with(Some(("max_response_chars", RESPONSE_MIN_MAX_CHARS)));
-    let (status, body) = post(&state, "/commands/trace-data-flow", cli).await;
-    assert_eq!(
-        status,
-        StatusCode::BAD_REQUEST,
-        "the CLI route refuses the caller's budget: {body}"
-    );
-    assert!(
-        body.contains("even at the smallest retained walk"),
-        "the CLI refusal names the floor it could not fit: {body}"
-    );
-    // The control: a failure that is not the budget's keeps the status it had.
     let (status, body) = post(
         &state,
         "/commands/trace-data-flow",
-        json!({ "focal": "no_such_focal_in_this_fixture" }),
+        json!({"focal":"no_such_focal_in_this_fixture"}),
     )
     .await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
     assert!(body.contains("no entity found matching"), "{body}");
-
-    // A ceiling the smallest walk fits under is a ceiling the answer keeps: the
-    // chain is cut, the bytes land inside it, and nothing claims an overrun.
-    let fits = walk_with(Some(("max_chars", 12_000)));
-    let (_, client) = served(&state, &fits).await;
-    assert_ne!(client.is_error, Some(true), "{}", text(&client));
-    let answer = payload(&client);
-    assert_cut_but_never_emptied(&answer, "12,000");
-    assert!(
-        text(&client).len() <= 12_000,
-        "{} bytes",
-        text(&client).len()
-    );
-    assert!(
-        answer["_kin"]["response"]["chars_after_budget"]
-            .as_u64()
-            .is_some_and(|shipped| shipped <= 12_000),
-        "{}",
-        answer["_kin"]["response"]
-    );
-    assert!(
-        over_budget_ceilings(&answer).is_empty(),
-        "{:?}",
-        reasons(&answer)
-    );
-
-    // The registered default. The daemon walks under the default less the room
-    // it holds back for the envelope, and the client is served the default.
-    let (daemon, client) = served(&state, &walk_with(None)).await;
-    let walked = payload(&daemon);
-    assert_eq!(
-        walked["max_response_chars"],
-        json!(RESPONSE_DEFAULT_MAX_CHARS - RESPONSE_ENVELOPE_RESERVE_CHARS)
-    );
-    let answer = payload(&client);
-    assert_eq!(
-        answer["_kin"]["response"]["max_chars"],
-        json!(RESPONSE_DEFAULT_MAX_CHARS)
-    );
-    assert_eq!(
-        step_ids(&answer).len(),
-        WALK_STEPS,
-        "the default carries the whole walk"
-    );
-    assert!(
-        answer["elisions"].get("chain").is_none(),
-        "{}",
-        answer["elisions"]
-    );
-    assert!(
-        over_budget_ceilings(&answer).is_empty(),
-        "{:?}",
-        reasons(&answer)
-    );
-
-    // The `agent-default` default, injected the way the stdio server injects it
-    // when the caller names no budget.
     let mut belt_args = arguments(&walk_with(None));
     kin_mcp::agent_belt::apply_belt_defaults(TOOL, &mut belt_args);
     assert_eq!(
         belt_args.get("max_chars"),
         Some(&json!(kin_mcp::agent_belt::AGENT_CHAIN_RESPONSE_MAX_CHARS))
     );
-    let belt_walk = serde_json::to_value(&belt_args).unwrap();
-    let (daemon, client) = served(&state, &belt_walk).await;
+    let (_, belt_page) = served_page(&state, &json!(belt_args)).await;
     assert_eq!(
-        payload(&daemon)["max_response_chars"],
-        json!(kin_mcp::agent_belt::AGENT_CHAIN_RESPONSE_MAX_CHARS)
+        payload(&belt_page)["_kin"]["response"]["max_chars"],
+        kin_mcp::agent_belt::AGENT_CHAIN_RESPONSE_MAX_CHARS
     );
-    let answer = payload(&client);
-    assert_eq!(step_ids(&answer).len(), WALK_STEPS);
     assert!(
-        over_budget_ceilings(&answer).is_empty(),
-        "{:?}",
-        reasons(&answer)
-    );
-
-    // The exception: a target several owners share. Its candidate listing is
-    // held to the ceiling, and a walk that cannot fit beside the smallest form
-    // of it is refused with the count alone rather than shipped over.
-    let ambiguous = json!({
-        "focal": "start",
-        "target": "get",
-        "depth": 4,
-        "direction": "calls",
-        "include_body": false,
-        "max_chars": RESPONSE_MIN_MAX_CHARS,
-    });
-    let (daemon, client) = served(&state, &ambiguous).await;
-    for (arm, result) in [("daemon route", &daemon), ("stdio client", &client)] {
-        assert_eq!(result.is_error, Some(true), "{arm}: {}", text(result));
-        let refusal = payload(result);
-        assert!(
-            refusal["error"]
-                .as_str()
-                .is_some_and(|error| error.contains("cannot fit")),
-            "{arm}: {refusal}"
-        );
-        assert_eq!(refusal["ambiguous_target"], json!(true), "{arm}");
-        assert_eq!(refusal["candidate_count"], json!(OWNERS), "{arm}");
-        assert!(refusal.get("chain").is_none(), "{arm}: {refusal}");
-    }
-
-    // A focal several owners share is the same exception with no walk at all:
-    // the answer is its candidate listing, held to the budget the same way. At
-    // the floor even the listing's count-only form does not fit beside the
-    // envelope, so the client is refused with the count alone, and at the
-    // default the listing fits and is the answer.
-    let ambiguous_focal = json!({
-        "focal": "get",
-        "depth": 4,
-        "direction": "calls",
-        "include_body": false,
-        "max_chars": RESPONSE_MIN_MAX_CHARS,
-    });
-    let (daemon, client) = served(&state, &ambiguous_focal).await;
-    println!(
-        "ambiguous focal at the floor: daemon route is_error {:?}, {} bytes; stdio client \
-         is_error {:?}, {} bytes",
-        daemon.is_error,
-        text(&daemon).len(),
-        client.is_error,
-        text(&client).len()
-    );
-    assert_eq!(client.is_error, Some(true), "{}", text(&client));
-    let refusal = payload(&client);
-    assert!(
-        refusal["error"]
-            .as_str()
-            .is_some_and(|error| error.contains("cannot fit")),
-        "{refusal}"
-    );
-    assert_eq!(refusal["ambiguous_focal"], json!(true), "{refusal}");
-    assert_eq!(refusal["candidate_count"], json!(OWNERS), "{refusal}");
-    assert!(refusal.get("chain").is_none(), "{refusal}");
-    let mut roomy_focal = ambiguous_focal.clone();
-    roomy_focal["max_chars"] = json!(RESPONSE_DEFAULT_MAX_CHARS);
-    let (_, client) = served(&state, &roomy_focal).await;
-    assert_ne!(
-        client.is_error,
-        Some(true),
-        "a budget the listing fits is answered with it: {}",
-        text(&client)
-    );
-    let listing = payload(&client);
-    assert_eq!(listing["ambiguous_focal"], json!(true), "{listing}");
-    assert_eq!(listing["candidate_count"], json!(OWNERS), "{listing}");
-    assert!(
-        text(&client).len() <= RESPONSE_DEFAULT_MAX_CHARS,
-        "{} bytes",
-        text(&client).len()
-    );
-
-    // What a caller reads before it asks. The numbers are the budget's own, and
-    // the words must not promise a hard ceiling this route does not keep.
-    let listing = kin_mcp::tools::tool_definitions();
-    let trace = listing
-        .tools
-        .iter()
-        .find(|tool| tool.name == TOOL)
-        .expect("trace_data_flow is registered");
-    for key in ["max_response_chars", "max_chars"] {
-        let property = &trace.input_schema["properties"][key];
-        assert_eq!(property["minimum"], json!(RESPONSE_MIN_MAX_CHARS), "{key}");
-        assert_eq!(
-            property["default"],
-            json!(RESPONSE_DEFAULT_MAX_CHARS),
-            "{key}"
-        );
-        assert_eq!(property["maximum"], json!(RESPONSE_MAX_MAX_CHARS), "{key}");
-    }
-    let words = trace.input_schema["properties"]["max_response_chars"]["description"]
-        .as_str()
-        .unwrap();
-    assert!(
-        words.contains(OVER_BUDGET_REASON) && words.contains("not a hard ceiling"),
-        "the full schema names the disclosed overrun: {words}"
+        text(&belt_page).len()
+            <= usize::try_from(kin_mcp::agent_belt::AGENT_CHAIN_RESPONSE_MAX_CHARS).unwrap()
     );
     let belt = kin_mcp::tools::served_tools_list(
         Some(&kin_mcp::tools::name_set(
@@ -677,160 +490,64 @@ async fn mcp_trace_ships_its_smallest_walk_over_a_ceiling_it_cannot_reach_and_sa
         )),
         true,
     );
-    let belt_trace = belt
-        .tools
-        .iter()
-        .find(|tool| tool.name == TOOL)
-        .expect("agent-default serves trace_data_flow");
-    let belt_budget = &belt_trace.input_schema["properties"]["max_chars"];
+    let belt_trace = belt.tools.iter().find(|tool| tool.name == TOOL).unwrap();
     assert_eq!(
-        belt_budget["default"],
-        json!(kin_mcp::agent_belt::AGENT_CHAIN_RESPONSE_MAX_CHARS)
+        belt_trace.input_schema["properties"]["max_chars"]["default"],
+        kin_mcp::agent_belt::AGENT_CHAIN_RESPONSE_MAX_CHARS
     );
     assert!(
-        belt_budget["description"]
+        belt_trace.input_schema["properties"]["max_chars"]["description"]
             .as_str()
-            .is_some_and(|words| words.starts_with("Soft cap")),
-        "agent-default does not call the trace budget a maximum: {belt_budget}"
+            .unwrap()
+            .starts_with("Hard")
+    );
+    let listing = kin_mcp::tools::tool_definitions();
+    let trace = listing.tools.iter().find(|tool| tool.name == TOOL).unwrap();
+    for key in ["max_response_chars", "max_chars"] {
+        let property = &trace.input_schema["properties"][key];
+        assert_eq!(property["minimum"], RESPONSE_MIN_MAX_CHARS);
+        assert_eq!(property["default"], RESPONSE_DEFAULT_MAX_CHARS);
+        assert_eq!(property["maximum"], RESPONSE_MAX_MAX_CHARS);
+    }
+    assert_eq!(trace.input_schema["properties"]["cursor"]["maxLength"], 256);
+    assert!(
+        trace.input_schema["properties"]["max_response_chars"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("Hard")
     );
 }
 
-/// Budgets at which a different pass makes the cut on this fixture. At 2,000
-/// only the walk cuts, because it is already down to one step; at 6,000 the
-/// walk cuts and the envelope pass cuts the same chain again; at 13,000 only
-/// the envelope pass cuts, because the walk fits the budget before the
-/// envelope is added. Every step carries the keys a call into a symbol outside
-/// the repository fills, as null here, which put this fixture's walk at about
-/// 12,500 characters, just over the 12,000 this arm used before.
+/// Page ceilings span the minimum and multiple complete-record page sizes.
 const CUT_CEILINGS: [usize; 3] = [RESPONSE_MIN_MAX_CHARS, 6_000, 13_000];
 
-/// The counters beside a cut chain describe the chain that ships, whichever
-/// pass cut it.
-///
-/// The walk writes `total_steps` and `steps_omitted` for its own cut, and the
-/// envelope pass then cuts the same chain again when the reply and its
-/// envelope still do not fit. Measured on this fixture before that second cut
-/// restated them, 6,000 shipped one step beside `total_steps: 2`,
-/// `steps_omitted: 6` and an `elisions.chain` that withheld seven, and 12,000,
-/// where only the envelope pass cut, shipped two steps beside `total_steps: 8`
-/// and no `steps_omitted` at all.
-///
-/// Every disagreement is collected before the test fails, so one run names
-/// each counter at each budget rather than the first one it met.
+/// Totals and terminal counters describe the complete reconstructed chain.
 #[tokio::test]
-async fn mcp_trace_step_counters_describe_the_chain_that_ships() {
+async fn mcp_trace_step_counters_describe_the_reconstructed_chain() {
     let (_dir, state) = fixture().await;
-    let mut problems: Vec<String> = Vec::new();
     for ceiling in CUT_CEILINGS {
-        let arm = format!("max_chars {ceiling}");
-        let (_, client) = served(&state, &walk_with(Some(("max_chars", ceiling)))).await;
-        assert_ne!(client.is_error, Some(true), "{arm}: {}", text(&client));
-        let answer = payload(&client);
-        assert_cut_but_never_emptied(&answer, &arm);
-        let shipped = step_ids(&answer).len();
-        let elided = answer["elisions"]["chain"]["elided"]
-            .as_u64()
-            .expect("a cut chain publishes its elision") as usize;
-        // Which pass took what. `chain_withheld` is the envelope pass's share
-        // and `elisions.chain` the whole cut, so the walk's share is the rest.
-        let by_envelope = answer["chain_withheld"].as_u64().unwrap_or(0) as usize;
-        let by_walk = elided.checked_sub(by_envelope).unwrap_or_else(|| {
-            panic!("{arm}: chain_withheld {by_envelope} exceeds elisions.chain.elided {elided}")
-        });
-        println!(
-            "{arm}: {shipped} of {WALK_STEPS} steps ship; the walk cut {by_walk} and the \
-             envelope pass {by_envelope}; total_steps {}, steps_omitted {}, \
-             _kin.completeness.counted.reported {}",
-            answer["total_steps"],
-            answer["steps_omitted"],
-            answer["_kin"]["completeness"]["counted"]["reported"],
-        );
-        // The arm proves nothing unless the pass it is named for made the cut.
-        let (walk_cuts, envelope_cuts) = match ceiling {
-            RESPONSE_MIN_MAX_CHARS => (true, false),
-            6_000 => (true, true),
-            _ => (false, true),
-        };
-        assert_eq!(by_walk > 0, walk_cuts, "{arm}: the walk's cut: {answer}");
-        assert_eq!(
-            by_envelope > 0,
-            envelope_cuts,
-            "{arm}: the envelope pass's cut: {answer}"
-        );
-
-        if answer["total_steps"] != json!(shipped) {
-            problems.push(format!(
-                "{arm}: total_steps is {} and chain carries {shipped}",
-                answer["total_steps"]
-            ));
-        }
-        if answer["steps_omitted"] != json!(elided) {
-            problems.push(format!(
-                "{arm}: steps_omitted is {} and elisions.chain.elided is {elided}",
-                answer["steps_omitted"]
-            ));
-        }
-        let reported = &answer["_kin"]["completeness"]["counted"]["reported"];
-        if *reported != json!(shipped) {
-            problems.push(format!(
-                "{arm}: _kin.completeness.counted.reported is {reported} and chain carries \
-                 {shipped}"
-            ));
-        }
-        if answer["_kin"]["response"]["primary_rows"] != json!(shipped) {
-            problems.push(format!(
-                "{arm}: _kin.response.primary_rows is {} and chain carries {shipped}",
-                answer["_kin"]["response"]["primary_rows"]
-            ));
-        }
-        let sent = text(&client).len();
-        if answer["_kin"]["response"]["chars_after_budget"] != json!(sent) {
-            problems.push(format!(
-                "{arm}: _kin.response.chars_after_budget is {} and {sent} bytes ship",
-                answer["_kin"]["response"]["chars_after_budget"]
-            ));
-        }
+        let (_, result) = served(&state, &walk_with(Some(("max_chars", ceiling)))).await;
+        let answer = payload(&result);
+        assert_eq!(step_ids(&answer).len(), WALK_STEPS);
+        assert_eq!(answer["total_steps"], WALK_STEPS);
+        assert_eq!(answer["steps_omitted"].as_u64().unwrap_or(0), 0);
+        assert!(chain_contradictions(&format!("{ceiling}"), &answer).is_empty());
     }
-    assert!(problems.is_empty(), "{problems:#?}");
 }
 
-/// A reply the walk cut that still ships over its budget says so in
-/// `_kin.response.bounded`, though no envelope pass cut anything.
-///
-/// The field read only the envelope pass's own record of a cut, so a walk the
-/// walk itself cut from eight steps to one shipped `bounded: false`, which is
-/// the reading the field reserves for a reply that fits, on a reply several
-/// times over its budget. A walk nothing cut is the control: bounded there
-/// would be a flag that says nothing.
+/// The floor emits a qualified bounded page, unchanged by stdio finalization.
 #[tokio::test]
-async fn mcp_trace_reports_a_reply_the_walk_cut_as_bounded() {
+async fn mcp_trace_raw_page_accounting_is_bounded_and_stdio_preserves_it() {
     let (_dir, state) = fixture().await;
-    let (_, client) = served(
-        &state,
-        &walk_with(Some(("max_chars", RESPONSE_MIN_MAX_CHARS))),
-    )
-    .await;
-    let answer = payload(&client);
-    // The case: the walk made the whole cut and the envelope pass made none.
-    assert_eq!(answer["steps_omitted"], json!(WALK_STEPS - 1), "{answer}");
-    assert!(answer.get("chain_withheld").is_none(), "{answer}");
-    assert!(text(&client).len() > RESPONSE_MIN_MAX_CHARS);
-    assert_eq!(
-        answer["_kin"]["response"]["bounded"],
-        json!(true),
-        "a reply the walk cut from {WALK_STEPS} steps to one is bounded: {}",
-        answer["_kin"]["response"]
-    );
-
-    let (_, client) = served(&state, &walk_with(None)).await;
-    let whole = payload(&client);
-    assert_eq!(step_ids(&whole).len(), WALK_STEPS);
-    assert_eq!(
-        whole["_kin"]["response"]["bounded"],
-        json!(false),
-        "a walk nothing cut is not bounded: {}",
-        whole["_kin"]["response"]
-    );
+    let query = walk_with(Some(("max_chars", RESPONSE_MIN_MAX_CHARS)));
+    let (daemon, client) = served_page(&state, &query).await;
+    assert_eq!(text(&daemon), text(&client));
+    let page = payload(&client);
+    assert!(text(&client).len() <= RESPONSE_MIN_MAX_CHARS);
+    assert_eq!(page["_kin"]["response"]["bounded"], true);
+    assert!(page["next_cursor"].is_string());
+    assert_eq!(page["negative"]["safe_to_conclude_absent"], false);
+    assert_eq!(page["_kin"]["verdict"]["state"], "inconclusive");
 }
 
 /// How many steps the walk's own cut dropped, as its `response_budget`
@@ -885,272 +602,30 @@ fn step_sum_contradiction(label: &str, answer: &Value) -> Option<String> {
     })
 }
 
-/// A reply the walk cut is bounded whether or not it then fits, and its
-/// accounting states the size the whole walk measured before the cut.
-///
-/// A pass that bounds the reply after the walk can measure only what the walk
-/// handed it. So a reply the walk cut that then fit reported `bounded: false`,
-/// and its `chars_before_budget` was the size of the cut reply: with bodies,
-/// the daemon route at 12,000 bytes shipped one step of eight beside
-/// `bounded: false` and `chars_before_budget: 11338`, against a whole walk of
-/// more than 22,000. The walk now records the size it measured before its own
-/// cut, as `chars_before_budget` on the trace payload.
-///
-/// Two cases are graded, each on arms of its own. In the first the walk makes
-/// the whole cut and the envelope pass makes none, so nothing but the walk's
-/// record can say the reply was cut. In the second the envelope pass cuts the
-/// walk's reply again, because an explicit `max_chars` reserves no room for the
-/// envelope, and the accounting must still carry the walk's size while the two
-/// passes' step counts add up to the reply's.
-///
-/// An explicit `max_chars` reserves no room for the envelope on the daemon
-/// route, so a cut the walk makes alone needs a walk whose bodies outweigh the
-/// envelope. At 12,000 and 20,000 on the deep chain both passes cut, which is
-/// where the second case is graded. The first is graded on a
-/// padded chain, at a ceiling derived from sizes measured here: the whole
-/// walk, and what the walk's bodies-only cut ships enveloped. Each arm asserts
-/// the case it grades before grading it, so growth in what a step or the
-/// envelope carries fails here by name rather than turning an arm into the
-/// other case. The in-process walk, which the hosted and offline routes serve,
-/// grades the first case with a step cut, on a wide tree whose pretty
-/// rendering the walk cuts and whose compact one then fits. The daemon route's
-/// record is the walk's whole size exactly. The in-process walk writes a few
-/// counts after its cut, so its record falls between the cut walk and the
-/// whole one.
+/// Requested entity bodies and absolute parent/step identities survive every page.
 #[tokio::test]
-async fn mcp_trace_reports_every_walk_cut_as_bounded_with_the_walks_size() {
-    let (_dir, state) = fixture().await;
-    let mut problems: Vec<String> = Vec::new();
-    let with_bodies = |ceiling: usize| {
-        let mut walk = walk_with(Some(("max_chars", ceiling)));
-        walk["include_body"] = json!(true);
-        walk
-    };
-
-    // The whole walk as the walk renders it, which is what `kin trace-data-flow`
-    // prints uncut. The MCP route adds its own `source_derivation` block after
-    // the walk, and that block is not part of the walk's size.
-    let (status, body) = post(
-        &state,
-        "/commands/trace-data-flow",
-        with_bodies(RESPONSE_MAX_MAX_CHARS),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let whole_walk = kin_cli::commands::trace_data_flow::render_response_json(
-        &serde_json::from_str(&body).expect("the CLI route answers with the walk"),
-    )
-    .expect("the walk renders")
-    .len();
-
-    // The walk makes the whole cut and the envelope pass makes none. On this
-    // route an explicit `max_chars` reserves no room for the envelope. The deep
-    // chain's 12,000 and 20,000 arms below exercise both passes. This case is
-    // graded on the padded chain, whose bodies outweigh the
-    // envelope, at a ceiling inside the range the sizes measured here leave.
-    let (_padded_dir, padded) = fixture_with(&[("src/padded.py", padded_source())]).await;
-    let padded_walk = |ceiling: usize| {
-        json!({
-            "focal": "padded_entry", "depth": PADDED_STEPS, "direction": "calls",
-            "limit_per_step": 25, "include_body": true, "max_chars": ceiling,
-        })
-    };
-    let (status, body) = post(
-        &padded,
-        "/commands/trace-data-flow",
-        padded_walk(RESPONSE_MAX_MAX_CHARS),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let whole_padded = kin_cli::commands::trace_data_flow::render_response_json(
-        &serde_json::from_str(&body).expect("the CLI route answers with the walk"),
-    )
-    .expect("the walk renders")
-    .len();
-    // The walk's bodies-only cut: every step kept, every step body shed. Its
-    // bodies are most of the walk, so half the walk's size is a ceiling it
-    // makes that cut under, and what the cut ships enveloped, where nothing
-    // cuts it, is the smallest ceiling it fits under whole.
-    let (probe, _) = served(&padded, &padded_walk(whole_padded / 2)).await;
-    let probed = payload(&probe);
-    assert!(
-        reasons(&probed).contains(&"bodies_omitted".to_string())
-            && step_ids(&probed).len() == PADDED_STEPS,
-        "the padded walk at half its {whole_padded} bytes must shed its step bodies and keep \
-         all {PADDED_STEPS} steps, or the sizes below measure some other cut: {:?}, {} steps",
-        reasons(&probed),
-        step_ids(&probed).len()
-    );
-    let bodies_only_reply = text(&finalize_bounded(
-        probe.clone(),
-        Envelope::daemon(),
-        TOOL,
-        &ResponseBudget::from_arguments(&arguments(&padded_walk(RESPONSE_MAX_MAX_CHARS))),
-    ))
-    .len();
-    println!(
-        "padded sizes: whole walk {whole_padded} bytes; the walk's bodies-only cut renders {} \
-         bytes and ships {bodies_only_reply} enveloped",
-        text(&probe).len()
-    );
-    // Room for the digits the ceiling itself writes into the reply.
-    assert!(
-        bodies_only_reply + 64 < whole_padded - 1,
-        "no ceiling grades a cut the walk makes alone on the padded chain: its bodies-only cut \
-         ships {bodies_only_reply} bytes enveloped, and a ceiling at or above the whole walk's \
-         {whole_padded} is one the walk never cuts under"
-    );
-    let ceiling = (bodies_only_reply + whole_padded) / 2;
-    let arm = format!(
-        "daemon route, padded bodies, {ceiling} (between {bodies_only_reply} and \
-         {whole_padded}), the walk's cut alone"
-    );
-    let (daemon, client) = served(&padded, &padded_walk(ceiling)).await;
-    let answer = payload(&client);
-    assert!(
-        reasons(&answer)
-            .iter()
-            .any(|reason| reason == "bodies_omitted" || reason == "steps_omitted"),
-        "{arm}: the walk must cut, or this grades nothing: {:?}",
-        reasons(&answer)
-    );
-    assert!(answer.get("chain_withheld").is_none(), "{arm}: {answer}");
-    assert!(text(&client).len() <= ceiling, "{arm}: it must fit");
-    assert!(
-        !reasons(&answer).contains(&"response_bounded".to_string()),
-        "{arm}: the envelope pass must cut nothing here: {:?}",
-        reasons(&answer)
-    );
-    assert!(
-        !reasons(&answer).contains(&"steps_omitted".to_string()),
-        "{arm}: the walk must shed only bodies here: {:?}",
-        reasons(&answer)
-    );
-    grade_walk_cut(&arm, &daemon, &answer, whole_padded, &mut problems);
-    problems.extend(step_sum_contradiction(&arm, &answer));
-
-    // The walk cuts, and the envelope pass cuts its reply again.
-    for ceiling in [12_000usize, 20_000] {
-        let arm = format!("daemon route, bodies, {ceiling}, both passes");
-        let (daemon, client) = served(&state, &with_bodies(ceiling)).await;
-        let answer = payload(&client);
-        assert!(
-            walk_cut_steps(&payload(&daemon)).is_some(),
-            "{arm}: the walk must cut, or this grades nothing: {:?}",
-            reasons(&payload(&daemon))
-        );
-        assert!(
-            answer["chain_withheld"]
-                .as_u64()
-                .is_some_and(|withheld| withheld > 0),
-            "{arm}: the envelope pass must cut the walk's reply too, or this arm grades the \
-             other case: {answer}"
-        );
-        assert!(text(&client).len() <= ceiling, "{arm}: it must fit");
-        grade_walk_cut(&arm, &daemon, &answer, whole_walk, &mut problems);
-        problems.extend(step_sum_contradiction(&arm, &answer));
-    }
-
-    let tree = |ceiling: usize| {
-        json!({
-            "focal": "root", "depth": 2, "direction": "calls", "limit_per_step": 5,
-            "include_body": false, "max_response_chars": ceiling,
-        })
-    };
-    let in_process = |walk: &Value| {
-        kin_mcp::handlers::entities::handle_trace_data_flow(&arguments(walk), state.graph.as_ref())
-            .expect("the in-process walk answers")
-    };
-    let whole_tree = text(&in_process(&tree(RESPONSE_MAX_MAX_CHARS))).len();
-    let walk = tree(20_000);
-    let raw = in_process(&walk);
-    let walked = payload(&raw);
-    let client = finalize_bounded(
-        raw.clone(),
-        Envelope::offline(),
-        TOOL,
-        &ResponseBudget::from_arguments(&arguments(&walk)),
-    );
-    let answer = payload(&client);
-    let arm = "in-process, tree, 20000, the walk's step cut alone";
-    assert!(
-        walked["steps_omitted"]
-            .as_u64()
-            .is_some_and(|omitted| omitted > 0),
-        "{arm}: the walk must cut steps, or this grades nothing: {walked}"
-    );
-    assert!(answer.get("chain_withheld").is_none(), "{arm}: {answer}");
-    assert!(text(&client).len() <= 20_000, "{arm}: it must fit");
-    let response = &answer["_kin"]["response"];
-    println!(
-        "{arm}: cut walk {} bytes, whole walk {whole_tree} bytes; the walk recorded {}; \
-         reply {} bytes; _kin.response {response}",
-        text(&raw).len(),
-        walked["chars_before_budget"],
-        text(&client).len()
-    );
-    if response["bounded"] != json!(true) {
-        problems.push(format!("{arm}: bounded is {}", response["bounded"]));
-    }
-    // The walk measures itself before the counts it adds after its cut, so its
-    // record lies between the cut walk and the whole one.
-    let recorded = walked["chars_before_budget"].as_u64().unwrap_or(0) as usize;
-    if recorded <= text(&raw).len() || recorded > whole_tree {
-        problems.push(format!(
-            "{arm}: the walk recorded {recorded}, not between the cut walk's {} and the whole \
-             walk's {whole_tree}",
-            text(&raw).len()
-        ));
-    }
-    if response["chars_before_budget"]
-        .as_u64()
-        .is_none_or(|before| (before as usize) < recorded.max(20_001))
-    {
-        problems.push(format!(
-            "{arm}: _kin.response.chars_before_budget is {}, under the walk's own record",
-            response["chars_before_budget"]
-        ));
-    }
-    problems.extend(step_sum_contradiction(arm, &answer));
-    assert!(problems.is_empty(), "{problems:#?}");
-}
-
-/// The three checks every daemon-route arm above grades, whichever pass cut:
-/// the reply is bounded, the walk recorded the whole walk's size before its
-/// cut, and `_kin.response.chars_before_budget` is no smaller than that.
-fn grade_walk_cut(
-    arm: &str,
-    daemon: &ToolCallResult,
-    answer: &Value,
-    whole_walk: usize,
-    problems: &mut Vec<String>,
-) {
-    let response = &answer["_kin"]["response"];
-    let recorded = payload(daemon)["chars_before_budget"].clone();
-    println!(
-        "{arm}: whole walk {whole_walk} bytes; the walk recorded {recorded} and kept {} step(s) \
-         in {} bytes; the reply ships {} step(s); _kin.response {response}",
-        step_ids(&payload(daemon)).len(),
-        text(daemon).len(),
-        step_ids(answer).len()
-    );
-    if response["bounded"] != json!(true) {
-        problems.push(format!("{arm}: bounded is {}", response["bounded"]));
-    }
-    if recorded != json!(whole_walk) {
-        problems.push(format!(
-            "{arm}: the walk recorded {recorded} before its cut, and the whole walk is {whole_walk}"
-        ));
-    }
-    if response["chars_before_budget"]
-        .as_u64()
-        .is_none_or(|before| before < whole_walk as u64)
-    {
-        problems.push(format!(
-            "{arm}: _kin.response.chars_before_budget is {}, under the whole walk's \
-             {whole_walk}",
-            response["chars_before_budget"]
-        ));
+async fn mcp_trace_paging_preserves_requested_bodies_and_step_identity() {
+    let (_dir, state) = fixture_with(&[("src/padded.py", padded_source())]).await;
+    let mut wide = walk_with(Some(("max_chars", RESPONSE_MAX_MAX_CHARS)));
+    wide["include_body"] = json!(true);
+    wide["focal"] = json!("padded_entry");
+    let (_, whole) = served(&state, &wide).await;
+    let expected = payload(&whole);
+    assert_eq!(expected["chain"].as_array().unwrap().len(), WALK_STEPS);
+    assert!(expected["chain"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|row| row["body"].as_str().is_some_and(|body| body.len() > 2000)));
+    for ceiling in [2000, 6000, 12000, 20000] {
+        let mut query = wide.clone();
+        query["max_chars"] = json!(ceiling);
+        let (_, result) = served(&state, &query).await;
+        let answer = payload(&result);
+        assert_eq!(answer["chain"], expected["chain"]);
+        assert_eq!(answer["focal"], expected["focal"]);
+        assert_eq!(answer["steps_omitted"].as_u64().unwrap_or(0), 0);
+        assert!(!answer["body_omitted"].as_bool().unwrap_or(false));
     }
 }
 
@@ -1383,38 +858,25 @@ async fn the_in_process_walk_reads_the_budget_the_envelope_grades() {
     assert!(problems.is_empty(), "{problems:#?}");
 }
 
-/// The daemon route walks under the budget its envelope grades, read by the
-/// same rule, whichever spelling a call uses and when it uses both.
-///
-/// The route read `max_response_chars` first and the envelope reads
-/// `max_chars` first, so a call passing `max_chars: 12000` and
-/// `max_response_chars: 2000` walked under 2,000 and was graded against 12,000.
+/// Both byte-budget spellings and their precedence govern the exact emitted page.
 #[tokio::test]
-async fn the_daemon_route_walks_under_the_budget_the_envelope_grades() {
+async fn the_daemon_route_pages_under_the_budget_the_envelope_grades() {
     let (_dir, state) = fixture().await;
-    let mut both = walk_with(Some(("max_chars", 12_000)));
-    both["max_response_chars"] = json!(RESPONSE_MIN_MAX_CHARS);
-    let mut problems: Vec<String> = Vec::new();
-    for (label, walk) in [
-        ("max_chars", walk_with(Some(("max_chars", 6_000)))),
-        (
-            "max_response_chars",
-            walk_with(Some(("max_response_chars", 6_000))),
-        ),
-        ("both spellings", both),
+    let mut both = walk_with(Some(("max_chars", 12000)));
+    both["max_response_chars"] = json!(2000);
+    for query in [
+        walk_with(Some(("max_chars", 6000))),
+        walk_with(Some(("max_response_chars", 6000))),
+        both,
     ] {
-        let (daemon, client) = served(&state, &walk).await;
-        let walked = payload(&daemon)["max_response_chars"].clone();
-        let graded = payload(&client)["_kin"]["response"]["max_chars"].clone();
-        println!("{label}: the walk ran under {walked}, the envelope graded {graded}");
-        if walked != graded {
-            problems.push(format!(
-                "{label}: the walk ran under max_response_chars {walked} and the envelope \
-                 graded max_chars {graded}"
-            ));
-        }
+        let expected = ResponseBudget::from_arguments(&arguments(&query)).max_chars;
+        let (daemon, client) = served_page(&state, &query).await;
+        assert_eq!(text(&daemon), text(&client));
+        assert_eq!(payload(&client)["_kin"]["response"]["max_chars"], expected);
+        assert!(text(&client).len() <= expected);
+        let (_, reconstructed) = served(&state, &query).await;
+        assert_eq!(step_ids(&payload(&reconstructed)).len(), WALK_STEPS);
     }
-    assert!(problems.is_empty(), "{problems:#?}");
 }
 
 /// The spine a walk reports, as `(clipped node, continued_below, dropped)` per
@@ -1746,7 +1208,7 @@ async fn mcp_trace_spine_disclosure_describes_the_chain_that_ships() {
                 if ceiling == RESPONSE_DEFAULT_MAX_CHARS {
                     walk_spine = walk_spine
                         .max(answer["spine_clipped_steps"].as_u64().unwrap_or(0) as usize);
-                } else if found.is_empty() && shipped > 0 {
+                } else if route == "in-process" && found.is_empty() && shipped > 0 {
                     let spine = answer["spine_clipped_steps"].as_u64().unwrap_or(0) as usize;
                     spine_narrowed |= spine > 0 && spine < walk_spine;
                     if spine == 0 && walk_spine > 0 {
@@ -1879,8 +1341,8 @@ async fn the_envelope_pass_reads_every_shipped_spine_nodes_clip_record() {
     }
     println!("{arms} arms; the route passes withheld clip records in {route_withheld_records}");
     assert!(
-        route_withheld_records > 0,
-        "no daemon route pass withheld a clip record in {arms} arms, so this grades nothing"
+        route_withheld_records == 0,
+        "pagination must preserve every clip record across {arms} arms"
     );
     assert!(problems.is_empty(), "{problems:#?}");
 }
@@ -1984,8 +1446,8 @@ async fn a_spine_crossing_count_the_envelope_pass_cannot_read_whole_is_marked_a_
          occurred in {occurred}"
     );
     assert!(
-        withheld_arms > 0,
-        "the route passes never withheld a clip record, so this grades nothing"
+        withheld_arms == 0,
+        "pagination must preserve every questioned spine clip record"
     );
     assert!(problems.is_empty(), "{problems:#?}");
 }

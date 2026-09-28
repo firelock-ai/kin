@@ -138,7 +138,7 @@ impl ServerProcess {
     }
 
     /// The leader's pid, which is also the group's id.
-    #[cfg(all(test, unix))]
+    #[cfg(unix)]
     pub(crate) fn leader_pid(&self) -> libc::pid_t {
         self.group
     }

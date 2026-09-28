@@ -677,3 +677,180 @@ fn binding_debt_versions_reject_missing_mixed_and_fabricated_original_locations(
             .is_err()
     );
 }
+
+fn retire_inferred_call(repo: &Repo) -> Relation {
+    use kin_model::{GraphNodeId, RelationOrigin};
+    let source = repo.source("caller.py");
+    let retired = repo
+        .graph
+        .get_all_relations_for_entity(&source.id)
+        .unwrap()
+        .into_iter()
+        .find(|relation| {
+            relation.src == GraphNodeId::Entity(source.id)
+                && relation.kind == RelationKind::Calls
+                && relation.origin == RelationOrigin::Inferred
+        })
+        .expect("the actual linker produced an inferred call");
+    let mut relations = kin_reconcile::plan_withdrawn_local_binding_obligations(
+        std::slice::from_ref(&retired),
+        |id| Ok(repo.graph.get_entity(&id).unwrap()),
+        |file| {
+            let path = RepoPath::from_utf8(file.0.clone()).unwrap();
+            Ok(repo.graph.artifact_id_at_path(&path).and_then(|artifact| {
+                match repo.graph.get_tree_entry(file).unwrap() {
+                    Some(TreeEntry::Blob { hash, .. }) => Some((artifact, hash)),
+                    _ => None,
+                }
+            }))
+        },
+        |id| {
+            Ok(repo
+                .graph
+                .get_all_relations_for_node(&GraphNodeId::Artifact(id))
+                .unwrap())
+        },
+        |id| Ok(repo.graph.get_relation_by_id(&id)),
+    )
+    .unwrap();
+    relations.push(RelationDelta::Removed {
+        old: retired.clone(),
+    });
+    repo.graph
+        .apply_transaction_delta(&TransactionDelta {
+            relation_deltas: relations,
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(repo
+        .debt()
+        .unwrap()
+        .obligations
+        .iter()
+        .any(|o| o.retired_relation == retired));
+    retired
+}
+
+const GUESSED_TARGET: &str = "class Worker:\n    def work(self, value):\n        return value\n";
+const GUESSED_CALLER: &str =
+    "from local import Worker\n\ndef run(client):\n    return client.work(value=1)\n";
+
+#[test]
+fn a_dependent_rederivation_does_not_reinstall_an_exact_withdrawn_guess() {
+    for reopen in [false, true] {
+        let mut repo = Repo::new();
+        repo.edit("local.py", GUESSED_TARGET);
+        repo.edit("caller.py", GUESSED_CALLER);
+        let retired = retire_inferred_call(&repo);
+        let debt = repo.debt().unwrap();
+        if reopen {
+            repo.reopen();
+        }
+        // The caller's bytes never change. Editing its dependency makes the
+        // cross-file linker derive that same weak guess again.
+        repo.edit(
+            "local.py",
+            "class Worker:\n    def work(self, value):\n        return value + 1\n",
+        );
+        repo.edit("local.py", GUESSED_TARGET);
+        assert!(
+            repo.graph.get_relation_by_id(&retired.id).is_none(),
+            "reopen={reopen}"
+        );
+        assert_eq!(repo.debt(), Some(debt), "no guess may discharge itself");
+        repo.reopen();
+        assert!(repo.graph.get_relation_by_id(&retired.id).is_none());
+        assert!(repo.debt().is_some());
+        // Positive counterfactual: this very same linker observation recreates
+        // the guessed edge when no recorded withdrawal guards it.
+        let debt_row = repo.obligation_relation().unwrap();
+        repo.graph
+            .apply_transaction_delta(&TransactionDelta {
+                relation_deltas: vec![RelationDelta::Removed { old: debt_row }],
+                ..Default::default()
+            })
+            .unwrap();
+        repo.edit(
+            "local.py",
+            "class Worker:\n    def work(self, value):\n        return value + 2\n",
+        );
+        assert!(
+            repo.graph.get_relation_by_id(&retired.id).is_some(),
+            "the fixture must actually exercise dependent rederivation"
+        );
+    }
+}
+
+#[test]
+fn withdrawn_guess_suppression_does_not_cover_different_source_bytes() {
+    let mut repo = Repo::new();
+    repo.edit("local.py", GUESSED_TARGET);
+    repo.edit("caller.py", GUESSED_CALLER);
+    retire_inferred_call(&repo);
+    let changed = "from local import Worker\n\ndef run(client):\n    return Worker()\n";
+    repo.edit("caller.py", changed);
+    assert!(
+        repo.debt().is_none(),
+        "a real newly resolved call can settle the prior obligation"
+    );
+    assert!(repo
+        .graph
+        .get_all_relations_for_entity(&repo.source("caller.py").id)
+        .unwrap()
+        .iter()
+        .any(|relation| relation.kind == RelationKind::Calls));
+}
+
+#[test]
+fn a_live_reintroduced_guess_requests_repair_but_outstanding_debt_alone_does_not() {
+    let mut repo = Repo::new();
+    repo.edit("local.py", GUESSED_TARGET);
+    repo.edit("caller.py", GUESSED_CALLER);
+    let old = retire_inferred_call(&repo);
+    let file = FilePathId::new("caller.py");
+    assert!(!kin_reconcile::has_reintroduced_withdrawn_guess(repo.graph.as_ref(), &file).unwrap());
+    repo.graph
+        .apply_transaction_delta(&TransactionDelta {
+            relation_deltas: vec![RelationDelta::Added { new: old.clone() }],
+            ..Default::default()
+        })
+        .unwrap();
+    repo.reopen();
+    assert!(kin_reconcile::has_reintroduced_withdrawn_guess(repo.graph.as_ref(), &file).unwrap());
+    repo.graph
+        .apply_transaction_delta(&TransactionDelta {
+            relation_deltas: vec![RelationDelta::Removed { old }],
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(repo.debt().is_some());
+    assert!(!kin_reconcile::has_reintroduced_withdrawn_guess(repo.graph.as_ref(), &file).unwrap());
+}
+
+#[test]
+fn independently_reproved_named_import_can_restore_a_withdrawn_exact_call() {
+    for reopen in [false, true] {
+        let mut repo = resolved();
+        let retired = retire_inferred_call(&repo);
+        assert!(kin_index::linker::has_named_import_factory_identity(
+            &retired
+        ));
+        assert_eq!(retired.confidence.to_bits(), 0.95_f32.to_bits());
+        assert!(retired.evidence.iter().any(|e| e.source_path.is_some()));
+        if reopen {
+            repo.reopen();
+        }
+        // This is an independently resolved named import from the same admitted
+        // caller, not a repeated receiver-name guess. Re-reading its target must
+        // admit the exact positive observation and discharge its old obligation.
+        repo.edit("local.py", "def work(value):\n    return value + 1\n");
+        let restored = repo.graph.get_relation_by_id(&retired.id).unwrap();
+        assert_eq!(restored.src, retired.src);
+        assert_eq!(restored.dst, retired.dst);
+        assert_eq!(restored.evidence, retired.evidence);
+        assert!(repo.debt().is_none(), "reopen={reopen}");
+        repo.reopen();
+        assert!(repo.graph.get_relation_by_id(&retired.id).is_some());
+        assert!(repo.debt().is_none());
+    }
+}
