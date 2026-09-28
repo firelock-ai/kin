@@ -108,7 +108,7 @@ impl ActiveRepositoryAuthorityManager {
         max_bytes: u64,
     ) -> std::result::Result<Option<Vec<u8>>, kin_db::KinDbError> {
         match self {
-            Self::Local(manager) => manager.load_source_blob(digest),
+            Self::Local(manager) => manager.load_source_blob_bounded(digest, max_bytes),
             Self::Hosted { backend, .. } => backend.load_source_blob_bounded(
                 repository_id.as_str(),
                 *digest.as_bytes(),
@@ -270,8 +270,21 @@ impl RequestRepositoryAuthority {
         authority: &ActiveRepositoryAuthority,
         digest: Hash256,
     ) -> Result<Arc<Vec<u8>>> {
-        if authority.hosted_head.is_none() {
-            return authority.load_source_blob(digest).map(Arc::new);
+        self.load_source_blob_bounded(authority, digest, HOSTED_SEMANTIC_SOURCE_BLOB_MAX_BYTES)
+    }
+
+    /// Clamp this read to the census allowance as well as the request's
+    /// shared allowance. Local CAS must honor the same pre-allocation limit.
+    pub(crate) fn load_source_blob_bounded(
+        &self,
+        authority: &ActiveRepositoryAuthority,
+        digest: Hash256,
+        max_bytes: u64,
+    ) -> Result<Arc<Vec<u8>>> {
+        if authority.hosted_head.is_none() && self.hosted_source_budget.is_none() {
+            return authority
+                .load_source_blob_bounded(digest, max_bytes)
+                .map(Arc::new);
         }
         let budget = self.hosted_source_budget.as_ref().ok_or_else(|| {
             McpError::Context(
@@ -284,6 +297,11 @@ impl RequestRepositoryAuthority {
             .lock()
             .expect("hosted source projection budget is never poisoned");
         if let Some(bytes) = state.blobs.get(&digest) {
+            if bytes.len() as u64 > max_bytes {
+                return Err(McpError::SourceBudgetExhausted(format!(
+                    "blob {digest} exceeds the remaining {max_bytes}-byte census allowance"
+                )));
+            }
             return Ok(Arc::clone(bytes));
         }
         if state.remaining_reads == 0 || state.remaining_bytes == 0 {
@@ -293,7 +311,9 @@ impl RequestRepositoryAuthority {
                 "this request's source allowance was spent before blob {digest}"
             )));
         }
-        let max_bytes = budget.max_blob_bytes.min(state.remaining_bytes);
+        let max_bytes = max_bytes
+            .min(budget.max_blob_bytes)
+            .min(state.remaining_bytes);
         state.remaining_reads -= 1;
         let bytes = authority.load_source_blob_bounded(digest, max_bytes)?;
         state.remaining_bytes = state

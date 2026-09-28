@@ -523,9 +523,37 @@ fn existing_repository_is_not_rebuilt_from_the_working_tree() {
     assert!(first.status.success());
     let manifest_before = fs::read(repo.join(".kin/manifest.json")).expect("read initial manifest");
 
+    // A store this build opens is already done: the second run says so,
+    // reports the repository ready, names one command to run next, exits 0
+    // and rebuilds nothing.
     let second = kin_init(&repo, &home, &[]);
-    assert!(!second.status.success());
-    assert!(String::from_utf8_lossy(&second.stderr)
+    assert!(
+        second.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let said = String::from_utf8_lossy(&second.stdout);
+    assert!(said.contains("is already a Kin repository."), "{said}");
+    assert!(
+        said.lines()
+            .any(|line| line.contains("Repository") && line.contains("ready")),
+        "{said}"
+    );
+    assert!(
+        said.lines()
+            .any(|line| line.trim_start().starts_with("Next")),
+        "{said}"
+    );
+    assert_eq!(
+        fs::read(repo.join(".kin/manifest.json")).expect("read unchanged manifest"),
+        manifest_before
+    );
+
+    // `--json` callers parse one result shape, so they keep the refusal.
+    let json = kin_init(&repo, &home, &["--json"]);
+    assert!(!json.status.success());
+    assert!(String::from_utf8_lossy(&json.stderr)
         .contains("never rebuilds graph authority from the working tree"));
     assert_eq!(
         fs::read(repo.join(".kin/manifest.json")).expect("read unchanged manifest"),
@@ -539,7 +567,7 @@ fn pre_release_init_flags_are_not_accepted() {
     let home = root.path().join("home");
     fs::create_dir_all(&home).expect("create home");
 
-    for flag in ["--git-history", "--no-lsp", "--force", "--verbose"] {
+    for flag in ["--git-history", "--no-lsp", "--force"] {
         let repo = root.path().join(flag.trim_start_matches('-'));
         let mut command = Command::new(env!("CARGO_BIN_EXE_kin"));
         command.arg("init").arg(&repo).arg(flag).env("HOME", &home);

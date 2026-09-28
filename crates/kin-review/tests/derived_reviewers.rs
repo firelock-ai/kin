@@ -29,9 +29,14 @@ const DERIVED_READ: &str = "assignments::current_assignments(";
 ///
 /// A test reads the stored set on purpose, to prove the add log still holds
 /// what a removal hid, and counting those would make this guard measure the
-/// tests rather than the surfaces.
+/// tests rather than the surfaces. The cut is at the test module, not at the
+/// first `#[cfg(test)]`, because a test-only helper can sit above production
+/// code and cutting there would hide the reads below it.
 fn production(source: &str) -> &str {
-    source.split("\n#[cfg(test)]").next().unwrap_or(source)
+    source
+        .split("\n#[cfg(test)]\nmod ")
+        .next()
+        .unwrap_or(source)
 }
 
 fn occurrences(haystack: &str, needle: &str) -> usize {

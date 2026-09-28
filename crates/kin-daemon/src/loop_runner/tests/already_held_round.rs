@@ -82,7 +82,12 @@ async fn a_round_that_finds_the_bytes_already_held_leaves_the_epoch_and_a_captur
         cancel_rx,
         Some(WatchArmed::new(armed_tx)),
     ));
-    crate::daemon::await_watch_armed(armed_rx, Duration::from_secs(5)).await;
+    // The controlled write requires the actual callback-delivery barrier.
+    assert_eq!(
+        crate::daemon::await_watch_armed(armed_rx, WATCH_ARMING_BOUND).await,
+        crate::daemon::WatchArming::Armed,
+        "the real watch must acknowledge delivery before the controlled write"
+    );
 
     let epoch = settled_epoch(&state).await;
     let captured = crate::daemon::lsp_publication::QueryInputs::capture(&state)
@@ -121,7 +126,8 @@ async fn a_round_that_finds_the_bytes_already_held_leaves_the_epoch_and_a_captur
     );
 
     cancel_tx.send(true).ok();
-    let joined = tokio::time::timeout(Duration::from_secs(5), &mut runner).await;
+    // This is the same cancelled reconciliation handle daemon shutdown joins.
+    let joined = tokio::time::timeout(crate::daemon::TASK_DRAIN_BOUND, &mut runner).await;
     if joined.is_err() {
         runner.abort();
         let _ = runner.await;

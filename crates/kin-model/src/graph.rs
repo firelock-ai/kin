@@ -82,6 +82,12 @@ pub trait EntityStore: Send + Sync {
     ) -> std::result::Result<Option<ExternalReference>, Self::Error> {
         Ok(None)
     }
+    /// Every symbol outside the repository this store holds, in identity
+    /// order, for a read that matches a name against them. A store that holds
+    /// no external symbols answers none.
+    fn external_references(&self) -> std::result::Result<Vec<ExternalReference>, Self::Error> {
+        Ok(Vec::new())
+    }
     /// Every relation from the entity `id` to a symbol outside the
     /// repository, in identity order. [`Self::get_all_relations_for_entity`]
     /// answers only relations between two entities; this is the rest of an
@@ -2060,6 +2066,9 @@ impl<G: EntityStore> EntityStore for &G {
         id: &ExternalReferenceId,
     ) -> std::result::Result<Option<ExternalReference>, Self::Error> {
         (**self).lookup_external_reference(id)
+    }
+    fn external_references(&self) -> std::result::Result<Vec<ExternalReference>, Self::Error> {
+        (**self).external_references()
     }
     fn get_external_relations_for_entity(
         &self,

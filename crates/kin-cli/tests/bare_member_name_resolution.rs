@@ -735,6 +735,7 @@ fn walk(
         &authority,
         graph,
         &kin_cli::commands::trace_data_flow::TraceDataFlowRequest {
+            cursor: None,
             focal: focal.to_string(),
             depth: None,
             direction: None,

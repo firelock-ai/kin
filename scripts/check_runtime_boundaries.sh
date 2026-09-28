@@ -25,6 +25,9 @@ allowed_session_registry_files=(
   "crates/kin-mcp/src/session.rs"
   "crates/kin-mcp/src/handlers/mod.rs"
   "crates/kin-mcp/src/handlers/sessions.rs"
+  # Declared only under #[cfg(test)] in handlers/mod.rs. These fixtures own
+  # isolated registries to prove external scopes cannot acquire local locks.
+  "crates/kin-mcp/src/handlers/external_symbols_tests.rs"
 )
 
 is_allowed() {
@@ -349,10 +352,19 @@ if rg -n 'tokio::spawn' "$repo_root/crates/kin-mcp/src/handlers/sessions.rs" -g 
 fi
 
 # The re-derivation commit is the one place a binding-history lineage may start
-# part way through a store's operation log, so `kin upgrade` is its only
+# part way through a store's operation log, so the upgrade module is its only
 # caller. An HTTP, MCP or hosted route, or any other command, reaching it would
 # let a request qualify state no re-derivation produced. kin-db defines it,
 # kin-index implements the verifier it takes, and the upgrade calls it.
+#
+# The upgrade module reaches it from two entry points, and only two. `kin
+# upgrade` is one. The other is `requalify_at_daemon_start`, which a daemon
+# runs as it starts on a store whose workspace carries no checked binding
+# history, so that nobody has to run `kin upgrade` by hand. It is the same plan,
+# verifier, compare-and-swap and payment, run where the command runs them:
+# holding the repository's runtime authority, before any state is open, never
+# from a request. Only the daemon's startup module may name that entry point,
+# and nothing outside the upgrade module may name the commit or its verifier.
 unexpected_rederivation_hits=()
 rederivation_caller_seen=0
 while IFS=: read -r file line text; do
@@ -391,6 +403,37 @@ fi
 if ((rederivation_caller_seen == 0)); then
   echo "kin upgrade no longer names the re-derivation commit in crates/kin-cli/src/commands/upgrade.rs:" >&2
   echo "  update this rule when the caller or the API is renamed" >&2
+  exit 1
+fi
+
+# The daemon-start entry point runs the same re-derivation commit, so it has
+# exactly one runtime caller: the daemon's startup, before it opens state.
+unexpected_startup_requalification_hits=()
+startup_requalification_caller_seen=0
+while IFS=: read -r file line _; do
+  [[ -z "$file" ]] && continue
+  file="${file#"$repo_root/"}"
+  case "$file" in
+    crates/kin-cli/src/commands/upgrade.rs) ;;
+    crates/kin-daemon/src/startup_requalification.rs)
+      startup_requalification_caller_seen=1
+      ;;
+    # Test targets drive it directly against fixture stores.
+    crates/kin-cli/tests/store_upgrade.rs) ;;
+    *)
+      unexpected_startup_requalification_hits+=("$file:$line")
+      ;;
+  esac
+done < <(rg -n 'requalify_at_daemon_start' "$repo_root/crates" -g '*.rs')
+
+if ((${#unexpected_startup_requalification_hits[@]} > 0)); then
+  echo "Unexpected caller of the daemon-start re-qualification outside the daemon's startup:" >&2
+  printf '  %s\n' "${unexpected_startup_requalification_hits[@]}" >&2
+  exit 1
+fi
+if ((startup_requalification_caller_seen == 0)); then
+  echo "the daemon's startup no longer names requalify_at_daemon_start in crates/kin-daemon/src/startup_requalification.rs:" >&2
+  echo "  update this rule when the caller or the entry point is renamed" >&2
   exit 1
 fi
 

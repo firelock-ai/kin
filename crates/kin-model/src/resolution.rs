@@ -109,6 +109,14 @@ impl ResolutionRecordId {
         preimage.finish()
     }
 
+    /// The identity of the one record saying which proof context `language`'s
+    /// call-site ledgers are current under.
+    pub fn context_validation(language: LanguageId) -> Self {
+        let mut preimage = IdPreimage::new(b"context_validation");
+        preimage.field(language.to_string().as_bytes());
+        preimage.finish()
+    }
+
     /// The evidence token a proven edge carries to name this proof context:
     /// `ctx:<uuid>`.
     pub fn context_token(&self) -> String {
@@ -585,6 +593,70 @@ pub enum DispatchProvenance {
     Model,
 }
 
+/// Which proof context a language's call-site ledgers are current under, as
+/// the last sweep that checked settled it. A store holds at most one per
+/// language, written in the same publication as the ledgers that sweep
+/// proved, so every reader, with or without a daemon, judges a ledger by the
+/// same durable answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ContextValidation {
+    pub language: LanguageId,
+    pub state: ContextValidationState,
+}
+
+/// What the sweep that last checked a language settled.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ContextValidationState {
+    /// The server this host would start, or started, proves under this
+    /// context: a ledger proven under it is current.
+    Validated { context: ProofContext },
+    /// No server could be started or identified to settle it, for `reason`:
+    /// no ledger of the language is current until one is.
+    Unverified { reason: String },
+}
+
+impl ContextValidation {
+    /// The longest reason an unverified validation carries.
+    pub const MAX_REASON_LEN: usize = 512;
+
+    pub fn validate(&self) -> Result<()> {
+        match &self.state {
+            ContextValidationState::Validated { context } => {
+                if context.language != self.language {
+                    return Err(ModelError::InvalidOperation(format!(
+                        "a {} context validation names a {} proof context",
+                        self.language, context.language
+                    )));
+                }
+                context.validate()
+            }
+            ContextValidationState::Unverified { reason } => {
+                if reason.trim().is_empty() || reason.len() > Self::MAX_REASON_LEN {
+                    return Err(ModelError::InvalidOperation(format!(
+                        "an unverified {} context validation needs a reason of 1 to {} bytes",
+                        self.language,
+                        Self::MAX_REASON_LEN
+                    )));
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// The identity of the context a current ledger names, when the language
+    /// is validated.
+    pub fn current_context(&self) -> Option<ResolutionRecordId> {
+        match &self.state {
+            ContextValidationState::Validated { context } => {
+                Some(ResolutionRecordId::proof_context(context))
+            }
+            ContextValidationState::Unverified { .. } => None,
+        }
+    }
+}
+
 /// One resolution record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -593,6 +665,7 @@ pub enum ResolutionRecord {
     ProofContext(ProofContext),
     CallSites(CallSiteLedger),
     DispatchSet(DispatchSet),
+    ContextValidation(ContextValidation),
 }
 
 impl ResolutionRecord {
@@ -602,6 +675,9 @@ impl ResolutionRecord {
             Self::ProofContext(context) => ResolutionRecordId::proof_context(context),
             Self::CallSites(ledger) => ResolutionRecordId::call_sites(ledger.caller),
             Self::DispatchSet(set) => ResolutionRecordId::dispatch_set(&set.scope, set.context),
+            Self::ContextValidation(validation) => {
+                ResolutionRecordId::context_validation(validation.language)
+            }
         }
     }
 
@@ -611,6 +687,7 @@ impl ResolutionRecord {
             Self::ProofContext(_) => "proof_context",
             Self::CallSites(_) => "call_sites",
             Self::DispatchSet(_) => "dispatch_set",
+            Self::ContextValidation(_) => "context_validation",
         }
     }
 
@@ -621,6 +698,7 @@ impl ResolutionRecord {
             Self::ProofContext(context) => context.validate(),
             Self::CallSites(ledger) => ledger.validate(),
             Self::DispatchSet(set) => set.validate(),
+            Self::ContextValidation(validation) => validation.validate(),
         }
     }
 
@@ -628,7 +706,7 @@ impl ResolutionRecord {
     pub fn named_nodes(&self) -> Vec<GraphNodeId> {
         let mut nodes = Vec::new();
         match self {
-            Self::ProofContext(_) => {}
+            Self::ProofContext(_) | Self::ContextValidation(_) => {}
             Self::CallSites(ledger) => {
                 nodes.push(GraphNodeId::Entity(ledger.caller));
                 for site in &ledger.sites {
@@ -654,7 +732,9 @@ impl ResolutionRecord {
     pub fn referenced_records(&self) -> Vec<ResolutionRecordId> {
         let mut records = Vec::new();
         match self {
-            Self::ProofContext(_) => {}
+            // A validation embeds the context it names, so it depends on no
+            // other record being held.
+            Self::ProofContext(_) | Self::ContextValidation(_) => {}
             Self::CallSites(ledger) => {
                 records.push(ledger.context);
                 for site in &ledger.sites {
@@ -685,6 +765,13 @@ impl ResolutionRecord {
     pub fn as_dispatch_set(&self) -> Option<&DispatchSet> {
         match self {
             Self::DispatchSet(set) => Some(set),
+            _ => None,
+        }
+    }
+
+    pub fn as_context_validation(&self) -> Option<&ContextValidation> {
+        match self {
+            Self::ContextValidation(validation) => Some(validation),
             _ => None,
         }
     }
@@ -1009,14 +1096,14 @@ impl ResolutionRecordSet {
             .filter(|record_delta| record_delta.new_state().is_none())
             .map(ResolutionRecordDelta::target_id)
             .collect();
-        let added: HashSet<ResolutionRecordId> = plan
+        let written: HashMap<ResolutionRecordId, &ResolutionRecord> = plan
             .effective
             .iter()
             .filter_map(ResolutionRecordDelta::new_state)
-            .map(ResolutionRecord::id)
+            .map(|record| (record.id(), record))
             .collect();
         let exists_after = |id: &ResolutionRecordId| {
-            added.contains(id) || (self.records.contains_key(id) && !removed.contains(id))
+            written.contains_key(id) || (self.records.contains_key(id) && !removed.contains(id))
         };
         for record in plan
             .effective
@@ -1044,7 +1131,18 @@ impl ResolutionRecordSet {
             let Some(referrers) = self.referencing.get(id) else {
                 continue;
             };
-            if let Some(referrer) = referrers.iter().find(|referrer| exists_after(referrer)) {
+            // The reverse index describes the predecessor. A surviving ledger
+            // may move to a new context in this same transaction, so its old
+            // reference does not prevent collecting the retired context.
+            if let Some(referrer) = referrers.iter().find(|referrer| {
+                let referrer = *referrer;
+                !removed.contains(referrer)
+                    && written
+                        .get(referrer)
+                        .copied()
+                        .or_else(|| self.records.get(referrer))
+                        .is_some_and(|record| record.referenced_records().contains(id))
+            }) {
                 return Err(ModelError::InvalidOperation(format!(
                     "resolution record {id} is removed while resolution record {referrer} still \
                      names it"
@@ -1719,6 +1817,69 @@ mod tests {
         world.set.apply(&plan);
         assert!(!world.set.contains(&set_record.id()));
         assert_eq!(world.set.naming(&GraphNodeId::Entity(entity(3))).count(), 0);
+    }
+
+    #[test]
+    fn context_replacement_checks_the_successor_ledger_references() {
+        let mut world = world();
+        let old = ResolutionRecord::CallSites(ledger(entity(1), world.context.id()));
+        add(&mut world, old.clone());
+        let replacement = ResolutionRecord::ProofContext(ProofContext {
+            environment_hash: Hash256::from_bytes([0x55; 32]),
+            ..context()
+        });
+        let context_deltas = vec![
+            ResolutionRecordDelta::Removed {
+                old: world.context.clone(),
+            },
+            ResolutionRecordDelta::Added {
+                new: replacement.clone(),
+            },
+        ];
+        let plan = world.set.plan_parts(&[], &[], &context_deltas).unwrap();
+        assert!(
+            world
+                .set
+                .check_references(&plan, |node| world.nodes.contains(node))
+                .is_err(),
+            "a surviving unchanged ledger still needs its old context"
+        );
+
+        let mut still_old = ledger(entity(1), world.context.id());
+        still_old.body_hash = Hash256::from_bytes([0x66; 32]);
+        let mut deltas = context_deltas.clone();
+        deltas.push(ResolutionRecordDelta::Modified {
+            old: old.clone(),
+            new: ResolutionRecord::CallSites(still_old),
+        });
+        let plan = world.set.plan_parts(&[], &[], &deltas).unwrap();
+        assert!(
+            world
+                .set
+                .check_references(&plan, |node| world.nodes.contains(node))
+                .is_err(),
+            "a rewritten ledger which keeps the old reference still needs it"
+        );
+
+        let new = ResolutionRecord::CallSites(ledger(entity(1), replacement.id()));
+        let mut deltas = context_deltas;
+        deltas.push(ResolutionRecordDelta::Modified {
+            old: old.clone(),
+            new: new.clone(),
+        });
+        let plan = world.set.plan_parts(&[], &[], &deltas).unwrap();
+        world
+            .set
+            .check_references(&plan, |node| world.nodes.contains(node))
+            .expect("the replacement ledger names only the new context");
+        world.set.apply(&plan);
+        assert!(!world.set.contains(&world.context.id()));
+        assert_eq!(world.set.get(&new.id()), Some(&new));
+        assert_eq!(world.set.get(&replacement.id()), Some(&replacement));
+        world
+            .set
+            .validate(|node| world.nodes.contains(node))
+            .unwrap();
     }
 
     #[test]

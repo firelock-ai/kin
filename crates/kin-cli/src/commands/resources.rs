@@ -28,6 +28,11 @@ pub struct EmbedRuntimeState {
     pub embed_batch_size: Option<usize>,
     /// The background embedding worker has permanently stopped (embed-degraded).
     pub embed_worker_failed: bool,
+    /// The daemon has paused automatic indexing. An explicit `kin embed`
+    /// resumes it. This is the serving daemon's state, not the caller's
+    /// environment; older daemons omit it.
+    #[serde(default)]
+    pub background_embed_paused: bool,
     /// The embedding work mutex is currently held — an embed pass is in flight.
     pub embedding_work_busy: bool,
     pub embeddings_indexed: usize,
@@ -79,6 +84,11 @@ pub struct EmbedRuntimeState {
     /// to false so an ordinary local store is unaffected.
     #[serde(default)]
     pub embed_persistence_unavailable: bool,
+    /// This daemon is staying up for an embedding pass memory is holding back,
+    /// so the pass resumes on its own when memory frees. A queued retry, not
+    /// progress: `embeddings_indexed` is the progress.
+    #[serde(default)]
+    pub embed_held_for_memory: bool,
     /// Where the runtime fetch of the embedding model stands.
     ///
     /// The weights are not shipped, so the first embed pass on a fresh machine
@@ -231,7 +241,8 @@ fn non_empty_env(key: &str) -> Option<String> {
 pub struct BackgroundPassReport {
     /// Stable pass name, e.g. `embed` or `reconcile`.
     pub name: String,
-    /// `idle`, `working`, `waiting_deferred`, or `stopped`.
+    /// `idle`, `working`, `publishing`, `waiting_deferred`, or `stopped`.
+    /// `publishing` means completed work is in an indivisible durable write.
     ///
     /// `waiting_deferred` is not idleness. It means the pass has nothing it may
     /// admit this instant because deferred work is waiting out a retry ladder,
@@ -2139,6 +2150,7 @@ mod tests {
             expected_bytes: Some(crate::embed_model::DEFAULT_EMBED_MODEL_BYTES),
             fetching: true,
             no_fetch_reason: None,
+            declined: false,
             relocated_hf_home: None,
         };
 
@@ -2205,6 +2217,7 @@ mod tests {
     fn json_response_carries_schema_version_and_embed_state() {
         let embed = EmbedRuntimeState {
             embed_worker_failed: true,
+            background_embed_paused: true,
             embedding_work_busy: true,
             embeddings_indexed: 3,
             embeddings_pending: 7,
@@ -2232,6 +2245,7 @@ mod tests {
         assert_eq!(value["schema_version"], "kin.resource_plan.v1");
         assert_eq!(value["profile"], "interactive");
         assert_eq!(value["embed_runtime"]["embed_worker_failed"], true);
+        assert_eq!(value["embed_runtime"]["background_embed_paused"], true);
         assert_eq!(value["embed_runtime"]["embedding_work_busy"], true);
         assert_eq!(value["embed_runtime"]["embeddings_indexed"], 3);
         assert_eq!(value["embed_runtime"]["embeddings_pending"], 7);
@@ -2243,6 +2257,16 @@ mod tests {
         assert_eq!(value["actual"]["tokenizers_parallelism_env"], "false");
         // Unset env overrides are omitted from the JSON surface.
         assert!(value["actual"]["rayon_num_threads_env"].is_null());
+        let mut legacy = value["embed_runtime"].clone();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("background_embed_paused");
+        assert!(
+            !serde_json::from_value::<EmbedRuntimeState>(legacy)
+                .unwrap()
+                .background_embed_paused
+        );
     }
 
     #[test]

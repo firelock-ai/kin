@@ -159,6 +159,64 @@ MUTATE_MARKER = "0x2c"
 MUTATE_SUMMARY = "Raise mutable to 0x2c"
 
 
+# BEGIN failure evidence excerpt
+# Every suite carries this block byte for byte, because a suite is also copied
+# out and run as a single file. test_failure_excerpt.py keeps the copies equal.
+EVIDENCE_LIMIT = 4000
+EVIDENCE_LINE_LIMIT = 600
+EVIDENCE_PANICS = ("panicked at", "has overflowed its stack")
+EVIDENCE_ESCAPES = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+EVIDENCE_ERROR = re.compile(r"^(?:[\w./-]+:\s*)?(?:error|fatal)\b", re.IGNORECASE)
+EVIDENCE_LOG_ERROR = re.compile(r"\sERROR\s")
+
+
+def failure_excerpt(text, limit=EVIDENCE_LIMIT):
+    """Bounded evidence from a command's output that still says why it failed.
+
+    Output that fits is returned whole. Longer output keeps its opening and its
+    end, and between them every line that carries a Rust panic, with the
+    message line under it, and the last error line, wherever they fall. A
+    warning printed around the error cannot push it out, and a long log cannot
+    cut the panic out. `limit` only ever raises the bound, never lowers it.
+    """
+    text = (text or "").strip()
+    limit = max(int(limit), EVIDENCE_LIMIT)
+    if len(text) <= limit:
+        return text
+    head_end = limit // 4
+    tail_start = len(text) - limit // 2
+    lines = text.split("\n")
+    starts, offset = [], 0
+    panics, errors = [], []
+    for index, line in enumerate(lines):
+        starts.append(offset)
+        offset += len(line) + 1
+        plain = EVIDENCE_ESCAPES.sub("", line).strip()
+        if any(marker in plain for marker in EVIDENCE_PANICS):
+            panics.extend((index, index + 1))
+        if EVIDENCE_ERROR.match(plain) or EVIDENCE_LOG_ERROR.search(plain):
+            errors.append(index)
+    # The first panic and its message, then the last error line, then any
+    # later panics, for as long as the middle's share of the bound lasts.
+    order = panics[:2] + errors[-1:] + panics[2:]
+    budget, kept = limit // 4, set()
+    for index in order:
+        if index >= len(lines) or index in kept:
+            continue
+        start, end = starts[index], starts[index] + len(lines[index])
+        if end <= head_end or start >= tail_start:
+            continue
+        cost = min(len(lines[index]), EVIDENCE_LINE_LIMIT) + 1
+        if cost > budget:
+            continue
+        kept.add(index)
+        budget -= cost
+    middle = [lines[index][:EVIDENCE_LINE_LIMIT] for index in sorted(kept)]
+    parts = [text[:head_end], "[...]"] + middle + (["[...]"] if middle else [])
+    return "\n".join(parts + [text[tail_start:]])
+# END failure evidence excerpt
+
+
 def run(cmd, cwd=None, env=None, timeout=600):
     proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -691,7 +749,7 @@ class Suite(object):
             self.git(path, ["commit", "-q", "-m", "Add the agent write fixture"])
             rc, out, err = run([self.kin, "init"], cwd=path, env=self.env, timeout=900)
             if rc not in (0, 7, 8):
-                raise RuntimeError("kin init exited %s: %s" % (rc, err.strip()[-600:]))
+                raise RuntimeError("kin init exited %s: %s" % (rc, failure_excerpt(err)))
         except Exception as error:  # noqa: BLE001 - recorded once, raised for every check
             self._setup_error = "fixture setup failed: %s" % error
             raise RuntimeError(self._setup_error)
@@ -730,7 +788,7 @@ class Suite(object):
         finally:
             endpoint.close()
         if self.verbose:
-            print("kin agent run rc=%s\n%s" % (rc, stderr[-2000:]))
+            print("kin agent run rc=%s\n%s" % (rc, failure_excerpt(stderr)))
         self.last_requests = endpoint.requests
         tool_result = None
         self.last_tool_error = None
@@ -801,7 +859,7 @@ class Suite(object):
         rc, _, err = run([self.kin, "daemon", "stop"], cwd=self.repo(), env=self.env,
                          timeout=180)
         if rc != 0:
-            return rc, "kin daemon stop exited %s: %s" % (rc, err.strip()[-300:])
+            return rc, "kin daemon stop exited %s: %s" % (rc, failure_excerpt(err))
         deadline = time.time() + 60
         while time.time() < deadline:
             probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

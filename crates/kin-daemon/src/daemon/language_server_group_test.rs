@@ -94,6 +94,7 @@ async fn start_fake_server(root: &Path) -> (kin_lsp::lifecycle::LspServer, [u32;
     let record = root.join(PIDS);
     let server = start_resolved_language_server(
         LanguageId::Python,
+        &super::ReadinessObservations::default(),
         "python3",
         &[
             "-u".to_string(),

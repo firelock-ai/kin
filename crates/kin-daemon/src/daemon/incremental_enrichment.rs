@@ -213,8 +213,16 @@ pub(crate) async fn enrich_changed_file(
     };
     let mut hierarchy_outside = Vec::new();
     for entity in &asked {
-        let (derived, outcomes) =
-            super::enrich_single_entity(server, entity, index, root, documents, arms).await;
+        let (derived, outcomes) = super::enrich_single_entity(
+            server,
+            entity,
+            index,
+            root,
+            documents,
+            arms,
+            std::time::Duration::from_secs(5),
+        )
+        .await;
         tally.query_failures += outcomes.failures;
         tally.query_declines += outcomes.declines;
         tally.query_refusals += outcomes.refusals.len();
@@ -602,6 +610,7 @@ mod tests {
                 root,
                 Some(&provider),
                 arms,
+                std::time::Duration::from_secs(5),
             )
             .await;
             answers.extend(kin_lsp::call_sites::call_hierarchy_answers(&derived));
@@ -1243,10 +1252,61 @@ mod tests {
 
     /// An incremental pass over an edited file leaves the call-site ledgers a
     /// sweep of that file leaves, and so may record the file's mark: in the
-    /// same store, where a sweep right after the pass changes no ledger, and
+    /// same store, where a sweep changes only the peer's proof context, and
     /// in a store that was only ever swept at the edited text.
     #[tokio::test]
     async fn an_incremental_pass_leaves_the_ledgers_a_fresh_sweep_does() {
+        async fn validated_ledgers(
+            fixture: &Fixture,
+        ) -> (
+            kin_model::ProofContext,
+            BTreeMap<EntityId, kin_model::CallSiteLedger>,
+        ) {
+            let current = fixture.state.lsp_current_contexts.lock().unwrap()[&LanguageId::Python];
+            let record = fixture.state.graph.get_resolution_record(&current).unwrap();
+            let context = record.as_proof_context().unwrap().clone();
+            assert_eq!(context.language, LanguageId::Python);
+            let ledgers = fixture.ledger_records("app/run.py");
+            assert_eq!(ledgers.len(), fixture.declarations("app/run.py").len());
+            for ledger in ledgers.values() {
+                assert_eq!(
+                    ledger.context, current,
+                    "every caller uses this peer's context"
+                );
+            }
+            // These direct file-pass helpers omit the worker's validation
+            // orchestration. Record the actual peer context through its normal
+            // fresh-capture path, then require the persisted validation too.
+            let inputs = QueryInputs::capture(&fixture.state).await.unwrap();
+            let validation = kin_model::ContextValidationState::Validated {
+                context: context.clone(),
+            };
+            inputs
+                .record_context_validation(&fixture.state, LanguageId::Python, validation.clone())
+                .await
+                .unwrap();
+            let record = fixture
+                .state
+                .graph
+                .get_resolution_record(&kin_model::ResolutionRecordId::context_validation(
+                    LanguageId::Python,
+                ))
+                .unwrap();
+            let persisted = record.as_context_validation().unwrap();
+            assert_eq!(persisted.state, validation);
+            assert_eq!(persisted.current_context(), Some(current));
+            (context, ledgers)
+        }
+
+        fn same_resolver_context(a: &kin_model::ProofContext, b: &kin_model::ProofContext) {
+            // Each helper starts a new `python3 -c` peer. On Linux its
+            // interpreter is intentionally unidentifiable, so each launch has
+            // a fresh configuration hash. Every other context field must match.
+            let mut normalized = b.clone();
+            normalized.configuration_hash = a.configuration_hash;
+            assert_eq!(&normalized, a);
+        }
+
         let before = "from app.alpha import Alpha\n\n\ndef run(client):\n    xx = client.close()\n\n\ndef other(client):\n    zzzzzz = client.send(1)\n";
         let after = "from app.alpha import Alpha\n\n\ndef run(client):\n    q = 1\n    wwwwwwwww = client.close()\n    vvvvvvvvvvvvvvv = client.open()\n\n\ndef other(client):\n    zzzzzz = client.send(1)\n";
         let answered = |root: &Path, text: &str, close_line: usize, send_line: usize| {
@@ -1311,8 +1371,8 @@ mod tests {
         );
         assert!(incremental.contains_key("other"), "{incremental:#?}");
 
-        // A sweep of the same file right after the pass changes no ledger.
-        let held = edited.ledger_records("app/run.py");
+        // A sweep with a separately started peer changes no ledger payload.
+        let (incremental_context, held) = validated_ledgers(&edited).await;
         sweep_file(
             &edited.state,
             &root,
@@ -1320,10 +1380,14 @@ mod tests {
             &answered(&root, after, 5, 10),
         )
         .await;
+        let (sweep_context, mut swept) = validated_ledgers(&edited).await;
+        same_resolver_context(&incremental_context, &sweep_context);
+        for ledger in swept.values_mut() {
+            ledger.context = kin_model::ResolutionRecordId::proof_context(&incremental_context);
+        }
         assert_eq!(
-            edited.ledger_records("app/run.py"),
-            held,
-            "a sweep after the incremental pass finds every ledger as it would write it"
+            swept, held,
+            "all ledger fields except the checked peer context agree"
         );
 
         // A store that only ever saw the edited text, swept once.
@@ -1336,6 +1400,8 @@ mod tests {
             &answered(&fresh_root, after, 5, 10),
         )
         .await;
+        let (fresh_context, _) = validated_ledgers(&fresh).await;
+        same_resolver_context(&incremental_context, &fresh_context);
         assert_eq!(
             incremental,
             fresh.ledgers("app/run.py"),

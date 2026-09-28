@@ -412,9 +412,13 @@ Recorded in Kin authority, not in git. `git status` stays dirty until you run `k
 The first commit starts the repository's daemon. Before that, right after
 `kin init`, `kin status` reports durable authority alone and says so on its
 `Tree:` line; once the daemon is up, every `kin status` measures the working
-copy. Who made the change comes from your Git identity when you have one, and
-otherwise from `default_author` in `.kin/config.toml`. Kin refuses to record a
-change attributed to nobody.
+copy. `GIT_AUTHOR_NAME` and `GIT_AUTHOR_EMAIL` override the respective author
+fields for a command. Missing fields come from `default_author` in
+`.kin/config.toml`, then Git's repository or global `user.name` and `user.email`.
+An explicitly empty or unusable author override refuses; unset it to use the
+configured identity. Kin refuses to invent a missing identity or a `user@host.local`
+address. Semantic changes record the author; Git's separate `GIT_COMMITTER_*`
+identity does not replace or fill that role.
 
 Branch, change the function on the branch, and commit there:
 

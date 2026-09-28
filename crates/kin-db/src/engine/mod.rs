@@ -9,7 +9,8 @@ mod traverse;
 #[cfg(feature = "vector")]
 pub use graph::VectorSalvageStats;
 pub use graph::{
-    EmbeddingStatus, InMemoryGraph, PersistenceEpoch, ProducedSemanticSearch,
+    EmbeddingStatus, EnrichmentContextStatus, EnrichmentStatusError, EnrichmentStatusFacts,
+    FileEnrichmentStatus, InMemoryGraph, PersistenceEpoch, ProducedSemanticSearch,
     ProducedSemanticSearchBatch, ResolvedRetrievalItem, SourceDerivationFacts,
     SourceDerivationLimit, SourceDerivationLimits, SourceDerivationUnavailable,
     SourceEntityBinding, SourceLayoutFact, SourceOpaqueFact, SourceReservedRelation,

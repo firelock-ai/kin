@@ -243,6 +243,16 @@ pub fn execute_note_request(
             )
         }
         NoteRequest::List { target } => {
+            if let Some(lines) = crate::commands::external_symbols::scope_argument_refusal(
+                graph,
+                &target,
+                &format!(
+                    "`kin note list` {}",
+                    crate::commands::external_symbols::NOTE_LIST_WHY
+                ),
+            )? {
+                anyhow::bail!(lines.join("\n"));
+            }
             let annotations = match parse_annotation_target(&target)? {
                 AnnotationTarget::Scope(scope) => graph.get_annotations_for_scope(&scope)?,
                 AnnotationTarget::Work(work_id) => graph.get_annotations_for_work_item(&work_id)?,
@@ -408,6 +418,35 @@ mod tests {
         assert_eq!(anns.len(), 1);
         assert_eq!(anns[0].annotation_id, ann.annotation_id);
         assert_eq!(anns[0].scopes, work.scopes);
+    }
+
+    /// No annotation is anchored to a symbol outside the repository, so `kin
+    /// note list` refuses one as its target by what it names rather than
+    /// answering an empty list that reads as an absence.
+    #[test]
+    fn note_list_refuses_an_external_symbol_target() {
+        let store = crate::commands::external_symbols::fixture::external_store(false);
+        let dir = tempfile::tempdir().unwrap();
+        let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
+        for target in [
+            store.address(),
+            format!("entity:{}", store.node.id),
+            store.node.id.to_string(),
+        ] {
+            let error = match execute_note_request(
+                &layout,
+                &store.graph,
+                NoteRequest::List {
+                    target: target.clone(),
+                },
+            ) {
+                Ok(_) => panic!("{target} was listed"),
+                Err(error) => format!("{error:#}"),
+            };
+            assert!(error.contains("Array.map"), "{error}");
+            assert!(error.contains("`kin note list`"), "{error}");
+            assert!(!error.contains("No annotations"), "{error}");
+        }
     }
 
     /// An annotation is anchored to a repository entity. `kin note add`

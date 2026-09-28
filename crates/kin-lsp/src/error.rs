@@ -117,6 +117,27 @@ impl LspError {
         }
     }
 
+    /// Whether retrying can recover without changing the admitted source.
+    /// Session loss and timeouts need another attempt. The protocol also
+    /// explicitly asks for one with RequestCancelled, ContentModified and
+    /// ServerCancelled. Other errors retain their existing failure policy;
+    /// declines and deterministic refusals never become retry debt here.
+    pub fn is_retryable(&self) -> bool {
+        if self.is_declined() || self.is_refusal() {
+            return false;
+        }
+        if self.ends_the_session() || matches!(self, Self::Timeout) {
+            return true;
+        }
+        let Self::JsonRpc(error) = self else {
+            return false;
+        };
+        serde_json::from_str::<serde_json::Value>(error)
+            .ok()
+            .and_then(|error| error.get("code").and_then(serde_json::Value::as_i64))
+            .is_some_and(|code| matches!(code, -32802..=-32800))
+    }
+
     /// The one classification every pass applies, in its one order:
     /// session-ending, then timeout, then decline, then failure.
     pub fn class(&self) -> QueryErrorClass {
@@ -342,6 +363,40 @@ mod tests {
             "not json".to_string(),
         ] {
             assert!(!LspError::JsonRpc(other.clone()).is_refusal(), "{other}");
+        }
+    }
+
+    #[test]
+    fn retryability_recognizes_protocol_cancellation_without_retrying_refusals() {
+        for code in [-32800, -32801, -32802] {
+            let error = LspError::JsonRpc(rpc(code, "ask again"));
+            assert!(error.is_retryable(), "{error}");
+            assert!(!error.is_refusal());
+            assert_eq!(error.class(), QueryErrorClass::Failed);
+        }
+        for error in [
+            LspError::Timeout,
+            LspError::ServerDied,
+            LspError::Io(std::io::Error::other("broken pipe")),
+        ] {
+            assert!(error.is_retryable(), "{error}");
+        }
+        for error in [
+            LspError::Declined {
+                method: "textDocument/references".into(),
+                message: "no identifier found".into(),
+            },
+            LspError::Protocol("a declaration cannot be proved".into()),
+            LspError::JsonRpc(rpc(-32603, "internal error")),
+            LspError::JsonRpc(rpc(-32803, "request failed")),
+            LspError::JsonRpc("not json: -32801".into()),
+            LspError::JsonRpc(r#"{"code":"-32801","message":"content modified"}"#.into()),
+            LspError::JsonRpc(rpc(
+                -32800,
+                "TypeScript Server Error (5.6.3)\nDebug Failure.",
+            )),
+        ] {
+            assert!(!error.is_retryable(), "{error}");
         }
     }
 

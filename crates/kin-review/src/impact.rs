@@ -40,6 +40,34 @@ fn entity_identity_key(entity: &Entity) -> (String, String, String) {
 /// by construction, so a ref-scoped implementation cannot be misused to
 /// mutate graph state.
 pub trait ImpactGraph {
+    /// Recorded site limits from this exact graph view, when it can expose
+    /// them. An absent observation makes no completeness claim.
+    fn enrichment_observation(
+        &self,
+    ) -> Result<Option<crate::enrichment::EnrichmentObservation>, ReviewError> {
+        Ok(None)
+    }
+
+    /// Site limits relevant to this impact: reached entities plus possible
+    /// inbound callers throughout the selected graph. The repository-wide
+    /// observation above must never stand in for an answer-scoped census.
+    fn impact_enrichment_observation(
+        &self,
+        _targets: &[Entity],
+        _unknown_target: bool,
+    ) -> Result<Option<crate::enrichment::EnrichmentObservation>, ReviewError> {
+        Ok(None)
+    }
+
+    fn impact_enrichment_observation_with_source(
+        &self,
+        targets: &[Entity],
+        unknown_target: bool,
+        _escape_evidence: Option<&crate::enrichment::EscapeEvidence<'_>>,
+    ) -> Result<Option<crate::enrichment::EnrichmentObservation>, ReviewError> {
+        self.impact_enrichment_observation(targets, unknown_target)
+    }
+
     /// Whether graph-owned parser coverage proves complete source coverage for
     /// this view. The default is fail-closed so implementations of
     /// the older public trait remain source-compatible without certifying new
@@ -224,6 +252,35 @@ fn live_call_shape_prerequisites_with_tree_read<G: GraphStore>(
 mod freshness_tests;
 
 impl<G: GraphStore> ImpactGraph for LiveGraph<'_, G> {
+    fn enrichment_observation(
+        &self,
+    ) -> Result<Option<crate::enrichment::EnrichmentObservation>, ReviewError> {
+        crate::enrichment::observe_selected_graph(self.0).map(Some)
+    }
+
+    fn impact_enrichment_observation(
+        &self,
+        targets: &[Entity],
+        unknown_target: bool,
+    ) -> Result<Option<crate::enrichment::EnrichmentObservation>, ReviewError> {
+        crate::enrichment::observe_selected_impact(self.0, targets, unknown_target).map(Some)
+    }
+
+    fn impact_enrichment_observation_with_source(
+        &self,
+        targets: &[Entity],
+        unknown_target: bool,
+        escape_evidence: Option<&crate::enrichment::EscapeEvidence<'_>>,
+    ) -> Result<Option<crate::enrichment::EnrichmentObservation>, ReviewError> {
+        crate::enrichment::observe_selected_impact_with_source(
+            self.0,
+            targets,
+            unknown_target,
+            escape_evidence,
+        )
+        .map(Some)
+    }
+
     fn call_shape_binding_prerequisites_complete(&self) -> Result<bool, ReviewError> {
         live_call_shape_prerequisites_with_tree_read(
             self.0,
@@ -307,6 +364,11 @@ impl<G: GraphStore> ImpactGraph for LiveGraph<'_, G> {
 /// Structured impact report for a set of changed entities.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ImpactReport {
+    /// Call-site limits within this impact's reach and possible inbound
+    /// callers elsewhere in the selected graph. Candidates are not asserted
+    /// to depend on the changed code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enrichment: Option<crate::enrichment::EnrichmentObservation>,
     /// Entities that call into changed entities.
     pub affected_callers: Vec<Entity>,
     /// Entities that depend on changed entities.
@@ -617,6 +679,14 @@ pub fn analyze_impact<G: GraphStore>(
     analyze_impact_at(&LiveGraph(store), diff)
 }
 
+pub fn analyze_impact_with_source<G: GraphStore>(
+    store: &G,
+    diff: &SemanticDiff,
+    escape_evidence: Option<&crate::enrichment::EscapeEvidence<'_>>,
+) -> Result<ImpactReport, ReviewError> {
+    analyze_impact_at_with_source(&LiveGraph(store), diff, escape_evidence)
+}
+
 /// Analyze the impact of changes described in a `SemanticDiff` by walking
 /// the supplied [`ImpactGraph`] for each changed entity.
 ///
@@ -627,6 +697,14 @@ pub fn analyze_impact<G: GraphStore>(
 pub fn analyze_impact_at<I: ImpactGraph>(
     graph: &I,
     diff: &SemanticDiff,
+) -> Result<ImpactReport, ReviewError> {
+    analyze_impact_at_with_source(graph, diff, None)
+}
+
+pub fn analyze_impact_at_with_source<I: ImpactGraph>(
+    graph: &I,
+    diff: &SemanticDiff,
+    escape_evidence: Option<&crate::enrichment::EscapeEvidence<'_>>,
 ) -> Result<ImpactReport, ReviewError> {
     let changed_ids = diff.changed_entity_ids();
     let changed_set: HashSet<EntityId> = changed_ids.iter().copied().collect();
@@ -971,7 +1049,63 @@ pub fn analyze_impact_at<I: ImpactGraph>(
         }
     }
 
+    // Include both spellings of a rename and base-side removed identities.
+    // A removal without its old record cannot safely narrow possible callers.
+    let mut enrichment_targets = Vec::new();
+    let mut unknown_target = false;
+    for change in &diff.entity_changes {
+        match &change.kind {
+            EntityChangeKind::Added(entity) => enrichment_targets.push(entity.clone()),
+            EntityChangeKind::Modified { old, new } => {
+                enrichment_targets.extend([old.clone(), new.clone()]);
+            }
+            EntityChangeKind::Removed { old: Some(entity) } => {
+                enrichment_targets.push(entity.clone())
+            }
+            EntityChangeKind::Removed { old: None } => unknown_target = true,
+        }
+    }
+    // A relation-only review still changes semantic reach. Its endpoint
+    // identities belong to the observation even when no entity body changed.
+    for change in &diff.relation_changes {
+        let relations = match &change.kind {
+            crate::diff::RelationChangeKind::Added(relation)
+            | crate::diff::RelationChangeKind::Removed { old: relation } => vec![relation],
+            crate::diff::RelationChangeKind::Modified { old, new } => vec![old, new],
+        };
+        for relation in relations {
+            for id in [relation.src.as_entity(), relation.dst.as_entity()]
+                .into_iter()
+                .flatten()
+            {
+                if enrichment_targets.iter().any(|entity| entity.id == id) {
+                    continue;
+                }
+                match graph.get_entity(&id)? {
+                    Some(entity) => enrichment_targets.push(entity),
+                    None => unknown_target = true,
+                }
+            }
+        }
+    }
+    enrichment_targets.extend(
+        callers
+            .iter()
+            .chain(&dependents)
+            .chain(&contract_consumers)
+            .chain(&tests)
+            .cloned(),
+    );
+    enrichment_targets.sort_by(|left, right| (left.id, &left.name).cmp(&(right.id, &right.name)));
+    enrichment_targets.dedup_by(|left, right| left.id == right.id && left.name == right.name);
+    let enrichment = graph.impact_enrichment_observation_with_source(
+        &enrichment_targets,
+        unknown_target,
+        escape_evidence,
+    )?;
+
     Ok(ImpactReport {
+        enrichment,
         affected_callers: callers,
         affected_dependents: dependents,
         affected_contract_consumers: contract_consumers,

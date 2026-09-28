@@ -280,10 +280,10 @@ pub(crate) fn recommend_profile(hardware: &DetectedHardware) -> ProfileRecommend
     let memory = hardware.effective_memory_bytes();
     let upgrade = match (unified, memory) {
         (true, Some(bytes)) if bytes >= THROUGHPUT_UNIFIED_MEMORY_FLOOR => Some(format!(
-            "throughput would scale the embedding batch budgets with this machine's {} of unified \
-             memory and engage the CPU twin. It stays opt-in because it also overlaps a batch's \
-             persist with the next batch's compute, which changes the order vectors are written \
-             in, so its results are not citable.",
+            "throughput would batch more embedding work at once with this machine's {} of \
+             unified memory. It stays opt-in because it also saves one batch while computing the \
+             next, so vectors can land in a different order from run to run and its results are \
+             not reproducible.",
             human_bytes(bytes)
         )),
         (true, Some(bytes)) => Some(format!(
@@ -594,11 +594,11 @@ mod tests {
             .upgrade
             .expect("a host at the floor is offered the upgrade");
         assert!(
-            at_floor.contains("would scale the embedding batch budgets"),
+            at_floor.contains("would batch more embedding work"),
             "{at_floor:?}"
         );
         assert!(
-            at_floor.contains("not citable"),
+            at_floor.contains("not reproducible"),
             "an upgrade offered without its cost is a recommendation, not an option: {at_floor:?}"
         );
     }

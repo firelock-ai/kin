@@ -627,7 +627,7 @@ pub const AGENT_DEFAULT_CONTEXT_PACK_TOKEN_BUDGET: u64 = 4_000;
 /// building the registry there to rediscover eight names would cost more than
 /// it saves. `the_budget_tool_list_matches_the_registry` fails if the registry
 /// and this list ever disagree, so it cannot go stale quietly.
-const BUDGET_TOOLS: [&str; 9] = [
+const BUDGET_TOOLS: [&str; 10] = [
     "semantic_locate",
     DECLARATION_FILTER_CANONICAL,
     "find_references",
@@ -636,6 +636,7 @@ const BUDGET_TOOLS: [&str; 9] = [
     "graph_neighborhood",
     "impact_analysis",
     "get_context_pack",
+    "kin_graph_status",
     crate::handlers::lexical::TOOL_NAME,
 ];
 
@@ -891,7 +892,7 @@ fn tool_property_descriptions() -> BTreeMap<(&'static str, &'static str), &'stat
         (("semantic_search", "limit"), "Max rows."),
         (
             ("find_references", "answer_only"),
-            "False adds coverage and candidates.",
+            "False adds coverage and all candidates.",
         ),
         (("find_references", "entity_id"), "UUID, or give query."),
         // A member name several owners share is answered for each owner, in its
@@ -942,6 +943,14 @@ fn tool_property_descriptions() -> BTreeMap<(&'static str, &'static str), &'stat
         (("impact_analysis", "change_ids"), "Change ids to combine."),
         (("impact_analysis", "entity_ids"), "Entity UUIDs."),
         (("impact_analysis", "files"), "Deprecated; use entity_ids."),
+        (
+            ("kin_graph_status", "dependencies"),
+            "Exact projection paths to account for.",
+        ),
+        (
+            ("kin_graph_status", "max_chars"),
+            "Hard cap on reply bytes.",
+        ),
         (("kin_provenance_query", "limit"), "Page size."),
         (
             (crate::repository_init::TOOL_NAME, "path"),
@@ -1026,9 +1035,7 @@ fn tool_property_descriptions() -> BTreeMap<(&'static str, &'static str), &'stat
             "Inline sources; false gives the shape.",
         ),
         (("trace_data_flow", "limit_per_step"), "Edges kept per hop."),
-        // Not "Max": below the size of its smallest retained walk this tool
-        // ships that walk over the budget and discloses `response_over_budget`.
-        (("trace_data_flow", "max_chars"), "Soft cap on reply bytes."),
+        (("trace_data_flow", "max_chars"), "Hard page byte ceiling."),
         (
             ("trace_data_flow", "target"),
             "A symbol to reach; its branch is kept.",

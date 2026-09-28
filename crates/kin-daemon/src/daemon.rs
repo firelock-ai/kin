@@ -7,6 +7,9 @@ use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
 mod incremental_enrichment;
+mod readiness;
+
+use readiness::{LaunchKey, ReadinessObservations};
 pub(crate) mod lsp_publication;
 
 #[cfg(all(test, unix))]
@@ -70,8 +73,8 @@ fn should_enable_lsp_enrichment(config_enabled: bool, filesystem_reconcile_disab
 /// launched typescript-language-server, rust-analyzer and pyright at startup,
 /// and its answer described a host this daemon was never going to use. Now the
 /// same decision that opens the sweep's channel decides, and a daemon that does
-/// not enrich leaves readiness unpublished, which every observation already
-/// reads as unknown: the honest state for a daemon that did not look.
+/// not enrich records a completed switched-off finding for every enrichable
+/// language instead of probing (`ReadinessObservations::switched_off`).
 ///
 /// The spawner is a parameter so the gate is testable without a server.
 fn start_readiness_probe_if_enabled(
@@ -258,6 +261,32 @@ pub(crate) enum BackgroundEmbeddingBatchOutcome {
 /// duration of the first batch.
 const SLOW_EMBEDDER_PREPARE: Duration = Duration::from_secs(1);
 
+/// One background batch owns this observer; foreground embedding cannot feed
+/// its watchdog, and parallel inference arms share only this batch's handle.
+struct BackgroundEmbeddingWork<'a> {
+    pass: &'a crate::background_work::BackgroundPass,
+    cancel: &'a tokio::sync::watch::Receiver<bool>,
+}
+
+impl kin_db::embed::EmbeddingWork for BackgroundEmbeddingWork<'_> {
+    fn cancelled(&self) -> bool {
+        self.pass.halted() || *self.cancel.borrow()
+    }
+
+    fn completed_chunk(&self, vectors: usize) {
+        self.pass.computed_chunk(vectors, Instant::now());
+    }
+
+    fn publish(
+        &self,
+        publication: Box<dyn FnOnce() -> std::result::Result<usize, kin_db::KinDbError> + '_>,
+    ) -> std::result::Result<usize, kin_db::KinDbError> {
+        let _publication = self.pass.publishing();
+        self.checkpoint()?;
+        publication()
+    }
+}
+
 /// Run one background embedding batch and any first-error vector recovery under
 /// one `embedding_work` guard.
 ///
@@ -395,95 +424,44 @@ pub(crate) fn reset_vector_index_and_requeue_after_contention_for_test(
 /// for this language", and two surfaces outside the enrichment loop need that
 /// answer to agree with it: the provisioning advice that tells an operator what
 /// to install, and the proof that starts a real server against a fixture.
-/// Probe what each enrichable language's server can actually do, then publish
-/// it for the query paths.
-///
-/// Spawned rather than awaited. Probing means starting each server and running
-/// the initialize handshake, and five languages against the probe budget would
-/// add seconds to daemon startup in the healthy case and far more when a server
-/// hangs. Nothing waits on the answer: until it publishes, every observation
-/// reads the readiness as unknown, which already keeps the absence-trust gate
-/// silent and is the honest state for a daemon that has not finished looking.
-///
-/// Safe against the daemon's own enrichment path by construction, not by
-/// timing. The sweep decides what to start from `lsp_adapter_for` and its own
-/// `servers` map, and enrichment availability comes from `discover_servers`;
-/// neither reads the published verdict, so a probe still in flight cannot
-/// change what the daemon does. The publish is write-only here and consumed
-/// only by kin-mcp.
-///
-/// The probes run concurrently, so the worst case is one probe budget rather
-/// than one per language.
-fn spawn_language_server_readiness_probe(workspace_root: std::path::PathBuf) {
-    use kin_core::reference_coverage::{
-        LanguageServerReadiness, LanguageServerReadinessMap, ENRICHABLE_LANGUAGES,
-    };
-
+/// Probe only when no startup sweep will supply actual worker observations.
+/// Per-language ownership coalesces a concurrent request and keeps a delayed
+/// language from replacing another language's newer observation.
+fn spawn_language_server_readiness_probe(
+    workspace_root: std::path::PathBuf,
+    observations: Arc<ReadinessObservations>,
+    mut cancel: tokio::sync::watch::Receiver<bool>,
+) {
     tokio::spawn(async move {
-        // One task per language so the probes overlap: the worst case is one
-        // probe budget rather than one per language.
-        let probes: Vec<_> = ENRICHABLE_LANGUAGES
-            .iter()
-            .copied()
-            .map(|language| {
-                let workspace_root = workspace_root.clone();
-                tokio::spawn(async move {
-                    let readiness = probe_language_server(language, &workspace_root).await;
-                    (language, readiness)
-                })
-            })
-            .collect();
-
-        let mut readiness = LanguageServerReadinessMap::new();
-        for probe in probes {
-            match probe.await {
-                Ok((language, state)) => {
-                    if let LanguageServerReadiness::Unusable { reason } = &state {
-                        warn!(
-                            %language,
-                            %reason,
-                            "a language server is installed but cannot start, so this \
-                             language's cross-file reference edges cannot be produced on \
-                             this host"
-                        );
-                    }
-                    readiness.insert(language, state);
+        let mut probes = tokio::task::JoinSet::new();
+        for &language in kin_core::reference_coverage::ENRICHABLE_LANGUAGES {
+            let workspace_root = workspace_root.clone();
+            let observations = Arc::clone(&observations);
+            probes.spawn(async move {
+                let observed = observations.probe(language, &workspace_root).await;
+                if let kin_core::reference_coverage::LanguageServerReadiness::Unusable { reason } = observed {
+                    warn!(%language, %reason, "the language server could not complete its readiness handshake");
                 }
-                // A probe task that panicked establishes nothing about its
-                // language, and recording it as Absent would be a claim this
-                // process did not earn. Leaving it out reads as unknown.
-                Err(error) => warn!(%error, "a language server readiness probe did not finish"),
+            });
+        }
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel.changed() => break,
+                result = probes.join_next() => match result {
+                    Some(Err(error)) => warn!(%error, "a language server readiness probe did not finish"),
+                    Some(Ok(())) => {},
+                    None => break,
+                }
             }
         }
-
-        kin_mcp::edge_coverage::publish_language_server_readiness(readiness);
+        // Dropping the JoinSet aborts pending owned launches on cancellation.
     });
-}
-
-/// Whether this daemon can start `language`'s server right now, asked the way
-/// the sweep and the incremental path start one.
-///
-/// The command is resolved by [`crate::language_server_command`], so the probe
-/// starts the binary the sweep will start, with the adapter's own arguments.
-/// It used to resolve kin-lsp's registry list instead (`pylsp` behind
-/// `pyright-langserver`, `vtsls` behind `typescript-language-server`) through
-/// the daemon's inherited working directory, so it could read a language as
-/// served that no sweep could serve, and the other way round.
-pub(crate) async fn probe_language_server(
-    language: kin_model::LanguageId,
-    workspace_root: &std::path::Path,
-) -> kin_core::reference_coverage::LanguageServerReadiness {
-    let Some((command, _, _)) = lsp_adapter_for(language, workspace_root) else {
-        return kin_core::reference_coverage::LanguageServerReadiness::Absent;
-    };
-    let resolved =
-        crate::language_server_command::resolve_on_this_host(command, workspace_root.to_path_buf())
-            .await;
-    probe_resolved_language_server(language, workspace_root, resolved).await
 }
 
 /// The probe's second half, from a resolution already made, so a test can hand
 /// it any resolution without the host's toolchains.
+#[cfg(test)]
 async fn probe_resolved_language_server(
     language: kin_model::LanguageId,
     workspace_root: &std::path::Path,
@@ -510,6 +488,21 @@ async fn probe_resolved_language_server(
     let (args, launch) = lsp_adapter_for(language, workspace_root)
         .map(|(_, args, launch)| (args, launch))
         .unwrap_or_default();
+    match probe_server(&program, &args, workspace_root, &launch).await {
+        Ok(server) => {
+            drop(server);
+            LanguageServerReadiness::Usable
+        }
+        Err(reason) => LanguageServerReadiness::Unusable { reason },
+    }
+}
+
+async fn probe_server(
+    program: &std::path::Path,
+    args: &[String],
+    workspace_root: &std::path::Path,
+    launch: &kin_lsp::adapters::ServerLaunch,
+) -> std::result::Result<kin_lsp::lifecycle::LspServer, String> {
     let args_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     match tokio::time::timeout(
         kin_lsp::lifecycle::READINESS_PROBE_TIMEOUT,
@@ -517,28 +510,18 @@ async fn probe_resolved_language_server(
             &program.to_string_lossy(),
             &args_refs,
             workspace_root,
-            &launch,
+            launch,
             Some(typescript_grammars()),
         ),
     )
     .await
     {
-        Err(_) => LanguageServerReadiness::Unusable {
-            reason: format!(
-                "{} did not complete the initialize handshake within {}s",
-                program.display(),
-                kin_lsp::lifecycle::READINESS_PROBE_TIMEOUT.as_secs()
-            ),
-        },
-        Ok(Err(error)) => LanguageServerReadiness::Unusable {
-            reason: error.to_string(),
-        },
-        // Dropped rather than shut down: a drop ends the server's whole
-        // process group at once, and a probe has no session worth closing.
-        Ok(Ok(server)) => {
-            drop(server);
-            LanguageServerReadiness::Usable
-        }
+        Err(_) => Err(format!(
+            "{} did not complete the initialize handshake within {}s",
+            program.display(),
+            kin_lsp::lifecycle::READINESS_PROBE_TIMEOUT.as_secs()
+        )),
+        Ok(result) => result.map_err(|error| error.to_string()),
     }
 }
 
@@ -562,57 +545,184 @@ fn typescript_grammars() -> kin_lsp::TypeScriptGrammars {
 /// The error is a sentence a skip reason can carry as it is: the resolver's
 /// own when nothing it found can serve, and the server's when it started and
 /// refused the handshake.
+/// The configuration and environment hashes a server this daemon would start
+/// for `language` proves under, for each configuration it may settle on (the
+/// adapter's launch and each fallback), known without starting one.
+///
+/// `None` when no server resolves on this host or its executable cannot be
+/// identified by content (see [`kin_lsp::proof_context::resolver_content_identity`]):
+/// then only a running server can say which context is current.
+async fn prestart_proof_hashes(
+    language: kin_model::LanguageId,
+    workspace_root: &std::path::Path,
+) -> Option<Vec<(kin_model::Hash256, kin_model::Hash256)>> {
+    use crate::language_server_command::ServerCommand;
+
+    let (command, _, launch) = lsp_adapter_for(language, workspace_root)?;
+    let ServerCommand::Resolved { program, .. } =
+        crate::language_server_command::resolve_on_this_host(command, workspace_root.to_path_buf())
+            .await
+    else {
+        return None;
+    };
+    let identity = kin_lsp::proof_context::resolver_content_identity(&program)?;
+    let program = program.to_string_lossy().into_owned();
+    let mut hashes = Vec::new();
+    let mut next = Some(&launch);
+    while let Some(candidate) = next {
+        hashes.push(kin_lsp::proof_context::prestart_hashes(
+            candidate,
+            workspace_root,
+            &program,
+            &identity,
+        ));
+        next = candidate.fallback.as_deref();
+    }
+    Some(hashes)
+}
+
+/// The proof contexts the call-site ledgers of `entities` were proven under,
+/// each once.
+fn ledger_proof_contexts(
+    state: &DaemonState,
+    entities: &[&kin_model::Entity],
+) -> Vec<kin_model::ProofContext> {
+    let mut contexts: Vec<kin_model::ProofContext> = Vec::new();
+    for entity in entities {
+        let Some(context) = state
+            .graph
+            .get_resolution_record(&kin_model::ResolutionRecordId::call_sites(entity.id))
+            .and_then(|record| record.as_call_sites().map(|ledger| ledger.context))
+            .and_then(|id| state.graph.get_resolution_record(&id))
+            .and_then(|record| record.as_proof_context().cloned())
+        else {
+            continue;
+        };
+        if !contexts.contains(&context) {
+            contexts.push(context);
+        }
+    }
+    contexts
+}
+
+/// How the current proof context of a language is settled before a finished
+/// file of it is skipped.
+#[derive(Debug, PartialEq, Eq)]
+enum PrestartSettlement<'a> {
+    /// What this host would start proves under this ledger context, so the
+    /// context is current and no server needs to start to confirm it.
+    Current(&'a kin_model::ProofContext),
+    /// Only a running server can say: the executable cannot be identified by
+    /// content, or it would prove under none of the contexts the ledgers name.
+    StartServer,
+}
+
+/// Settle a language's current context from what its finished file's ledgers
+/// were proven under and the hashes what this host would start proves under.
+fn settle_before_skipping<'a>(
+    ledgers: &'a [kin_model::ProofContext],
+    prestart: Option<&[(kin_model::Hash256, kin_model::Hash256)]>,
+) -> PrestartSettlement<'a> {
+    prestart
+        .and_then(|hashes| {
+            ledgers.iter().find(|context| {
+                hashes.contains(&(context.configuration_hash, context.environment_hash))
+            })
+        })
+        .map_or(PrestartSettlement::StartServer, PrestartSettlement::Current)
+}
+
+/// Whether this daemon knows the proof context `language`'s server runs under.
+fn current_proof_context_known(state: &DaemonState, language: kin_model::LanguageId) -> bool {
+    state
+        .lsp_current_contexts
+        .lock()
+        .map(|current| current.contains_key(&language))
+        .unwrap_or(false)
+}
+
 async fn start_resolved_language_server(
     language: kin_model::LanguageId,
+    observations: &ReadinessObservations,
     command: &str,
     args: &[String],
     workspace_root: &std::path::Path,
     launch: kin_lsp::adapters::ServerLaunch,
 ) -> std::result::Result<kin_lsp::lifecycle::LspServer, String> {
     use crate::language_server_command::ServerCommand;
+    use kin_core::reference_coverage::LanguageServerReadiness;
 
-    let program = match crate::language_server_command::resolve_on_this_host(
-        command.to_string(),
-        workspace_root.to_path_buf(),
-    )
-    .await
-    {
-        ServerCommand::Resolved { program, chosen } => {
-            info!(
-                %language,
-                program = %program.display(),
-                %chosen,
-                "starting the language server this daemon resolved"
-            );
-            program
+    // A start that fails carries the finding it completes with. A server that is
+    // not installed is Absent, as the readiness probe records it, so the same
+    // host reads the same whichever of the two asked first.
+    let unusable = |reason: String| (reason.clone(), LanguageServerReadiness::Unusable { reason });
+    let mut observation = observations.acquire(language).await;
+    observation.begin();
+    let started = async {
+        let program = match crate::language_server_command::resolve_on_this_host(
+            command.to_string(),
+            workspace_root.to_path_buf(),
+        )
+        .await
+        {
+            ServerCommand::Resolved { program, chosen } => {
+                info!(
+                    %language,
+                    program = %program.display(),
+                    %chosen,
+                    "starting the language server this daemon resolved"
+                );
+                program
+            }
+            ServerCommand::NotInstalled => {
+                return Err((
+                    kin_core::reference_coverage::no_server_on_daemon_path(Some(command)),
+                    LanguageServerReadiness::Absent,
+                ));
+            }
+            ServerCommand::Unresolvable { reason } => return Err(unusable(reason)),
+        };
+        let launch = provision_pending_environment(language, workspace_root, launch).await;
+        if let Some(resolution) = &launch.resolution {
+            log_language_server_resolution(language, resolution);
         }
-        ServerCommand::NotInstalled => {
-            return Err(kin_core::reference_coverage::no_server_on_daemon_path(
-                Some(command),
-            ));
-        }
-        ServerCommand::Unresolvable { reason } => return Err(reason),
-    };
-    let launch = provision_pending_environment(language, workspace_root, launch).await;
-    if let Some(resolution) = &launch.resolution {
-        log_language_server_resolution(language, resolution);
+        let key = LaunchKey::capture(workspace_root, &program, args, &launch);
+        let args_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let server = kin_lsp::lifecycle::LspServer::launch_settled(
+            &program.to_string_lossy(),
+            &args_refs,
+            workspace_root,
+            &launch,
+            Some(typescript_grammars()),
+        )
+        .await
+        .map_err(|error| unusable(error.to_string()))?;
+        info!(
+            %language,
+            configuration = %server.configuration(),
+            "the language server this daemon started is configured"
+        );
+        Ok((server, key))
     }
-    let args_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let server = kin_lsp::lifecycle::LspServer::launch_settled(
-        &program.to_string_lossy(),
-        &args_refs,
-        workspace_root,
-        &launch,
-        Some(typescript_grammars()),
-    )
-    .await
-    .map_err(|error| error.to_string())?;
-    info!(
-        %language,
-        configuration = %server.configuration(),
-        "the language server this daemon started is configured"
-    );
-    Ok(server)
+    .await;
+    match started {
+        Ok((server, key)) => {
+            let context = server.proof_context(language);
+            let result = if server.is_disconnected() {
+                LanguageServerReadiness::Unusable {
+                    reason: "the language server disconnected after starting".into(),
+                }
+            } else {
+                LanguageServerReadiness::Usable
+            };
+            observation.finish(Some(key), result, Some(&context));
+            Ok(server)
+        }
+        Err((reason, finding)) => {
+            observation.finish(None, finding, None);
+            Err(reason)
+        }
+    }
 }
 
 /// How long a server start waits for its analysis environment to be fetched.
@@ -825,8 +935,8 @@ fn take_servers_a_sweep_started<S>(
 /// kept asking it recorded each remaining file as a question that got no
 /// answer, and counted each one as enriched: 546 files in fifteen seconds on
 /// one Go repository, with the reason for the death nowhere. Nothing restarts
-/// the server here. The rest of the pass reports the language unserved, and
-/// the next sweep starts a fresh one, as it would after a failed start.
+/// the server here. The sweep's retry queue decides whether to start a fresh
+/// one for the interrupted file, within its bounded restart allowance.
 async fn retire_disconnected_server(
     servers: &mut std::collections::HashMap<kin_model::LanguageId, kin_lsp::lifecycle::LspServer>,
     first_open_done: &mut std::collections::HashSet<kin_model::LanguageId>,
@@ -846,13 +956,12 @@ async fn retire_disconnected_server(
         command,
         exit = departure.exit.as_deref().unwrap_or("its process had not exited"),
         stderr = %departure.stderr,
-        "the language server stopped answering partway through this sweep; the rest of this \
-         language is left unenriched in this pass"
+        "the language server stopped answering partway through this sweep; retiring it before \
+         deciding whether to retry the interrupted file"
     );
     server.abandon().await;
     Some(format!(
-        "the `{command}` language server stopped answering partway through this sweep ({}), so \
-         the rest of this language was not asked",
+        "the `{command}` language server stopped answering partway through this sweep ({})",
         departure.describe(LOST_SERVER_STDERR_IN_REASON)
     ))
 }
@@ -1662,6 +1771,36 @@ pub(crate) const AUTO_EMBED_ENV: &str = "KIN_DAEMON_AUTO_EMBED";
 /// sets both in CI, so neither is a branch that exists on every daemon and is
 /// exercised by nothing.
 pub(crate) const STARTUP_HOLD_ENV: &str = "KIN_DAEMON_TEST_STARTUP_HOLD_SECS";
+pub(crate) const STARTUP_GATE_ENV: &str = "KIN_DAEMON_TEST_STARTUP_GATE";
+
+/// Wait before opening any state for as long as the file the startup gate
+/// names exists.
+///
+/// Fault injection for the window in which a daemon holds its repository but
+/// has published no endpoint, which a real start spends opening or
+/// re-qualifying a large store. A test that needs a daemon in that window
+/// holds it there with a file it controls and releases it by removing the
+/// file, rather than racing a clock. Unset or empty disarms it, and only the
+/// file's existence is read.
+pub fn wait_at_startup_gate() {
+    let Some(gate) = std::env::var_os(STARTUP_GATE_ENV).filter(|value| !value.is_empty()) else {
+        return;
+    };
+    let gate = std::path::PathBuf::from(gate);
+    if std::fs::symlink_metadata(&gate).is_err() {
+        return;
+    }
+    warn!(
+        lever = STARTUP_GATE_ENV,
+        gate = %gate.display(),
+        "holding this daemon before it opens any state: fault injection is armed, and the \
+         start resumes once the gate file is removed. This is not a healthy daemon; unset the \
+         lever to restore it."
+    );
+    while std::fs::symlink_metadata(&gate).is_ok() {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
 pub(crate) const HOLD_SWEEP_ENV: &str = "KIN_DAEMON_TEST_HOLD_ENRICHMENT_SWEEP";
 
 /// How long to hold the endpoint unpublished, from a raw value.
@@ -1697,6 +1836,19 @@ pub(crate) fn hold_sweep_from(value: Option<&str>) -> bool {
 /// so one spelling works across the daemon's env surface.
 pub(crate) fn auto_embed_enabled() -> bool {
     kin_daemon_spawn::auto_embed_enabled_from(std::env::var(AUTO_EMBED_ENV).ok().as_deref())
+}
+
+/// Why the background pass stays off on this machine even though no operator
+/// opted out: `kin setup` declined the embedding model download and the model
+/// is not in the cache. `None` when the pass may run.
+pub(crate) fn background_embed_declined() -> Option<String> {
+    kin_cli::embed_model::declined_and_absent()
+}
+
+/// Whether a background embedding pass runs here without being asked: the
+/// operator did not opt out, and the model download was not declined.
+pub(crate) fn background_embed_runs() -> bool {
+    auto_embed_enabled() && background_embed_declined().is_none()
 }
 
 /// Whether the selected graph has no queued or unindexed embedding work.
@@ -1758,6 +1910,21 @@ fn start_or_defer_background_embed(state: &DaemonState) -> bool {
         warn!(
             trigger = AUTO_EMBED_ENV,
             "background embedding deferred by operator opt-out: no vectors will be generated, and semantic coverage stays as it is until an explicit embed request runs"
+        );
+        return false;
+    }
+    // Asked next, for the same reason: a machine whose `kin setup` declined
+    // the model download wants none of this pass either. The embedder would
+    // refuse the download on the first batch anyway; standing the pass down
+    // here keeps the refusal from being reported as a failed batch, and keeps
+    // the daemon eligible for idle shutdown. `kin embed` records consent and
+    // resumes the worker.
+    if let Some(reason) = background_embed_declined() {
+        state.pause_background_embed();
+        clear_pressure_refusal_for_work(state, kin_core::memory_pressure::HeavyWork::EmbedBatch);
+        info!(
+            reason = %reason,
+            "background embedding off: this machine declined the embedding model download and the model is not in the cache, so no vectors are generated until `kin embed` runs"
         );
         return false;
     }
@@ -1945,10 +2112,162 @@ fn coverage_drain_verdict(missing: usize, backfilled_gap: Option<usize>) -> Cove
 
 fn embed_work_in_flight(state: &DaemonState) -> bool {
     embed_work_outstanding(
-        state.embed_pass_active(),
+        state.embed_pass_active() || background_embed_batch_running(state),
         state.graph.pending_embeddings() > 0 || state.graph.pending_artifact_embeddings() > 0,
         state.background_embed_worker_can_drain(),
     )
+}
+
+/// The background embed worker is inside a batch right now.
+///
+/// The queue alone cannot say so: the worker takes a whole batch off it before
+/// computing a vector, so a store whose backlog fits one batch reads an empty
+/// queue for the whole of that batch. On a CPU that is over a minute, and the
+/// idle monitor shut such a daemon down mid-batch, the pass lost, while the
+/// command that started it had told the person it was finishing in the
+/// background. The worker marks its working stretch from a batch's start to its
+/// next idle wake, and a halted pass is not working, so a wedged worker still
+/// cannot hold the daemon open.
+fn background_embed_batch_running(state: &DaemonState) -> bool {
+    state
+        .background_work
+        .registered(crate::background_work::PASS_EMBED)
+        .is_some_and(|pass| pass.is_working())
+}
+
+/// How long a daemon stays up for an embedding pass memory is holding back,
+/// before it idles out as it would with nothing owed.
+const DEFAULT_EMBED_MEMORY_HOLD: Duration = Duration::from_secs(20 * 60);
+
+/// When this daemon began holding itself up for a pass memory refused.
+///
+/// Process-wide because a daemon serves one repository. Advanced only by the
+/// idle monitor, through [`embed_held_for_memory`].
+static EMBED_MEMORY_HOLD_SINCE: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+
+/// When this daemon last let go of the embedding model for a hold, so a host
+/// whose pressure comes and goes cannot make it load and drop the model over
+/// and over: at most once per hold window.
+static EMBED_MODEL_RELEASED_AT: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+
+fn embed_memory_hold_window() -> Duration {
+    duration_from_env_secs(
+        "KIN_DAEMON_EMBED_MEMORY_HOLD_SECS",
+        DEFAULT_EMBED_MEMORY_HOLD,
+    )
+}
+
+/// Whether a daemon whose embedding pass memory is holding back stays up.
+///
+/// The worker already asks the pressure gate again on every wake, so a pass
+/// refused for memory resumes by itself as soon as the host has room, but only
+/// while the daemon that owns it is alive. A refused pass leaves its queue
+/// unbuilt, which the idle monitor reads as no work, so a CLI-started daemon
+/// idled out a minute later and the pass waited for whatever kin command came
+/// next. This keeps such a daemon up for a bounded window so the pass resumes on
+/// its own when memory frees. After the window it idles out as before, because
+/// a host that stays short of memory is better served by one less resident
+/// process than by a daemon waiting for room indefinitely.
+///
+/// Returns the hold's start to carry forward, and whether it holds now. A hold
+/// ends, and its clock resets, the moment the pass is no longer owed and
+/// refused. Pure, so the window is testable in virtual time.
+fn embed_memory_hold(
+    since: Option<Instant>,
+    now: Instant,
+    window: Duration,
+    owed_and_refused: bool,
+) -> (Option<Instant>, bool) {
+    if !owed_and_refused {
+        return (None, false);
+    }
+    let since = since.unwrap_or(now);
+    (Some(since), now.saturating_duration_since(since) < window)
+}
+
+/// The embedding pass is owed, this daemon's worker could drain it, and a
+/// recorded memory refusal is what holds it back, returning that refusal.
+///
+/// Read from coverage and the store's refusal record rather than from the
+/// queue, because a refused pass never builds its queue.
+fn embed_memory_refusal_holding_owed_pass(
+    state: &DaemonState,
+) -> Option<kin_core::memory_pressure::PressureRefusal> {
+    if !state.background_embed_worker_can_drain()
+        || state
+            .background_work
+            .registered(crate::background_work::PASS_EMBED)
+            .is_some_and(|pass| pass.halted())
+    {
+        return None;
+    }
+    let status = state.graph.embedding_status();
+    if embedding_coverage_is_complete(status.pending, status.indexed, status.total) {
+        return None;
+    }
+    kin_core::memory_pressure::PressureRefusal::read_for_work(
+        state.layout.root(),
+        kin_core::memory_pressure::HeavyWork::EmbedBatch,
+    )
+}
+
+/// Whether this daemon holds itself up for its memory-refused pass now,
+/// advancing the hold's clock. Called by the idle monitor.
+///
+/// A host-pressure hold also lets go of the embedding model, so a daemon waiting
+/// for memory costs about what an idle one does. It lets go only when nothing is
+/// using the model, and at most once per window. The next batch or semantic
+/// query loads it again. A refusal of this daemon's own budget keeps the model,
+/// because that budget's floor-batch rule counts on reusing it.
+fn embed_held_for_memory(state: &DaemonState) -> bool {
+    let refusal = embed_memory_refusal_holding_owed_pass(state);
+    let now = Instant::now();
+    let window = embed_memory_hold_window();
+    let mut since = EMBED_MEMORY_HOLD_SINCE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let entering = since.is_none() && refusal.is_some();
+    let (next, holds) = embed_memory_hold(*since, now, window, refusal.is_some());
+    *since = next;
+    drop(since);
+    if entering {
+        let host_pressure = refusal.as_ref().is_some_and(|refusal| !refusal.from_budget);
+        let mut released_at = EMBED_MODEL_RELEASED_AT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let may_release = released_at.is_none_or(|at| now.saturating_duration_since(at) >= window);
+        let released = host_pressure
+            && may_release
+            && !background_embed_batch_running(state)
+            && !state.embed_pass_active()
+            && state.graph.release_embedder();
+        if released {
+            *released_at = Some(now);
+        }
+        info!(
+            window_secs = window.as_secs(),
+            released_model = released,
+            "embedding is owed and memory is holding it back: staying up so the pass resumes when memory frees"
+        );
+    }
+    holds
+}
+
+/// Whether this daemon is, or on its next idle check will be, holding itself up
+/// for a memory-refused pass. For the resources report, which says "resumes
+/// when memory frees" only while this is true; it does not move the clock.
+pub(crate) fn embed_held_for_memory_now(state: &DaemonState) -> bool {
+    let since = *EMBED_MEMORY_HOLD_SINCE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let window = embed_memory_hold_window();
+    embed_memory_hold(
+        since,
+        Instant::now(),
+        window,
+        embed_memory_refusal_holding_owed_pass(state).is_some(),
+    )
+    .1
 }
 
 /// Language-server enrichment running right now: the cold sweep, or an
@@ -1979,6 +2298,7 @@ pub(crate) enum ShutdownBlocker {
     FirstScan,
     Reconciliation,
     Embedding,
+    EmbeddingHeldForMemory,
     Enrichment,
     EventSubscriber,
     AttachedSession,
@@ -1992,6 +2312,9 @@ impl ShutdownBlocker {
             Self::FirstScan => "the first scan of the repository is still running",
             Self::Reconciliation => "reconciliation is running",
             Self::Embedding => "embedding is running or queued",
+            Self::EmbeddingHeldForMemory => {
+                "embedding is owed and waiting for memory to free, for a bounded window"
+            }
             Self::Enrichment => "language-server enrichment is running",
             Self::EventSubscriber => "a client is subscribed to its events",
             Self::AttachedSession => "a client session is attached",
@@ -2034,6 +2357,8 @@ fn work_blockers(state: &DaemonState, requests_to_ignore: u64) -> Vec<ShutdownBl
     }
     if embed_work_in_flight(state) {
         blockers.push(ShutdownBlocker::Embedding);
+    } else if embed_held_for_memory(state) {
+        blockers.push(ShutdownBlocker::EmbeddingHeldForMemory);
     }
     if enrichment_in_flight(state) {
         blockers.push(ShutdownBlocker::Enrichment);
@@ -2100,6 +2425,20 @@ async fn save_snapshot_blocking(state: Arc<DaemonState>) -> Result<crate::state:
     tokio::task::spawn_blocking(move || state.save_snapshot_reporting_enrichment())
         .await
         .map_err(|error| DaemonError::Io(std::io::Error::other(error.to_string())))?
+}
+
+async fn save_sweep_snapshot_blocking(
+    state: Arc<DaemonState>,
+) -> Result<crate::state::EnrichmentFlush> {
+    tokio::task::spawn_blocking(move || {
+        let pass = state.background_work.pass(crate::background_work::PASS_LSP);
+        // The guard belongs to the write, not the awaiting task, which can be
+        // cancelled while this blocking publication continues.
+        let _publication = pass.publishing();
+        state.save_snapshot_reporting_enrichment()
+    })
+    .await
+    .map_err(|error| DaemonError::Io(std::io::Error::other(error.to_string())))?
 }
 
 /// The shortest persistence flush worth timing, and the least a flush in
@@ -2231,7 +2570,7 @@ fn flush_outruns_grace(
 /// loop reports, and this only decides how long a wedged loop may hold the
 /// endpoint back. Registering a recursive watch is fast on the backends Kin
 /// uses, so reaching this bound means something is wrong rather than large.
-const WATCH_ARMING_BOUND: Duration = Duration::from_secs(30);
+pub(crate) const WATCH_ARMING_BOUND: Duration = Duration::from_secs(30);
 
 /// How the wait for the reconcile loop's watch ended.
 ///
@@ -2965,7 +3304,10 @@ fn lsp_enriched_marker_path_in(layout: &kin_core::KinLayout) -> std::path::PathB
 /// context they were made under, and a file proven again drops the proofs its
 /// ledgers no longer hold. A file an earlier version finished has no ledgers,
 /// so it is swept again.
-pub(crate) const LSP_ENRICHMENT_MARKER_VERSION: u32 = 7;
+/// Version 8: durable marks bind full caller, owned relation/evidence, ledger
+/// and selected proof-context payloads. Earlier ID-only marks remain readable,
+/// but cannot certify a current completed observation and are swept again.
+pub(crate) const LSP_ENRICHMENT_MARKER_VERSION: u32 = kin_model::ENRICHMENT_PROOF_MARK_VERSION;
 
 /// Whether a file an enrichment of `version` finished is still finished for
 /// this build: the one rule the completion marker and the enrichment marks in
@@ -4965,10 +5307,16 @@ pub(crate) async fn sweep_checkpoint(state: &Arc<DaemonState>) -> u64 {
         .lsp_marks_committed
         .load(std::sync::atomic::Ordering::SeqCst);
     let checkpointing = Arc::clone(state);
-    let saved = tokio::task::spawn_blocking(move || checkpointing.save_sweep_checkpoint())
-        .await
-        .map_err(|error| DaemonError::Io(std::io::Error::other(error.to_string())))
-        .and_then(|saved| saved);
+    let saved = tokio::task::spawn_blocking(move || {
+        let pass = checkpointing
+            .background_work
+            .pass(crate::background_work::PASS_LSP);
+        let _publication = pass.publishing();
+        checkpointing.save_sweep_checkpoint()
+    })
+    .await
+    .map_err(|error| DaemonError::Io(std::io::Error::other(error.to_string())))
+    .and_then(|saved| saved);
     match saved {
         Ok(crate::state::EnrichmentFlush::Proceeded) => state.mark_clean(),
         Ok(crate::state::EnrichmentFlush::HeldForOpenMerge) => {
@@ -5110,6 +5458,10 @@ struct SweepTally {
     /// answer this build could not decode or refused to trust, or one of the
     /// protocol's "ask again" codes. A file with one is held back and owed.
     query_failures: usize,
+    /// Timeouts and lost server sessions. These can recover without changing
+    /// source bytes or the proof context, so they remain owed after backoff.
+    transient_failures: usize,
+    retryable_protocol_failures: usize,
     /// Queries the server answered by declining them, such as gopls's
     /// `typeDefinition` at a keyword. Counted for the completion line, never
     /// held against a file: asking again returns the same answer.
@@ -5334,6 +5686,26 @@ fn load_lsp_owed_files(state: &DaemonState) {
     }
 }
 
+/// Sleep until persisted debt becomes due without keeping the worker busy.
+async fn wait_for_owed_retry(state: &DaemonState, now_unix_s: u64) {
+    let delay = if state.filesystem_reconcile_disabled() {
+        None
+    } else {
+        state
+            .lsp_owed_files
+            .lock()
+            .ok()
+            .and_then(|owed| crate::owed_enrichment::next_retry_delay(&owed, now_unix_s))
+    };
+    match delay {
+        // A full channel can refuse a queued sweep. Avoid spinning when its
+        // owed-file deadline has already expired; receiving queued work still
+        // wins the worker's select and a new deadline is read afterwards.
+        Some(delay) => tokio::time::sleep(delay.max(Duration::from_secs(1))).await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
 /// The language-server `References` relations among `relations`.
 fn produced_reference_ids(
     relations: &[kin_model::Relation],
@@ -5368,11 +5740,178 @@ fn note_current_proof_context(
     kin_mcp::publish_current_proof_contexts(current.clone());
 }
 
+/// Record in the graph which proof context `language`'s call-site ledgers are
+/// current under, as this sweep settled it, so it is published with the
+/// ledgers and every later reader, with or without this daemon, judges them
+/// by it. A validation already recorded as the same is left alone, so a
+/// converged store writes nothing.
+fn record_context_validation(
+    state: &DaemonState,
+    language: kin_model::LanguageId,
+    settled: kin_model::ContextValidationState,
+) {
+    let new = kin_model::ResolutionRecord::ContextValidation(kin_model::ContextValidation {
+        language,
+        state: settled,
+    });
+    let graph_mutation = state.begin_graph_authority_mutation();
+    // Read and replaced under one mutation, so no other writer's validation
+    // lands between the two.
+    let held = state.graph.get_resolution_record(&new.id());
+    let delta = match held.clone() {
+        None => kin_model::ResolutionRecordDelta::Added { new },
+        Some(old) if old != new => kin_model::ResolutionRecordDelta::Modified { old, new },
+        Some(_) => {
+            forget_unrecorded_validation(state, language);
+            return;
+        }
+    };
+    // Whatever this write meant to say, the validation it replaces no longer
+    // holds: a server just proved another context, or none could. So a
+    // refused write never leaves the old one standing for a reader to take
+    // its ledgers as current. It is replaced by an unverified validation,
+    // which publishes like any other; failing that it is removed, and the
+    // removal is carried into authority by the next publication; failing
+    // that this daemon stops serving.
+    let outcome = match state.graph.apply_resolution_record_deltas(&[delta]) {
+        Ok(()) => ValidationWrite::Changed,
+        Err(error) => {
+            warn!(
+                %language,
+                %error,
+                "the graph refused this language's context validation; recording it as \
+                 unverified instead"
+            );
+            match held {
+                None => ValidationWrite::Unchanged,
+                Some(old) => {
+                    let unverified = kin_model::ResolutionRecord::ContextValidation(
+                        kin_model::ContextValidation {
+                            language,
+                            state: unverified_validation(format!(
+                                "the validation this host settled could not be recorded: {error}"
+                            )),
+                        },
+                    );
+                    let replaced = old != unverified
+                        && state
+                            .graph
+                            .apply_resolution_record_deltas(&[
+                                kin_model::ResolutionRecordDelta::Modified {
+                                    old: old.clone(),
+                                    new: unverified,
+                                },
+                            ])
+                            .is_ok();
+                    if replaced {
+                        ValidationWrite::Changed
+                    } else if state
+                        .graph
+                        .apply_resolution_record_deltas(&[
+                            kin_model::ResolutionRecordDelta::Removed { old },
+                        ])
+                        .is_ok()
+                    {
+                        state.lsp_validation_removals.record();
+                        ValidationWrite::Changed
+                    } else {
+                        ValidationWrite::Stuck
+                    }
+                }
+            }
+        }
+    };
+    match outcome {
+        ValidationWrite::Changed => {
+            forget_unrecorded_validation(state, language);
+            state.bump_version();
+            state.mark_dirty();
+        }
+        ValidationWrite::Unchanged => forget_unrecorded_validation(state, language),
+        ValidationWrite::Stuck => {
+            tracing::error!(
+                %language,
+                "this language's proof-context validation could be neither replaced nor \
+                 cleared, so language-server enrichment is not published and this daemon stops \
+                 serving"
+            );
+            if let Ok(mut unrecorded) = state.lsp_unrecorded_validations.lock() {
+                unrecorded.insert(language);
+            }
+            // The live graph still holds a validation that no longer holds, and
+            // this daemon's own answers read the live graph, so refusing to
+            // publish is not enough. The same cancel channel a cooperative stop
+            // request sends on stops it serving on every platform, and the
+            // publication on its way out refuses while the language is listed.
+            // The next daemon starts from authority and validates again.
+            if !state.stop_serving() {
+                state.request_retirement();
+            }
+        }
+    }
+    drop(graph_mutation);
+}
+
+/// What one attempt to record a context validation did to the live graph.
+enum ValidationWrite {
+    /// The validation, or the removal of the one it replaced, is in the graph.
+    Changed,
+    /// Nothing was recorded and nothing stood to be cleared.
+    Unchanged,
+    /// A validation that no longer holds could be neither replaced nor cleared.
+    Stuck,
+}
+
+fn forget_unrecorded_validation(state: &DaemonState, language: kin_model::LanguageId) {
+    if let Ok(mut unrecorded) = state.lsp_unrecorded_validations.lock() {
+        unrecorded.remove(&language);
+    }
+}
+
+/// What a context validation records when no server could settle it.
+fn unverified_validation(reason: impl Into<String>) -> kin_model::ContextValidationState {
+    let mut reason = reason.into();
+    if reason.trim().is_empty() {
+        reason = "no language server could be started to check these proofs".to_string();
+    }
+    while reason.len() > kin_model::ContextValidation::MAX_REASON_LEN {
+        reason.pop();
+    }
+    kin_model::ContextValidationState::Unverified { reason }
+}
+
+/// Record that this daemon could not learn the proof context `language`'s
+/// server runs under now, so no ledger of that language reads as current.
+///
+/// Every finished file of the language is then asked about again, and while
+/// its server cannot start each is owed with the server's own reason, so an
+/// answer over it discloses that its calls are unproven on this host instead
+/// of serving proofs nothing here can vouch for. The context is never stored;
+/// it only stands in for the one this daemon could not learn.
+fn note_unverified_proof_context(state: &DaemonState, language: kin_model::LanguageId) {
+    note_current_proof_context(state, language, &unverified_proof_context(language));
+}
+
+/// The context [`note_unverified_proof_context`] records as current.
+fn unverified_proof_context(language: kin_model::LanguageId) -> kin_model::ProofContext {
+    kin_model::ProofContext {
+        language,
+        resolver: "lsp:unverified".to_string(),
+        resolver_version: "unverified".to_string(),
+        configuration_hash: kin_model::Hash256::from_bytes([0; 32]),
+        environment_hash: kin_model::Hash256::from_bytes([0; 32]),
+        environment_summary: "the language server could not be started to check these proofs"
+            .to_string(),
+    }
+}
+
 /// Why a file a sweep would skip as finished must be asked about again
 /// anyway, from what the graph holds about its callers' call-site ledgers:
 ///
 /// - an entity with source text in it holds no ledger, so its call sites have
 ///   no state, whatever an older completion record says;
+/// - a ledger describes a different caller behavior, even after an exact
+///   source revert restored the same declaration identity;
 /// - a ledger was proven under a proof context other than the one its
 ///   language's server runs under now, which this daemon knows only once it
 ///   has run that server.
@@ -5387,14 +5926,18 @@ fn finished_file_needs_asking(
         .ok()
         .and_then(|current| current.get(&language).copied());
     for entity in entities {
-        if entity.span.is_none() || kin_model::in_a_file_without_calls(entity) {
-            continue;
-        }
         let ledger = state
             .graph
             .get_resolution_record(&kin_model::ResolutionRecordId::call_sites(entity.id))
-            .and_then(|record| record.as_call_sites().map(|ledger| ledger.context));
-        match (ledger, current) {
+            .and_then(|record| record.as_call_sites().cloned());
+        if ledger
+            .as_ref()
+            .is_some_and(|ledger| ledger.behavior_hash != entity.fingerprint.behavior_hash)
+        {
+            return Some("its call-site ledger describes an earlier caller behavior");
+        }
+        match (ledger.map(|ledger| ledger.context), current) {
+            (None, _) if entity.span.is_none() || kin_model::in_a_file_without_calls(entity) => {}
             (None, _) => {
                 return Some(
                     "a caller in it holds no call-site ledger, so its call sites have no state",
@@ -5407,6 +5950,18 @@ fn finished_file_needs_asking(
                 )
             }
             _ => {}
+        }
+    }
+    if let Some(file) = entities
+        .iter()
+        .find_map(|entity| entity.file_origin.as_ref())
+    {
+        match kin_reconcile::has_reintroduced_withdrawn_guess(state.graph.as_ref(), file) {
+            Ok(true) => return Some("a recorded withdrawn guess is present again in this file"),
+            Err(_) => {
+                return Some("the file's recorded binding withdrawals could not be validated")
+            }
+            Ok(false) => {}
         }
     }
     None
@@ -5427,8 +5982,9 @@ enum SweepGate {
 }
 
 /// The sweep's decision for one file, in the order the sweep takes it: a
-/// marked file is skipped, an owed one waits out its backoff, and anything
-/// else is asked about.
+/// currently owed file waits out its backoff, a marked one is skipped, and
+/// anything else is asked about. Debt from a failed revalidation overrides an
+/// older completion marker for the same bytes.
 fn sweep_gate(
     state: &DaemonState,
     owed: &crate::owed_enrichment::OwedFiles,
@@ -5437,6 +5993,15 @@ fn sweep_gate(
     retry_owed_now: bool,
     now_unix_s: u64,
 ) -> SweepGate {
+    if owed
+        .get(file)
+        .is_some_and(|entry| Some(entry.blob.as_str()) == blob)
+    {
+        return match owed_backoff_remaining(owed, file, blob, retry_owed_now, now_unix_s) {
+            Some(retry_in) => SweepGate::Owed { retry_in },
+            None => SweepGate::Ask,
+        };
+    }
     if file_already_enriched(state, file) {
         return SweepGate::AlreadyEnriched;
     }
@@ -5481,6 +6046,7 @@ fn settle_owed_files(
     recorded: &[String],
     failed: &[(String, String)],
     contexts: &std::collections::HashMap<String, String>,
+    due_before_unix_s: u64,
 ) -> usize {
     let Ok(mut owed) = state.lsp_owed_files.lock() else {
         return 0;
@@ -5504,10 +6070,58 @@ fn settle_owed_files(
             now,
         );
     }
+    crate::owed_enrichment::defer_unattempted(
+        &mut owed,
+        due_before_unix_s,
+        "the sweep ended before this owed file could be queried",
+        now,
+    );
     if *owed != before {
         crate::owed_enrichment::persist(&state.layout, &owed);
     }
     owed.len()
+}
+
+/// A retry replaces one file's failure rather than counting it twice. Keep
+/// it here while a retry waits in the queue, so cancellation still records
+/// the exact file whose last visit was incomplete.
+fn remember_sweep_debt(owed: &mut Vec<(String, String)>, file: &str, reason: String) {
+    if let Some((_, held)) = owed.iter_mut().find(|(path, _)| path == file) {
+        *held = reason;
+    } else {
+        owed.push((file.to_owned(), reason));
+    }
+}
+
+/// An unavailable prerequisite delays an existing obligation without creating
+/// debt for every file whose optional language server has never been installed.
+fn remember_blocked_sweep_debt(
+    previous: &crate::owed_enrichment::OwedFiles,
+    owed: &mut Vec<(String, String)>,
+    contexts: &mut std::collections::HashMap<String, String>,
+    file: &str,
+    reason: String,
+) {
+    if previous.contains_key(file) || owed.iter().any(|(path, _)| path == file) {
+        remember_sweep_debt(owed, file, reason);
+        contexts.remove(file);
+    }
+}
+
+fn defer_unattempted_sweep_debt(
+    state: &DaemonState,
+    due_before_unix_s: u64,
+    reason: &str,
+    now_unix_s: u64,
+) {
+    let Ok(mut owed) = state.lsp_owed_files.lock() else {
+        return;
+    };
+    let before = owed.clone();
+    crate::owed_enrichment::defer_unattempted(&mut owed, due_before_unix_s, reason, now_unix_s);
+    if *owed != before {
+        crate::owed_enrichment::persist(&state.layout, &owed);
+    }
 }
 
 /// Record `files` as durably enriched, when this sweep's write was durable.
@@ -5581,11 +6195,24 @@ fn fresh_sweep_was_queued(state: &DaemonState) -> bool {
         .load(std::sync::atomic::Ordering::SeqCst)
 }
 
+fn request_incremental_remainder(
+    state: &DaemonState,
+    pass: &incremental_enrichment::IncrementalPass,
+) -> bool {
+    if pass.refused.is_some() || pass.marked {
+        return false;
+    }
+    // The sweep owns the existing bounded per-file retry/backoff. A partial
+    // incremental observation hands off once, even without another edit.
+    lsp_publication::request_fresh_sweep(state);
+    true
+}
+
 /// Whether one incremental file's reservation finished.
 ///
 /// A language-server query arm can return an error for a position that is not
-/// a symbol, and this path does not requeue that file. Treating the error as
-/// abandoned work leaves `failed_work` set after the relations that did
+/// a symbol; any unmarked remainder is handed to the sweep separately.
+/// Treating this reservation as abandoned leaves `failed_work` set after the relations that did
 /// publish are already in the graph, which is what `enrichment_drained` reads
 /// as incomplete. A stale snapshot is the sweep's job. A relation the graph
 /// refused, or a vector invalidation that failed, is still unfinished.
@@ -5660,6 +6287,9 @@ fn attribute_unserved_already_enriched(
             LanguageServerReadiness::Absent => {
                 kin_core::reference_coverage::no_server_on_daemon_path(None)
             }
+            LanguageServerReadiness::Disabled => {
+                "language-server enrichment is switched off for this daemon".to_string()
+            }
         };
         let files = already_enriched_by_language
             .get(language)
@@ -5704,6 +6334,141 @@ fn lsp_file_definitions_budget() -> Duration {
     duration_from_env_secs("KIN_DAEMON_LSP_FILE_BUDGET_SECS", Duration::from_secs(120))
 }
 
+/// Observe successful responses only while this worker owns a finite query
+/// pass. Timer ticks and error replies confer no liveness, and the observer
+/// never changes the pass's result, publication boundary or durable counters.
+async fn observe_lsp_answers<F, A>(
+    future: F,
+    mut answered: A,
+    pass: &crate::background_work::BackgroundPass,
+) -> F::Output
+where
+    F: std::future::Future,
+    A: FnMut() -> u64,
+{
+    let mut seen = answered();
+    let mut sample = || {
+        let current = answered();
+        pass.completed_work(
+            current.saturating_sub(seen),
+            tokio::time::Instant::now().into_std(),
+        );
+        seen = current;
+    };
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    tokio::pin!(future);
+    loop {
+        tokio::select! {
+            biased;
+            output = &mut future => {
+                sample();
+                return output;
+            }
+            _ = interval.tick() => sample(),
+        }
+    }
+}
+
+/// A stall recovery retires every server before another request can run. The
+/// backoff is cancellable, only typed supervisor stalls can resume, and the
+/// pass itself enforces both the no-progress allowance and cumulative budget.
+async fn recover_stalled_lsp_worker(
+    state: &DaemonState,
+    pass: &crate::background_work::BackgroundPass,
+    servers: &mut std::collections::HashMap<kin_model::LanguageId, kin_lsp::lifecycle::LspServer>,
+    first_open_done: &mut std::collections::HashSet<kin_model::LanguageId>,
+    cancel: &mut tokio::sync::watch::Receiver<bool>,
+    delay: Duration,
+) -> bool {
+    stop_language_servers(
+        std::mem::take(servers),
+        "the background-work supervisor stopped enrichment",
+    )
+    .await;
+    first_open_done.clear();
+    if !retry_lsp_supervisor_stall(
+        pass,
+        cancel,
+        delay,
+        crate::background_work::configured_retry_budget(),
+    )
+    .await
+    {
+        return false;
+    }
+    // `running` is reserved before a send and cannot prove its acceptance.
+    // Keep demand until this worker receives a sweep, which then captures
+    // fresh inputs covering every request made before that receive.
+    lsp_publication::request_fresh_sweep(state);
+    drain_pending_lsp_sweep(state);
+    info!("LSP enrichment is retrying interrupted work with fresh language servers");
+    true
+}
+
+/// An interrupted reservation stays owned until an accepted sweep takes over.
+/// A full channel leaves the pending demand set, so claiming completion there
+/// would lose cancellation accounting, while dropping it would stick a failure
+/// over a later successful retry.
+fn complete_lsp_recovery_handoffs(
+    state: &DaemonState,
+    received: &crate::state::LspEnrichmentMessage,
+    interrupted: &mut Vec<crate::state::LspWorkGuard>,
+) {
+    if matches!(received, crate::state::LspEnrichmentMessage::Sweep) {
+        // This sole consumer has an accepted message, unlike a `running`
+        // reservation before try_send. The sweep has not captured inputs yet,
+        // so it also covers coalesced demand already present at this boundary.
+        state.take_pending_lsp_sweep();
+        for mut work in interrupted.drain(..) {
+            work.complete();
+        }
+    }
+}
+
+fn retain_supervisor_interruption(
+    pass: &crate::background_work::BackgroundPass,
+    work: crate::state::LspWorkGuard,
+    interrupted: &mut Vec<crate::state::LspWorkGuard>,
+) {
+    if pass.supervisor_stalled() {
+        interrupted.push(work);
+    }
+    // Any other failure still drops as abandoned work.
+}
+
+async fn retry_lsp_supervisor_stall(
+    pass: &crate::background_work::BackgroundPass,
+    cancel: &mut tokio::sync::watch::Receiver<bool>,
+    delay: Duration,
+    budget: Duration,
+) -> bool {
+    if *cancel.borrow() || !pass.supervisor_stalled() {
+        return false;
+    }
+    info!(
+        delay_s = delay.as_secs(),
+        "LSP supervisor stall will retry after backoff; unfinished work remains owed"
+    );
+    tokio::select! {
+        biased;
+        _ = cancel.changed() => false,
+        _ = tokio::time::sleep(delay) => {
+            !*cancel.borrow() && pass.resume_supervisor_stall(delay, budget, tokio::time::Instant::now().into_std())
+        }
+    }
+}
+
+fn lsp_sweep_finish_message(ended_early: bool, succeeded: bool) -> &'static str {
+    if ended_early {
+        "LSP cold sweep interrupted; unfinished work remains owed"
+    } else if succeeded {
+        "LSP cold sweep complete"
+    } else {
+        "LSP cold sweep ended with incomplete enrichment"
+    }
+}
+
 /// Run the file-level definitions pass under a wall-clock budget.
 ///
 /// A pass that overruns yields the empty result the call site already used for
@@ -5744,6 +6509,8 @@ where
         Ok(Ok(result)) => {
             let failures = FilePassFailures::of(&result);
             tally.query_failures += failures.unanswered;
+            tally.transient_failures += result.transient_queries;
+            tally.retryable_protocol_failures += result.retryable_protocol_queries;
             tally.query_refusals += failures.refused;
             tally.query_declines += result.declined_queries;
             let failure = (failures.unanswered > 0).then(|| {
@@ -5779,6 +6546,12 @@ where
                 kin_lsp::error::QueryErrorClass::SessionEnded => kin_model::ServerFailure::Crash,
                 _ => kin_model::ServerFailure::ProtocolError,
             };
+            if error.is_retryable() {
+                tally.transient_failures += 1;
+                if error.class() == kin_lsp::error::QueryErrorClass::Failed {
+                    tally.retryable_protocol_failures += 1;
+                }
+            }
             (
                 kin_lsp::file_enrichment::FileEnrichmentResult::default(),
                 Some(format!("the file-level definitions pass failed: {error}")),
@@ -5788,6 +6561,7 @@ where
         }
         Err(_) => {
             tally.definitions_over_budget += 1;
+            tally.transient_failures += 1;
             warn!(
                 file = %file,
                 budget_s = budget.as_secs(),
@@ -6021,11 +6795,20 @@ impl PendingEnrichment {
 /// What it offers for an edge the graph already holds is the union of both
 /// records' sites, by [`with_union_of_sites`], so one pass's positions cannot
 /// erase another's.
-fn unheld_lsp_relations(
-    state: &DaemonState,
-    relations: &[kin_model::Relation],
-) -> Vec<kin_model::Relation> {
+///
+/// A language-server edge the graph holds under another id, with the same
+/// kind and ends as an offer, is the same edge keyed by an older build: its
+/// id came from a hasher the standard library may change between releases.
+/// Its sites join the offer's, as a held record's would, and it is named in
+/// [`UnheldRelations::superseded`] so the install retires it once the offer is
+/// written. Without that, the edge would be held twice. A parser's edge
+/// between the same ends has another origin and is never superseded.
+fn unheld_lsp_relations(state: &DaemonState, relations: &[kin_model::Relation]) -> UnheldRelations {
     use kin_model::EntityStore;
+    let offer_everything = || UnheldRelations {
+        relations: relations.to_vec(),
+        superseded: Vec::new(),
+    };
     let mut held: std::collections::HashMap<kin_model::RelationId, kin_model::Relation> =
         std::collections::HashMap::new();
     let mut fetched: std::collections::HashSet<kin_model::EntityId> =
@@ -6038,7 +6821,7 @@ fn unheld_lsp_relations(
             continue;
         }
         let Ok(existing) = state.graph.get_all_relations_for_entity(&source) else {
-            return relations.to_vec();
+            return offer_everything();
         };
         for existing in existing {
             held.insert(existing.id, existing);
@@ -6046,23 +6829,88 @@ fn unheld_lsp_relations(
         // Edges into symbols outside the repository are not among an
         // entity's entity-to-entity relations, and merge the same way.
         let Ok(external) = state.graph.get_external_relations_for_entity(&source) else {
-            return relations.to_vec();
+            return offer_everything();
         };
         for existing in external {
             held.insert(existing.id, existing);
         }
     }
-    relations
-        .iter()
-        .filter_map(|candidate| match held.get(&candidate.id) {
-            None => Some(candidate.clone()),
-            Some(held) if held == candidate => None,
-            Some(held) => {
-                let merged = with_union_of_sites(held, candidate);
-                (&merged != held).then_some(merged)
+    // The language-server edges held for each kind and pair of ends, in id
+    // order so a merge of several reads them in the same order every time.
+    let mut by_identity: std::collections::HashMap<
+        (
+            kin_model::RelationKind,
+            kin_model::GraphNodeId,
+            kin_model::GraphNodeId,
+        ),
+        Vec<&kin_model::Relation>,
+    > = std::collections::HashMap::new();
+    for relation in held.values() {
+        if relation.origin == kin_model::RelationOrigin::Lsp {
+            by_identity
+                .entry((relation.kind, relation.src, relation.dst))
+                .or_default()
+                .push(relation);
+        }
+    }
+    for edges in by_identity.values_mut() {
+        edges.sort_by_key(|edge| edge.id);
+    }
+    let mut unheld = UnheldRelations::default();
+    for candidate in relations {
+        let superseded: Vec<&kin_model::Relation> =
+            if candidate.origin == kin_model::RelationOrigin::Lsp {
+                by_identity
+                    .get(&(candidate.kind, candidate.src, candidate.dst))
+                    .into_iter()
+                    .flatten()
+                    .copied()
+                    .filter(|edge| edge.id != candidate.id)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+        if superseded.is_empty() {
+            match held.get(&candidate.id) {
+                None => unheld.relations.push(candidate.clone()),
+                Some(held) if held == candidate => {}
+                Some(held) => {
+                    let merged = with_union_of_sites(held, candidate);
+                    if &merged != held {
+                        unheld.relations.push(merged);
+                    }
+                }
             }
-        })
-        .collect()
+            continue;
+        }
+        // Newest last: the offer, then what the graph holds under its id,
+        // then the edges an older build keyed. A site the offer proves under
+        // a proof context keeps the offer's record, as it does over a held
+        // one.
+        let mut merged = match held.get(&candidate.id) {
+            Some(current) => with_union_of_sites(current, candidate),
+            None => candidate.clone(),
+        };
+        for old in &superseded {
+            merged = with_union_of_sites(old, &merged);
+        }
+        unheld
+            .superseded
+            .extend(superseded.iter().map(|old| (candidate.id, old.id)));
+        unheld.relations.push(merged);
+    }
+    unheld
+}
+
+/// What [`unheld_lsp_relations`] offers the graph.
+#[derive(Debug, Default)]
+struct UnheldRelations {
+    /// The relations to write, each merged with what the graph holds of it.
+    relations: Vec<kin_model::Relation>,
+    /// Language-server edges the graph holds under an id other than the one
+    /// an offer in `relations` carries for the same kind and ends, each as
+    /// the offer's id and then its own. Retired once the offer is held.
+    superseded: Vec<(kin_model::RelationId, kin_model::RelationId)>,
 }
 
 /// The most evidence records one enrichment edge keeps, matching the producer's
@@ -6260,7 +7108,10 @@ fn install_lsp_relations_locked(
         return EnrichmentWrite::default();
     }
 
-    let relations = unheld_lsp_relations(state, relations);
+    let UnheldRelations {
+        relations,
+        superseded,
+    } = unheld_lsp_relations(state, relations);
     if relations.is_empty() {
         debug!("every enrichment relation offered is already held in this form; nothing written");
         return EnrichmentWrite::default();
@@ -6331,6 +7182,44 @@ fn install_lsp_relations_locked(
         .collect();
     if !crate::accepted_enrichment::record(&state.layout, &accepted) {
         note_unrecorded_evidence(state, &accepted);
+    }
+    // The same edges under the ids an older build keyed them by leave once
+    // the edge that replaces each is held, and not before, so a refused write
+    // never loses the edge. Local authority publishes enrichment by diffing
+    // and retracts nothing on its own, so it is told which ids went, as it is
+    // told about a settled call guess. A hosted store persists the live
+    // graph's own deltas, which already carry the removal.
+    let superseded: std::collections::BTreeMap<kin_model::RelationId, kin_model::RelationId> =
+        superseded
+            .into_iter()
+            .map(|(successor, old)| (old, successor))
+            .collect();
+    let mut retired = Vec::new();
+    for (old, successor) in &superseded {
+        if !held.contains(successor) {
+            continue;
+        }
+        match state.graph.remove_relation(old) {
+            Ok(()) => retired.push(*old),
+            Err(error) => {
+                debug!(
+                    relation = %old,
+                    %error,
+                    "graph refused to retire a language-server edge its successor replaces"
+                );
+            }
+        }
+    }
+    if !retired.is_empty() {
+        if state.storage_backend.is_none() {
+            if let Ok(mut settled) = state.lsp_settled_guesses.lock() {
+                settled.extend(retired.iter().copied());
+            }
+        }
+        debug!(
+            retired = retired.len(),
+            "retired language-server edges held under the ids an older build gave them"
+        );
     }
 
     if written.lost() > 0 {
@@ -6497,7 +7386,10 @@ fn settle_call_sites_locked(
     }
     for guess in &settlement.retired {
         match state.graph.remove_relation(&guess.id) {
-            Ok(()) => settled.push(guess.id),
+            Ok(()) => {
+                settled.push(guess.id);
+                state.note_census_settled_retirement(guess.kind);
+            }
             Err(error) => {
                 debug!(relation = %guess.id, %error, "graph refused to retire a call guess");
             }
@@ -6566,6 +7458,7 @@ pub(crate) fn install_call_site_ledgers_locked(
     retract: bool,
 ) -> LedgerWrite {
     use kin_model::EntityStore;
+    rekey_language_server_edges_locked(state, pass.entities);
     // The call edges the file's callers hold: the language server's, which the
     // ledgers' proofs are made to agree with, and every other origin's, whose
     // sites the census counts as well.
@@ -6749,6 +7642,69 @@ pub(crate) fn install_call_site_ledgers_locked(
     write
 }
 
+/// Key every language-server edge from or to an entity in `entities` under
+/// the id a new proof of it carries, and retire the id an older build gave it.
+///
+/// An older build keyed these edges through the standard library's default
+/// hasher. A pass over a file offers again only the edges it proves again,
+/// and settlement mints a `Calls` proof only at a site no edge carries yet,
+/// so an edge whose sites still hold would keep its old id, and one whose
+/// other end's file is not asked about again would too. Keyed here, before
+/// the file's ledgers read them, the edges its entities hold are each held
+/// once, under the id a new proof would write, and the rewrite and
+/// retraction that follow read them as they would read a new proof.
+///
+/// Where the current id is already held, that record is the one offered, so
+/// the older record's sites join it as older sites. An edge into a symbol
+/// outside the repository keeps the resolver's id, which has not changed.
+fn rekey_language_server_edges_locked(state: &DaemonState, entities: &[&kin_model::Entity]) {
+    use kin_model::EntityStore;
+    // By current id: the record held under it, and the first held under
+    // another id.
+    type Keyed = (Option<kin_model::Relation>, Option<kin_model::Relation>);
+    let mut keyed: std::collections::BTreeMap<kin_model::RelationId, Keyed> =
+        std::collections::BTreeMap::new();
+    for entity in entities {
+        let Ok(relations) = state.graph.get_all_relations_for_entity(&entity.id) else {
+            continue;
+        };
+        for relation in relations {
+            if relation.origin != kin_model::RelationOrigin::Lsp {
+                continue;
+            }
+            let (kin_model::GraphNodeId::Entity(src), kin_model::GraphNodeId::Entity(dst)) =
+                (relation.src, relation.dst)
+            else {
+                continue;
+            };
+            let id =
+                kin_lsp::relation_identity::language_server_relation_id(relation.kind, src, dst);
+            let (current, older) = keyed.entry(id).or_default();
+            if relation.id == id {
+                *current = Some(relation);
+            } else if older.is_none() {
+                *older = Some(relation);
+            }
+        }
+    }
+    let offers: Vec<kin_model::Relation> = keyed
+        .into_iter()
+        .filter_map(|(id, (current, older))| {
+            let older = older?;
+            Some(current.unwrap_or(kin_model::Relation { id, ..older }))
+        })
+        .collect();
+    if offers.is_empty() {
+        return;
+    }
+    let written = install_lsp_relations_locked(state, &offers);
+    debug!(
+        offered = offers.len(),
+        published = written.published,
+        "keyed language-server edges an older build proved under their current ids"
+    );
+}
+
 /// How one entity's language-server query arms ended.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct QueryOutcomes {
@@ -6756,6 +7712,10 @@ struct QueryOutcomes {
     /// stopped answering or returned an error of its own. Any one holds the
     /// file back.
     failures: usize,
+    transient_failures: usize,
+    retryable_protocol_failures: usize,
+    /// The aggregate uses-type allowance elapsed, rather than an RPC failing.
+    uses_type_timed_out: bool,
     /// Arms the server answered by declining, which hold nothing back.
     declines: usize,
     /// Arms the server answered in a way this build cannot prove, which
@@ -6891,10 +7851,18 @@ where
             None
         }
         Ok(Err(error)) => {
+            if error.is_retryable() {
+                outcomes.transient_failures += 1;
+                if error.class() == kin_lsp::error::QueryErrorClass::Failed {
+                    outcomes.retryable_protocol_failures += 1;
+                }
+            }
             outcomes.fail(arm, format!("failed: {error}"));
             None
         }
         Err(_) => {
+            outcomes.transient_failures += 1;
+            outcomes.uses_type_timed_out |= arm == "uses-type";
             outcomes.fail(arm, format!("ran over its {}s budget", budget.as_secs()));
             None
         }
@@ -6913,7 +7881,8 @@ enum EntityArms {
 }
 
 /// Enrich a single entity with all available LSP relation types (calls, overrides,
-/// uses-type, references). Each query is capped at 5 seconds.
+/// uses-type, references). Most arms are capped at 5 seconds. Uses-type makes
+/// many sequential queries, so its aggregate budget grows on a bounded retry.
 ///
 /// Returns what the language server answered rather than writing it. The
 /// caller owns the graph write, so one entity's four query arms no longer open
@@ -6928,6 +7897,7 @@ async fn enrich_single_entity(
     root: &std::path::Path,
     documents: Option<kin_lsp::DocumentProvider<'_>>,
     arms: EntityArms,
+    uses_type_budget: Duration,
 ) -> (Vec<kin_model::Relation>, QueryOutcomes) {
     let timeout = Duration::from_secs(5);
     let mut derived = Vec::new();
@@ -6967,15 +7937,29 @@ async fn enrich_single_entity(
     {
         derived.extend(relations);
     }
+    let uses_type_started = Instant::now();
+    let failures_before_uses_type = outcomes.failures;
     if let Some(relations) = lsp_query_within_budget(
         "uses-type",
         kin_lsp::enrichment::enrich_entity_uses_type(server, entity_ref, index, root, documents),
-        timeout,
+        uses_type_budget,
         &mut outcomes,
     )
     .await
     {
         derived.extend(relations);
+    }
+    if uses_type_started.elapsed() >= Duration::from_secs(1)
+        || outcomes.failures > failures_before_uses_type
+    {
+        info!(
+            file = %entity_ref.file_path,
+            entity = %entity_ref.name,
+            elapsed_ms = uses_type_started.elapsed().as_millis() as u64,
+            budget_ms = uses_type_budget.as_millis() as u64,
+            completed = outcomes.failures == failures_before_uses_type,
+            "LSP uses-type entity query finished"
+        );
     }
     if let Some(relations) = lsp_query_within_budget(
         "references",
@@ -7105,16 +8089,7 @@ pub async fn run_with_authority_on(
     let enrichment_enabled =
         should_enable_lsp_enrichment(config.lsp_enabled, state.filesystem_reconcile_disabled());
 
-    // The working directory as the layout already holds it. Deliberately not
-    // canonicalized: a readiness probe asks whether a server starts and
-    // completes a handshake, never resolving a file through this path, so the
-    // filesystem round trip would buy nothing and this is an authority-path
-    // crate where every such call has to earn itself.
-    start_readiness_probe_if_enabled(
-        enrichment_enabled,
-        state.layout.working_dir().to_path_buf(),
-        spawn_language_server_readiness_probe,
-    );
+    let readiness = Arc::new(ReadinessObservations::default());
     // Recorded so a caller can tell a deliberately disabled daemon from one that
     // simply found no server. Those need opposite answers and the channel alone
     // cannot separate them.
@@ -7124,6 +8099,14 @@ pub async fn run_with_authority_on(
     // its callers are unproven for want of a resolver, not owed to a sweep
     // that will never run.
     kin_mcp::call_sites::publish_enrichment_switched_off(!enrichment_enabled);
+    // Such a daemon starts no readiness probe and no sweep, so its readiness is
+    // recorded here as a completed switched-off finding. Left unobserved, every
+    // answer would read it as a probe still pending for the daemon's whole life.
+    // Recorded before the state is shared, so no answer this daemon serves can
+    // read it before it lands.
+    if !enrichment_enabled {
+        readiness.switched_off().await;
+    }
     let lsp_rx = if enrichment_enabled {
         let discovered = kin_lsp::discovery::discover_servers();
         if enrichment_channel_opens(enrichment_enabled, discovered.len()) {
@@ -7218,7 +8201,11 @@ pub async fn run_with_authority_on(
                 // reads. Nothing further is needed here beyond not queueing.
             }
             SweepStartDecision::Queue => {
-                startup_sweep_work = Some(state.lsp_work.reserve());
+                startup_sweep_work = Some(state.lsp_work.reserve_for(
+                    crate::state::LspWorkItem::Sweep {
+                        source_generation: current_marker_epoch(&state),
+                    },
+                ));
                 clear_pressure_refusal_for_work(
                     &state,
                     kin_core::memory_pressure::HeavyWork::LspSweep,
@@ -7255,6 +8242,25 @@ pub async fn run_with_authority_on(
 
     // Shutdown signal: when set to true, all loops exit.
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    // A path that must stop this daemon serving sends on the same channel a
+    // cooperative stop request does.
+    let _ = state.stop_trigger.set(cancel_tx.clone());
+    // A planned sweep supplies readiness from the actual servers it starts.
+    // A warm no-op sweep probes skipped languages once at its tail. Until
+    // then availability remains unknown, independently of durable contexts.
+    if startup_sweep_work.is_none() {
+        start_readiness_probe_if_enabled(
+            enrichment_enabled,
+            state.layout.working_dir().to_path_buf(),
+            |root| {
+                spawn_language_server_readiness_probe(
+                    root,
+                    Arc::clone(&readiness),
+                    cancel_rx.clone(),
+                )
+            },
+        );
+    }
 
     // Spawn the reconciliation loop BEFORE the endpoint is published, and wait
     // for it to report its file watcher.
@@ -7772,7 +8778,7 @@ pub async fn run_with_authority_on(
         // for the life of the process, and a gate that re-read them could wait
         // on a backfill that was never going to run.
         let backfill_running =
-            auto_embed_enabled() && pending_state.can_persist_embed_progress_locally();
+            background_embed_runs() && pending_state.can_persist_embed_progress_locally();
         tokio::spawn(async move {
             let gate = await_backfill_before_sweep(
                 backfill_running,
@@ -7833,6 +8839,7 @@ pub async fn run_with_authority_on(
     if let Some(mut lsp_rx) = lsp_rx {
         let mut lsp_cancel = cancel_rx.clone();
         let lsp_state = Arc::clone(&state);
+        let lsp_readiness = Arc::clone(&readiness);
         // Canonicalize to resolve symlinks (macOS /tmp → /private/tmp).
         // RA needs rootUri and file URIs to match.
         let lsp_root = state
@@ -7853,6 +8860,10 @@ pub async fn run_with_authority_on(
             > = std::collections::HashMap::new();
             // Buffer for requests that arrive during server startup.
             let mut pending_buffer = std::collections::VecDeque::new();
+            // A server-start replay is still the same attempt: retain its
+            // failure cutoff so a concurrent failure cannot be cleared by it.
+            let mut buffered_work = None;
+            let mut interrupted_work = Vec::new();
             // Track which languages have had their first didOpen processed.
             let mut first_open_done: std::collections::HashSet<kin_model::LanguageId> =
                 std::collections::HashSet::new();
@@ -7864,12 +8875,28 @@ pub async fn run_with_authority_on(
                 // checkpoint, so an enrichment in flight finishes rather than
                 // being torn out from under the LSP server it is talking to.
                 if lsp_pass.halted() {
-                    stop_language_servers(
-                        servers,
-                        "the background-work supervisor stopped enrichment",
+                    for language in servers.keys().copied().collect::<Vec<_>>() {
+                        lsp_readiness
+                            .failed(
+                                language,
+                                "the language server worker was halted before completing its work"
+                                    .into(),
+                            )
+                            .await;
+                    }
+                    if recover_stalled_lsp_worker(
+                        &lsp_state,
+                        &lsp_pass,
+                        &mut servers,
+                        &mut first_open_done,
+                        &mut lsp_cancel,
+                        Duration::from_secs(30),
                     )
-                    .await;
-                    info!("LSP enrichment worker stopped by the background-work supervisor");
+                    .await
+                    {
+                        continue;
+                    }
+                    info!(reason = ?lsp_pass.halt_reason(), "LSP enrichment worker parked by the background-work supervisor; unfinished work remains owed");
                     break;
                 }
 
@@ -7904,10 +8931,28 @@ pub async fn run_with_authority_on(
                             break;
                         }
                         Some(msg) = lsp_rx.recv() => msg,
+                        _ = wait_for_owed_retry(&lsp_state, crate::owed_enrichment::now_unix_s()) => {
+                            if lsp_state.queue_lsp_sweep() {
+                                info!("queueing an LSP sweep for owed files whose backoff expired");
+                            }
+                            continue;
+                        }
                     }
                 };
+                complete_lsp_recovery_handoffs(&lsp_state, &message, &mut interrupted_work);
                 lsp_pass.working(Instant::now());
-                let mut work = lsp_state.lsp_work.resume();
+                let item = match &message {
+                    LspEnrichmentMessage::Incremental(request) => crate::state::LspWorkItem::file(
+                        request.file_id.0.clone(),
+                        current_marker_epoch(&lsp_state),
+                    ),
+                    LspEnrichmentMessage::Sweep => crate::state::LspWorkItem::Sweep {
+                        source_generation: current_marker_epoch(&lsp_state),
+                    },
+                };
+                let mut work = buffered_work
+                    .take()
+                    .unwrap_or_else(|| lsp_state.lsp_work.resume_for(item));
 
                 match message {
                     LspEnrichmentMessage::Incremental(request) => {
@@ -7941,7 +8986,12 @@ pub async fn run_with_authority_on(
                         if !servers.contains_key(&lang) {
                             if let Some((cmd, args, init_opts)) = lsp_adapter_for(lang, &lsp_root) {
                                 match start_resolved_language_server(
-                                    lang, &cmd, &args, &lsp_root, init_opts,
+                                    lang,
+                                    &lsp_readiness,
+                                    &cmd,
+                                    &args,
+                                    &lsp_root,
+                                    init_opts,
                                 )
                                 .await
                                 {
@@ -7954,6 +9004,18 @@ pub async fn run_with_authority_on(
                                             waited_ms = waiting.elapsed().as_millis() as u64,
                                             "LSP server ready"
                                         );
+                                        // A server started for an edit settles its
+                                        // language's context as a sweep's does, so
+                                        // readers judge the ledgers it writes by it.
+                                        let context = server.proof_context(lang);
+                                        note_current_proof_context(&lsp_state, lang, &context);
+                                        record_context_validation(
+                                            &lsp_state,
+                                            lang,
+                                            kin_model::ContextValidationState::Validated {
+                                                context,
+                                            },
+                                        );
                                         servers.insert(lang, server);
 
                                         // Buffer the current request + drain any that arrived during startup.
@@ -7962,7 +9024,7 @@ pub async fn run_with_authority_on(
                                             request,
                                             &mut lsp_rx,
                                         );
-                                        work.transfer();
+                                        buffered_work = Some(work);
                                         info!(
                                             buffered = pending_buffer.len(),
                                             "replaying requests after server startup"
@@ -7971,20 +9033,53 @@ pub async fn run_with_authority_on(
                                     }
                                     Err(e) => {
                                         debug!(language = %lang, error = %e, "failed to start LSP server");
+                                        // This host cannot settle the language's
+                                        // context now, so no earlier validation of
+                                        // it stands.
+                                        note_unverified_proof_context(&lsp_state, lang);
+                                        record_context_validation(
+                                            &lsp_state,
+                                            lang,
+                                            unverified_validation(format!(
+                                                "the `{cmd}` language server did not start: {e}"
+                                            )),
+                                        );
+                                        retain_supervisor_interruption(
+                                            &lsp_pass,
+                                            work,
+                                            &mut interrupted_work,
+                                        );
                                         continue;
                                     }
                                 }
+                            } else {
+                                note_unverified_proof_context(&lsp_state, lang);
+                                record_context_validation(
+                                    &lsp_state,
+                                    lang,
+                                    unverified_validation(
+                                        "this build wires no language server for this language",
+                                    ),
+                                );
                             }
                         }
 
                         // Build entity index from graph for matching LSP locations.
                         let Some(server) = servers.get(&lang) else {
+                            retain_supervisor_interruption(&lsp_pass, work, &mut interrupted_work);
                             continue;
                         };
                         let inputs = match lsp_publication::QueryInputs::capture(&lsp_state).await {
                             Ok(inputs) => inputs,
                             Err(reason) => {
                                 warn!(?reason, "LSP input universe could not be proved; enrichment remains incomplete");
+                                let now = crate::owed_enrichment::now_unix_s();
+                                defer_unattempted_sweep_debt(
+                                    &lsp_state,
+                                    now,
+                                    &format!("the sweep could not capture its source authority: {reason:?}"),
+                                    now,
+                                );
                                 if reason == lsp_publication::Refused::Stale {
                                     lsp_publication::request_fresh_sweep(&lsp_state);
                                     // The next receive drains that demand. This
@@ -7992,9 +9087,15 @@ pub async fn run_with_authority_on(
                                     // not failed work.
                                     work.complete();
                                 }
+                                retain_supervisor_interruption(
+                                    &lsp_pass,
+                                    work,
+                                    &mut interrupted_work,
+                                );
                                 continue;
                             }
                         };
+                        work.bind_file(request.file_id.0.clone(), inputs.marker_epoch);
                         let entity_refs: Vec<kin_lsp::EntityRef> = inputs
                             .entities
                             .iter()
@@ -8012,6 +9113,11 @@ pub async fn run_with_authority_on(
                                 warn!(
                                     file = %request.file_id,
                                     "LSP enrichment skipped because graph-owned source could not be loaded"
+                                );
+                                retain_supervisor_interruption(
+                                    &lsp_pass,
+                                    work,
+                                    &mut interrupted_work,
                                 );
                                 continue;
                             }
@@ -8075,16 +9181,20 @@ pub async fn run_with_authority_on(
                         // re-derived: each call proven at its callee token,
                         // the guesses it contradicts settled, and the calls
                         // leaving the repository named and proven.
-                        let pass = incremental_enrichment::enrich_changed_file(
-                            &lsp_state,
-                            &inputs,
-                            server,
-                            lang,
-                            &index,
-                            &lsp_root,
-                            &rel_path,
-                            &file_content,
-                            &request.changed_entity_ids,
+                        let pass = observe_lsp_answers(
+                            incremental_enrichment::enrich_changed_file(
+                                &lsp_state,
+                                &inputs,
+                                server,
+                                lang,
+                                &index,
+                                &lsp_root,
+                                &rel_path,
+                                &file_content,
+                                &request.changed_entity_ids,
+                            ),
+                            || server.client.answered(),
+                            &lsp_pass,
                         )
                         .await;
                         // Closed as the sweep closes each file, so the next
@@ -8098,6 +9208,14 @@ pub async fn run_with_authority_on(
                                 }),
                             )
                             .await;
+                        if server.is_disconnected() {
+                            lsp_readiness
+                                .failed(
+                                    lang,
+                                    "the incremental language server stopped answering".into(),
+                                )
+                                .await;
+                        }
                         let elapsed_ms = started.elapsed().as_millis() as u64;
                         if let Some(reason) = pass.refused {
                             warn!(?reason, path = %rel_path, "discarded LSP answers; enrichment remains incomplete");
@@ -8122,9 +9240,8 @@ pub async fn run_with_authority_on(
                             lsp_state.mark_dirty();
                             // Relations reaching the graph is this pass's unit of
                             // durable work, so it is what the supervisor is told
-                            // about. Querying an LSP server and finding nothing is
-                            // not progress, and crediting it would let a worker
-                            // that answers "no relations" forever look healthy.
+                            // about. Successful empty queries feed only the
+                            // finite-work liveness observer, never this count.
                             lsp_pass.advanced(pass.written.published as u64, Instant::now());
                         } else if pass.refused.is_none() {
                             info!(
@@ -8140,7 +9257,7 @@ pub async fn run_with_authority_on(
                                 "LSP enrichment completed: no new relations found"
                             );
                         }
-                        if pass.refused.is_none() && !pass.marked {
+                        if request_incremental_remainder(&lsp_state, &pass) {
                             info!(
                                 path = %rel_path,
                                 whole_file = pass.whole_file,
@@ -8153,10 +9270,21 @@ pub async fn run_with_authority_on(
                         }
                         // `failed_queries` is intentionally not a reason to
                         // abandon the reservation. What answered is already in
-                        // the graph, and a protocol error on one position does
-                        // not get a retry. It is still disclosed, on the
-                        // enrichment status, rather than dropped on the floor
-                        // here, and it keeps the file from its mark.
+                        // the graph. Unmarked work is handed to the sweep,
+                        // whose retry policy classifies each refusal. Failures
+                        // remain disclosed on enrichment status and keep the
+                        // file from its mark.
+                        // A completion mark is the existing whole-file/current-input
+                        // proof. Finishing a partial edit or transferring stale work
+                        // cannot clear an earlier failed enrichment reservation.
+                        if pass.marked
+                            && pass.refused.is_none()
+                            && pass.written.lost() == 0
+                            && pass.written.vector_stale == 0
+                            && pass.failed_queries == 0
+                        {
+                            work.resolve_completed();
+                        }
                         finish_incremental_reservation(
                             &mut work,
                             pass.refused,
@@ -8177,18 +9305,9 @@ pub async fn run_with_authority_on(
                         // between here and the tail leaves the store saying so.
                         // First, because "any work" includes the probe below.
                         sweep_started(&lsp_state);
-                        // Re-probe here, not only at daemon start. Readiness
-                        // taken once latches: a user who follows Kin's own
-                        // advice and installs the server it just named leaves a
-                        // long-lived daemon reporting that language unavailable
-                        // for the rest of its life, and the stale answer is an
-                        // input under an agent-facing verdict. A sweep is the
-                        // moment the daemon is about to want servers, so it is
-                        // the firing point that needs no new signal invented.
-                        // Same probe-then-publish as at start, and it overwrites
-                        // rather than merges, because a fresh answer supersedes
-                        // an old one wholesale.
-                        spawn_language_server_readiness_probe(lsp_root.clone());
+                        // Actual worker starts publish readiness. Languages
+                        // skipped as current reuse or obtain one keyed
+                        // observation at the tail, without a competing probe.
                         lsp_state
                             .lsp_sweep_running
                             .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -8222,6 +9341,11 @@ pub async fn run_with_authority_on(
                                         superseded && fresh_sweep_was_queued(&lsp_state),
                                     ),
                                 );
+                                retain_supervisor_interruption(
+                                    &lsp_pass,
+                                    work,
+                                    &mut interrupted_work,
+                                );
                                 continue;
                             }
                         };
@@ -8240,6 +9364,10 @@ pub async fn run_with_authority_on(
                             }
                         }
 
+                        work.bind_files(
+                            by_file.keys().map(|file| file.0.clone()),
+                            inputs.marker_epoch,
+                        );
                         let total_files = by_file.len();
                         lsp_state
                             .lsp_sweep_files_total
@@ -8249,6 +9377,7 @@ pub async fn run_with_authority_on(
                         // Files an interrupted sweep finished, skipped here and
                         // recorded as enriched once this sweep publishes.
                         let mut resumed_this_sweep: Vec<String> = Vec::new();
+                        let mut already_completed_files = Vec::new();
                         let mut checkpoints = SweepCheckpoints::new(Instant::now());
                         // Files the sweep asked about whose queries failed or ran
                         // over budget: counted held back, never marked, retried
@@ -8285,6 +9414,11 @@ pub async fn run_with_authority_on(
                         let mut server_start_failed: std::collections::HashSet<
                             kin_model::LanguageId,
                         > = std::collections::HashSet::new();
+                        // Languages whose current proof context this pass has
+                        // settled before skipping a finished file, so the
+                        // check runs once per language rather than per file.
+                        let mut context_settled: std::collections::HashSet<kin_model::LanguageId> =
+                            std::collections::HashSet::new();
                         // What this process OBSERVED when it tried to serve each
                         // language it could not, and how many files that cost.
                         // `files_blocked` counts files and cannot name a
@@ -8317,12 +9451,22 @@ pub async fn run_with_authority_on(
                         let index = kin_lsp::EntityIndex::new(entity_refs, &lsp_root);
 
                         let mut refused = None;
-                        for (file_id, file_entities) in &by_file {
+                        let mut sweep_files =
+                            crate::sweep_retry::SweepFiles::new(by_file.keys().cloned());
+                        while let Some(file_id) = sweep_files.next() {
+                            // A retry must observe cancellation and authority
+                            // changes before starting another server or query.
+                            if *lsp_cancel.borrow() || lsp_pass.halted() {
+                                tally.ended_early = true;
+                                break;
+                            }
                             if let Err(reason) = inputs.current(&lsp_state).await {
                                 refused = Some(reason);
                                 tally.ended_early = true;
                                 break;
                             }
+                            let file_entities = &by_file[&file_id];
+                            let tally_before_file = tally;
                             let abs_path = lsp_root.join(&file_id.0);
 
                             // Determine language from file extension.
@@ -8353,14 +9497,194 @@ pub async fn run_with_authority_on(
                             // again. On a 3,590-file TypeScript repository a full
                             // pass is 47 minutes, and restarting it on every daemon
                             // start meant it never once finished.
-                            let mut gate = sweep_gate(
-                                &lsp_state,
-                                &owed_at_start,
-                                &file_id.0,
-                                inputs.blob(&file_id.0).as_deref(),
-                                retry_owed_now,
-                                sweep_clock,
-                            );
+                            let mut gate = if sweep_files.is_retry(&file_id) {
+                                SweepGate::Ask
+                            } else {
+                                sweep_gate(
+                                    &lsp_state,
+                                    &owed_at_start,
+                                    &file_id.0,
+                                    inputs.blob(&file_id.0).as_deref(),
+                                    retry_owed_now,
+                                    sweep_clock,
+                                )
+                            };
+                            // Before the first finished file of a language is
+                            // skipped, learn the context its server runs under
+                            // now. Otherwise a pass over a store where every
+                            // file is finished starts no server, never learns
+                            // it, and keeps proofs a changed server, workspace
+                            // or configuration no longer makes. When what this
+                            // host would start hashes as a ledger's context
+                            // does, that context is current and no server
+                            // starts. When it does not, or the executable
+                            // cannot be identified by content, one server
+                            // start settles it within the ordinary start
+                            // bounds. When no server can start, the context is
+                            // recorded as unverified: finished files of the
+                            // language are asked about and owed with the
+                            // server's reason, and their proofs are not served
+                            // as current.
+                            if matches!(gate, SweepGate::AlreadyEnriched | SweepGate::Resumed)
+                                && !context_settled.contains(&lang)
+                                && !current_proof_context_known(&lsp_state, lang)
+                            {
+                                let ledgers = ledger_proof_contexts(&lsp_state, file_entities);
+                                if !ledgers.is_empty() {
+                                    context_settled.insert(lang);
+                                    let prestart = prestart_proof_hashes(lang, &lsp_root).await;
+                                    if let PrestartSettlement::Current(context) =
+                                        settle_before_skipping(&ledgers, prestart.as_deref())
+                                    {
+                                        info!(
+                                            language = %lang,
+                                            "the server this host would start proves under the \
+                                             context finished files were proven under; no server \
+                                             started to confirm it"
+                                        );
+                                        note_current_proof_context(&lsp_state, lang, context);
+                                        if let Err(reason) = inputs
+                                            .record_context_validation(
+                                                &lsp_state,
+                                                lang,
+                                                kin_model::ContextValidationState::Validated {
+                                                    context: context.clone(),
+                                                },
+                                            )
+                                            .await
+                                        {
+                                            refused = Some(reason);
+                                            tally.ended_early = true;
+                                            break;
+                                        }
+                                    } else if server_start_failed.contains(&lang) {
+                                        note_unverified_proof_context(&lsp_state, lang);
+                                        if let Err(reason) = inputs
+                                            .record_context_validation(
+                                                &lsp_state,
+                                                lang,
+                                                unverified_validation(
+                                                    skip_reason
+                                                        .get(&lang)
+                                                        .cloned()
+                                                        .unwrap_or_default(),
+                                                ),
+                                            )
+                                            .await
+                                        {
+                                            refused = Some(reason);
+                                            tally.ended_early = true;
+                                            break;
+                                        }
+                                    } else if !servers.contains_key(&lang) {
+                                        info!(
+                                            language = %lang,
+                                            identified = prestart.is_some(),
+                                            "starting the language server to learn whether finished \
+                                             files were proven under the context it runs under now"
+                                        );
+                                        if let Some((cmd, args, init_opts)) =
+                                            lsp_adapter_for(lang, &lsp_root)
+                                        {
+                                            match start_resolved_language_server(
+                                                lang,
+                                                &lsp_readiness,
+                                                &cmd,
+                                                &args,
+                                                &lsp_root,
+                                                init_opts,
+                                            )
+                                            .await
+                                            {
+                                                Ok(server) => {
+                                                    wait_for_lsp_index(
+                                                        &server,
+                                                        Duration::from_secs(60),
+                                                    )
+                                                    .await;
+                                                    let context = server.proof_context(lang);
+                                                    note_current_proof_context(
+                                                        &lsp_state, lang, &context,
+                                                    );
+                                                    servers.insert(lang, server);
+                                                    if let Err(reason) = inputs.record_context_validation(
+                                                        &lsp_state,
+                                                        lang,
+                                                        kin_model::ContextValidationState::Validated {
+                                                            context,
+                                                        },
+                                                    ).await {
+                                                        refused = Some(reason);
+                                                        tally.ended_early = true;
+                                                        break;
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    warn!(
+                                                        language = %lang,
+                                                        command = %cmd,
+                                                        error = %e,
+                                                        "could not start the language server to \
+                                                         check finished files; their calls are \
+                                                         owed until it starts"
+                                                    );
+                                                    server_start_failed.insert(lang);
+                                                    note_unverified_proof_context(&lsp_state, lang);
+                                                    if let Err(reason) = inputs
+                                                        .record_context_validation(
+                                                            &lsp_state,
+                                                            lang,
+                                                            unverified_validation(format!(
+                                                            "the `{cmd}` language server did not \
+                                                             start: {e}"
+                                                        )),
+                                                        )
+                                                        .await
+                                                    {
+                                                        refused = Some(reason);
+                                                        tally.ended_early = true;
+                                                        break;
+                                                    }
+                                                    skip_reason.entry(lang).or_insert_with(|| {
+                                                        format!(
+                                                            "the `{cmd}` language server did not \
+                                                             start ({e}), so nothing in this \
+                                                             language was enriched"
+                                                        )
+                                                    });
+                                                }
+                                            }
+                                        } else {
+                                            // This build wires no server for a
+                                            // language it recognizes, so nothing
+                                            // on this host can settle its
+                                            // context, and no earlier validation
+                                            // of it stands.
+                                            server_start_failed.insert(lang);
+                                            skip_reason.entry(lang).or_insert_with(|| {
+                                                "this build wires no language server for this \
+                                                 language, so none was started"
+                                                    .to_string()
+                                            });
+                                            note_unverified_proof_context(&lsp_state, lang);
+                                            if let Err(reason) = inputs
+                                                .record_context_validation(
+                                                    &lsp_state,
+                                                    lang,
+                                                    unverified_validation(
+                                                        skip_reason[&lang].clone(),
+                                                    ),
+                                                )
+                                                .await
+                                            {
+                                                refused = Some(reason);
+                                                tally.ended_early = true;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             // A finished file is asked about again when a
                             // caller in it has no call-site ledger, or its
                             // ledgers were proven under a context its
@@ -8382,7 +9706,11 @@ pub async fn run_with_authority_on(
                                 if gate == SweepGate::Resumed {
                                     resumed_this_sweep.push(file_id.0.clone());
                                 }
+                                already_completed_files.push((file_id.0.clone(), lang));
                                 tally.already_enriched += 1;
+                                // Revalidating a finished file is finite work,
+                                // even though it publishes no new relation.
+                                lsp_pass.completed_work(1, Instant::now());
                                 *already_enriched_by_language.entry(lang).or_insert(0) += 1;
                                 // Published here as well as on the enriching
                                 // arm, because `files_done` means a file the
@@ -8447,6 +9775,15 @@ pub async fn run_with_authority_on(
                             // A language whose server already refused to start is
                             // not retried for every remaining file.
                             if server_start_failed.contains(&lang) {
+                                remember_blocked_sweep_debt(
+                                    &owed_at_start,
+                                    &mut owed_this_sweep,
+                                    &mut owed_contexts,
+                                    &file_id.0,
+                                    skip_reason.get(&lang).cloned().unwrap_or_else(|| {
+                                        "the language server is unavailable for this pass".into()
+                                    }),
+                                );
                                 tally.server_unavailable += 1;
                                 *skip_files.entry(lang).or_insert(0) += 1;
                                 continue;
@@ -8458,7 +9795,12 @@ pub async fn run_with_authority_on(
                                     lsp_adapter_for(lang, &lsp_root)
                                 {
                                     match start_resolved_language_server(
-                                        lang, &cmd, &args, &lsp_root, init_opts,
+                                        lang,
+                                        &lsp_readiness,
+                                        &cmd,
+                                        &args,
+                                        &lsp_root,
+                                        init_opts,
                                     )
                                     .await
                                     {
@@ -8497,6 +9839,31 @@ pub async fn run_with_authority_on(
                                                      enriched"
                                                 )
                                             });
+                                            // This host cannot settle the
+                                            // language's context now, so no
+                                            // earlier validation of it stands.
+                                            note_unverified_proof_context(&lsp_state, lang);
+                                            if let Err(reason) = inputs
+                                                .record_context_validation(
+                                                    &lsp_state,
+                                                    lang,
+                                                    unverified_validation(
+                                                        skip_reason[&lang].clone(),
+                                                    ),
+                                                )
+                                                .await
+                                            {
+                                                refused = Some(reason);
+                                                tally.ended_early = true;
+                                                break;
+                                            }
+                                            remember_blocked_sweep_debt(
+                                                &owed_at_start,
+                                                &mut owed_this_sweep,
+                                                &mut owed_contexts,
+                                                &file_id.0,
+                                                skip_reason[&lang].clone(),
+                                            );
                                             tally.server_unavailable += 1;
                                             *skip_files.entry(lang).or_insert(0) += 1;
                                             continue;
@@ -8516,6 +9883,26 @@ pub async fn run_with_authority_on(
                                      none was started"
                                         .to_string()
                                 });
+                                note_unverified_proof_context(&lsp_state, lang);
+                                if let Err(reason) = inputs
+                                    .record_context_validation(
+                                        &lsp_state,
+                                        lang,
+                                        unverified_validation(skip_reason[&lang].clone()),
+                                    )
+                                    .await
+                                {
+                                    refused = Some(reason);
+                                    tally.ended_early = true;
+                                    break;
+                                }
+                                remember_blocked_sweep_debt(
+                                    &owed_at_start,
+                                    &mut owed_this_sweep,
+                                    &mut owed_contexts,
+                                    &file_id.0,
+                                    skip_reason[&lang].clone(),
+                                );
                                 tally.server_unavailable += 1;
                                 *skip_files.entry(lang).or_insert(0) += 1;
                                 continue;
@@ -8523,11 +9910,20 @@ pub async fn run_with_authority_on(
                             // The context this server answers under is now the
                             // current one for its language: a file marked under
                             // another is proven again when the sweep reaches it.
-                            note_current_proof_context(
-                                &lsp_state,
-                                lang,
-                                &server.proof_context(lang),
-                            );
+                            let context = server.proof_context(lang);
+                            note_current_proof_context(&lsp_state, lang, &context);
+                            if let Err(reason) = inputs
+                                .record_context_validation(
+                                    &lsp_state,
+                                    lang,
+                                    kin_model::ContextValidationState::Validated { context },
+                                )
+                                .await
+                            {
+                                refused = Some(reason);
+                                tally.ended_early = true;
+                                break;
+                            }
 
                             // didOpen exact graph/CAS content. The compatibility
                             // path may not exist on the host; that must not
@@ -8538,6 +9934,14 @@ pub async fn run_with_authority_on(
                                     warn!(
                                         file = %file_id,
                                         "LSP sweep skipped graph source that could not be loaded from authority"
+                                    );
+                                    remember_blocked_sweep_debt(
+                                        &owed_at_start,
+                                        &mut owed_this_sweep,
+                                        &mut owed_contexts,
+                                        &file_id.0,
+                                        "the graph source could not be loaded from authority"
+                                            .into(),
                                     );
                                     tally.source_unreadable += 1;
                                     continue;
@@ -8562,10 +9966,8 @@ pub async fn run_with_authority_on(
                             settle_after_open(server, lang, &uri, first).await;
 
                             // A server that died before this file's first
-                            // question cannot answer it or any question after
-                            // it. Nothing about the file was asked, so it is
-                            // blocked rather than owed, and so is the rest of
-                            // the language for this pass.
+                            // question cannot answer it. Retire it and retry
+                            // this file once before advancing through the graph.
                             if server.is_disconnected() {
                                 let reason = retire_disconnected_server(
                                     &mut servers,
@@ -8577,8 +9979,20 @@ pub async fn run_with_authority_on(
                                 .unwrap_or_else(|| {
                                     "its language server stopped answering".to_string()
                                 });
-                                server_start_failed.insert(lang);
-                                skip_reason.insert(lang, reason);
+                                lsp_readiness.failed(lang, reason.clone()).await;
+                                remember_sweep_debt(
+                                    &mut owed_this_sweep,
+                                    &file_id.0,
+                                    reason.clone(),
+                                );
+                                match sweep_files.failed(&file_id, lang, true, None) {
+                                    crate::sweep_retry::Retry::Queued => continue,
+                                    crate::sweep_retry::Retry::LanguageUnavailable => {
+                                        server_start_failed.insert(lang);
+                                    }
+                                    crate::sweep_retry::Retry::Owed => {}
+                                }
+                                skip_reason.insert(lang, reason.clone());
                                 tally.server_unavailable += 1;
                                 *skip_files.entry(lang).or_insert(0) += 1;
                                 continue;
@@ -8602,13 +10016,17 @@ pub async fn run_with_authority_on(
                                 covered_call_hierarchy,
                                 mut pass_ending,
                             ) = file_definitions_within_budget(
-                                kin_lsp::file_enrichment::enrich_file_definitions(
-                                    server,
-                                    &abs_path,
-                                    &file_content,
-                                    &index,
-                                    &lsp_root,
-                                    documents,
+                                observe_lsp_answers(
+                                    kin_lsp::file_enrichment::enrich_file_definitions(
+                                        server,
+                                        &abs_path,
+                                        &file_content,
+                                        &index,
+                                        &lsp_root,
+                                        documents,
+                                    ),
+                                    || server.client.answered(),
+                                    &lsp_pass,
                                 ),
                                 file_definitions_budget,
                                 &file_id.0,
@@ -8629,6 +10047,21 @@ pub async fn run_with_authority_on(
                             let proof_context_id =
                                 kin_model::ResolutionRecord::ProofContext(proof_context.clone())
                                     .id();
+                            let uses_type_budget = crate::owed_enrichment::uses_type_budget(
+                                &owed_at_start,
+                                &file_id.0,
+                                inputs.blob(&file_id.0).as_deref(),
+                                &proof_context_id.to_string(),
+                                sweep_files.retry_count(&file_id),
+                            );
+                            let mut uses_type_timed_out = false;
+                            info!(
+                                file = %file_id,
+                                uses_type_budget_ms = uses_type_budget.as_millis() as u64,
+                                in_sweep_retry = sweep_files.is_retry(&file_id),
+                                in_sweep_retries = sweep_files.retry_count(&file_id),
+                                "LSP entity query budget selected"
+                            );
                             // What the definitions pass asked and could not
                             // prove, for the file's call-site ledgers.
                             let unproven_sites = std::mem::take(&mut file_result.unproven_sites);
@@ -8672,14 +10105,49 @@ pub async fn run_with_authority_on(
                                 EntityArms::All
                             };
                             for entity_ref in &file_entity_refs {
-                                if refused.is_some() {
+                                // Once an arm times out, piling more references
+                                // and hierarchy requests onto that same server
+                                // only adds work it has already failed to keep
+                                // up with. The bounded retry revisits this file.
+                                if refused.is_some()
+                                    || server.is_disconnected()
+                                    || tally.transient_failures
+                                        > tally_before_file.transient_failures
+                                {
                                     break;
                                 }
-                                let (derived, outcomes) = enrich_single_entity(
-                                    server, entity_ref, &index, &lsp_root, documents, arms,
+                                if *lsp_cancel.borrow() || lsp_pass.halted() {
+                                    tally.ended_early = true;
+                                    tally.query_failures += 1;
+                                    tally.transient_failures += 1;
+                                    file_failure = Some(
+                                        "the pass stopped before all entity queries completed"
+                                            .into(),
+                                    );
+                                    pass_ending = crate::call_site_ledger::PassEnding::Stopped(
+                                        kin_model::ServerFailure::Timeout,
+                                    );
+                                    break;
+                                }
+                                let (derived, outcomes) = observe_lsp_answers(
+                                    enrich_single_entity(
+                                        server,
+                                        entity_ref,
+                                        &index,
+                                        &lsp_root,
+                                        documents,
+                                        arms,
+                                        uses_type_budget,
+                                    ),
+                                    || server.client.answered(),
+                                    &lsp_pass,
                                 )
                                 .await;
+                                uses_type_timed_out |= outcomes.uses_type_timed_out;
                                 tally.query_failures += outcomes.failures;
+                                tally.transient_failures += outcomes.transient_failures;
+                                tally.retryable_protocol_failures +=
+                                    outcomes.retryable_protocol_failures;
                                 tally.query_declines += outcomes.declines;
                                 tally.query_refusals += outcomes.refusals.len();
                                 file_unprovable.extend(outcomes.refusals);
@@ -8693,6 +10161,21 @@ pub async fn run_with_authority_on(
                                     Ok(written) => file_relations += written,
                                     Err(reason) => refused = Some(reason),
                                 }
+                            }
+                            if pass_ending == crate::call_site_ledger::PassEnding::Complete
+                                && tally.transient_failures > tally_before_file.transient_failures
+                            {
+                                pass_ending = crate::call_site_ledger::PassEnding::Stopped(
+                                    if server.is_disconnected() {
+                                        kin_model::ServerFailure::Crash
+                                    } else if tally.retryable_protocol_failures
+                                        > tally_before_file.retryable_protocol_failures
+                                    {
+                                        kin_model::ServerFailure::ProtocolError
+                                    } else {
+                                        kin_model::ServerFailure::Timeout
+                                    },
+                                );
                             }
                             // Written before the file is closed, so the graph
                             // holds this file's work before the next didOpen.
@@ -8782,11 +10265,11 @@ pub async fn run_with_authority_on(
                             }
 
                             // A server that died during this file's questions
-                            // left some of them unanswered, and those failures
-                            // already hold the file back. Its reason gains what
-                            // the server left behind, and the rest of the
-                            // language is not asked.
-                            if server.is_disconnected() {
+                            // left some questions unanswered. The retry keeps
+                            // already accepted evidence and starts this file
+                            // again on a fresh server, without marking it done.
+                            let server_died = server.is_disconnected();
+                            if server_died {
                                 let reason = retire_disconnected_server(
                                     &mut servers,
                                     &mut first_open_done,
@@ -8797,11 +10280,13 @@ pub async fn run_with_authority_on(
                                 .unwrap_or_else(|| {
                                     "its language server stopped answering".to_string()
                                 });
+                                lsp_readiness.failed(lang, reason.clone()).await;
                                 file_failure = Some(match file_failure.take() {
                                     Some(first) => format!("{first}; {reason}"),
                                     None => reason.clone(),
                                 });
-                                server_start_failed.insert(lang);
+                                tally.query_failures += 1;
+                                tally.transient_failures += 1;
                                 skip_reason.insert(lang, reason);
                             }
 
@@ -8811,12 +10296,59 @@ pub async fn run_with_authority_on(
                                     query_failures_before,
                                     definitions_over_budget_before,
                                 );
+                            let transient =
+                                tally.transient_failures > tally_before_file.transient_failures;
+                            if !passes_completed
+                                && refused.is_none()
+                                && transient
+                                && !*lsp_cancel.borrow()
+                                && !lsp_pass.halted()
+                            {
+                                match sweep_files.failed(
+                                    &file_id,
+                                    lang,
+                                    server_died,
+                                    uses_type_timed_out.then_some(uses_type_budget),
+                                ) {
+                                    crate::sweep_retry::Retry::Queued => {
+                                        remember_sweep_debt(
+                                            &mut owed_this_sweep,
+                                            &file_id.0,
+                                            file_failure.clone().unwrap_or_else(|| {
+                                                "a language-server query got no answer".into()
+                                            }),
+                                        );
+                                        owed_contexts.insert(
+                                            file_id.0.clone(),
+                                            proof_context_id.to_string(),
+                                        );
+                                        // Relations accepted by the first attempt
+                                        // stand, but only the final visit counts
+                                        // this file and its call-site ledgers.
+                                        total_relations += file_relations;
+                                        if file_relations.published > 0 {
+                                            lsp_pass.advanced(
+                                                file_relations.published as u64,
+                                                Instant::now(),
+                                            );
+                                        }
+                                        tally = tally_before_file;
+                                        info!(file = %file_id, server_died, "retrying an interrupted file within the sweep");
+                                        continue;
+                                    }
+                                    crate::sweep_retry::Retry::LanguageUnavailable => {
+                                        server_start_failed.insert(lang);
+                                    }
+                                    crate::sweep_retry::Retry::Owed => {}
+                                }
+                            }
                             // A file whose server keeps failing on the same
                             // bytes under the same proof context is settled
                             // after its last allowed attempt: its ledgers
                             // record the sites the server failed at, and the
                             // sweep stops asking about it.
                             if !passes_completed
+                                && !transient
                                 && refused.is_none()
                                 && ledger_write.censused
                                 && ledger_write.refused == 0
@@ -8856,18 +10388,25 @@ pub async fn run_with_authority_on(
                             // files are, and never a reason to ask again.
                             record_unprovable_queries(&lsp_state, &file_id.0, file_unprovable);
                             if refused.is_none() && passes_completed {
+                                sweep_files.completed(lang);
+                                owed_this_sweep.retain(|(file, _)| file != &file_id.0);
+                                owed_contexts.remove(&file_id.0);
                                 tally.enriched += 1;
+                                // A finite file pass can finish with no new
+                                // relations, including an empty source file.
+                                lsp_pass.completed_work(1, Instant::now());
                                 enriched_this_sweep.push(file_id.0.clone());
                             } else {
                                 tally.held_back += 1;
                                 held_back_this_sweep.push(file_id.0.clone());
                                 if refused.is_none() {
-                                    owed_this_sweep.push((
-                                        file_id.0.clone(),
+                                    remember_sweep_debt(
+                                        &mut owed_this_sweep,
+                                        &file_id.0,
                                         file_failure.unwrap_or_else(|| {
                                             "a language-server query got no answer".to_string()
                                         }),
-                                    ));
+                                    );
                                     owed_contexts
                                         .insert(file_id.0.clone(), proof_context_id.to_string());
                                 }
@@ -9028,7 +10567,7 @@ pub async fn run_with_authority_on(
                         // printing the histogram that proves the loss and then
                         // an all-clear over it.
                         crate::background_work::record_relation_census(
-                            &lsp_state.layout,
+                            &lsp_state,
                             lsp_state.graph.as_ref(),
                             kin_core::relation_census::CensusSource::Sweep,
                         );
@@ -9063,7 +10602,7 @@ pub async fn run_with_authority_on(
                         // already recovers by re-sweeping.
                         let published = if sweep_must_publish(&lsp_state, total_relations.published)
                         {
-                            match save_snapshot_blocking(Arc::clone(&lsp_state)).await {
+                            match save_sweep_snapshot_blocking(Arc::clone(&lsp_state)).await {
                                 Ok(crate::state::EnrichmentFlush::Proceeded) => {
                                     lsp_state.mark_clean();
                                     true
@@ -9187,10 +10726,8 @@ pub async fn run_with_authority_on(
                             },
                             &owed_this_sweep,
                             &owed_contexts,
+                            sweep_clock,
                         );
-
-                        let interruptions =
-                            sweep_finished(&lsp_state, tally.ended_early, tally.visited());
 
                         // A language whose every file this pass skipped as
                         // already enriched never reached a server start, so the
@@ -9221,7 +10758,19 @@ pub async fn run_with_authority_on(
                                         ),
                                     }
                                 } else {
-                                    probe_language_server(*language, &lsp_root).await
+                                    if *lsp_cancel.borrow() {
+                                        tally.ended_early = true;
+                                        break;
+                                    }
+                                    let mut probe_cancel = lsp_cancel.clone();
+                                    tokio::select! {
+                                        biased;
+                                        _ = probe_cancel.changed() => {
+                                            tally.ended_early = true;
+                                            break;
+                                        }
+                                        observed = lsp_readiness.probe(*language, &lsp_root) => observed,
+                                    }
                                 };
                                 readiness_now.insert(*language, readiness);
                             }
@@ -9238,12 +10787,21 @@ pub async fn run_with_authority_on(
                             );
                         }
 
+                        let interruptions =
+                            sweep_finished(&lsp_state, tally.ended_early, tally.visited());
+
                         // Marked complete even when the loop broke early on
                         // shutdown or a supervisor halt. What was enriched is
                         // durable either way, and the next sweep resumes from
                         // it. The reason the counters move together, and the
                         // demand this drains, are on the function.
-                        complete_lsp_sweep(&lsp_state, tally.blocked() as u64);
+                        complete_lsp_sweep(
+                            &lsp_state,
+                            tally
+                                .blocked()
+                                .saturating_add(tally.not_visited(total_files))
+                                as u64,
+                        );
                         // Published with the counts, so a caller reading a
                         // nonzero blocked count can also say which language it
                         // lost and what this process saw. Replaces the previous
@@ -9271,6 +10829,31 @@ pub async fn run_with_authority_on(
                             skipped.sort_by(|a, b| a.language.cmp(&b.language));
                             if let Ok(mut slot) = lsp_state.lsp_sweep_languages_skipped.lock() {
                                 *slot = skipped;
+                            }
+                        }
+                        // Resolve only this capture's durably marked files. A
+                        // successful file repairs its own earlier failure even
+                        // when another file remains owed. Readiness refusals and
+                        // any later source admission keep their failures intact.
+                        if marker_written
+                            && total_relations.lost() == 0
+                            && total_relations.vector_stale == 0
+                            && inputs.current(&lsp_state).await.is_ok()
+                        {
+                            let mut completed_files = marked_this_sweep.clone();
+                            completed_files.extend(
+                                already_completed_files
+                                    .iter()
+                                    .filter(|(_, language)| !skip_files.contains_key(language))
+                                    .map(|(file, _)| file.clone()),
+                            );
+                            work.resolve_files(&completed_files, inputs.marker_epoch);
+                            if sweep_work_succeeded(&tally, total_files, total_relations, published)
+                            {
+                                work.resolve_absent_files(inputs.marker_epoch, |path| {
+                                    inputs.path_is_absent(path)
+                                });
+                                work.resolve_completed();
                             }
                         }
                         let unaccounted = tally.unaccounted(total_files);
@@ -9314,7 +10897,7 @@ pub async fn run_with_authority_on(
                                 total_relations.offered as u32,
                                 total_relations.vector_stale as u32,
                             );
-                        } else {
+                        } else if !tally.ended_early {
                             kin_daemon_spawn::RefusedEnrichment::clear(lsp_state.layout.root());
                         }
 
@@ -9356,7 +10939,16 @@ pub async fn run_with_authority_on(
                             retracted_records = tally.retracted_records,
                             completed_sites = tally.completed_sites,
                             settled_failed = tally.settled_failed,
-                            "LSP cold sweep complete"
+                            "{}",
+                            lsp_sweep_finish_message(
+                                tally.ended_early,
+                                sweep_work_succeeded(
+                                    &tally,
+                                    total_files,
+                                    total_relations,
+                                    published,
+                                )
+                            )
                         );
                         // A sweep that finished having done nothing is a
                         // finding, and it used to be indistinguishable from a
@@ -9394,6 +10986,36 @@ pub async fn run_with_authority_on(
                             .await;
                     } // end Sweep
                 } // end match
+
+                // Keep the attempt reservation until its retry is handed off,
+                // so an interruption successfully queued for recovery does not
+                // leave a permanent failed-work count over later convergence.
+                if lsp_pass.halted() {
+                    for language in servers.keys().copied().collect::<Vec<_>>() {
+                        lsp_readiness
+                            .failed(
+                                language,
+                                "the language server worker was halted before completing its work"
+                                    .into(),
+                            )
+                            .await;
+                    }
+                    if recover_stalled_lsp_worker(
+                        &lsp_state,
+                        &lsp_pass,
+                        &mut servers,
+                        &mut first_open_done,
+                        &mut lsp_cancel,
+                        Duration::from_secs(30),
+                    )
+                    .await
+                    {
+                        interrupted_work.push(work);
+                    } else {
+                        info!(reason = ?lsp_pass.halt_reason(), "LSP enrichment worker parked; unfinished work remains owed");
+                        break;
+                    }
+                }
             }
         }));
     }
@@ -9643,6 +11265,10 @@ async fn drain_lsp_enrichment(handle: Option<tokio::task::JoinHandle<()>>) {
     }
 }
 
+/// Time allowed to join ordinary daemon task handles after cancellation.
+/// Persistence and LSP publication have their own drain contracts.
+pub(crate) const TASK_DRAIN_BOUND: Duration = Duration::from_secs(10);
+
 async fn drain_handles(
     loop_handle: Option<
         tokio::task::JoinHandle<std::result::Result<(), crate::error::DaemonError>>,
@@ -9656,7 +11282,7 @@ async fn drain_handles(
     state: &DaemonState,
     grace_ends: Option<Instant>,
 ) {
-    let drain_timeout = Duration::from_secs(10);
+    let drain_timeout = TASK_DRAIN_BOUND;
     info!("draining task handles before cleanup...");
 
     // Persistence drains on its own budget, and before the rest.
@@ -10265,16 +11891,24 @@ pub(crate) fn spawn_background_embedding_worker(
                     pending
                 };
 
+                let pass_for_embed = Arc::clone(&embed_pass);
+                let cancel_for_embed = embed_cancel.clone();
                 let embed_result = tokio::task::spawn_blocking(move || {
+                    let work = BackgroundEmbeddingWork {
+                        pass: &pass_for_embed,
+                        cancel: &cancel_for_embed,
+                    };
                     run_background_embedding_batch(
                         &state_for_embed,
                         reset_on_index_error,
                         |state| state.graph.prepare_embedder(),
                         |state| {
                             if is_artifact {
-                                state.graph.process_artifact_embedding_queue(batch)
+                                state
+                                    .graph
+                                    .process_artifact_embedding_queue_observed(batch, &work)
                             } else {
-                                state.graph.process_embedding_queue(batch)
+                                state.graph.process_embedding_queue_observed(batch, &work)
                             }
                         },
                     )
@@ -10362,6 +11996,23 @@ pub(crate) fn spawn_background_embedding_worker(
                             "embedding worker error: reset vector index, retrying next interval"
                         );
                         break;
+                    }
+                    Ok(BackgroundEmbeddingBatchOutcome::Failed(
+                        kin_db::KinDbError::EmbeddingCancelled,
+                    )) => {
+                        // The observer stopped at a completed-work boundary and
+                        // the graph requeued every uncommitted key. Cancellation
+                        // is neither an index error nor a failed retry attempt.
+                        drain_embed_flush(
+                            &mut pending_flush,
+                            &mut embedded_since_flush,
+                            &embed_pass,
+                        )
+                        .await;
+                        if embed_pass.halted() {
+                            release_stopped_embed_worker_vectors(&embed_state);
+                        }
+                        break 'wake;
                     }
                     Ok(BackgroundEmbeddingBatchOutcome::Failed(e)) => {
                         // Distinguish a persistent vector-index error (a stale
@@ -10477,6 +12128,67 @@ pub(crate) fn spawn_background_embedding_worker(
 
 #[cfg(all(test, unix))]
 mod tests {
+    #[test]
+    fn embedding_progress_publication_holds_the_guard_and_honors_cancellation() {
+        use kin_db::embed::EmbeddingWork;
+        let supervisor = crate::background_work::BackgroundWorkSupervisor::new(
+            std::time::Duration::from_secs(1),
+        );
+        let pass = supervisor.pass(crate::background_work::PASS_EMBED);
+        let (cancel_tx, cancel) = tokio::sync::watch::channel(false);
+        let work = super::BackgroundEmbeddingWork {
+            pass: &pass,
+            cancel: &cancel,
+        };
+        let now = std::time::Instant::now();
+        pass.working(now);
+        assert_eq!(
+            work.publish(Box::new(|| {
+                assert!(supervisor
+                    .sweep(now + std::time::Duration::from_secs(2))
+                    .is_empty());
+                assert!(pass.is_working());
+                Ok(3)
+            }))
+            .unwrap(),
+            3
+        );
+        assert_eq!(
+            pass.progress(),
+            0,
+            "index publication is not durable flush credit"
+        );
+        cancel_tx.send(true).unwrap();
+        assert!(matches!(
+            work.publish(Box::new(|| panic!("cancelled work must not publish"))),
+            Err(kin_db::KinDbError::EmbeddingCancelled)
+        ));
+        assert!(matches!(
+            work.checkpoint(),
+            Err(kin_db::KinDbError::EmbeddingCancelled)
+        ));
+    }
+
+    #[tokio::test]
+    async fn embedding_progress_failed_flush_never_credits_computed_vectors() {
+        let supervisor = crate::background_work::BackgroundWorkSupervisor::new(
+            std::time::Duration::from_secs(600),
+        );
+        let pass = supervisor.pass(crate::background_work::PASS_EMBED);
+        pass.working(std::time::Instant::now());
+        pass.computed_chunk(85, std::time::Instant::now());
+        let mut pending = Some(tokio::spawn(async {
+            Err(crate::error::DaemonError::Io(std::io::Error::other(
+                "test flush refused",
+            )))
+        }));
+        let mut embedded = 85;
+        super::drain_embed_flush(&mut pending, &mut embedded, &pass).await;
+        assert_eq!(pass.progress(), 0);
+        assert_eq!(embedded, 0);
+        assert!(pending.is_none());
+    }
+
     /// The store root the watchdog worker below is told to serve.
     const WATCHDOG_WORKER_ROOT: &str = "KINTEST_WATCHDOG_WORKER_ROOT";
 
@@ -11215,6 +12927,17 @@ mod tests {
         )
         .await
         .unwrap();
+        let context = server.proof_context(kin_model::LanguageId::Python);
+        inputs
+            .record_context_validation(
+                state,
+                kin_model::LanguageId::Python,
+                kin_model::ContextValidationState::Validated {
+                    context: context.clone(),
+                },
+            )
+            .await
+            .unwrap();
         let provider = |path: &str| inputs.document(path);
         let mut pass = kin_lsp::file_enrichment::enrich_file_definitions(
             &server,
@@ -11226,7 +12949,6 @@ mod tests {
         )
         .await
         .unwrap();
-        let context = server.proof_context(kin_model::LanguageId::Python);
         server.shutdown().await.unwrap();
         let answers = std::mem::take(&mut pass.site_answers);
         let unproven = std::mem::take(&mut pass.unproven_sites);
@@ -11277,11 +12999,243 @@ mod tests {
         (written, inputs.marker_epoch)
     }
 
+    #[tokio::test]
+    async fn lsp_failed_work_removed_source_uses_the_admitted_tree_not_entity_presence() {
+        use crate::state::LspWorkItem;
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("removed.py"), "def old():\n    pass\n").unwrap();
+        std::fs::write(root.path().join("present.opaque"), "unparsed artifact\n").unwrap();
+        let state = super::DaemonState::open(kin_core::init(root.path()).unwrap().layout).unwrap();
+        crate::loop_runner::sync_filesystem_with_graph(&state)
+            .await
+            .unwrap();
+        let old = super::current_marker_epoch(&state);
+        for file in ["removed.py", "present.opaque"] {
+            drop(state.lsp_work.reserve_for(LspWorkItem::file(file, old)));
+        }
+        std::fs::remove_file(root.path().join("removed.py")).unwrap();
+        crate::loop_runner::sync_filesystem_with_graph(&state)
+            .await
+            .unwrap();
+        let inputs = super::lsp_publication::QueryInputs::capture(&state)
+            .await
+            .unwrap();
+        assert!(inputs.path_is_absent("removed.py"));
+        assert!(!inputs.path_is_absent("present.opaque"));
+        assert!(!inputs.path_is_absent("../not-a-repo-path.py"));
+        assert!(inputs.entities.iter().all(|entity| entity
+            .file_origin
+            .as_ref()
+            .is_none_or(|file| file.0 != "present.opaque")));
+        let mut sweep = state.lsp_work.reserve_for(LspWorkItem::Sweep {
+            source_generation: inputs.marker_epoch,
+        });
+        inputs.current(&state).await.unwrap();
+        sweep.resolve_absent_files(inputs.marker_epoch, |path| inputs.path_is_absent(path));
+        sweep.resolve_completed();
+        drop(sweep);
+        assert_eq!(
+            state.lsp_work.failed_items(),
+            vec![LspWorkItem::file("present.opaque", old)]
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_context_validation_keeps_an_empty_file_current_across_repeated_passes() {
+        use super::lsp_publication::QueryInputs;
+        use kin_model::{ContextValidationState, LanguageId, ResolutionRecordId};
+
+        let root = tempfile::tempdir().unwrap();
+        // A package marker at the repository root has no package name and
+        // emits no module entity. Match the real sweep's named package.
+        std::fs::create_dir(root.path().join("app")).unwrap();
+        std::fs::write(root.path().join("app/__init__.py"), "").unwrap();
+        let state = super::DaemonState::open(kin_core::init(root.path()).unwrap().layout).unwrap();
+        crate::loop_runner::sync_filesystem_with_graph(&state)
+            .await
+            .unwrap();
+        assert!(kin_core::lsp_scope::upgrade_recorded(&state.layout));
+        let python = LanguageId::Python;
+        let context = kin_model::ProofContext {
+            language: python,
+            resolver: "lsp:pyright".into(),
+            resolver_version: "1.0.0".into(),
+            configuration_hash: kin_model::Hash256::from_bytes([1; 32]),
+            environment_hash: kin_model::Hash256::from_bytes([2; 32]),
+            environment_summary: "python test context".into(),
+        };
+        let validation = ContextValidationState::Validated { context };
+        let id = ResolutionRecordId::context_validation(python);
+
+        for _ in 0..2 {
+            let inputs = QueryInputs::capture(&state).await.unwrap();
+            assert_eq!(inputs.document("app/__init__.py").as_deref(), Some(""));
+            assert!(inputs.entities.iter().any(|entity| entity
+                .file_origin
+                .as_ref()
+                .is_some_and(|file| file.0 == "app/__init__.py")));
+            // The first write installs the validation; later calls take the
+            // identical-value branch. Both must preserve this source capture.
+            for _ in 0..2 {
+                inputs
+                    .record_context_validation(&state, python, validation.clone())
+                    .await
+                    .unwrap();
+                inputs.current(&state).await.unwrap();
+            }
+            assert_eq!(
+                state
+                    .graph
+                    .get_resolution_record(&id)
+                    .unwrap()
+                    .as_context_validation()
+                    .unwrap()
+                    .state,
+                validation
+            );
+            let mut pending = super::PendingEnrichment::default();
+            inputs.absorb(&state, &mut pending, vec![]).await.unwrap();
+            inputs.flush(&state, &mut pending).await.unwrap();
+            assert!(inputs
+                .record_file_completed(&state, "app/__init__.py")
+                .await
+                .unwrap());
+            assert!(state
+                .lsp_pending_marks
+                .lock()
+                .unwrap()
+                .contains_key("app/__init__.py"));
+            assert!(inputs
+                .mark_completed(
+                    &state,
+                    &["app/__init__.py".to_owned()],
+                    super::EnrichmentWrite::default(),
+                    true,
+                )
+                .await
+                .unwrap());
+            assert!(super::file_already_enriched(&state, "app/__init__.py"));
+            inputs.current(&state).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn sweep_context_validation_cannot_accept_a_writer_while_waiting_for_coordination() {
+        use super::lsp_publication::{QueryInputs, Refused};
+        use kin_model::{ContextValidationState, EntityStore as _, LanguageId, ResolutionRecordId};
+
+        let root = tempfile::tempdir().unwrap();
+        // A package marker at the repository root has no package name and
+        // emits no module entity. Match the real sweep's named package.
+        std::fs::create_dir(root.path().join("app")).unwrap();
+        std::fs::write(root.path().join("app/__init__.py"), "").unwrap();
+        let state = super::DaemonState::open(kin_core::init(root.path()).unwrap().layout).unwrap();
+        crate::loop_runner::sync_filesystem_with_graph(&state)
+            .await
+            .unwrap();
+        let inputs = QueryInputs::capture(&state).await.unwrap();
+        let python = LanguageId::Python;
+        let validation = ContextValidationState::Validated {
+            context: kin_model::ProofContext {
+                language: python,
+                resolver: "lsp:pyright".into(),
+                resolver_version: "1.0.0".into(),
+                configuration_hash: kin_model::Hash256::from_bytes([1; 32]),
+                environment_hash: kin_model::Hash256::from_bytes([2; 32]),
+                environment_summary: "python test context".into(),
+            },
+        };
+        let id = ResolutionRecordId::context_validation(python);
+        let gate = state.coordination_gate.lock().await;
+        let mut record = Box::pin(inputs.record_context_validation(&state, python, validation));
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(std::future::Future::poll(record.as_mut(), &mut cx).is_pending());
+
+        // An unrelated graph writer finishes while validation is queued. It
+        // must not be adopted as this sweep's own context-validation write.
+        let mutation = state.begin_graph_authority_mutation();
+        let mut entity = inputs.entities[0].clone();
+        entity
+            .metadata
+            .extra
+            .insert("another_writer".into(), serde_json::json!(true));
+        state.graph.upsert_entity(&entity).unwrap();
+        drop(mutation);
+        let changed_epoch = state.stable_graph_authority_epoch().unwrap();
+        drop(gate);
+        assert_eq!(record.await, Err(Refused::Stale));
+        assert_eq!(state.stable_graph_authority_epoch(), Some(changed_epoch));
+        assert!(state.graph.get_resolution_record(&id).is_none());
+        assert_eq!(inputs.current(&state).await, Err(Refused::Stale));
+        assert_eq!(
+            inputs
+                .record_file_completed(&state, "app/__init__.py")
+                .await,
+            Err(Refused::Stale)
+        );
+        assert!(state.lsp_pending_marks.lock().unwrap().is_empty());
+        assert!(!super::file_already_enriched(&state, "app/__init__.py"));
+    }
+
     /// Every entity in a file a sweep finishes gets one call-site ledger, with
     /// one state for each call expression its body holds, and authority takes
     /// the ledgers with the file's mark. When the file is proven again and a
     /// call's answer names another target, the proof of the old target is
     /// retracted, live and in authority, and the ledger names the new one.
+    /// A validation the graph refuses to replace is cleared, never kept: a
+    /// server just proved another context, so the ledgers under the old one
+    /// must not read as current.
+    #[tokio::test]
+    async fn a_refused_validation_clears_the_one_it_was_replacing() {
+        let root = tempfile::tempdir().unwrap();
+        let layout = kin_core::init(root.path()).unwrap().layout;
+        let state = super::DaemonState::open(layout).unwrap();
+        let python = kin_model::LanguageId::Python;
+        let context = |version: &str, language| kin_model::ProofContext {
+            language,
+            resolver: "lsp:pyright".to_string(),
+            resolver_version: version.to_string(),
+            configuration_hash: kin_model::Hash256::from_bytes([1; 32]),
+            environment_hash: kin_model::Hash256::from_bytes([2; 32]),
+            environment_summary: "python 3.12".to_string(),
+        };
+        let id = kin_model::ResolutionRecordId::context_validation(python);
+
+        super::record_context_validation(
+            &state,
+            python,
+            kin_model::ContextValidationState::Validated {
+                context: context("1.0.0", python),
+            },
+        );
+        assert!(state.graph.get_resolution_record(&id).is_some());
+
+        // A validation the graph refuses: its context names another language.
+        super::record_context_validation(
+            &state,
+            python,
+            kin_model::ContextValidationState::Validated {
+                context: context("2.0.0", kin_model::LanguageId::Rust),
+            },
+        );
+        let held = state
+            .graph
+            .get_resolution_record(&id)
+            .and_then(|record| record.as_context_validation().cloned())
+            .expect("the language still has a validation, and it is the unverified one");
+        assert!(
+            matches!(
+                held.state,
+                kin_model::ContextValidationState::Unverified { .. }
+            ),
+            "the validation a refused write meant to replace is not kept: {held:?}"
+        );
+        assert!(
+            state.lsp_unrecorded_validations.lock().unwrap().is_empty(),
+            "replacing it succeeded, so nothing holds publication back"
+        );
+    }
+
     #[tokio::test]
     async fn a_finished_file_ledgers_every_caller_and_a_changed_target_retires_its_old_proof() {
         use kin_model::{EntityStore as _, GraphNodeId, RelationKind, RelationOrigin};
@@ -11342,6 +13296,17 @@ mod tests {
                 .id
         };
         let caller = named("run", "app/run.py");
+        let withdrawn_guess = state
+            .graph
+            .get_all_relations_for_entity(&caller)
+            .unwrap()
+            .into_iter()
+            .find(|row| {
+                row.src == GraphNodeId::Entity(caller)
+                    && row.kind == RelationKind::Calls
+                    && row.origin == RelationOrigin::Inferred
+            })
+            .expect("the real linker has a cross-file receiver guess");
         let proofs_to = |callee: kin_model::EntityId| {
             state
                 .graph
@@ -11494,6 +13459,48 @@ mod tests {
             None,
             "no server has run, so no context is judged stale"
         );
+        // Before such a file is skipped, the sweep settles the context from
+        // what this host would start: current when it proves under the
+        // ledger's context, a server start when it cannot be identified (as
+        // on a store whose contexts predate identities) or when it proves
+        // under another.
+        let ledgers = super::ledger_proof_contexts(&state, &entities);
+        let proven = state
+            .graph
+            .get_resolution_record(&ledger.context)
+            .and_then(|record| record.as_proof_context().cloned())
+            .expect("the ledger names a proof context the graph holds");
+        assert_eq!(ledgers, std::slice::from_ref(&proven));
+        let same = [(proven.configuration_hash, proven.environment_hash)];
+        assert_eq!(
+            super::settle_before_skipping(&ledgers, Some(&same)),
+            super::PrestartSettlement::Current(&proven)
+        );
+        assert_eq!(
+            super::settle_before_skipping(&ledgers, None),
+            super::PrestartSettlement::StartServer
+        );
+        let changed = [(
+            kin_model::Hash256::from_bytes([7; 32]),
+            proven.environment_hash,
+        )];
+        assert_eq!(
+            super::settle_before_skipping(&ledgers, Some(&changed)),
+            super::PrestartSettlement::StartServer
+        );
+        assert_eq!(
+            super::settle_before_skipping(&[], Some(&same)),
+            super::PrestartSettlement::StartServer
+        );
+        // A context no server could be started to learn is no ledger's, so a
+        // finished file is asked about again rather than served as current.
+        state.lsp_current_contexts.lock().unwrap().insert(
+            python,
+            kin_model::ResolutionRecord::ProofContext(super::unverified_proof_context(python)).id(),
+        );
+        assert!(super::finished_file_needs_asking(&state, python, &entities)
+            .is_some_and(|reason| reason.contains("proof context")));
+        state.lsp_current_contexts.lock().unwrap().clear();
         state
             .lsp_current_contexts
             .lock()
@@ -11503,6 +13510,94 @@ mod tests {
             super::finished_file_needs_asking(&state, python, &entities),
             None
         );
+        let withdrawn_guess = state.graph.get_relation_by_id(&withdrawn_guess.id).expect(
+            "the selected parser guess remains in the fixture before its recorded withdrawal",
+        );
+        let mut debt_changes = kin_reconcile::plan_withdrawn_local_binding_obligations(
+            std::slice::from_ref(&withdrawn_guess),
+            |id| Ok(state.graph.get_entity(&id).unwrap()),
+            |file| {
+                let path = kin_model::RepoPath::from_utf8(file.0.clone()).unwrap();
+                Ok(state.graph.artifact_id_at_path(&path).and_then(|artifact| {
+                    match state.graph.get_tree_entry(file).unwrap() {
+                        Some(kin_model::TreeEntry::Blob { hash, .. }) => Some((artifact, hash)),
+                        _ => None,
+                    }
+                }))
+            },
+            |artifact| {
+                Ok(state
+                    .graph
+                    .get_all_relations_for_node(&GraphNodeId::Artifact(artifact))
+                    .unwrap())
+            },
+            |id| Ok(state.graph.get_relation_by_id(&id)),
+        )
+        .unwrap();
+        debt_changes.push(kin_model::RelationDelta::Removed {
+            old: withdrawn_guess.clone(),
+        });
+        state
+            .graph
+            .apply_transaction_delta(&kin_model::TransactionDelta {
+                relation_deltas: debt_changes,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            super::finished_file_needs_asking(&state, python, &entities),
+            None,
+            "a recorded withdrawal with no live returning row needs no repair"
+        );
+        state
+            .graph
+            .apply_transaction_delta(&kin_model::TransactionDelta {
+                relation_deltas: vec![kin_model::RelationDelta::Added {
+                    new: withdrawn_guess.clone(),
+                }],
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            super::finished_file_needs_asking(&state, python, &entities)
+                .is_some_and(|reason| reason.contains("withdrawn guess")),
+            "current ledgers cannot hide a weak row a previous release reintroduced"
+        );
+        state
+            .graph
+            .apply_transaction_delta(&kin_model::TransactionDelta {
+                relation_deltas: vec![kin_model::RelationDelta::Removed {
+                    old: withdrawn_guess,
+                }],
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            super::finished_file_needs_asking(&state, python, &entities),
+            None,
+            "outstanding debt alone must not repeatedly schedule the same completed file"
+        );
+        let mut changed_caller =
+            (**entities.iter().find(|entity| entity.id == caller).unwrap()).clone();
+        changed_caller.fingerprint.behavior_hash = kin_model::Hash256::from_bytes([0x3b; 32]);
+        assert_ne!(
+            changed_caller.fingerprint.behavior_hash,
+            ledger.behavior_hash
+        );
+        assert!(
+            super::finished_file_needs_asking(&state, python, &[&changed_caller])
+                .is_some_and(|reason| reason.contains("earlier caller behavior")),
+            "a finished marker cannot hide the same owed-enrichment state readers disclose"
+        );
+        changed_caller.metadata.extra.insert(
+            kin_model::call_site_reading::FILE_PARSED_CALL_SITES_KEY.into(),
+            serde_json::json!(0),
+        );
+        assert!(
+            super::finished_file_needs_asking(&state, python, &[&changed_caller]).is_some(),
+            "no-sites metadata exempts a missing ledger, never a held stale one"
+        );
+
         state.lsp_current_contexts.lock().unwrap().insert(
             python,
             kin_model::ResolutionRecordId(uuid::Uuid::from_u128(0xfeed)),
@@ -11527,14 +13622,574 @@ mod tests {
             .is_some_and(|reason| reason.contains("no call-site ledger")));
     }
 
+    /// The id an older build gave a language-server edge between two
+    /// entities: two passes of the standard library's default hasher, whose
+    /// algorithm a toolchain release may change. Here only to write the store
+    /// such a build left behind.
+    fn legacy_language_server_relation_id(
+        kind: kin_model::RelationKind,
+        src: kin_model::EntityId,
+        dst: kin_model::EntityId,
+    ) -> kin_model::RelationId {
+        use std::hash::{Hash, Hasher};
+        let mut first = std::collections::hash_map::DefaultHasher::new();
+        kind.hash(&mut first);
+        src.hash(&mut first);
+        dst.hash(&mut first);
+        "kin-lsp".hash(&mut first);
+        let mut second = std::collections::hash_map::DefaultHasher::new();
+        "kin-lsp".hash(&mut second);
+        dst.hash(&mut second);
+        src.hash(&mut second);
+        kind.hash(&mut second);
+        let mut bytes = [0_u8; 16];
+        bytes[..8].copy_from_slice(&first.finish().to_le_bytes());
+        bytes[8..].copy_from_slice(&second.finish().to_le_bytes());
+        kin_model::RelationId::from_bytes(bytes)
+    }
+
+    /// A Python repository whose `run` calls `client.close()` after importing
+    /// `Alpha`, with `Alpha` and `Beta` each declaring `close`, opened and
+    /// derived. Returns the root, the state and `run.py`'s text.
+    async fn closing_client_fixture() -> (tempfile::TempDir, super::DaemonState, String) {
+        let root = tempfile::tempdir().unwrap();
+        let run = [
+            "from app.alpha import Alpha",
+            "",
+            "",
+            "def run(client):",
+            "    client.send(1)",
+            "    xx = client.close()",
+            "    helper(2)",
+            "",
+        ]
+        .join("\n");
+        let class = |name: &str| {
+            [
+                format!("class {name}:"),
+                "    def send(self, x):".into(),
+                "        return x".into(),
+                String::new(),
+                "    def close(self):".into(),
+                "        return None".into(),
+                String::new(),
+                String::new(),
+                "def helper(x):".into(),
+                "    return x".into(),
+                String::new(),
+            ]
+            .join("\n")
+        };
+        std::fs::create_dir(root.path().join("app")).unwrap();
+        std::fs::write(root.path().join("app/__init__.py"), "").unwrap();
+        std::fs::write(root.path().join("app/run.py"), &run).unwrap();
+        std::fs::write(root.path().join("app/alpha.py"), class("Alpha")).unwrap();
+        std::fs::write(root.path().join("app/beta.py"), class("Beta")).unwrap();
+        let layout = kin_core::init(root.path()).unwrap().layout;
+        let state = super::DaemonState::open(layout).unwrap();
+        crate::loop_runner::sync_filesystem_with_graph(&state)
+            .await
+            .unwrap();
+        (root, state, run)
+    }
+
+    /// The id of the entity `state` holds named `name` in `file`.
+    fn entity_named(state: &super::DaemonState, name: &str, file: &str) -> kin_model::EntityId {
+        use kin_model::EntityStore as _;
+        state
+            .graph
+            .list_all_entities()
+            .unwrap()
+            .into_iter()
+            .find(|entity| {
+                entity.name == name
+                    && entity.kind != kin_model::EntityKind::Module
+                    && entity
+                        .file_origin
+                        .as_ref()
+                        .is_some_and(|origin| origin.0 == file)
+            })
+            .unwrap_or_else(|| panic!("the fixture declares {name} in {file}"))
+            .id
+    }
+
+    /// The relations workspace authority holds, as a publication left them.
+    fn authority_relations(state: &super::DaemonState) -> Vec<kin_model::Relation> {
+        let binding = state.local_repository_authority_binding().unwrap();
+        let authority = binding.open_manager().unwrap();
+        let lease = authority.read_authority();
+        lease
+            .workspace_graph_snapshot(&binding.workspace_id())
+            .unwrap()
+            .unwrap()
+            .relations
+            .into_values()
+            .collect()
+    }
+
+    /// A store an older build enriched holds its language-server edges under
+    /// the ids that build's hasher gave them. When a file is proven again,
+    /// through the same definitions pass, settlement and call-site ledgers a
+    /// sweep runs, every language-server edge from or to an entity in it is
+    /// held once, under its current id, live and in authority: the call and
+    /// reference the pass proves again, a `UsesType` edge it does not ask
+    /// about, and a reference into the file from a file nobody asks about
+    /// again. The linker's own `Calls` edge between the same ends as the
+    /// proof stays beside it.
+    #[tokio::test]
+    async fn a_file_proven_again_replaces_the_edges_an_older_build_keyed() {
+        use kin_model::{EntityStore as _, GraphNodeId, RelationKind, RelationOrigin};
+        use std::collections::HashSet;
+
+        let (root, state, run) = closing_client_fixture().await;
+        let caller = entity_named(&state, "run", "app/run.py");
+        let alpha_close = entity_named(&state, "Alpha.close", "app/alpha.py");
+        let alpha = entity_named(&state, "Alpha", "app/alpha.py");
+        let alpha_send = entity_named(&state, "Alpha.send", "app/alpha.py");
+        // Edges an older build proved that this pass does not produce: a
+        // type use out of `run`, and a reference into it from another file.
+        let unasked = |id: fn(
+            RelationKind,
+            kin_model::EntityId,
+            kin_model::EntityId,
+        ) -> kin_model::RelationId| {
+            let evidence = |file: &str| {
+                vec![kin_model::RelationEvidence {
+                    source_span: Some(kin_model::SourceSpan {
+                        file: kin_model::FilePathId::new(file),
+                        start_byte: 0,
+                        end_byte: 5,
+                        start_line: 0,
+                        start_col: 0,
+                        end_line: 0,
+                        end_col: 5,
+                    }),
+                    parser_rule: Some("lsp_references".to_string()),
+                    ..kin_model::RelationEvidence::default()
+                }]
+            };
+            [
+                (RelationKind::UsesType, caller, alpha, "app/run.py"),
+                (RelationKind::References, alpha_send, caller, "app/alpha.py"),
+            ]
+            .map(|(kind, src, dst, file)| kin_model::Relation {
+                id: id(kind, src, dst),
+                kind,
+                src: GraphNodeId::Entity(src),
+                dst: GraphNodeId::Entity(dst),
+                confidence: 0.85,
+                origin: RelationOrigin::Lsp,
+                created_in: None,
+                import_source: None,
+                evidence: evidence(file),
+            })
+        };
+        let unasked_ids = |relations: &[kin_model::Relation]| {
+            let wanted = unasked(kin_lsp::relation_identity::language_server_relation_id);
+            relations
+                .iter()
+                .filter(|relation| {
+                    relation.origin == RelationOrigin::Lsp
+                        && wanted.iter().any(|edge| {
+                            edge.kind == relation.kind
+                                && edge.src == relation.src
+                                && edge.dst == relation.dst
+                        })
+                })
+                .map(|relation| relation.id)
+                .collect::<HashSet<_>>()
+        };
+        // The edges from `run` to `Alpha.close`, the language server's or
+        // every other origin's.
+        let between = |relations: Vec<kin_model::Relation>, language_server: bool| {
+            relations
+                .into_iter()
+                .filter(|relation| {
+                    (relation.origin == RelationOrigin::Lsp) == language_server
+                        && relation.src == GraphNodeId::Entity(caller)
+                        && relation.dst == GraphNodeId::Entity(alpha_close)
+                })
+                .map(|relation| (relation.kind, relation.id))
+                .collect::<HashSet<_>>()
+        };
+        let live = |language_server| {
+            between(
+                state.graph.get_all_relations_for_entity(&caller).unwrap(),
+                language_server,
+            )
+        };
+
+        let uri = kin_lsp::protocol::path_to_uri(&root.path().join("app/run.py"));
+        let alpha_uri = kin_lsp::protocol::path_to_uri(&root.path().join("app/alpha.py"));
+        let column = run.lines().nth(5).unwrap().find("close").unwrap();
+        let mut responses = serde_json::json!({"initialize": {"result": {"capabilities": {
+            "definitionProvider": true, "callHierarchyProvider": false
+        }}}});
+        responses[format!("textDocument/definition@{uri}#{column}")] = serde_json::json!({"result": [{"uri": alpha_uri, "range": {
+                "start": {"line": 4, "character": 8},
+                "end": {"line": 4, "character": 13}}}]});
+
+        sweep_one_file(&state, root.path(), "app/run.py", &responses, true).await;
+        let current: HashSet<(RelationKind, kin_model::RelationId)> =
+            [RelationKind::Calls, RelationKind::References]
+                .into_iter()
+                .map(|kind| {
+                    (
+                        kind,
+                        kin_lsp::relation_identity::language_server_relation_id(
+                            kind,
+                            caller,
+                            alpha_close,
+                        ),
+                    )
+                })
+                .collect();
+        assert_eq!(
+            live(true),
+            current,
+            "the pass proves the call and the reference under their current ids"
+        );
+        let linker = live(false);
+        assert!(
+            linker.iter().any(|(kind, _)| *kind == RelationKind::Calls),
+            "the linker binds the call through the import: {linker:?}"
+        );
+
+        // The store an older build left: the same edges, keyed by its ids.
+        let mut legacy = HashSet::new();
+        for edge in state.graph.get_all_relations_for_entity(&caller).unwrap() {
+            if edge.origin != RelationOrigin::Lsp
+                || edge.src != GraphNodeId::Entity(caller)
+                || edge.dst != GraphNodeId::Entity(alpha_close)
+            {
+                continue;
+            }
+            let old = legacy_language_server_relation_id(edge.kind, caller, alpha_close);
+            assert_ne!(old, edge.id);
+            state.graph.remove_relation(&edge.id).unwrap();
+            state
+                .graph
+                .upsert_relation(&kin_model::Relation {
+                    id: old,
+                    ..edge.clone()
+                })
+                .unwrap();
+            legacy.insert((edge.kind, old));
+        }
+        for edge in unasked(legacy_language_server_relation_id) {
+            state.graph.upsert_relation(&edge).unwrap();
+        }
+        let older_unasked: HashSet<kin_model::RelationId> =
+            unasked(legacy_language_server_relation_id)
+                .iter()
+                .map(|edge| edge.id)
+                .collect();
+        let current_unasked: HashSet<kin_model::RelationId> =
+            unasked(kin_lsp::relation_identity::language_server_relation_id)
+                .iter()
+                .map(|edge| edge.id)
+                .collect();
+        state.save_snapshot().unwrap();
+        assert_eq!(
+            between(authority_relations(&state), true),
+            legacy,
+            "authority holds the edges under the older build's ids"
+        );
+        assert_eq!(unasked_ids(&authority_relations(&state)), older_unasked);
+
+        // Proven again.
+        sweep_one_file(&state, root.path(), "app/run.py", &responses, true).await;
+        assert_eq!(
+            live(true),
+            current,
+            "each edge is held once, under its current id"
+        );
+        assert_eq!(
+            live(false),
+            linker,
+            "the linker's edge between the same ends stays"
+        );
+        let live_relations: Vec<kin_model::Relation> = [caller, alpha_send]
+            .iter()
+            .flat_map(|entity| state.graph.get_all_relations_for_entity(entity).unwrap())
+            .collect();
+        assert_eq!(
+            unasked_ids(&live_relations),
+            current_unasked,
+            "edges the pass did not produce are keyed again, each once"
+        );
+        let retired: std::collections::BTreeSet<kin_model::RelationId> = legacy
+            .iter()
+            .map(|(_, id)| *id)
+            .chain(older_unasked.iter().copied())
+            .collect();
+        assert!(state
+            .lsp_settled_guesses
+            .lock()
+            .unwrap()
+            .is_superset(&retired));
+        state.save_snapshot().unwrap();
+        let held = authority_relations(&state);
+        assert_eq!(
+            between(held.clone(), true),
+            current,
+            "authority retires the older ids and holds each edge once"
+        );
+        assert_eq!(unasked_ids(&held), current_unasked);
+        assert_eq!(between(held, false), linker, "and keeps the linker's edge");
+        let binding = state.local_repository_authority_binding().unwrap();
+        let authority = binding.open_manager().unwrap();
+        let lease = authority.read_authority();
+        let marks: Vec<String> = lease
+            .workspace_enrichment_marks(&binding.workspace_id())
+            .iter()
+            .map(|mark| mark.path.clone())
+            .collect();
+        assert_eq!(marks, ["app/run.py"], "the file is still marked finished");
+        let ledger = lease
+            .workspace_graph_snapshot(&binding.workspace_id())
+            .unwrap()
+            .unwrap()
+            .resolution_records
+            .get(&kin_model::ResolutionRecordId::call_sites(caller))
+            .and_then(|record| record.as_call_sites().cloned())
+            .expect("authority holds the caller's ledger");
+        assert!(
+            ledger.sites.iter().any(|site| site.state
+                == kin_model::CallSiteState::ProvenTarget {
+                    target: alpha_close
+                }),
+            "the ledger's proof is carried by the edge under its current id: {ledger:#?}"
+        );
+        assert!(state.lsp_settled_guesses.lock().unwrap().is_empty());
+    }
+
+    /// Every kind of language-server edge an older build keyed under another
+    /// id is replaced rather than doubled when a pass offers it again. The
+    /// edge is held once, under its current id, with the sites of both
+    /// records, and where both prove a site under a proof context the offer's
+    /// record stands. The old id leaves the live graph and authority, a
+    /// parser's edge of the same kind between the same ends stays, and a
+    /// second offer writes nothing.
+    #[tokio::test]
+    async fn every_language_server_kind_replaces_the_edge_an_older_build_keyed() {
+        use kin_model::{
+            ContextValidationState, EntityStore as _, FilePathId, GraphNodeId, Hash256, LanguageId,
+            ProofContext, Relation, RelationEvidence, RelationKind, RelationOrigin,
+            ResolutionRecord, ResolutionRecordId, SourceSpan,
+        };
+        use std::collections::{HashMap, HashSet};
+
+        let (_root, state, _) = closing_client_fixture().await;
+        let src = entity_named(&state, "run", "app/run.py");
+        let dst = entity_named(&state, "Beta.send", "app/beta.py");
+        let context = |version: &str| ProofContext {
+            language: LanguageId::Python,
+            resolver: "lsp:fixture".into(),
+            resolver_version: version.into(),
+            configuration_hash: Hash256::from_bytes([1; 32]),
+            environment_hash: Hash256::from_bytes([2; 32]),
+            environment_summary: "legacy relation identity fixture".into(),
+        };
+        let old_proof = context("previous");
+        let new_proof = context("current");
+        let old_context = ResolutionRecordId::proof_context(&old_proof).context_token();
+        let new_context = ResolutionRecordId::proof_context(&new_proof).context_token();
+        assert_ne!(old_context, new_context);
+        // Older producers recorded line/column evidence without byte offsets.
+        // Keep that real legacy shape. A context refresh still requires the
+        // canonical persisted contexts and the current validation that the
+        // production settlement path installs, not arbitrary ctx UUIDs.
+        assert!(super::install_resolution_nodes_locked(
+            &state,
+            &[],
+            &[ResolutionRecord::ProofContext(old_proof.clone())],
+        ));
+        super::record_context_validation(
+            &state,
+            LanguageId::Python,
+            ContextValidationState::Validated { context: old_proof },
+        );
+        let site = |line: u32, token: Option<&String>| RelationEvidence {
+            source_span: Some(SourceSpan {
+                file: FilePathId::new("app/run.py"),
+                start_byte: 0,
+                end_byte: 0,
+                start_line: line,
+                start_col: 4,
+                end_line: line,
+                end_col: 10,
+            }),
+            parser_rule: Some("lsp_references".to_string()),
+            token: token.cloned(),
+            ..RelationEvidence::default()
+        };
+        let edge = |kind, id, origin, evidence| Relation {
+            id,
+            kind,
+            src: GraphNodeId::Entity(src),
+            dst: GraphNodeId::Entity(dst),
+            confidence: 0.95,
+            origin,
+            created_in: None,
+            import_source: None,
+            evidence,
+        };
+        let kinds = [
+            RelationKind::Calls,
+            RelationKind::References,
+            RelationKind::UsesType,
+            RelationKind::Overrides,
+        ];
+        let current_id =
+            |kind| kin_lsp::relation_identity::language_server_relation_id(kind, src, dst);
+        let mut legacy = HashMap::new();
+        let mut parsed = Vec::new();
+        for kind in kinds {
+            let old = legacy_language_server_relation_id(kind, src, dst);
+            assert_ne!(old, current_id(kind));
+            state
+                .graph
+                .upsert_relation(&edge(
+                    kind,
+                    old,
+                    RelationOrigin::Lsp,
+                    vec![site(1, None), site(2, Some(&old_context))],
+                ))
+                .unwrap();
+            legacy.insert(kind, old);
+            let parser_edge = edge(
+                kind,
+                kin_model::RelationId::from_content(
+                    &src.to_string(),
+                    &dst.to_string(),
+                    &format!("{kind:?}"),
+                ),
+                RelationOrigin::Parsed,
+                vec![site(1, None)],
+            );
+            state.graph.upsert_relation(&parser_edge).unwrap();
+            parsed.push(parser_edge);
+        }
+        state.save_snapshot().unwrap();
+        let language_server_ids = |relations: Vec<Relation>| {
+            relations
+                .into_iter()
+                .filter(|relation| {
+                    relation.origin == RelationOrigin::Lsp
+                        && relation.src == GraphNodeId::Entity(src)
+                        && relation.dst == GraphNodeId::Entity(dst)
+                })
+                .map(|relation| relation.id)
+                .collect::<HashSet<_>>()
+        };
+        assert_eq!(
+            language_server_ids(authority_relations(&state)),
+            legacy.values().copied().collect(),
+            "authority holds the edges under the older build's ids"
+        );
+
+        assert!(super::install_resolution_nodes_locked(
+            &state,
+            &[],
+            &[ResolutionRecord::ProofContext(new_proof.clone())],
+        ));
+        super::record_context_validation(
+            &state,
+            LanguageId::Python,
+            ContextValidationState::Validated {
+                context: new_proof.clone(),
+            },
+        );
+        assert_eq!(
+            state
+                .graph
+                .get_resolution_record(&ResolutionRecordId::context_validation(LanguageId::Python))
+                .unwrap()
+                .as_context_validation()
+                .unwrap()
+                .current_context(),
+            Some(ResolutionRecordId::proof_context(&new_proof))
+        );
+        let offers: Vec<Relation> = kinds
+            .into_iter()
+            .map(|kind| {
+                edge(
+                    kind,
+                    current_id(kind),
+                    RelationOrigin::Lsp,
+                    vec![site(2, Some(&new_context)), site(3, None)],
+                )
+            })
+            .collect();
+        assert_eq!(
+            super::install_lsp_relations(&state, &offers),
+            super::EnrichmentWrite {
+                published: kinds.len(),
+                offered: kinds.len(),
+                vector_stale: 0,
+            }
+        );
+        let live = state.graph.get_all_relations_for_entity(&src).unwrap();
+        assert_eq!(
+            language_server_ids(live.clone()),
+            kinds.into_iter().map(current_id).collect(),
+            "each edge is held once, under its current id"
+        );
+        for relation in live.iter().filter(|relation| {
+            relation.origin == RelationOrigin::Lsp && relation.dst == GraphNodeId::Entity(dst)
+        }) {
+            assert_eq!(
+                relation.evidence,
+                vec![site(1, None), site(2, Some(&new_context)), site(3, None)],
+                "{:?} carries both records' sites, the offer's at the site both proved",
+                relation.kind
+            );
+        }
+        for parser_edge in &parsed {
+            assert_eq!(
+                live.iter().find(|relation| relation.id == parser_edge.id),
+                Some(parser_edge),
+                "the parser's {:?} edge between the same ends stays",
+                parser_edge.kind
+            );
+        }
+        assert_eq!(
+            *state.lsp_settled_guesses.lock().unwrap(),
+            legacy.values().copied().collect(),
+            "authority is told which ids went"
+        );
+
+        state.save_snapshot().unwrap();
+        let published = authority_relations(&state);
+        assert!(
+            published
+                .iter()
+                .all(|relation| !kin_index::binding_debt::claims_local_binding_debt(relation)),
+            "canonical rekey and validated context refresh retain every old occurrence"
+        );
+        assert_eq!(
+            language_server_ids(published),
+            kinds.into_iter().map(current_id).collect(),
+            "authority retires every older id and holds each edge once"
+        );
+        assert!(state.lsp_settled_guesses.lock().unwrap().is_empty());
+        assert_eq!(
+            super::install_lsp_relations(&state, &offers),
+            super::EnrichmentWrite::default(),
+            "a second offer finds each edge held and writes nothing"
+        );
+    }
+
     /// The linker's name-only guesses a language server contradicted at their
     /// call site leave the graph, the proven call takes their place, authority
     /// learns both in one publication together with the file's completion
-    /// mark, and a second sweep over the same file changes nothing. A restart
+    /// mark, and a second sweep preserves those bindings. A new unverified
+    /// resolver session may refresh its proof context. A restart
     /// opens on the settled graph and resumes past the file. Its startup
     /// re-derivation binds the guesses again from the same bytes, retires the
     /// file's marker as every re-derivation does, and the next sweep settles
-    /// the file again without publishing anything new.
+    /// the file again without changing the settlement.
     ///
     /// `run` imports `Alpha`, so the linker binds each `client.<method>()` to
     /// `Alpha`'s method of that name by the name alone. The server answers
@@ -11546,7 +14201,10 @@ mod tests {
     /// stay exactly as the linker left them.
     #[tokio::test]
     async fn a_contradicted_name_only_guess_is_retired_published_and_stays_retired() {
-        use kin_model::{EntityStore as _, GraphNodeId, RelationKind, RelationOrigin};
+        use kin_model::{
+            EntityStore as _, GraphNodeId, LanguageId, RelationKind, RelationOrigin,
+            ResolutionRecordId,
+        };
 
         let root = tempfile::tempdir().unwrap();
         // The scripted server answers by column alone, so each answered callee
@@ -11680,6 +14338,51 @@ mod tests {
                 .map(|mark| mark.path.clone())
                 .collect::<Vec<_>>()
         };
+        // Each scripted pass starts a new Python interpreter. On platforms
+        // where its content cannot identify the resolver, the real launch path
+        // assigns a fresh context rather than reusing unverified session proof.
+        let recorded_context = |state: &super::DaemonState| {
+            let validation = state
+                .graph
+                .get_resolution_record(&ResolutionRecordId::context_validation(LanguageId::Python))
+                .unwrap();
+            let id = validation
+                .as_context_validation()
+                .unwrap()
+                .current_context()
+                .unwrap();
+            let record = state.graph.get_resolution_record(&id).unwrap();
+            let context = record.as_proof_context().unwrap().clone();
+            assert_eq!(context.language, LanguageId::Python);
+            assert_eq!(ResolutionRecordId::proof_context(&context), id);
+            (id, context)
+        };
+        let calls_without_validated_context =
+            |calls: &[kin_model::Relation], context: ResolutionRecordId| {
+                let mut normalized = calls.to_vec();
+                for relation in &mut normalized {
+                    if relation.origin == RelationOrigin::Lsp {
+                        for evidence in &mut relation.evidence {
+                            let id = evidence
+                                .token
+                                .as_deref()
+                                .and_then(ResolutionRecordId::from_context_token)
+                                .expect("every scripted proof names its recorded context");
+                            assert_eq!(id, context, "the proof must match current validation");
+                            evidence.token = None;
+                        }
+                    }
+                }
+                normalized
+            };
+        let same_configuration_except_session =
+            |before: &kin_model::ProofContext, after: &kin_model::ProofContext| {
+                let mut normalized = after.clone();
+                // The resolver's per-start content fallback is part of this hash.
+                // Language, resolver/version and environment must remain exact.
+                normalized.configuration_hash = before.configuration_hash;
+                assert_eq!(&normalized, before);
+            };
         // Everything the settled file should say, read off one graph.
         let assert_settled = |state: &super::DaemonState, when: &str| {
             let caller = named(state, "run", "app/run.py");
@@ -11707,7 +14410,7 @@ mod tests {
             calls
         };
 
-        {
+        let published_context = {
             let state = super::DaemonState::open(layout.clone()).unwrap();
             crate::loop_runner::sync_filesystem_with_graph(&state)
                 .await
@@ -11746,6 +14449,8 @@ mod tests {
                 sweep_one_file(&state, root.path(), "app/run.py", &responses, true).await;
             assert!(written.published > 0);
             let settled = assert_settled(&state, "after the first sweep");
+            let (first_id, first_context) = recorded_context(&state);
+            let settled_semantics = calls_without_validated_context(&settled, first_id);
             assert_eq!(
                 helpers(&settled),
                 helpers(&before),
@@ -11771,20 +14476,41 @@ mod tests {
                 true,
             ));
 
-            // Sweep two, in the same process: nothing left to settle, nothing
-            // written, nothing published.
+            // Sweep two has nothing left to settle. A new unverified resolver
+            // session may still refresh its context, which must be published.
+            // A completed pass must also refresh the durable completion mark:
+            // it seals the exact context and ledger payload, not just the file.
             let (again, _) =
-                sweep_one_file(&state, root.path(), "app/run.py", &responses, false).await;
+                sweep_one_file(&state, root.path(), "app/run.py", &responses, true).await;
             assert_eq!(
                 again.published, 0,
                 "a second sweep over a settled file writes nothing"
             );
             assert!(state.lsp_settled_guesses.lock().unwrap().is_empty());
-            assert_eq!(calls_from(&state, caller), settled);
+            let (second_id, second_context) = recorded_context(&state);
+            same_configuration_except_session(&first_context, &second_context);
+            assert_eq!(
+                calls_without_validated_context(&calls_from(&state, caller), second_id),
+                settled_semantics,
+                "all relation and evidence fields except validated session context stay exact"
+            );
             let published = generation(&state);
             state.save_snapshot().unwrap();
-            assert_eq!(generation(&state), published, "and publishes nothing");
-        }
+            assert_eq!(
+                generation(&state),
+                published + 1,
+                "completion and any refreshed context publish atomically once"
+            );
+            assert!(state.lsp_pending_marks.lock().unwrap().is_empty());
+            let completed = generation(&state);
+            state.save_snapshot().unwrap();
+            assert_eq!(
+                generation(&state),
+                completed,
+                "a second save with no new proof or completion is an exact publication no-op"
+            );
+            (second_id, second_context)
+        };
 
         // A restart loads what authority committed: the retirement holds.
         let state = super::DaemonState::open(layout).unwrap();
@@ -11821,14 +14547,18 @@ mod tests {
                         .contains_key("app/run.py")),
             "a re-derivation that brings a retired guess back must leave its file owed a sweep"
         );
+        let (before_id, before_context) = published_context;
         let (_, _) = sweep_one_file(&state, root.path(), "app/run.py", &responses, false).await;
-        assert_settled(&state, "after the sweep that follows a restart");
+        let restarted_calls = assert_settled(&state, "after the sweep that follows a restart");
+        let (after_id, after_context) = recorded_context(&state);
+        same_configuration_except_session(&before_context, &after_context);
+        calls_without_validated_context(&restarted_calls, after_id);
         let committed = generation(&state);
         state.save_snapshot().unwrap();
         assert_eq!(
             generation(&state),
-            committed,
-            "authority already holds this settlement, so re-proving it publishes nothing"
+            committed + u64::from(before_id != after_id),
+            "authority already holds the settlement; only a changed proof context is published"
         );
         // An edit to the file that declares the retired destinations re-links
         // this caller's calls too. The same rule holds: a guess that comes back
@@ -11865,6 +14595,294 @@ mod tests {
             &state,
             "after the sweep that follows an edit to the destination",
         );
+    }
+
+    /// A store whose `run` makes three receiver calls the linker binds to
+    /// `Alpha` by name alone and two calls to functions declared beside it,
+    /// and a scripted server that answers `send` outside the repository and
+    /// `close` at `Beta.close`. A sweep over
+    /// `app/run.py` retires both contradicted guesses and proves one call in
+    /// their place, so `Calls` falls by one while every entity stays.
+    fn census_settlement_fixture() -> (tempfile::TempDir, kin_core::KinLayout, serde_json::Value) {
+        let root = tempfile::tempdir().unwrap();
+        let run = [
+            "from app.alpha import Alpha",
+            "",
+            "",
+            "def run(client):",
+            "    client.send(1)",
+            "    xx = client.close()",
+            "    yyy = client.open()",
+            "    first(2)",
+            "    second(3)",
+            "",
+            "",
+            "def first(x):",
+            "    return x",
+            "",
+            "",
+            "def second(x):",
+            "    return x",
+            "",
+        ]
+        .join("\n");
+        let class = |name: &str| {
+            [
+                format!("class {name}:"),
+                "    def send(self, x):".into(),
+                "        return x".into(),
+                String::new(),
+                "    def close(self):".into(),
+                "        return None".into(),
+                String::new(),
+                "    def open(self):".into(),
+                "        return None".into(),
+                String::new(),
+            ]
+            .join("\n")
+        };
+        std::fs::create_dir(root.path().join("app")).unwrap();
+        std::fs::write(root.path().join("app/__init__.py"), "").unwrap();
+        std::fs::write(root.path().join("app/run.py"), &run).unwrap();
+        std::fs::write(root.path().join("app/alpha.py"), class("Alpha")).unwrap();
+        std::fs::write(root.path().join("app/beta.py"), class("Beta")).unwrap();
+        let layout = kin_core::init(root.path()).unwrap().layout;
+
+        let uri = kin_lsp::protocol::path_to_uri(&root.path().join("app/run.py"));
+        let beta_uri = kin_lsp::protocol::path_to_uri(&root.path().join("app/beta.py"));
+        let column = |line: usize, token: &str| run.lines().nth(line).unwrap().find(token).unwrap();
+        let at = |uri: &str, line: u32, start: u32, end: u32| {
+            serde_json::json!({"result": [{"uri": uri, "range": {
+                "start": {"line": line, "character": start},
+                "end": {"line": line, "character": end}}}]})
+        };
+        let mut responses = serde_json::json!({"initialize": {"result": {"capabilities": {
+            "definitionProvider": true, "callHierarchyProvider": false
+        }}}});
+        responses[format!("textDocument/definition@{uri}#{}", column(4, "send"))] = at(
+            "file:///opt/python/lib/python3.12/site-packages/httpx/_client.py",
+            40,
+            8,
+            12,
+        );
+        responses[format!("textDocument/definition@{uri}#{}", column(5, "close"))] =
+            at(&beta_uri, 4, 8, 13);
+        (root, layout, responses)
+    }
+
+    /// The census as `kin upgrade` leaves it: the re-derived graph, made the
+    /// baseline whatever came before.
+    fn rebaseline_census_as_an_upgrade_does(state: &super::DaemonState) -> u64 {
+        let (kinds, entities) =
+            kin_cli::commands::graph::measure_relation_census_with_entities(&state.graph).unwrap();
+        let calls = kinds.get("Calls").copied().unwrap_or(0);
+        kin_core::relation_census::rebaseline(
+            &state.layout,
+            &kin_core::relation_census::RelationCensus::new(
+                chrono::Utc::now(),
+                kin_core::relation_census::CensusSource::Commit,
+                kinds,
+                Vec::new(),
+            )
+            .with_entities(entities),
+        )
+        .unwrap();
+        calls
+    }
+
+    fn census_calls(state: &super::DaemonState) -> u64 {
+        kin_cli::commands::graph::measure_relation_census_with_entities(&state.graph)
+            .unwrap()
+            .0
+            .get("Calls")
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn baseline_calls(layout: &kin_core::KinLayout) -> u64 {
+        match kin_core::relation_census::read(layout) {
+            kin_core::relation_census::RelationCensusRead::Recorded(recorded) => {
+                recorded.kinds.get("Calls").copied().unwrap_or(0)
+            }
+            other => panic!("the store records a census baseline, got {other:?}"),
+        }
+    }
+
+    /// The sweep after an upgrade retires the name-only guesses the
+    /// re-derivation bound again. `Calls` falls with no entity removed, and
+    /// before the census credited those retirements it held the store below
+    /// the upgrade's baseline forever, so every answer read degraded through
+    /// `relation_census_loss`. Now the sweep's census settles, and neither a
+    /// restart nor the sweeps after it report a loss.
+    #[tokio::test]
+    async fn a_sweep_that_retires_contradicted_guesses_reports_no_census_loss_across_a_restart() {
+        let (root, layout, responses) = census_settlement_fixture();
+        let no_hold = |when: &str| {
+            assert_eq!(
+                kin_core::relation_census::CensusHold::read(layout.root()),
+                None,
+                "{when}: proven retirements are not lost relation ground"
+            );
+        };
+        {
+            let state = super::DaemonState::open(layout.clone()).unwrap();
+            crate::loop_runner::sync_filesystem_with_graph(&state)
+                .await
+                .unwrap();
+            let upgraded = rebaseline_census_as_an_upgrade_does(&state);
+
+            let (written, _) =
+                sweep_one_file(&state, root.path(), "app/run.py", &responses, true).await;
+            assert!(written.published > 0, "the sweep proved the close call");
+            let swept = census_calls(&state);
+            assert!(
+                swept < upgraded,
+                "the sweep must lower Calls over the upgrade's baseline for this test to prove \
+                 anything: {upgraded} to {swept}"
+            );
+            assert_eq!(
+                state.census_settled_retirements(),
+                [("Calls".to_string(), 2)].into_iter().collect(),
+                "the contradicted send and close guesses are counted as proven retirements"
+            );
+
+            crate::background_work::record_relation_census(
+                &state,
+                &state.graph,
+                kin_core::relation_census::CensusSource::Sweep,
+            );
+            no_hold("after the sweep");
+            assert_eq!(
+                baseline_calls(&layout),
+                swept,
+                "the settled census advanced"
+            );
+            assert!(
+                state.census_settled_retirements().is_empty(),
+                "the census accounted for what it credited"
+            );
+            state.save_snapshot().unwrap();
+        }
+
+        // A restart opens on the settled graph. Whatever its startup sync
+        // re-derives, and whatever the next sweep settles again, no pass after
+        // it reports a loss.
+        {
+            let state = super::DaemonState::open(layout.clone()).unwrap();
+            crate::background_work::record_relation_census(
+                &state,
+                &state.graph,
+                kin_core::relation_census::CensusSource::Commit,
+            );
+            no_hold("on reopen");
+            crate::loop_runner::sync_filesystem_with_graph(&state)
+                .await
+                .unwrap();
+            crate::background_work::record_relation_census(
+                &state,
+                &state.graph,
+                kin_core::relation_census::CensusSource::Commit,
+            );
+            no_hold("after the startup sync");
+            let (_, _) = sweep_one_file(&state, root.path(), "app/run.py", &responses, false).await;
+            crate::background_work::record_relation_census(
+                &state,
+                &state.graph,
+                kin_core::relation_census::CensusSource::Sweep,
+            );
+            no_hold("after the sweep that follows the restart");
+            state.save_snapshot().unwrap();
+        }
+
+        let state = super::DaemonState::open(layout.clone()).unwrap();
+        crate::background_work::record_relation_census(
+            &state,
+            &state.graph,
+            kin_core::relation_census::CensusSource::Sweep,
+        );
+        no_hold("after a second restart");
+    }
+
+    /// Proof excuses exactly the edges it retired. Call edges that leave the
+    /// graph with no language-server answer behind them are still lost
+    /// ground, in the same pass as a settlement and over an entity count that
+    /// held, and the census still holds and says so.
+    ///
+    /// The sweep retired two guesses and proved one call in their place, so
+    /// it has one edge of slack against its credit. Every call `run` still
+    /// holds that no server proved then leaves by hand, which is more than
+    /// that slack, and nothing retired them.
+    #[tokio::test]
+    async fn calls_lost_without_proof_still_hold_the_census_beside_a_settlement() {
+        use kin_model::EntityStore as _;
+
+        let (root, layout, responses) = census_settlement_fixture();
+        let state = super::DaemonState::open(layout.clone()).unwrap();
+        crate::loop_runner::sync_filesystem_with_graph(&state)
+            .await
+            .unwrap();
+        let upgraded = rebaseline_census_as_an_upgrade_does(&state);
+        let (_, _) = sweep_one_file(&state, root.path(), "app/run.py", &responses, true).await;
+        assert_eq!(
+            state.census_settled_retirements(),
+            [("Calls".to_string(), 2)].into_iter().collect()
+        );
+
+        let run = state
+            .graph
+            .list_all_entities()
+            .unwrap()
+            .into_iter()
+            .find(|entity| entity.name == "run" && entity.kind != kin_model::EntityKind::Module)
+            .expect("the fixture declares run")
+            .id;
+        let unproven: Vec<kin_model::RelationId> = state
+            .graph
+            .get_all_relations_for_entity(&run)
+            .unwrap()
+            .into_iter()
+            .filter(|relation| {
+                relation.kind == kin_model::RelationKind::Calls
+                    && relation.src == kin_model::GraphNodeId::Entity(run)
+                    && relation.origin != kin_model::RelationOrigin::Lsp
+            })
+            .map(|relation| relation.id)
+            .collect();
+        assert!(
+            unproven.len() >= 2,
+            "run must hold more unproven calls than the settlement's slack for this test to \
+             prove anything: {unproven:?}"
+        );
+        for id in &unproven {
+            state.graph.remove_relation(id).unwrap();
+        }
+
+        crate::background_work::record_relation_census(
+            &state,
+            &state.graph,
+            kin_core::relation_census::CensusSource::Sweep,
+        );
+        let hold = kin_core::relation_census::CensusHold::read(layout.root())
+            .expect("a call lost without proof holds the census");
+        assert!(
+            hold.summary().contains("Calls ")
+                && hold
+                    .summary()
+                    .contains("beyond the 2 edges exact language-server proof"),
+            "the hold names the unexplained fall and the retirements it already credited: {}",
+            hold.summary()
+        );
+        assert_eq!(
+            hold.settled,
+            [("Calls".to_string(), 2)].into_iter().collect(),
+            "the hold carries the credit for the pass after it"
+        );
+        assert_eq!(
+            baseline_calls(&layout),
+            upgraded,
+            "the baseline stays where the upgrade left it"
+        );
+        assert!(state.census_settled_retirements().is_empty());
     }
 
     /// A file whose every query was declined, with none answered, is owed; a
@@ -11934,7 +14952,7 @@ mod tests {
             false
         ));
         assert_eq!(
-            super::settle_owed_files(&state, &inputs, &completed, &failed, &Default::default()),
+            super::settle_owed_files(&state, &inputs, &completed, &failed, &Default::default(), 0),
             1
         );
 
@@ -11983,7 +15001,7 @@ mod tests {
             false
         ));
         assert_eq!(
-            super::settle_owed_files(&state, &inputs, &retried, &[], &Default::default()),
+            super::settle_owed_files(&state, &inputs, &retried, &[], &Default::default(), 0),
             0
         );
         assert!(crate::owed_enrichment::load(&state.layout).is_empty());
@@ -12013,6 +15031,167 @@ mod tests {
             buffer.pop_front(),
             Some(LspEnrichmentMessage::Sweep)
         ));
+    }
+
+    #[tokio::test]
+    async fn blocked_owed_files_back_off_without_creating_debt_or_completion() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("owed.py"), "def owed():\n    return 1\n").unwrap();
+        let state = super::DaemonState::open(kin_core::init(root.path()).unwrap().layout).unwrap();
+        crate::loop_runner::sync_filesystem_with_graph(&state)
+            .await
+            .unwrap();
+        let inputs = super::lsp_publication::QueryInputs::capture(&state)
+            .await
+            .unwrap();
+        let blob = inputs.blob("owed.py").unwrap();
+        crate::owed_enrichment::record_failure(
+            &mut state.lsp_owed_files.lock().unwrap(),
+            "owed.py",
+            &blob,
+            Some("previous-server"),
+            "timeout".into(),
+            0,
+        );
+        for (index, reason) in [
+            "the language server did not start",
+            "this build wires no language server",
+            "the language server is unavailable for this pass",
+            "the graph source could not be loaded from authority",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            state
+                .lsp_owed_files
+                .lock()
+                .unwrap()
+                .get_mut("owed.py")
+                .unwrap()
+                .last_attempt_unix_s = 0;
+            let previous = state.lsp_owed_files.lock().unwrap().clone();
+            let mut failed = Vec::new();
+            let mut contexts = std::collections::HashMap::from([(
+                "owed.py".to_owned(),
+                "previous-server".to_owned(),
+            )]);
+            for file in ["owed.py", "optional.py"] {
+                super::remember_blocked_sweep_debt(
+                    &previous,
+                    &mut failed,
+                    &mut contexts,
+                    file,
+                    reason.to_owned(),
+                );
+            }
+            assert_eq!(
+                failed.len(),
+                1,
+                "an absent optional adapter creates no new obligation"
+            );
+            assert!(
+                contexts.is_empty(),
+                "no proof context answered the blocked attempt"
+            );
+            assert_eq!(
+                super::settle_owed_files(&state, &inputs, &[], &failed, &contexts, 30_000),
+                1
+            );
+            let owed = crate::owed_enrichment::load(&state.layout);
+            let entry = &owed["owed.py"];
+            assert_eq!(entry.reason, reason);
+            assert_eq!(entry.attempts, index as u32 + 1);
+            assert_eq!(entry.context, None);
+            assert_eq!(
+                crate::owed_enrichment::next_retry_delay(&owed, entry.last_attempt_unix_s),
+                Some(crate::owed_enrichment::retry_interval(entry.attempts))
+            );
+            assert!(!super::file_already_enriched(&state, "owed.py"));
+        }
+        let completed = vec!["owed.py".to_owned()];
+        assert!(super::mark_completed_sweep_files(
+            &state,
+            &completed,
+            super::current_marker_epoch(&state),
+            super::EnrichmentWrite::all_published(0),
+            false
+        ));
+        assert_eq!(
+            super::settle_owed_files(
+                &state,
+                &inputs,
+                &completed,
+                &[],
+                &Default::default(),
+                30_000
+            ),
+            0
+        );
+        assert!(crate::owed_enrichment::load(&state.layout).is_empty());
+    }
+
+    #[test]
+    fn refused_input_capture_persists_a_new_deadline_for_existing_debt() {
+        let root = tempfile::tempdir().unwrap();
+        let state = super::DaemonState::open(kin_core::init(root.path()).unwrap().layout).unwrap();
+        crate::owed_enrichment::record_failure(
+            &mut state.lsp_owed_files.lock().unwrap(),
+            "owed.py",
+            "admitted-blob",
+            Some("old-context"),
+            "timeout".into(),
+            1_000,
+        );
+        super::defer_unattempted_sweep_debt(&state, 1_300, "source authority unavailable", 1_300);
+        let owed = crate::owed_enrichment::load(&state.layout);
+        assert_eq!(owed["owed.py"].blob, "admitted-blob");
+        assert_eq!(owed["owed.py"].last_attempt_unix_s, 1_300);
+        assert_eq!(owed["owed.py"].reason, "source authority unavailable");
+        assert_eq!(
+            crate::owed_enrichment::next_retry_delay(&owed, 1_300),
+            Some(Duration::from_secs(300))
+        );
+        assert!(!super::file_already_enriched(&state, "owed.py"));
+    }
+
+    #[tokio::test]
+    async fn cancelled_lsp_queries_remain_retryable_protocol_failures() {
+        let mut outcomes = super::QueryOutcomes::default();
+        let mut tally = super::SweepTally::default();
+        for code in [-32800, -32801, -32802] {
+            let error = || {
+                kin_lsp::LspError::JsonRpc(
+                    serde_json::json!({"code": code, "message": "retry this request"}).to_string(),
+                )
+            };
+            let result = super::lsp_query_within_budget(
+                "references",
+                async { Err::<(), _>(error()) },
+                Duration::from_secs(1),
+                &mut outcomes,
+            )
+            .await;
+            assert_eq!(result, None);
+            let (_, failure, _, ending) = super::file_definitions_within_budget(
+                async { Err(error()) },
+                Duration::from_secs(1),
+                "owed.py",
+                &mut tally,
+            )
+            .await;
+            assert!(failure.is_some());
+            assert_eq!(
+                ending,
+                crate::call_site_ledger::PassEnding::Stopped(
+                    kin_model::ServerFailure::ProtocolError
+                )
+            );
+        }
+        assert_eq!(outcomes.failures, 3);
+        assert_eq!(outcomes.transient_failures, 3);
+        assert_eq!(outcomes.retryable_protocol_failures, 3);
+        assert_eq!(tally.transient_failures, 3);
+        assert_eq!(tally.retryable_protocol_failures, 3);
     }
 
     #[tokio::test]
@@ -12071,6 +15250,10 @@ mod tests {
             None
         );
         assert_eq!(outcomes.failures, 3);
+        assert_eq!(
+            outcomes.transient_failures, 2,
+            "only the lost server and timeout are transient"
+        );
         assert_eq!(outcomes.declines, 0);
         // A code-0 error the client did not recognize as a decline is a
         // failure: gopls sends "no package metadata" exactly that way.
@@ -12199,6 +15382,455 @@ while True:
     data=json.dumps({'jsonrpc':'2.0','id':msg['id'],'result':result}).encode()
     sys.stdout.buffer.write(f'Content-Length: {len(data)}\r\n\r\n'.encode()+data);sys.stdout.buffer.flush()
 "#;
+
+    #[tokio::test(start_paused = true)]
+    async fn lsp_answer_observer_keeps_zero_relation_queries_live_but_not_a_hung_pass() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let supervisor =
+            crate::background_work::BackgroundWorkSupervisor::new(Duration::from_secs(6));
+        let pass = supervisor.pass(crate::background_work::PASS_LSP);
+        pass.working(tokio::time::Instant::now().into_std());
+        let responses = AtomicU64::new(0);
+        let queries = async {
+            for _ in 0..3 {
+                tokio::time::sleep(Duration::from_secs(4)).await;
+                responses.fetch_add(1, Ordering::Relaxed);
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            Vec::<kin_model::Relation>::new()
+        };
+        let watch = async {
+            for _ in 0..14 {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                assert!(supervisor
+                    .sweep(tokio::time::Instant::now().into_std())
+                    .is_empty());
+            }
+        };
+        let (relations, ()) = tokio::join!(
+            super::observe_lsp_answers(queries, || responses.load(Ordering::Relaxed), &pass),
+            watch,
+        );
+        assert!(relations.is_empty());
+        assert_eq!(
+            pass.progress(),
+            0,
+            "successful empty responses are not durable relation units"
+        );
+        let hung = super::observe_lsp_answers(
+            std::future::pending::<()>(),
+            || responses.load(Ordering::Relaxed),
+            &pass,
+        );
+        let watch = async {
+            tokio::time::sleep(Duration::from_secs(7)).await;
+            assert_eq!(
+                supervisor
+                    .sweep(tokio::time::Instant::now().into_std())
+                    .len(),
+                1,
+                "observer timer ticks must not keep an unanswered request alive"
+            );
+        };
+        tokio::select! {
+            _ = hung => panic!("the hung query cannot finish"),
+            _ = watch => {}
+        }
+        assert!(pass.halted());
+        assert_eq!(pass.progress(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lsp_stall_backoff_is_cancellable_and_cannot_clear_explicit_halts() {
+        let supervisor =
+            crate::background_work::BackgroundWorkSupervisor::new(Duration::from_secs(6));
+        let pass = supervisor.pass(crate::background_work::PASS_LSP);
+        let base = tokio::time::Instant::now().into_std();
+        pass.working(base);
+        assert_eq!(supervisor.sweep(base + Duration::from_secs(7)).len(), 1);
+        let reason = pass.halt_reason();
+        let (cancel_tx, mut cancel) = tokio::sync::watch::channel(false);
+        let cancellation = async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            cancel_tx.send(true).unwrap();
+        };
+        let (resumed, ()) = tokio::join!(
+            super::retry_lsp_supervisor_stall(
+                &pass,
+                &mut cancel,
+                Duration::from_secs(30),
+                Duration::from_secs(90)
+            ),
+            cancellation,
+        );
+        assert!(!resumed);
+        assert!(pass.halted());
+        assert_eq!(pass.halt_reason(), reason);
+        assert_eq!(pass.retry_spent(), Duration::ZERO);
+        let (_tx, mut uncancelled) = tokio::sync::watch::channel(false);
+        pass.halt("operator stop");
+        assert!(
+            !super::retry_lsp_supervisor_stall(
+                &pass,
+                &mut uncancelled,
+                Duration::ZERO,
+                Duration::from_secs(90)
+            )
+            .await
+        );
+    }
+
+    #[test]
+    fn lsp_stall_handoff_waits_for_a_full_channel_without_sticking_failed_work() {
+        use std::sync::atomic::Ordering;
+        let root = tempfile::tempdir().unwrap();
+        let mut state =
+            super::DaemonState::open(kin_core::init(root.path()).unwrap().layout).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        state.lsp_enrichment_tx = Some(tx);
+        state.queue_lsp_enrichment(crate::state::LspEnrichmentRequest {
+            file_id: kin_model::FilePathId::new("changed.py"),
+            changed_entity_ids: Vec::new(),
+        });
+        let supervisor =
+            crate::background_work::BackgroundWorkSupervisor::new(Duration::from_secs(6));
+        let pass = supervisor.pass(crate::background_work::PASS_LSP);
+        let base = std::time::Instant::now();
+        pass.working(base);
+        supervisor.sweep(base + Duration::from_secs(7));
+        let mut interrupted = Vec::new();
+        super::retain_supervisor_interruption(&pass, state.lsp_work.reserve(), &mut interrupted);
+        super::lsp_publication::request_fresh_sweep(&state);
+        super::drain_pending_lsp_sweep(&state);
+        let unrelated =
+            crate::state::LspEnrichmentMessage::Incremental(crate::state::LspEnrichmentRequest {
+                file_id: kin_model::FilePathId::new("other.py"),
+                changed_entity_ids: Vec::new(),
+            });
+        state.lsp_sweep_running.store(true, Ordering::SeqCst);
+        super::complete_lsp_recovery_handoffs(&state, &unrelated, &mut interrupted);
+        assert_eq!(
+            interrupted.len(),
+            1,
+            "a concurrent pre-send running reservation proves no handoff"
+        );
+        state.lsp_sweep_running.store(false, Ordering::SeqCst);
+        assert_eq!(
+            interrupted.len(),
+            1,
+            "a full channel has not accepted ownership"
+        );
+        assert!(state.lsp_sweep_pending.load(Ordering::SeqCst));
+        assert!(!state.lsp_sweep_running.load(Ordering::SeqCst));
+        assert_eq!(state.lsp_work.pending.load(Ordering::SeqCst), 2);
+        assert_eq!(state.lsp_work.failed.load(Ordering::SeqCst), 0);
+
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            crate::state::LspEnrichmentMessage::Incremental(_)
+        ));
+        let mut edit = state.lsp_work.resume();
+        edit.complete();
+        drop(edit);
+        super::drain_pending_lsp_sweep(&state);
+        assert_eq!(
+            interrupted.len(),
+            1,
+            "keep interruption accounting until the message is received"
+        );
+        let received = rx.try_recv().unwrap();
+        assert!(matches!(
+            received,
+            crate::state::LspEnrichmentMessage::Sweep
+        ));
+        super::complete_lsp_recovery_handoffs(&state, &received, &mut interrupted);
+        assert!(interrupted.is_empty());
+        assert!(!state.lsp_sweep_pending.load(Ordering::SeqCst));
+        assert_eq!(state.lsp_work.failed.load(Ordering::SeqCst), 0);
+        let mut retry = state.lsp_work.resume();
+        retry.complete();
+        super::complete_lsp_sweep(&state, 0);
+        drop(retry);
+        assert_eq!(state.lsp_work.pending.load(Ordering::SeqCst), 0);
+        assert_eq!(state.lsp_work.failed.load(Ordering::SeqCst), 0);
+        assert!(
+            !super::file_already_enriched(&state, "changed.py"),
+            "reservation completion is not a source or ledger completion mark"
+        );
+
+        // Cancellation before a handoff really abandons that reservation.
+        super::retain_supervisor_interruption(&pass, state.lsp_work.reserve(), &mut interrupted);
+        drop(interrupted);
+        assert_eq!(state.lsp_work.failed.load(Ordering::SeqCst), 1);
+        // A closed receiver cannot deliver the retry and must stay a failure.
+        drop(rx);
+        assert!(!state.queue_lsp_sweep());
+        assert_eq!(state.lsp_work.failed.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn an_unmarked_incremental_pass_queues_its_remaining_callers_without_another_edit() {
+        use super::incremental_enrichment::IncrementalPass;
+        use std::sync::atomic::Ordering;
+        let (_root, mut state, _) = closing_client_fixture().await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        state.lsp_enrichment_tx = Some(tx);
+        let partial = IncrementalPass::default();
+        assert!(super::request_incremental_remainder(&state, &partial));
+        super::drain_pending_lsp_sweep(&state);
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            crate::state::LspEnrichmentMessage::Sweep
+        ));
+        assert!(state.lsp_sweep_running.load(Ordering::SeqCst));
+        let mut work = state.lsp_work.resume();
+        work.complete();
+        drop(work);
+        super::complete_lsp_sweep(&state, 0);
+        assert!(!state.lsp_sweep_pending.load(Ordering::SeqCst));
+        assert!(
+            !super::file_already_enriched(&state, "app/run.py"),
+            "queue acceptance does not mint a completion mark"
+        );
+        assert!(!super::request_incremental_remainder(
+            &state,
+            &IncrementalPass {
+                marked: true,
+                ..Default::default()
+            }
+        ));
+        assert!(!super::request_incremental_remainder(
+            &state,
+            &IncrementalPass {
+                refused: Some(super::lsp_publication::Refused::UnprovenSource),
+                ..Default::default()
+            }
+        ));
+        assert!(rx.try_recv().is_err());
+        assert!(!state.lsp_sweep_pending.load(Ordering::SeqCst));
+        assert_eq!(state.lsp_work.pending.load(Ordering::SeqCst), 0);
+        assert_eq!(state.lsp_work.failed.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn lsp_supervisor_recovery_restarts_the_server_and_preserves_unfinished_work() {
+        use kin_model::LanguageId;
+        use std::sync::atomic::Ordering;
+        let root = tempfile::tempdir().unwrap();
+        let mut state =
+            super::DaemonState::open(kin_core::init(root.path()).unwrap().layout).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        state.lsp_enrichment_tx = Some(tx);
+        let server =
+            per_document_peer(root.path(), kin_lsp::adapters::Readiness::PerDocument).await;
+        server
+            .client
+            .request("before-restart", serde_json::Value::Null)
+            .await
+            .unwrap();
+        let mut servers = std::collections::HashMap::from([(LanguageId::Python, server)]);
+        let mut opened = std::collections::HashSet::from([LanguageId::Python]);
+        let supervisor =
+            crate::background_work::BackgroundWorkSupervisor::new(Duration::from_secs(6));
+        let pass = supervisor.pass(crate::background_work::PASS_LSP);
+        let base = std::time::Instant::now();
+        pass.working(base);
+        assert_eq!(supervisor.sweep(base + Duration::from_secs(7)).len(), 1);
+        crate::owed_enrichment::record_failure(
+            &mut state.lsp_owed_files.lock().unwrap(),
+            "owed.py",
+            "admitted-blob",
+            None,
+            "the pass was interrupted".into(),
+            1_000,
+        );
+        state.lsp_sweep_running.store(true, Ordering::SeqCst);
+        state.lsp_sweep_files_total.store(3, Ordering::SeqCst);
+        state.lsp_sweep_files_done.store(1, Ordering::SeqCst);
+        let tally = super::SweepTally {
+            enriched: 1,
+            ended_early: true,
+            ..Default::default()
+        };
+        assert!(!super::sweep_work_succeeded(
+            &tally,
+            3,
+            Default::default(),
+            false
+        ));
+        assert_eq!(
+            super::lsp_sweep_finish_message(true, false),
+            "LSP cold sweep interrupted; unfinished work remains owed"
+        );
+        super::complete_lsp_sweep(&state, (tally.blocked() + tally.not_visited(3)) as u64);
+        assert_eq!(
+            state.lsp_sweeps_completed.load(Ordering::SeqCst),
+            1,
+            "waiters must learn that the interrupted attempt ended"
+        );
+        assert_eq!(state.lsp_sweep_files_blocked.load(Ordering::SeqCst), 2);
+        let (_cancel_tx, mut cancel) = tokio::sync::watch::channel(false);
+        assert!(
+            super::recover_stalled_lsp_worker(
+                &state,
+                &pass,
+                &mut servers,
+                &mut opened,
+                &mut cancel,
+                Duration::ZERO
+            )
+            .await
+        );
+        assert!(servers.is_empty());
+        assert!(opened.is_empty());
+        assert!(!pass.halted());
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            crate::state::LspEnrichmentMessage::Sweep
+        ));
+        assert!(state.lsp_owed_files.lock().unwrap().contains_key("owed.py"));
+        assert!(!super::file_already_enriched(&state, "owed.py"));
+        let fresh = per_document_peer(root.path(), kin_lsp::adapters::Readiness::PerDocument).await;
+        let seen = peer_seen(&fresh).await;
+        assert!(!seen.iter().any(|method| method == "before-restart"));
+        let answer = super::observe_lsp_answers(
+            fresh
+                .client
+                .request("textDocument/references", serde_json::Value::Null),
+            || fresh.client.answered(),
+            &pass,
+        )
+        .await
+        .unwrap();
+        assert_eq!(answer, serde_json::json!([]));
+        assert_eq!(pass.progress(), 0);
+        super::stop_language_servers([(LanguageId::Python, fresh)], "test complete").await;
+        let mut retry_work = state.lsp_work.resume();
+        retry_work.complete();
+        super::complete_lsp_sweep(&state, 2);
+        assert_eq!(state.lsp_sweeps_completed.load(Ordering::SeqCst), 2);
+        assert!(
+            !super::file_already_enriched(&state, "owed.py"),
+            "a finished attempt and a successful empty query cannot certify the owed file"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_crashed_peer_is_replaced_and_its_file_retried_in_the_same_pass() {
+        use crate::sweep_retry::{Retry, SweepFiles};
+        use kin_model::{FilePathId, LanguageId};
+        const PEER: &str = r#"
+import json,pathlib,sys
+crashed=pathlib.Path(sys.argv[1])
+while True:
+    headers={}
+    while True:
+        line=sys.stdin.buffer.readline()
+        if not line: sys.exit(0)
+        if line in (b'\n',b'\r\n'): break
+        key,value=line.decode().split(':',1);headers[key.lower()]=value.strip()
+    msg=json.loads(sys.stdin.buffer.read(int(headers['content-length'])))
+    if msg.get('method')=='exit': sys.exit(0)
+    if 'id' not in msg: continue
+    if msg['method']=='textDocument/references' and not crashed.exists():
+        crashed.write_text('crashed once')
+        sys.exit(1)
+    result={'capabilities':{'referencesProvider':True}} if msg['method']=='initialize' else []
+    data=json.dumps({'jsonrpc':'2.0','id':msg['id'],'result':result}).encode()
+    sys.stdout.buffer.write(f'Content-Length: {len(data)}\r\n\r\n'.encode()+data);sys.stdout.buffer.flush()
+"#;
+        let root = tempfile::tempdir().unwrap();
+        let marker = root.path().join("crashed");
+        let language = LanguageId::Python;
+        let mut servers = std::collections::HashMap::new();
+        let mut opened = std::collections::HashSet::new();
+        let mut files = SweepFiles::new([FilePathId::new("b.py"), FilePathId::new("a.py")]);
+        let mut asked = Vec::new();
+        let mut starts = 0;
+        while let Some(file) = files.next() {
+            if !servers.contains_key(&language) {
+                let server = kin_lsp::lifecycle::LspServer::start(
+                    "python3",
+                    &["-u", "-c", PEER, marker.to_str().unwrap()],
+                    root.path(),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+                servers.insert(language, server);
+                opened.insert(language);
+                starts += 1;
+            }
+            asked.push(file.0.clone());
+            let answer = servers[&language]
+                .client
+                .request("textDocument/references", serde_json::Value::Null)
+                .await;
+            if answer.is_err() {
+                let reason = super::retire_disconnected_server(
+                    &mut servers,
+                    &mut opened,
+                    language,
+                    "scripted peer",
+                )
+                .await;
+                assert!(reason.is_some());
+                assert!(!opened.contains(&language));
+                assert_eq!(files.failed(&file, language, true, None), Retry::Queued);
+            } else {
+                files.completed(language);
+            }
+        }
+        super::stop_language_servers(servers, "test completed").await;
+        assert_eq!(starts, 2);
+        assert_eq!(asked, ["a.py", "a.py", "b.py"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_owed_retry_waits_for_the_deadline_and_none_when_empty() {
+        let root = tempfile::tempdir().unwrap();
+        let state = super::DaemonState::open(kin_core::init(root.path()).unwrap().layout).unwrap();
+        assert!(tokio::time::timeout(
+            Duration::from_secs(1),
+            super::wait_for_owed_retry(&state, 1_000)
+        )
+        .await
+        .is_err());
+        crate::owed_enrichment::record_failure(
+            &mut state.lsp_owed_files.lock().unwrap(),
+            "slow.py",
+            "blob",
+            None,
+            "timeout".into(),
+            1_000,
+        );
+        let start = tokio::time::Instant::now();
+        super::wait_for_owed_retry(&state, 1_000).await;
+        assert_eq!(start.elapsed(), crate::owed_enrichment::retry_interval(1));
+        state.lsp_owed_files.lock().unwrap().clear();
+        assert!(tokio::time::timeout(
+            Duration::from_secs(1),
+            super::wait_for_owed_retry(&state, 1_000)
+        )
+        .await
+        .is_err());
+    }
+
+    #[test]
+    fn retry_debt_is_kept_once_until_the_file_finishes() {
+        let mut owed = Vec::new();
+        super::remember_sweep_debt(&mut owed, "a.py", "timeout".into());
+        super::remember_sweep_debt(&mut owed, "b.py", "lost server".into());
+        super::remember_sweep_debt(&mut owed, "a.py", "second timeout".into());
+        assert_eq!(
+            owed,
+            [
+                ("a.py".into(), "second timeout".into()),
+                ("b.py".into(), "lost server".into())
+            ]
+        );
+    }
 
     /// A peer that answers like tsserver before any document is open: it
     /// refuses every workspace symbol request, answers a document's symbols,
@@ -12430,6 +16062,7 @@ while True:
                 root.path(),
                 Some(&documents),
                 arms,
+                Duration::from_secs(5),
             )
             .await;
             let seen = peer_seen(&server).await;
@@ -12447,6 +16080,313 @@ while True:
                 "{arms:?} still asks the entity's references: {seen:?}"
             );
         }
+    }
+
+    /// Several individually responsive RPCs can take more than the initial
+    /// aggregate allowance. The same source gets a larger bounded retry, and
+    /// only that completed attempt qualifies its file as finished.
+    #[tokio::test]
+    async fn uses_type_retry_finishes_sequential_queries_past_five_seconds() {
+        let root = tempfile::tempdir().unwrap();
+        let caller = peer_entity("run", "large.py", 0, 0);
+        let index = kin_lsp::EntityIndex::new(vec![caller.clone()], root.path());
+        let documents = |path: &str| (path == "large.py").then(|| "one two three\n".to_owned());
+        let responses = serde_json::json!({
+            "initialize": {"capabilities": {"typeDefinitionProvider": true,
+                                            "positionEncoding": "utf-16"}},
+            "textDocument/typeDefinition": [],
+        })
+        .to_string();
+        let peer = SEEN_PEER.replace("import json,sys", "import json,sys,time")
+            .replace("    result=seen", "    if msg['method']=='textDocument/typeDefinition': time.sleep(2)\n    result=seen");
+        let mut owed = crate::owed_enrichment::OwedFiles::new();
+        for expected_complete in [false, true] {
+            let budget = crate::owed_enrichment::uses_type_budget(
+                &owed,
+                "large.py",
+                Some("blob"),
+                "context",
+                0,
+            );
+            let server = kin_lsp::lifecycle::LspServer::start(
+                "python3",
+                &["-u", "-c", &peer, &responses],
+                root.path(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            let (_, outcomes) = super::enrich_single_entity(
+                &server,
+                &caller,
+                &index,
+                root.path(),
+                Some(&documents),
+                super::EntityArms::AllButCalls,
+                budget,
+            )
+            .await;
+            let seen = peer_seen(&server).await;
+            server.shutdown().await.unwrap();
+            let tally = super::SweepTally {
+                query_failures: outcomes.failures,
+                ..Default::default()
+            };
+            assert_eq!(
+                super::file_passes_completed(&tally, 0, 0),
+                expected_complete,
+                "{outcomes:?}"
+            );
+            if expected_complete {
+                assert_eq!(
+                    seen.iter()
+                        .filter(|method| *method == "textDocument/typeDefinition")
+                        .count(),
+                    3
+                );
+                assert_eq!(outcomes.transient_failures, 0);
+            } else {
+                assert_eq!(outcomes.transient_failures, 1);
+                crate::owed_enrichment::record_failure(
+                    &mut owed,
+                    "large.py",
+                    "blob",
+                    Some("context"),
+                    outcomes.first_failure.unwrap(),
+                    1,
+                );
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn uses_type_retry_cap_keeps_a_silent_server_owed() {
+        let mut owed = crate::owed_enrichment::OwedFiles::new();
+        for attempt in 1..=5 {
+            let budget = crate::owed_enrichment::uses_type_budget(
+                &owed,
+                "silent.py",
+                Some("blob"),
+                "context",
+                0,
+            );
+            let mut outcomes = super::QueryOutcomes::default();
+            let answer: Option<()> = super::lsp_query_within_budget(
+                "uses-type",
+                std::future::pending(),
+                budget,
+                &mut outcomes,
+            )
+            .await;
+            assert!(answer.is_none());
+            assert_eq!(outcomes.transient_failures, 1);
+            let tally = super::SweepTally {
+                query_failures: outcomes.failures,
+                ..Default::default()
+            };
+            assert!(!super::file_passes_completed(&tally, 0, 0));
+            crate::owed_enrichment::record_failure(
+                &mut owed,
+                "silent.py",
+                "blob",
+                Some("context"),
+                outcomes.first_failure.unwrap(),
+                attempt as u64,
+            );
+            assert_eq!(owed["silent.py"].attempts, attempt);
+            assert!(budget <= Duration::from_secs(45));
+            if attempt >= 3 {
+                assert_eq!(budget, Duration::from_secs(45));
+                assert!(owed["silent.py"].reason.contains("45s budget"));
+            }
+        }
+    }
+
+    /// Drive the worker's real queue, timeout classification, completion and
+    /// durable owed bookkeeping with a deterministic query script. No separate
+    /// sleep/backoff scheduler or retry-budget model stands in for those paths.
+    async fn uses_type_sweep_script(answer_after: Option<Duration>, prior_failures: u32) {
+        let root = tempfile::tempdir().unwrap();
+        for name in ["a_large.py", "b_ready.py"] {
+            std::fs::write(root.path().join(name), "def run():\n    return 1\n").unwrap();
+        }
+        let state = super::DaemonState::open(kin_core::init(root.path()).unwrap().layout).unwrap();
+        crate::loop_runner::sync_filesystem_with_graph(&state)
+            .await
+            .unwrap();
+        let inputs = super::lsp_publication::QueryInputs::capture(&state)
+            .await
+            .unwrap();
+        let blob = inputs.blob("a_large.py").unwrap();
+        for _ in 0..prior_failures {
+            crate::owed_enrichment::record_failure(
+                &mut state.lsp_owed_files.lock().unwrap(),
+                "a_large.py",
+                &blob,
+                Some("context"),
+                "previous timeout".into(),
+                0,
+            );
+        }
+        let owed_at_start = state.lsp_owed_files.lock().unwrap().clone();
+        let mut files = crate::sweep_retry::SweepFiles::new([
+            kin_model::FilePathId::new("a_large.py"),
+            kin_model::FilePathId::new("b_ready.py"),
+        ]);
+        let mut failed: Vec<(String, String)> = Vec::new();
+        let mut completed = Vec::new();
+        let mut visits = Vec::new();
+        let mut budgets = Vec::new();
+        let started = tokio::time::Instant::now();
+        while let Some(file) = files.next() {
+            visits.push(file.0.clone());
+            if file.0 == "b_ready.py" {
+                completed.push(file.0);
+                files.completed(kin_model::LanguageId::Python);
+                continue;
+            }
+            let budget = crate::owed_enrichment::uses_type_budget(
+                &owed_at_start,
+                &file.0,
+                Some(&blob),
+                "context",
+                files.retry_count(&file),
+            );
+            budgets.push(budget.as_secs());
+            let mut outcomes = super::QueryOutcomes::default();
+            let answer = super::lsp_query_within_budget(
+                "uses-type",
+                async {
+                    match answer_after {
+                        Some(delay) => tokio::time::sleep(delay).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                    Ok::<_, kin_lsp::LspError>(())
+                },
+                budget,
+                &mut outcomes,
+            )
+            .await;
+            let tally = super::SweepTally {
+                query_failures: outcomes.failures,
+                ..Default::default()
+            };
+            if super::file_passes_completed(&tally, 0, 0) {
+                assert_eq!(answer, Some(()));
+                assert!(!outcomes.uses_type_timed_out);
+                failed.retain(|(path, _)| path != &file.0);
+                completed.push(file.0);
+                files.completed(kin_model::LanguageId::Python);
+                continue;
+            }
+            assert!(answer.is_none());
+            assert!(outcomes.uses_type_timed_out);
+            assert_eq!(outcomes.transient_failures, 1);
+            super::remember_sweep_debt(&mut failed, &file.0, outcomes.first_failure.unwrap());
+            let retry = files.failed(
+                &file,
+                kin_model::LanguageId::Python,
+                false,
+                outcomes.uses_type_timed_out.then_some(budget),
+            );
+            if retry == crate::sweep_retry::Retry::Owed {
+                assert_eq!(budget, crate::owed_enrichment::USES_TYPE_MAX_BUDGET);
+            } else {
+                assert_eq!(retry, crate::sweep_retry::Retry::Queued);
+            }
+        }
+        let elapsed = started.elapsed();
+        assert_eq!(
+            files.next(),
+            None,
+            "one sweep has no further admitted retries"
+        );
+        if prior_failures == 0 {
+            assert_eq!(budgets, [5, 15, 45]);
+            assert_eq!(
+                visits,
+                ["a_large.py", "b_ready.py", "a_large.py", "a_large.py"]
+            );
+        } else {
+            assert_eq!(
+                budgets,
+                [45],
+                "a capped prior attempt is not repeated in this sweep"
+            );
+        }
+        let contexts =
+            std::collections::HashMap::from([("a_large.py".to_owned(), "context".to_owned())]);
+        let owed = super::settle_owed_files(&state, &inputs, &completed, &failed, &contexts, 0);
+        let persisted = crate::owed_enrichment::load(&state.layout);
+        if answer_after.is_some() {
+            assert_eq!(elapsed, Duration::from_secs(40));
+            assert_eq!(completed, ["b_ready.py", "a_large.py"]);
+            assert!(failed.is_empty());
+            assert_eq!(owed, 0);
+            assert!(persisted.is_empty());
+        } else {
+            assert_eq!(
+                elapsed,
+                Duration::from_secs(if prior_failures == 0 { 65 } else { 45 })
+            );
+            assert_eq!(completed, ["b_ready.py"]);
+            assert_eq!(owed, 1);
+            assert_eq!(persisted.len(), 1);
+            assert_eq!(persisted["a_large.py"].blob, blob);
+            assert_eq!(persisted["a_large.py"].context.as_deref(), Some("context"));
+            assert!(persisted["a_large.py"].reason.contains("45s budget"));
+            assert!(!super::file_already_enriched(&state, "a_large.py"));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn uses_type_sweep_finishes_a_twenty_second_answer_without_backoff() {
+        uses_type_sweep_script(Some(Duration::from_secs(20)), 0).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn uses_type_sweep_exhausts_the_ladder_and_persists_silence_as_owed() {
+        uses_type_sweep_script(None, 0).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn uses_type_sweep_does_not_repeat_an_already_capped_attempt() {
+        uses_type_sweep_script(None, 2).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn uses_type_sweep_does_not_extend_other_query_timeouts() {
+        let file = kin_model::FilePathId::new("a.py");
+        let mut files = crate::sweep_retry::SweepFiles::new([file.clone()]);
+        for expected in [
+            crate::sweep_retry::Retry::Queued,
+            crate::sweep_retry::Retry::Owed,
+        ] {
+            assert_eq!(files.next(), Some(file.clone()));
+            let mut outcomes = super::QueryOutcomes::default();
+            let answer: Option<()> = super::lsp_query_within_budget(
+                "references",
+                std::future::pending(),
+                Duration::from_secs(5),
+                &mut outcomes,
+            )
+            .await;
+            assert!(answer.is_none());
+            assert!(!outcomes.uses_type_timed_out);
+            assert_eq!(
+                files.failed(
+                    &file,
+                    kin_model::LanguageId::Python,
+                    false,
+                    outcomes
+                        .uses_type_timed_out
+                        .then_some(Duration::from_secs(5)),
+                ),
+                expected
+            );
+        }
+        assert_eq!(files.next(), None);
     }
 
     /// A refusal settles its entity rather than holding its file owed. A
@@ -12492,6 +16432,7 @@ while True:
             root.path(),
             Some(&documents),
             super::EntityArms::All,
+            Duration::from_secs(5),
         )
         .await;
         server.shutdown().await.unwrap();
@@ -12601,6 +16542,7 @@ while True:
             root.path(),
             Some(&documents),
             super::EntityArms::All,
+            Duration::from_secs(5),
         )
         .await;
         server.shutdown().await.unwrap();
@@ -13224,6 +17166,40 @@ while True:
         assert!(
             super::ready_for_idle_shutdown(&state, expired, ControlPlane::Ours),
             "a genuinely idle initialized daemon must still idle out"
+        );
+    }
+
+    /// A background embed batch holds the daemon open even after it has taken
+    /// the whole queue, which is when the queue reads empty. A store whose
+    /// backlog fits one batch was idled out mid-batch on a CPU, and the pass the
+    /// command had just called "finishing in the background" was lost.
+    #[tokio::test]
+    async fn a_background_embed_batch_survives_the_idle_timeout_with_an_empty_queue() {
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let state = DaemonState::open(initialized.layout).unwrap();
+        state.is_initialized.store(true, Ordering::Relaxed);
+        let expired = Duration::ZERO;
+        assert_eq!(
+            state.graph.pending_embeddings(),
+            0,
+            "the queue reads empty, as it does while its only batch is computed"
+        );
+
+        let pass = state
+            .background_work
+            .pass(crate::background_work::PASS_EMBED);
+        pass.working(std::time::Instant::now());
+        assert!(
+            !super::ready_for_idle_shutdown(&state, expired, ControlPlane::Ours),
+            "a batch in flight outranks an expired idle timeout"
+        );
+        assert!(super::retirement_blockers(&state, 0).contains(&super::ShutdownBlocker::Embedding));
+
+        pass.idle();
+        assert!(
+            super::ready_for_idle_shutdown(&state, expired, ControlPlane::Ours),
+            "once the batch ends the daemon idles out as before"
         );
     }
 
@@ -15098,6 +19074,7 @@ mod memory_pressure_tests {
         start_or_defer_background_embed, tree_footprint_from, EmbedWakeDecision, ProcessRow,
         SweepStartDecision,
     };
+    use super::{coverage_drain_verdict, embed_memory_hold, CoverageDrainVerdict};
     // Gated exactly like its only caller, the walk test that spawns a real
     // child. The daemon itself calls this on every platform; it is the test
     // that cannot, so an ungated import here is dead on Windows and `-D
@@ -16495,6 +20472,107 @@ mod memory_pressure_tests {
             kin_core::memory_pressure::PressureLevel::Critical
         );
     }
+
+    /// A pass memory holds back resumes on its own when the host recovers,
+    /// without a restart, and the daemon that owns it stays up for it only for
+    /// a bounded window. Driven in virtual time through the same decisions the
+    /// worker and the idle monitor make.
+    #[test]
+    fn a_pass_held_for_memory_resumes_when_the_host_recovers() {
+        const CONFIGURED: usize = 512;
+        const MISSING: usize = 429;
+        let refuse = Verdict::Refuse {
+            reason: String::new(),
+        };
+        let window = std::time::Duration::from_secs(20 * 60);
+        let t0 = std::time::Instant::now();
+
+        // The pass was refused at start, so nothing is queued. The next wake
+        // still sees the gap and asks to fill it, rather than trusting the
+        // empty queue.
+        assert_eq!(
+            coverage_drain_verdict(MISSING, None),
+            CoverageDrainVerdict::Backfill { missing: MISSING }
+        );
+
+        // Wake under a critical host: held, nothing runs.
+        let (state, admission) = admit_refused_embed(
+            RefusedEmbedState::Clear,
+            BudgetObservation::Recovered {
+                held_bytes: 900_000_000,
+            },
+            PressureLevel::Critical,
+            false,
+            REFUSED_EMBED_GROWTH_TOLERANCE_BYTES,
+        );
+        assert_eq!(
+            embed_wake_decision(true, admission, state, &refuse, CONFIGURED),
+            EmbedWakeDecision::Hold
+        );
+        // Meanwhile the idle monitor keeps the daemon up for it.
+        let (since, holds) = embed_memory_hold(None, t0, window, true);
+        assert!(holds, "a refused, owed pass holds its daemon");
+        let (since, holds) = embed_memory_hold(since, t0 + window / 2, window, true);
+        assert!(holds, "still inside the window");
+
+        // The host recovers. The very next wake runs a full batch: no restart,
+        // no command, nothing queued by hand.
+        let (state, admission) = admit_refused_embed(
+            state,
+            BudgetObservation::Recovered {
+                held_bytes: 900_000_000,
+            },
+            PressureLevel::Nominal,
+            false,
+            REFUSED_EMBED_GROWTH_TOLERANCE_BYTES,
+        );
+        assert_eq!(state, RefusedEmbedState::Clear);
+        assert_eq!(
+            embed_wake_decision(false, admission, state, &Verdict::Proceed, CONFIGURED),
+            EmbedWakeDecision::Run(CONFIGURED),
+            "the recovered host resumes the pass on the next wake"
+        );
+        // Once the pass runs it is no longer refused, and the hold lets go and
+        // resets its clock.
+        let (since, holds) = embed_memory_hold(since, t0 + window / 2, window, false);
+        assert_eq!((since, holds), (None, false));
+    }
+
+    /// Under pressure that never lifts, the hold is bounded: the daemon stays
+    /// up for the window and then idles out as it would with nothing owed, and
+    /// it does not start holding again for the same refusal.
+    #[test]
+    fn a_hold_for_memory_that_never_lifts_ends_after_its_window() {
+        let window = std::time::Duration::from_secs(20 * 60);
+        let t0 = std::time::Instant::now();
+        let (since, holds) = embed_memory_hold(None, t0, window, true);
+        assert!(holds);
+        let (since, holds) = embed_memory_hold(
+            since,
+            t0 + window - std::time::Duration::from_secs(1),
+            window,
+            true,
+        );
+        assert!(holds, "one second before the window ends it still holds");
+        let (since, holds) = embed_memory_hold(since, t0 + window, window, true);
+        assert!(!holds, "at the window's end the daemon may idle out");
+        assert_eq!(
+            since,
+            Some(t0),
+            "and the clock is not restarted by asking again"
+        );
+        let (_, holds) = embed_memory_hold(since, t0 + 3 * window, window, true);
+        assert!(!holds);
+        // A window of zero is the operator's way to turn the hold off.
+        assert!(
+            !embed_memory_hold(None, t0, std::time::Duration::ZERO, true).1,
+            "a resource read before the first idle tick must not promise a zero-length hold"
+        );
+        assert!(
+            !embed_memory_hold(Some(t0), t0, std::time::Duration::ZERO, true).1,
+            "an idle tick must not make a zero-length hold active either"
+        );
+    }
 }
 
 /// The lifecycle a cold sweep has across daemon restarts, which is where this
@@ -16850,6 +20928,27 @@ mod sweep_lifecycle_tests {
         assert_eq!(
             sweep_gate(&state, &owed, "src/pkg/auth.py", None, true, 0),
             SweepGate::Ask
+        );
+        let mut owed = owed;
+        crate::owed_enrichment::record_failure(
+            &mut owed,
+            "src/main.py",
+            &body.to_string(),
+            None,
+            "timeout on revalidation".into(),
+            1_000,
+        );
+        assert_eq!(
+            sweep_gate(
+                &state,
+                &owed,
+                "src/main.py",
+                Some(&body.to_string()),
+                false,
+                1_300
+            ),
+            SweepGate::Ask,
+            "failed revalidation overrides an older completion record"
         );
     }
 
@@ -17260,6 +21359,39 @@ mod language_server_resolution_tests {
             spawned,
             Some(PathBuf::from("/work")),
             "an enabled daemon probes"
+        );
+    }
+
+    /// A server that is not installed completes its start as Absent, the finding
+    /// the readiness probe records for the same host, so the language reads as
+    /// no language server rather than a broken one or a pending one.
+    #[tokio::test]
+    async fn a_start_with_no_server_installed_completes_absent() {
+        use kin_core::reference_coverage::{
+            reference_enrichment_for, skip_reason_is_missing_server, ReferenceEnrichment,
+        };
+        let observations = super::ReadinessObservations::default();
+        let root = tempfile::tempdir().expect("a scratch workspace");
+        let reason = super::start_resolved_language_server(
+            LanguageId::Python,
+            &observations,
+            "kin-readiness-test-server-that-is-not-installed",
+            &[],
+            root.path(),
+            kin_lsp::adapters::ServerLaunch::default(),
+        )
+        .await
+        .err()
+        .expect("no such server can start");
+        assert!(skip_reason_is_missing_server(&reason), "{reason}");
+        let published = observations.published_findings();
+        assert_eq!(
+            published.get(&LanguageId::Python),
+            Some(&LanguageServerReadiness::Absent)
+        );
+        assert_eq!(
+            reference_enrichment_for(LanguageId::Python, &published),
+            ReferenceEnrichment::NoLanguageServer
         );
     }
 
@@ -18502,7 +22634,7 @@ mod enrichment_site_union_tests {
 
         let unheld = unheld_lsp_relations(&state, std::slice::from_ref(&held));
         assert!(
-            unheld.is_empty(),
+            unheld.relations.is_empty(),
             "an offer identical to the held record must write nothing: {unheld:?}"
         );
     }
@@ -18698,7 +22830,7 @@ mod enrichment_site_union_tests {
 
         let unheld = unheld_lsp_relations(&state, std::slice::from_ref(&held));
         assert!(
-            unheld.is_empty(),
+            unheld.relations.is_empty(),
             "an offer identical to the held record must write nothing: {unheld:?}"
         );
         assert_eq!(

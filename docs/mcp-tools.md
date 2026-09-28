@@ -264,6 +264,8 @@ bounded. No raw filesystem search or epoch cache supplies missing evidence.
 | `edge_coverage_budget_exhausted` | The coverage scan for the language stopped before it could establish what the graph holds. |
 | `edge_coverage_unknown` | Whether the graph holds cross-file edges of a requested class for the language could not be established. |
 | `edge_coverage_unreported` | The answer did not report whether the graph holds the cross-file edges it depends on. |
+| `enrichment_incomplete` | Persisted call-site evidence in the selected repository graph is unsettled, so impact counts are a lower bound and review risk may change; the listed entities are not proven dependencies of the change. |
+| `enrichment_metadata_unavailable` | Selected graph enrichment detail exceeded its bounded metadata scan. Aggregate counters remain observations, but the unavailable file inventory cannot attest dependency completion or absence. |
 | `entity_index_unresolved` | Nothing resolves the program behind the parsed declarations, so an empty name or kind filter cannot separate a missing declaration from one the extractor did not admit. |
 | `enumeration_shifted` | The file gained or lost entities between pages, so the pages do not assemble into one state; walk again from the start. |
 | `file_bytes_unadmitted` | The working copy holds content at this path that graph truth does not carry, so the spans describe earlier bytes; `kin admit` takes the working tree. |
@@ -293,9 +295,13 @@ bounded. No raw filesystem search or epoch cache supplies missing evidence.
 | `offline_fallback` | The in-process fallback graph answered, not the daemon's graph truth. |
 | `page_bounded` | The response holds one page of the file; follow `next_cursor` to the end before reading the set as whole. |
 | `proof_context_stale` | A call site in the answer's scope was proven under a proof context its resolver no longer runs under, so the proof may not hold for the code as it builds now. |
+| `proof_context_unverified` | The selected graph has not validated the proof context of recorded call-site evidence, so that evidence does not establish current validity. |
 | `ranking_is_bounded` | A ranking is a bounded candidate set, so a name absent from it may belong to an entity the query never ranked. |
 | `reference_enrichment_no_language_server` | An adapter is wired for the language but no language server for it is installed on this host. |
+| `reference_enrichment_unknown` | No completed language-server readiness observation is recorded for the selected language, so reference-enrichment availability is unestablished. |
 | `reference_enrichment_unsupported` | This build cannot link cross-file references for the language, so an unused symbol cannot be told from an unlinked one. |
+| `reference_enrichment_unusable` | A language server for the selected language failed to initialize, so reference-enrichment capability is unavailable. |
+| `reference_page_partial` | This page contains only part of a reference answer; reconstruct every page and retain the original safety readings before assessing the complete result. |
 | `relevance_floor_unmeasured` | Every returned row was a fallback neighbour and no calibrated threshold says any of them answers the concept. |
 | `response_bounded` | The response budget withheld part of the answer; `_kin.response` names what was cut. |
 | `retrieval_degraded` | The query reported degradations; the payload's `degradations` names them. |
@@ -311,6 +317,7 @@ bounded. No raw filesystem search or epoch cache supplies missing evidence.
 | `structural_authoritative` | Certifying: the daemon's graph is initialized and loaded. Appears only when trust is authoritative. |
 | `substrate_partial` | A coverage class the answer depended on was observed short of whole; `_kin.completeness.classes` names it and says whether it was `partial`, `absent` or `unproduced`. |
 | `substrate_unknown` | The coverage classes the answer depended on were not all observed present; `_kin.completeness.classes` names them. |
+| `trace_page_partial` | This page contains only part of a trace; reconstruct every page and retain the original safety readings before assessing the complete result. |
 | `trace_spine_clipped` | The per-step cap cut the walk's fan-out, so the chain is one route among those the cap kept and a missing hop was not looked for. |
 | `trace_walk_degraded` | The walk reported degradations, so it did not complete under its own work bounds. |
 | `trace_walk_truncated` | The walk hit a per-step or total cap before examining everything an empty chain would have to rule out. |
@@ -319,7 +326,7 @@ bounded. No raw filesystem search or epoch cache supplies missing evidence.
 | `unlisted_clause` | A reason this build carries no code for. The blocks the verdict's `inputs` name hold its facts. Seeing it is a Kin defect. |
 | `walk_bounded` | The walk stopped at a work bound before its frontier emptied, so a route may exist beyond what was explored. |
 | `walk_depth_bounded` | The walk stopped at max_depth before its frontier emptied; raise max_depth. |
-| `watcher_events_lost` | The filesystem watcher lost events no admission has covered; `kin admit` clears it. |
+| `watcher_events_lost` | The filesystem watcher lost events no admission has covered; a running daemon retries a full admission, and `kin admit` runs it now. |
 | `watcher_loss_unreadable` | The durable watcher-loss record could not be read, so recovery is unknown; `kin admit` rewrites it after a complete admission. |
 | `withheld_candidates` | Same-name candidates are held out of the counts and carried in `candidates`. |
 | `working_copy_unmeasured` | Nothing has measured the working copy, so whether graph truth is level with it is unknown. |
@@ -498,7 +505,11 @@ it.
 On the agent profiles, `find_references` defaults to `answer_only: true`: the same
 reference rows, focal identity, counts, withheld-row disclosures and verdict, with
 the graph generation, freshness, hydration, durability and degraded-state observations
-preserved. Detailed coverage and candidate blocks are available with `answer_only: false`.
+preserved. It also keeps `call_site_candidates`: the unsettled call sites whose callee
+or caller body spells the focal's name, each addressed by its caller and its line in
+that caller, up to 20 of them, and every unsettled site that could reach the focal
+counted by why it is kept. None of those sites is proven, and none is in `references`.
+Detailed coverage and the full candidate blocks are available with `answer_only: false`.
 An explicit `explain: true` or `compact: false` also requests the detailed response unless
 `answer_only` itself is set. Errors retain their original message. The full and benchmark
 profiles keep the detailed default and advertise the same optional parameter.
@@ -771,9 +782,16 @@ reported rather than served as a confident answer.
 *Tools:* `trace_computation`, `trace_data_flow`, `trace_path`, `find_references`, `bulk_check_references`, `entity_history`
 
 - **`trace_computation`**: Get a focal entity together with its control-/data-flow neighborhood in one structured response (a flat snapshot, not an ordered walk). The response carries its body plus callers, callees, and imports.
-- **`trace_data_flow`**: Walk the directional call/data-flow chain rooted at a focal entity and return it as an ordered list of steps (the path-walk counterpart to `trace_computation`'s flat neighborhood). `max_chars`, or its older spelling `max_response_chars`, is the size in UTF-8 bytes the walk cuts its reply toward. It accepts 2,000 to 60,000, serves a smaller value as 2,000 and a larger one as 60,000, and defaults to 45,000 on `full` and 24,576 on `agent-default`. It is a target, not a hard ceiling. The walk drops bodies before edges and then whole branches, least relevant first, and a cut chain always keeps at least one step. Read the cut from `elisions.chain`, which accounts for every step the walk reached. Whichever pass made the cut, `total_steps` is the number of steps `chain` carries and `steps_omitted` equals `elisions.chain.elided`; `chain_withheld` is the share the MCP envelope pass withheld after the walk, and `degradations` names each cut (`steps_omitted` for the walk's, `response_bounded` for the envelope pass's). `spine_clipped_steps`, `spine_dropped_crossing_file`, each clip's `continued_below` and the `fanout_cap` / `spine_clipped` disclosure likewise describe only the clipped nodes that chain still continues beneath, and name none the cut removed. A spine count a cut took to zero does not mean every missing hop was looked for, because `truncated` and `steps_omitted` still report that cut. When `spine_dropped_crossing_file_is_floor` is true, `spine_dropped_crossing_file` counts only the spine nodes whose clip records reached the envelope pass, so it is a floor. When the walk itself made a cut, `chars_before_budget` on the reply gives the size the walk measured before it, and `_kin.response` reports the reply as bounded, with a `chars_before_budget` no smaller than that, whether or not the reply then fits. The reply also carries parts the budget never trims: the focal's identity, the disclosures a cut requires, the `_kin` envelope and the `negative` object. When those and the smallest retained walk still exceed the budget, the tool answers with that walk anyway and adds a `response_over_budget` degradation naming the budget it missed, and `_kin.response.chars_after_budget` gives the size that shipped. A smaller budget cannot make that reply smaller. The exception is a focal or `target` that several owners share as a member name: its candidate listing is held to the budget, and a reply that cannot fit the listing's shortest form, beside the walk for a `target`, is refused with a count-only error (`isError: true`, `ambiguous_focal` or `ambiguous_target`, `candidate_count`) instead of shipped over. `kin trace-data-flow --max-response-chars` treats the budget as a hard limit and refuses a walk whose smallest retained form does not fit.
+- **`trace_data_flow`**: Walk the directional call chain rooted at a focal entity. `max_chars` and `max_response_chars` name the same hard UTF-8 JSON byte ceiling, including the page envelope. Values are clamped to 2,000 through 60,000 bytes; defaults are 45,000 on `full` and 24,576 on `agent-default`. A larger result returns `next_cursor`. Repeat the same query with `cursor` to continue; only the byte budget may change. CLI uses the same rule through `kin trace --cursor TOKEN --focal ENTITY --max-response-chars N`. Traversal depth, fan-out and work limits still bound which graph is walked, and their original disclosures remain in the result. Response pagination preserves every reached step, requested source body and ambiguous focal/target candidate. Absolute `step` and `parent_step` identities stay stable across pages. `_kin.page` reports the full totals and whether more remains, and every partial page refuses an absence conclusion, including its last page.
+
+  Ordinary hops remain `chain` rows. A semantic field too large for one page is returned as `record_fragment`, addressed by its collection/index, entity/step/parent identity and `field`. Append `text` fragments in `byte_offset` order until `field_complete`; offsets and `total_bytes` count UTF-8 bytes. `encoding: "utf8"` is the field's original string, including its source text. `encoding: "json_utf8"` is a structured field that must be JSON-decoded after concatenation. `record_complete` marks the last field of that record. Never interpret the temporary empty `chain` on a fragment or metadata page as a missing call. Full original safety readings arrive under `readings` (or their field fragments), so pagination adds a limit and removes no existing caveat.
+
+  Continuations hold a frozen result for at most ten minutes and are evicted under bounded cache pressure. Changed repository, selected graph, caller scope, graph revision or query is refused with restart guidance. The cache admits at most sixteen snapshots and 64 MiB of estimated resident content, with a 16 MiB per-snapshot ceiling; a trace exceeding that work-storage bound asks for a narrower traversal. There is no filesystem fallback.
+
+  Hosted source-read limits remain independent of page bytes: pagination preserves every source projection admitted by the hosted read limits, while any projection withheld by those limits stays disclosed. Local CLI, daemon MCP, offline MCP and hosted MCP use the same continuation contract.
+
 - **`trace_path`**: The route between two named entities, for the question "how does A reach B" that no single-rooted walk answers. It resolves both ends (by exact name, entity id, or `name@file` to pin a twin; a qualified name that matches nothing takes its bare leaf when that is unique and is refused with the candidates listed when it is not), searches breadth-first over call, instantiation, reference, import and include edges, and returns up to `limit` shortest routes, every hop carrying its kind, file, line, the relation into the next hop and the syntax lines that produced it. A class stands for its members, so a route between two classes runs through the methods that carry it, and those containment hops are shown. `direction` defaults to `either`: forward (A reaches B) is tried first and the answer says which sense held. No route is explicit rather than plausible: `found: false`, `routes: []`, a `gap` naming what stopped the walk and how much of the graph it explored, and the same-name twin count on each end; the `negative` and `_kin.verdict` beside it say whether the absence can be trusted. In the `agent-default` profile.
-- **`find_references`**: Find all entities that import, call, or reference a target symbol. One row is one referencing entity, so two callers in one file are two rows, and `total_upstream` counts those entities, the same unit `kin refs` prints. The `counts` object names the unit and adds the file and reference-site totals beside it. A row's `reference_lines` gives the lines inside that caller which reference the target, and names why under `reference_lines_absent_reason` when the graph does not carry them. Rows omit the caller's body by default; pass `include_snippets=true` for it. Given an `external_reference:<uuid>` id, it lists the entities with an edge into that symbol. `caller_arrival.count_exact` says whether every file that imports the focal's file was counted exactly from its callers' call-site ledgers, and `call_sites` tallies those callers' sites; see [Call sites](#call-sites).
+- **`find_references`**: Find all entities that import, call, or reference a target symbol. One row is one referencing entity, so two callers in one file are two rows, and `total_upstream` counts those entities, the same unit `kin refs` prints. The `counts` object names the unit and adds the file and reference-site totals beside it. A row addresses its caller by `entity_id` and each usage inside that caller, never by a file line: see [Reference rows](#reference-rows). Rows omit the caller's body by default; pass `include_snippets=true` for it. Given an `external_reference:<uuid>` id, it lists the entities with an edge into that symbol, and a `query` that names such a symbol, such as `Array.map`, does the same; see [Calls into symbols outside the repository](#calls-into-symbols-outside-the-repository). `caller_arrival.count_exact` says whether every file that imports the focal's file was counted exactly from its callers' call-site ledgers, and `call_sites` tallies those callers' sites; see [Call sites](#call-sites).
 - **`bulk_check_references`**: Classify many entities by reachability in one call.
 - **`entity_history`**: Read a bounded chronological page of recorded changes to one entity, including a retired entity. `offset` defaults to 0, and `limit` defaults to 20 with a maximum of 100. The reply keeps `result[]` and adds `change_count`, `latest_change_id`, `returned` and `next_offset`. Follow `next_offset`, and compare `change_count` and `latest_change_id` between calls before combining pages; a partial page or one past the end certifies neither the complete history nor its absence. Each entry is a focal projection of a change, not a replayable commit: `id`, `origin` and `parents` keep their original values, and the printable `change_id` is the native semantic ID `semantic_diff` takes. Sections about other entities are replaced by exact omitted counts, and oversized focal details and optional metadata by explicit summaries. A focal detail past 12,000 bytes is not available from history at any budget; its summary names the largest view of that row, a one-row page at `max_chars` 60,000, and its operations and original counts stay exact. `max_chars` bounds the final JSON payload in UTF-8 bytes, the MCP envelope included, and not the escaped size on the JSON-RPC wire (default 45,000, accepted from 2,000 to 60,000). A value outside those bounds, a `limit` outside 1 to 100, a negative `offset`, or any of the three not an integer, is refused with a structured `history_parameters_out_of_range` error rather than clamped. A budget too small to keep exact ancestry and the required qualifications returns a structured error. A change with more parents than history can carry exactly refuses its page with `history_ancestry_exceeds_limit`, and names that change's offset and the pages that read every other row. The page bounds the reply, not the read: a store read from disk may still decode each whole change while building it. The raw daemon route now returns the same paging object instead of a bare array, so a client of that route reads `result[]`.
 
@@ -806,17 +824,24 @@ Each read tool shows these calls in its own place.
 - `get_entity` on a caller adds `external_calls`. On an external id it returns the record with `caller_count` and `referrer_count`.
 - `get_context_pack` returns `external_calls` beside `dependencies`, and `dependency_selection.external_calls_returned` counts them. In a pack built from several focals each row names its focal in `caller_id`. A list stops at 50 rows and counts the rest in `external_calls_withheld`.
 - `graph_neighborhood` reaches the symbol as a leaf and never walks past it, because every other caller of `Array.map` belongs to that symbol's neighborhood and not to the focal's. The edge row carries `to` and the fields above. On an external id it returns the symbol's callers.
-- `find_references` on an external id returns one row per caller, with `site_count` and the fields above. Only a call a language server proved is an edge into such a symbol, so the list is a floor, and its `degradations` say so.
+- `find_references` on an external id returns one row per caller, with `site_count` and the fields above, addressed as every reference row is (see [Reference rows](#reference-rows)). Only a call a language server proved is an edge into such a symbol, so the list is a floor, and its `degradations` say so. A `query` reaches the symbol too, as described below.
 - `trace_data_flow` reaches the symbol as a leaf step with `terminal: "external_reference"`, `entity_kind: "external_symbol"`, the symbol's id as `entity_id`, and `package`, `stdlib`, `symbol`, `site_state`, `proof` and `sites` in place of file lines. Every other step carries those six keys as null, so a chain keeps one key set. An external leaf takes a `limit_per_step` slot only after the repository's own callees.
 - `get_entity_source` refuses an external id with `external_symbol_has_no_repository_source`.
 
-Every other tool that takes an entity id answers an external id by what it is and never as a missing or invalid entity, because the graph holds the symbol. `get_context_pack` and `trace_computation` (its `entity_id`), `trace_data_flow` (its `focal`), `trace_path` (either end), `impact_analysis`, `semantic_review` and `semantic_diff` (in `entity_ids`), `entity_history`, `kin_verify_entity`, `kin_provenance_query` and `kin_annotation_add` refuse it with the error code `external_symbol_not_served`. A call that names an external symbol among other ids is refused whole, so no answer about the rest reads as covering it. The error carries these fields.
+Every other tool that takes an entity id answers an external id by what it is and never as a missing or invalid entity, because the graph holds the symbol. These tools refuse it with the error code `external_symbol_not_served`:
+
+- `get_context_pack` and `trace_computation` (its `entity_id`), `trace_data_flow` (its `focal` or its `target`) and `trace_path` (either end);
+- `impact_analysis`, `semantic_review` and `semantic_diff` (in `entity_ids`), `entity_history`, `kin_verify_entity` and `kin_provenance_query`;
+- the tools that take a scope: `kin_annotation_add` and `kin_annotation_list` (in `targets` or `scopes`), `kin_work_create`, `kin_work_link` and `kin_work_implement` (in `scopes`), `kin_work_list` (its `scope` filter), `kin_review_create` (in `scopes` or `entity_ids`), `kin_review_note_add` and `kin_review_discuss` (their `scope`), and `kin_register_intent` and `kin_check_traffic` (in `scopes`);
+- `kin_mutate`, `kin_transaction_stage` and `kin_transaction_commit`, for a relation operation whose `from` or `to` names one.
+
+A call that names an external symbol among other ids is refused whole, so no answer about the rest reads as covering it. The error carries these fields.
 
 | Field | Meaning |
 | --- | --- |
 | `code` | `external_symbol_not_served`. |
 | `tool` | The tool that refused. |
-| `argument` | The argument that named the symbol, such as `entity_ids`, `focal`, `from` or `to`. |
+| `argument` | The argument that named the symbol, such as `entity_ids`, `focal`, `target`, `from`, `to`, `scopes`, `scope` or `operations[0].payload.Relation.to`. |
 | `id` | The symbol's `external_reference:<uuid>` id, whichever spelling was passed. |
 | `message` | What the id names, why this tool has nothing of the symbol's own to answer from, and the tools that do. |
 | `symbol` | The record `get_entity` returns for the id, with `caller_count` and `referrer_count`. |
@@ -824,9 +849,72 @@ Every other tool that takes an entity id answers an external id by what it is an
 
 What a change to an external symbol reaches is its callers here, which `find_references` lists with each call's proof, so `impact_analysis` refuses it and points there rather than building a blast radius from the symbol. Its consumer counts and covering tests are read off repository entities.
 
-`bulk_check_references` gives an external id a row with `error: "external_symbol_not_served"`, a `detail` sentence and the `symbol` record, with `has_references` null, and classifies the rest of the batch as before. `kin refs --bulk-json` gives it the same row. In a `get_context_pack` built from several focals, an external id named in `entities`, or as the `entity_id` beside them, is listed under `unresolved` with `reason: "external_symbol_not_served"`, the same `detail` and the `symbol` record, and the pack is built from the focals that are entities. `kin_review_create` refuses an external id in `entity_ids` as an invalid parameter that names the symbol, where its address was otherwise stored as a file path.
+A scope names a symbol outside the repository by its `external_reference:<uuid>` address, as `entity:<uuid>`, or by its bare uuid, and a tool that takes a scope refuses all three before it stores anything. None of them becomes a work link, review note or intent lock on an entity no read resolves, and the address is answered by what it names rather than as a spelling the scope parser does not recognise. `kin_work_list`, `kin_annotation_list` and `kin_check_traffic` refuse such a scope as a filter too, because no work, annotation or intent can be anchored to the symbol, so an empty answer would read as an absence. An intent scope is refused in either shape, the string or the `{"Entity": ...}` object. When the server forwards to the daemon, the daemon's intent and traffic routes give the same refusal, and it reaches the caller as the tool's own error.
 
-An `external_reference` id the graph holds no symbol under is an absence: `get_entity`, `impact_analysis`, `semantic_review`, `semantic_diff`, `entity_history`, `kin_verify_entity`, `kin_provenance_query` and `kin_annotation_add` report it as `External symbol not found`, and `trace_data_flow`, `trace_path` and `find_references` as the focal miss they report for any name.
+A relation operation in `kin_mutate`, `kin_transaction_stage` or the inline `operations` of `kin_transaction_commit` is refused before anything is staged when its `from` or `to` names a symbol outside the repository, by its address or by the bare uuid an edge's `dst` carries, whether the verb adds, upserts or removes. An edge into such a symbol exists only where a language server proved the call, and the enrichment sweep derives it again from the caller's source. A relation payload addresses entities at both ends, so an added edge would store the symbol as an entity no read resolves, and a removal would match nothing or be undone by the next sweep. To change what a caller calls, change the caller's source. The refusal's `argument` names the operation and the end, such as `operations[0].payload.Relation.to`.
+
+`trace_data_flow` ranks each step by whether it reaches its `target`, which it reads by walking back from the target's own edges. A symbol outside the repository has none here, so a `target` naming one is refused. Name one of its callers as the target instead; a walk through that caller reaches the symbol as a leaf step.
+
+A `find_references` `query` reaches a symbol outside the repository when no repository entity carries the name. The query matches a symbol exactly in one of three spellings, and the first spelling that matches any symbol wins: its whole SCIP symbol, the package and the descriptor chain such as ``npm typescript 5.6.3 `lib.es5.d.ts`/Array#map().``, with or without the scheme before them; its descriptor chain alone; or the name a reader writes, such as `Array.map`. Nothing is matched by prefix, substring or case. A query that names one symbol is answered as its id is, and `focal_resolution` carries `addressed_by: "name"` and `matched` (`scip_symbol`, `scip_descriptors` or `display_name`). A name several symbols carry, one per package or version the resolver loaded, is answered with `ambiguous_focal: true`, `candidate_count`, and each candidate's record under `candidates` with its id as `entity_id`, and no references; call again with one candidate's id. An id spelled as the `query` is answered as it is under `entity_id`, and an address naming nothing held is `External symbol not found`.
+
+`bulk_check_references` gives an external id a row with `error: "external_symbol_not_served"`, a `detail` sentence and the `symbol` record, with `has_references` null, and classifies the rest of the batch as before. `kin refs --bulk-json` gives it the same row. In a `get_context_pack` built from several focals, an external id named in `entities`, or as the `entity_id` beside them, is listed under `unresolved` with `reason: "external_symbol_not_served"`, the same `detail` and the `symbol` record, and the pack is built from the focals that are entities. `kin_review_create` refuses an external id in `entity_ids` or `scopes` with `external_symbol_not_served`, where its address was otherwise stored as a file path.
+
+An `external_reference` id the graph holds no symbol under is an absence: `get_entity`, `impact_analysis`, `semantic_review`, `semantic_diff`, `entity_history`, `kin_verify_entity`, `kin_provenance_query`, every tool that takes a scope, every relation operation, a `trace_data_flow` `target` and a `find_references` `query` report it as `External symbol not found`, and `trace_data_flow` (its `focal`), `trace_path` and `find_references` (its `entity_id`) as the focal miss they report for any name.
+
+### Impact and review enrichment limits
+
+`impact_analysis` returns an `enrichment` observation, and `semantic_review`
+returns the same observation under `impact.enrichment` in JSON mode or beside
+`message` in text mode. It reads persisted call-site ledgers over the selected
+repository graph. A committed review uses only its replayed entities and ledgers,
+with `scope: "committed_graph"` and `selected_change` identifying that snapshot.
+
+`status: "bounded"` means recorded call-site evidence remains unsettled. Impact
+counts are a lower bound and review risk may change. `pending_entities` names up
+to 20 entity identities, their states, and optional paths under `projection.path`;
+`total_pending_entities` and `entities_withheld` disclose the full count and list
+limit. This repository-wide bound is conservative: it does not prove that every
+listed entity reaches the changed code. The canonical verdict and any absence
+qualifier carry `enrichment_incomplete` on empty and populated answers alike.
+
+`status: "no_recorded_call_site_debt"` describes only this ledger observation.
+It does not establish current resolver availability, source admission, other
+relation enrichment, or a complete and stable review.
+
+### Reference rows
+
+`find_references` pages its complete semantic response when it exceeds `max_chars`
+(default 12000, range 2000–60000 bytes). Repeat the same query and filters with
+`cursor` set to `next_cursor` until it is null; the byte budget may change. Append
+collection rows in order, collect `readings` separately by key, then attach the
+collections at their dotted addresses (such as `call_sites.candidates`). Oversized
+records use `record_fragment`; concatenate their UTF-8 fragments before interpreting
+the record. The frozen response retains caller IDs, site evidence, candidate counts
+and trust clauses rather than dropping callers to fit. A partial page cannot prove
+absence. Completing the transport does not establish semantic completeness: retain
+the reconstructed answer's verdict and limits. Cursors are process-local, bounded
+and expiring; changed graph/source authority or an active writer requires a fresh
+query. A qualified positive first answer can remain available during a writer, but
+its cursor cannot certify the writer's current state.
+
+`find_references` returns one row per referencing entity, in `references`, `candidates`, `interface_dispatch.candidates`, `cross_repo.federated_references` and each section of `candidates_by_owner`. A row addresses its caller by its entity id and each usage inside that caller, the way a call-site row addresses a site. It carries no file line.
+
+| Field | Meaning |
+| --- | --- |
+| `entity_id` | The caller's id, its address. Null for a federated row, whose caller lives in another repository's graph. |
+| `name`, `kind`, `role` | The caller's name, entity kind, and whether it is product source, a test, vendored code and so on. |
+| `projection` | `path`, the file the caller is projected into. It is a projection, not an address, and a federated row prefixes it with its repository. |
+| `sites` | Each usage of the focal inside the caller, one per line, in order: `line_in_entity`, counted from 0 at the caller's first line as a numbered body counts its `+N` offsets, and `callee`, the text at the site cut from the caller's own body, with a call's argument list left out so the text names what is called. When the text cannot be read, `callee` is null and `callee_unavailable` says why, such as `caller_source_unavailable` for a caller with no body of its own to read, like a file's module scope. `line_in_entity` is null for a site outside the caller's span. |
+| `site_count` | How many sites the row lists. |
+| `sites_absent_reason` | Why `sites` is empty: `no_evidence_span`, `span_outside_caller_file`, `federated_xref`, `unconfirmed_sites_withheld` or `sites_in_entity`. Null when sites came back. |
+| `sites_partial_reason` | Why the sites that came back may not be all of them: `language_server_edge`, `producer_without_site_contract`, `incomplete_call_evidence`, `unconfirmed_sites_in_candidates` or `occurrence_qualification_unavailable`. Null when every edge behind the row came from a complete parse. |
+| `relation_kinds`, `resolution`, `via_override_of` | The edge kinds behind the row, how strongly its strongest edge was resolved, and the base method a composed row reaches the focal through. |
+
+`kin refs` prints the same rows: each caller by its id and `projection:` path, and each site as `+N` with the text at it.
+
+The focal of a Go interface method also carries `interface_implementations`, whose candidates are declarations rather than references. Each is addressed the same way, by its `entity_id`, with `projection.path` for its file and no file line.
+
+Every other entity the reply names is addressed the same way. `focal_entity` carries its `id`, `name`, `kind`, `signature` and `projection.path`. Each of `focal_resolution.other_candidates` carries its `id`, `name`, `kind` and `projection.path`, and so does each entry of a sectioned reply's `unsectioned_candidates`. Each row of the `call_sites` block's `candidates`, an unsettled call site that could be a call to the focal, is addressed by its caller's id under `caller`, with `caller_name`, `line_in_entity` and `callee` inside that caller, and the caller's file as `projection.path`. None of them carries a file line.
 
 ### Call sites
 
@@ -834,10 +922,13 @@ Every call expression the parser reads in an entity's body is a call site, and a
 
 1. the caller's file holds bytes its entities were not derived from, so its derivation is owed and nothing about its sites is known;
 2. no ledger describes the caller, so its enrichment is owed;
-3. the ledger was proven under a proof context its resolver no longer runs under, so every site reads as stale;
-4. otherwise, each site reads as the state its ledger records.
+3. the selected graph holds no validated context for the language, or records a failed validation, so recorded sites read as `proof_context_unverified`;
+4. the ledger names a different context from the selected graph's validated context, so every site reads as stale;
+5. otherwise, each site reads as the state its ledger records.
 
-A site is settled when a resolver proved where the call goes: `proven_target` (a repository entity), `proven_external` (a symbol outside the repository), `proven_outside` (a declaration outside the repository with no symbol to name) or `proven_declaration` (a declaration that dispatches at run time). Every other state leaves the call's destination unknown: `binding` (a call through a value binding), `not_in_build` (a file no build compiles), `server_failed` (the resolver timed out, crashed or broke protocol), `unresolved` (the resolver answered and proved nothing), `owed_derivation`, `owed_enrichment` and `proof_context_stale`.
+Validation belongs to the selected graph and its recorded generation. Reopened readers use that record without starting a resolver. A historical view uses its own revision's validation, never the current host's resolver state. Missing legacy validation is unverified, not implicitly current. Recorded targets and proof states remain visible when validation is missing or stale.
+
+A site is settled when a resolver proved where the call goes: `proven_target` (a repository entity), `proven_external` (a symbol outside the repository), `proven_outside` (a declaration outside the repository with no symbol to name) or `proven_declaration` (a declaration that dispatches at run time). Every other state leaves the call's destination unknown: `binding` (a call through a value binding), `not_in_build` (a file no build compiles), `server_failed` (the resolver timed out, crashed or broke protocol), `unresolved` (the resolver answered and proved nothing), `owed_derivation`, `owed_enrichment`, `proof_context_stale` and `proof_context_unverified`.
 
 Each tool serves the sites in its answer's scope as one `call_sites` block.
 
@@ -848,17 +939,18 @@ Each tool serves the sites in its answer's scope as one `call_sites` block.
 | `callers` | Entities read. |
 | `callers_owed_derivation`, `callers_owed_enrichment` | Callers whose sites are not known yet. An owed caller adds no site, because how many it holds is not known. |
 | `callers_stale` | Callers whose ledger was proven under a stale proof context. |
+| `callers_unverified`, `unverified_contexts` | Callers whose recorded proof context is unverified, and the recorded validation failures or missing-validation reason with caller counts. |
 | `sites` | Sites the read ledgers hold. |
 | `by_state` | Those sites by the state each reads as. A state the block does not name holds no site. |
 | `clauses` | One verdict clause per unsettled kind, each opening with its code. Empty exactly when `settled` is true. |
 
-For a single focal the block adds `reading`, which is `current`, `owed_enrichment`, `owed_derivation`, `proof_context_stale` or `no_sites` for an entity with no source text, and `rows`, one per site in the order the sites appear, at most 50, with the rest counted in `rows_withheld`. A stale reading also names the proof context the ledger was proven under in `stale_context`.
+For a single focal the block adds `reading`, which is `current`, `owed_enrichment`, `owed_derivation`, `proof_context_stale`, `proof_context_unverified` or `no_sites` for an entity with no source text, and `rows`, one per site in the order the sites appear, at most 50, with the rest counted in `rows_withheld`. A stale reading also names the proof context the ledger was proven under in `stale_context`. An unverified reading names it in `unverified_context`, with `validation_reason`.
 
 | Row field | Meaning |
 | --- | --- |
 | `line_in_entity` | The site's line, counted from 0 at the caller's first line, as a numbered body counts its `+N` offsets. Never a file line. |
 | `callee` | The text at the site, cut from the caller's own body. When it cannot be read, `callee` is null and `callee_unavailable` says why. |
-| `state` | What the site reads as. A stale row adds `recorded_state`, the state its ledger records. |
+| `state` | What the site reads as. A stale or unverified row adds `recorded_state`, the state its ledger records. |
 | `reason` | Why an `unresolved`, `server_failed` or `not_in_build` site is what it is, or null. |
 | `target` | The proven destination, `entity:<uuid>` or `external_reference:<uuid>`, or null. `get_entity`, `find_references` and `graph_neighborhood` accept either spelling. |
 
@@ -869,18 +961,76 @@ Where each tool serves it:
 - `find_references` carries the block tallied over every caller in the files that import the focal's file, the same files `caller_arrival` reads. When every caller in such a file holds a current ledger, `caller_arrival` counts that file from its ledgers: the row's `count_source` is `site_ledgers`, `count_exact` is true, `unaccounted_call_sites` is the sites no resolver settled, and `unsettled_by_state` names their states. Otherwise the file keeps the parse-against-edge count, its row's `count_source` is `parse_versus_edges` and `owed_callers` counts the callers no ledger describes, which the block names under `owed_callers` beside `owed_caller_count`. The block's `count_exact` is true when every file was counted from ledgers, and `files_counted_from_site_ledgers` says how many were.
 - `kin_graph_status` carries the block over the whole store, with `census` (the sites the ledgers hold), `shares` (for every state its `sites` and its `share` of the census, which add up to it), `callers_owed`, and `owed_files`, each file holding a caller no current ledger describes and a sweep will still reach, with how many, at most 20, with the rest counted in `owed_files_withheld`.
 
+`kin_graph_status` and `kin graph status --json` also expose `enrichment`, a metadata-only
+observation fenced to the same selected graph. Each row names an admitted artifact and body
+digest, its projection path, parse standing, selected proof-context validation, call-site
+reading, and outstanding local-binding obligations. No source bodies are returned. Missing
+requested paths, unsupported artifacts and sources without a complete recorded census remain
+explicitly unverified. This observation reads persisted context validation, not the host's
+runtime readiness cache.
+
+Use MCP `dependencies: ["src/a.py", "src/b.py"]` or repeat CLI `--dependency` to inspect an
+exact set. This selection happens before detail construction and proof-input hashing,
+so an unrelated large inventory does not consume the requested detail budget.
+Unrelated gaps remain in the repository-wide `call_sites` block. Follow
+`status_page.next_cursor` for MCP or `enrichment.page.next_cursor` for CLI with the same
+dependencies, using MCP `cursor` or CLI `--cursor`.
+`max_chars` (`--max-chars`) bounds serialized payload bytes, including the response envelope.
+Rows are never silently clipped. An individual row or envelope that cannot fit returns an
+explicit budget error. Any selected graph, proof, source-authority or dependency change rejects
+a continuation; restart without the cursor. A daemon restart also invalidates it. A cached
+observation has `enrichment.current=false` and cannot continue a current page sequence.
+
+The metadata collector retains deterministic limits of 1,000,000 graph records and
+8 MiB of path bytes or serialized detail rows, separately from `max_chars`. If a
+detail limit is exceeded, fenced aggregate counts remain available while
+`enrichment.status=bounded` and `enrichment.unavailable` report `reason`,
+`limit_kind` (`records`, `path_bytes`, or `bytes`) and the exact `limit`.
+`enrichment_metadata_unavailable` qualifies the verdict. No `enrichment.page` is
+produced for that unavailable inventory. Any `status_page` then covers only the
+independently available operational transaction rows, not enrichment completion.
+Request a bounded dependency set to inspect its exact metadata. This does not
+remove an independent repository-wide source-derivation limitation. Cached status
+is reusable only for the same dependency selection and selected source scope.
+
+Read three distinct states. `current_completion=recorded` means a successfully published
+version-eight marker still matches complete selected source, caller, relation, ledger and
+context inputs. `proof=settled` means only that the recorded call-site census is settled.
+`outstanding_binding_obligations` counts historical bindings still owed independently of both.
+Thus completed analysis may still have unresolved call sites or binding debt. Legacy markers
+remain readable as `unverified_legacy_marker`; reading or hashing them never upgrades them.
+The supported successful enrichment publication path writes a new full-input marker. Historical
+views read their own context and proof records and report workspace completion unavailable.
+Neither `page.complete` nor any of these states proves all relationships or safe absence;
+`completion_attested` and `all_relationships_attested` remain false.
+
+MCP graph status also reports `open_transactions.items`, a fresh operational observation of
+unfinished, nonempty staged transactions owned by live writable sessions. Each row names its
+transaction, owner, scope, state, staged operation count and payload digest. Staged bodies are
+not exposed. `created_at` and `age_seconds` describe creation time; legacy transactions with no
+recorded creation time report both as null. This is separate from selected graph proof and
+workspace dirtiness. The graph observation may be cached while staged work is read fresh.
+
+MCP `status_page` pages both metadata collections losslessly, with transaction rows first.
+Transaction ownership, state, creation time or staged payload changes reject continuation;
+elapsed age alone does not. Each collection retains its own counts and scope. An offline MCP
+server still reports graph status unavailable, with an error result, while including its actual
+in-process staged work. It never invents daemon graph counters or proof completion. Ordinary
+`kin status` and `kin status --json` report the same live staged work separately under
+`repository.open_transactions`.
+
 A caller with no ledger reads as owed only while a resolver for its language can still prove its sites. When none can on this host now, because the daemon runs with language-server enrichment switched off, no language server serves the language, or the one that does cannot start, the caller reads as `unproven_no_resolver` instead: the block counts it under `callers_unproven_no_resolver`, `no_resolver` maps each reason (one per language and case, such as `python: no language server for it is installed or wired`) to its callers, and it is not an owed file. The daemon decides this from its own settings and from the language-server readiness it probes at start and at every sweep, so installing the server and letting the next sweep run turns these callers back into owed ones, and then settled ones.
 
-The verdict reads the block as its own input, `_kin.verdict.inputs.call_sites`: inconclusive with the block's clauses while a site in scope is owed, unproven for want of a resolver, unresolved, server-failed, not in any build, a binding that proves no target, or proven under a stale proof context; certified when every site is settled; and not applicable on an answer with no block. The codes are `call_sites_owed`, `call_sites_unproven_no_resolver`, `call_sites_unresolved`, `call_sites_server_failed`, `call_sites_not_in_build`, `binding_unproven` and `proof_context_stale`, listed with the others above. The same clauses reach `negative.trust_reason`, so the absence object and the verdict never disagree about them.
+The verdict reads the block as its own input, `_kin.verdict.inputs.call_sites`: inconclusive with the block's clauses while a site in scope is owed, unproven for want of a resolver, unresolved, server-failed, not in any build, a binding that proves no target, or proven under a stale or unverified proof context; certified when every site is settled; and not applicable on an answer with no block. The codes are `call_sites_owed`, `call_sites_unproven_no_resolver`, `call_sites_unresolved`, `call_sites_server_failed`, `call_sites_not_in_build`, `binding_unproven`, `proof_context_stale` and `proof_context_unverified`, listed with the others above. The same clauses reach `negative.trust_reason`, so the absence object and the verdict never disagree about them.
 
 ---
 
 ## 3. Semantic Change, Impact & Review
 *Tools:* `impact_analysis`, `semantic_diff`, `semantic_review`, `shadow_gate_report`
 
-- **`semantic_diff`**: Compute an entity-level diff of which declarations were added, removed, or changed, rather than a line-by-line text diff. Target it by base/head change IDs, entity IDs, or a list of change IDs (file paths still answer through 0.7.16 and are deprecated in favour of entity IDs).
+- **`semantic_diff`**: Compute an entity-level diff of which declarations were added, removed, or changed, rather than a line-by-line text diff. Target it by base/head change IDs, entity IDs, or a list of change IDs (file paths still answer through 0.7.16 and are deprecated in favour of entity IDs). Relation changes are counted by origin and kind the way `semantic_review` text counts them.
 - **`impact_analysis`**: Walk the relation graph from what changed to find the downstream entities that could be affected ("if I change this, what else might break?"). Each changed entity reported with `consumer_count: 0` is also read by the `caller_arrival` reading `find_references` publishes, in a top-level `caller_arrival` block. When a file that can reach the entity holds call sites that became no edge, or the reading could not be taken, the verdict is `inconclusive` and names the files rather than certifying the zero. The block's `scope` says what the reading can see: it counts a call site as arrived when the graph holds any call edge from it, including a call bound to a same-named definition in the caller's own file, and it reads only files that hold an import edge into the entity's file, so a caller that reaches the entity without one is not read. A zero certified over the reading says both in `negative.trust_reason`, and `_kin.verdict.inputs.caller_arrival` names the reading as one of the inputs the verdict was computed from, on `find_references` and `get_context_pack` absences as well.
-- **`semantic_review`**: Produce a complete review of a change in one call. It covers entity-level diff, downstream impact, and an overall risk assessment, in `text` or `json` form.
+- **`semantic_review`**: Produce a complete review of a change in one call. It covers entity-level diff, downstream impact, and an overall risk assessment, in `text` or `json` form. The text form opens with a summary of the risk, the counts and the findings, and counts relation changes by origin and kind, naming them when a group holds ten or fewer. The `json` form carries every relation change.
 - **`shadow_gate_report`**: Run the shadow-mode merge gate over a PR-shaped change (`base` ref to `head` ref) and return one report covering changed entities, graph-proven blast radius, the verdict the gate would have issued, the repair context needed to fix findings, explicit evidence gaps, and audit evidence. Shadow mode is report-only and never blocks. Refs accept branch names and semantic change IDs, and imported Git commit SHAs resolve once their history is in the graph. Where the graph cannot prove something, the report says so in `evidence_gaps` rather than passing silently.
 
 ---
@@ -904,8 +1054,8 @@ The verdict reads the block as its own input, `_kin.verdict.inputs.call_sites`: 
   When the command succeeds, what it wrote is handed back through the session reconcile boundary under the agent write-back policy: the manifests and lockfiles of the toolchain that ran are admitted, `go.mod`, `go.sum`, `go.work` and `go.work.sum` for Go; `package.json`, `package-lock.json`, `npm-shrinkwrap.json`, `yarn.lock` and `pnpm-lock.yaml` for Node; `Cargo.toml` and `Cargo.lock` for Rust; `pyproject.toml`, `requirements.txt`, `poetry.lock`, `uv.lock`, `Pipfile`, `Pipfile.lock` and `pdm.lock` for Python, and any of them for a configured command. They are recorded as one change attributed to the session, exactly as its `kin_mutate` commits are, and only while the workspace still holds exactly the tree that admission published. Source code it created, changed or removed is refused and reported, because code is written through entity operations; every other file, an application's own data files included, is refused too; and build outputs are never admitted. `write_back` names each admitted and withheld path with its reason, and the `change_id` and `tree_hash` of the new head, which the session's next command runs on. A command that fails or times out keeps nothing it wrote. The session needs `can_write` and `can_commit` for its manifests to be kept.
 
   The command itself runs the project's own code, which can do anything that code can do, and `npm run` runs the scripts `package.json` names. What the policy governs is what an agent can run directly and what comes back into the graph. `kin_session_exec` is served by name on `agent-default` and `full`, and as `exec` on `agent-routed`; a refusal's example call is written in the form the caller holds, `{"name":"kin_session_exec","arguments":{...}}` by name and `{"command":"exec","args":{...}}` routed.
-- **`kin_register_intent` / `kin_release_intent`**: Register or release intent to modify a specific entity or path, surfacing conflicts before code is edited.
-- **`kin_check_traffic`**: Query concurrent work on target entities or paths.
+- **`kin_register_intent` / `kin_release_intent`**: Register or release intent to modify a specific entity or path, surfacing conflicts before code is edited. A scope naming a symbol outside the repository is refused with `external_symbol_not_served`; see [Calls into symbols outside the repository](#calls-into-symbols-outside-the-repository).
+- **`kin_check_traffic`**: Query concurrent work on target entities or paths. A scope naming a symbol outside the repository is refused the same way.
 
 ---
 
@@ -944,7 +1094,7 @@ Whole-file creation, replacement, retirement and relocation are refused by the s
 
 - **`kin_transaction_validate`**: Run constraints and validation against staged changes.
 - **`kin_transaction_commit` / `kin_transaction_abort`**: Commit changes to the branch head or discard them. An optional `message` on the commit becomes the change's subject in history; without one the change records only `MCP transaction <id>`, which names the call and not the work.
-- **`kin_mutate`**: Atomically validate and commit a batch of graph mutations in a single call, the one-shot front for an agent that already knows what it is changing. It begins, stages and commits in one round trip, aborts cleanly on a refusal, and takes the change message as `summary`. Every refusal is a structured tool error the caller can retry from.
+- **`kin_mutate`**: Atomically validate and commit a batch of graph mutations in a single call, the one-shot front for an agent that already knows what it is changing. It begins, stages and commits in one round trip, aborts cleanly on a refusal, and takes the change message as `summary`. Every refusal is a structured tool error the caller can retry from. A relation whose `from` or `to` names a symbol outside the repository is refused with `external_symbol_not_served` before anything is staged, here and in `kin_transaction_stage` and `kin_transaction_commit`; see [Calls into symbols outside the repository](#calls-into-symbols-outside-the-repository).
 
 A body that came back marked `... [truncated]` is refused by `kin_transaction_stage`, `kin_mutate`, and the inline `operations` form of `kin_transaction_commit` before staging or committing it. Bodies rendered inside search results, context packs and trace steps are capped at 40 lines or 2400 characters, and committing one of those would replace the entity's whole span with the part that fit. `get_entity_source` serves an entity's complete span and applies no line or character cap of its own; read the body there.
 
@@ -954,7 +1104,7 @@ A body that came back marked `... [truncated]` is refused by `kin_transaction_st
 *Tools:* `kin_work_create`, `kin_work_list`, `kin_work_show`, `kin_work_link`, `kin_work_decompose`, `kin_work_block`, `kin_work_implement`, `kin_work_status`
 
 - **`kin_work_create`**: Create tasks or issues.
-- **`kin_work_link`**: Link tasks to specific entities or commits.
+- **`kin_work_link`**: Link tasks to specific entities or commits. A scope naming a symbol outside the repository is refused with `external_symbol_not_served` by `kin_work_create`, `kin_work_link`, `kin_work_implement` and the `scope` filter of `kin_work_list`; see [Calls into symbols outside the repository](#calls-into-symbols-outside-the-repository).
 - **`kin_work_decompose`**: Break a task into subtasks.
 - **`kin_work_block` / `kin_work_status`**: Manage and query implementation state.
 
@@ -964,7 +1114,7 @@ A body that came back marked `... [truncated]` is refused by `kin_transaction_st
 *Tools:* `kin_annotation_add`, `kin_annotation_list`, `kin_annotation_mark_resolved`, `kin_todo_import`
 
 - **`kin_annotation_add`**: Attach notes or documentation to specific graph nodes. An annotation is anchored to what the graph holds, so a target naming an entity id the graph holds no entity under is refused with the error code `entity_not_in_graph` and nothing is written. A symbol outside the repository is refused with `external_symbol_not_served`, as described under calls into symbols outside the repository.
-- **`kin_annotation_list`**: Query unresolved annotations and TODOs.
+- **`kin_annotation_list`**: Query unresolved annotations and TODOs. No annotation is anchored to a symbol outside the repository, so a target naming one is refused with `external_symbol_not_served` rather than answered with an empty list.
 - **`kin_annotation_mark_resolved`**: Mark annotations as completed.
 - **`kin_todo_import`**: Scan source files for inline `TODO`/`FIXME`/`HACK` markers and import each as a work item in the graph.
 
@@ -985,7 +1135,7 @@ A body that came back marked `... [truncated]` is refused by `kin_transaction_st
 ## 9. Semantic Reviews & Governance
 *Tools:* `kin_review_create`, `kin_review_decide`, `kin_review_note_add`, `kin_review_discuss`, `kin_review_discuss_reply`, `kin_review_discuss_resolve`, `kin_review_assign`, `kin_review_unassign`, `kin_review_list`, `kin_review_get`
 
-- **`kin_review_create`**: Open a review request for semantic changes.
+- **`kin_review_create`**: Open a review request for semantic changes. A scope or entity id naming a symbol outside the repository is refused with `external_symbol_not_served`, and so is one given to `kin_review_note_add` or `kin_review_discuss` as its `scope`.
 - **`kin_review_decide`**: Set review state (e.g. approved, blocked, needs_work).
 - **`kin_review_discuss` / `kin_review_discuss_reply` / `kin_review_discuss_resolve`**: Host comment threads attached to a review.
 - **`kin_review_assign` / `kin_review_unassign` / `kin_review_list` / `kin_review_get`**: Manage and inspect reviews.

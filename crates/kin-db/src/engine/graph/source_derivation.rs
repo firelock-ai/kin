@@ -42,11 +42,15 @@ pub struct SourceDerivationLimits {
 
 impl Default for SourceDerivationLimits {
     fn default() -> Self {
+        let max_bytes = 8 * 1_024 * 1_024;
         Self {
-            max_artifacts: 4_096,
+            // Inventory size alone must not reject compact facts that fit the
+            // byte budget. Keep a deterministic scan bound, derived from the
+            // space each admitted artifact necessarily consumes in those facts.
+            max_artifacts: max_bytes / size_of::<ResolvedArtifact>(),
             max_entities: 65_536,
             max_relations: 16_384,
-            max_bytes: 8 * 1_024 * 1_024,
+            max_bytes,
         }
     }
 }
@@ -384,12 +388,21 @@ impl InMemoryGraph {
                 facts.entities.push(binding);
             }
         }
-        budget.count(
-            ent.file_layouts.len(),
-            limits.max_artifacts,
-            SourceDerivationLimit::Artifacts,
-        )?;
-        for layout in ent.file_layouts.values() {
+        let layouts: Box<dyn Iterator<Item = &crate::types::FileLayout> + '_> =
+            if let Some(paths) = &requested {
+                Box::new(paths.values().filter_map(|path| {
+                    path.as_utf8()
+                        .and_then(|path| ent.file_layouts.get(&FilePathId::new(path)))
+                }))
+            } else {
+                budget.count(
+                    ent.file_layouts.len(),
+                    limits.max_artifacts,
+                    SourceDerivationLimit::Artifacts,
+                )?;
+                Box::new(ent.file_layouts.values())
+            };
+        for layout in layouts {
             if included(&layout.file_id) {
                 budget.array::<SourceLayoutFact>(1)?;
                 budget.charge(layout.file_id.0.len())?;
@@ -399,12 +412,21 @@ impl InMemoryGraph {
                 });
             }
         }
-        budget.count(
-            ent.opaque_artifacts.len(),
-            limits.max_artifacts,
-            SourceDerivationLimit::Artifacts,
-        )?;
-        for opaque in ent.opaque_artifacts.values() {
+        let opaque_records: Box<dyn Iterator<Item = &crate::types::OpaqueArtifact> + '_> =
+            if let Some(paths) = &requested {
+                Box::new(paths.values().filter_map(|path| {
+                    path.as_utf8()
+                        .and_then(|path| ent.opaque_artifacts.get(&FilePathId::new(path)))
+                }))
+            } else {
+                budget.count(
+                    ent.opaque_artifacts.len(),
+                    limits.max_artifacts,
+                    SourceDerivationLimit::Artifacts,
+                )?;
+                Box::new(ent.opaque_artifacts.values())
+            };
+        for opaque in opaque_records {
             if included(&opaque.file_id) {
                 budget.array::<SourceOpaqueFact>(1)?;
                 budget.charge(opaque.file_id.0.len())?;
@@ -441,7 +463,22 @@ impl InMemoryGraph {
         // Use the mixed-node adjacency without cloning it. Count every examined
         // adjacency slot and retain every outgoing artifact relation kind.
         let mut artifact_nodes = 0usize;
-        for (node_index, (node, outgoing)) in ent.node_outgoing.iter().enumerate() {
+        let adjacency: Box<dyn Iterator<Item = (GraphNodeId, &Vec<RelationId>)> + '_> =
+            if requested.is_some() {
+                Box::new(selected_artifacts.iter().filter_map(|id| {
+                    let node = GraphNodeId::Artifact(*id);
+                    ent.node_outgoing
+                        .get(&node)
+                        .map(|outgoing| (node, outgoing))
+                }))
+            } else {
+                Box::new(
+                    ent.node_outgoing
+                        .iter()
+                        .map(|(node, outgoing)| (*node, outgoing)),
+                )
+            };
+        for (node_index, (node, outgoing)) in adjacency.enumerate() {
             budget.count(
                 node_index.saturating_add(1),
                 limits
@@ -450,7 +487,7 @@ impl InMemoryGraph {
                     .saturating_add(limits.max_relations),
                 SourceDerivationLimit::Relations,
             )?;
-            let GraphNodeId::Artifact(id) = node else {
+            let GraphNodeId::Artifact(_) = node else {
                 continue;
             };
             artifact_nodes = artifact_nodes.saturating_add(1);
@@ -459,9 +496,6 @@ impl InMemoryGraph {
                 limits.max_artifacts,
                 SourceDerivationLimit::Artifacts,
             )?;
-            if requested.is_some() && !selected_artifacts.contains(id) {
-                continue;
-            }
             edges = edges.checked_add(outgoing.len()).ok_or(
                 SourceDerivationUnavailable::LimitExceeded(SourceDerivationLimit::Relations),
             )?;
@@ -474,7 +508,7 @@ impl InMemoryGraph {
                 let Some(relation) = ent.relations.get(id) else {
                     continue;
                 };
-                if relation.src == *node {
+                if relation.src == node {
                     budget.relation(relation)?;
                     facts.relations.push(relation.clone());
                 }
@@ -1135,6 +1169,156 @@ mod tests {
                 })
             );
         }
+    }
+
+    #[test]
+    fn whole_inventory_above_4096_artifacts_fits_existing_fact_budget() {
+        let graph = InMemoryGraph::new();
+        let artifacts: Vec<_> = (0..4_316)
+            .map(|index| artifact(path(&format!("src/{index}.rs")), 1))
+            .collect();
+        {
+            let mut ent = graph.entities.write();
+            ent.resolved_tree = ResolvedTree::from_artifacts(artifacts.clone()).unwrap();
+            for artifact in &artifacts {
+                let file = FilePathId::new(artifact.path.as_utf8().unwrap());
+                let item = entity(&file.0, 1);
+                ent.entities.insert(item.id, item);
+                ent.file_layouts.insert(
+                    file.clone(),
+                    FileLayout {
+                        file_id: file,
+                        parse_completeness: ParseCompleteness::Full,
+                        imports: ImportSection {
+                            byte_range: 0..0,
+                            items: Vec::new(),
+                        },
+                        regions: Vec::new(),
+                    },
+                );
+            }
+        }
+        for artifact in &artifacts {
+            insert_relation(&graph, relation(artifact));
+        }
+        let facts = graph
+            .source_derivation_facts_with_reserved_relation(limits(), None, reserved_id)
+            .unwrap();
+        assert_eq!(facts.artifacts.len(), 4_316);
+        assert_eq!(facts.entities.len(), 4_316);
+        assert_eq!(facts.layouts.len(), 4_316);
+        assert_eq!(facts.relations.len(), 4_316);
+        assert_eq!(facts.reserved_relations.len(), 4_316);
+        assert!(facts.missing_paths.is_empty());
+        assert_eq!(
+            graph.source_derivation_facts(
+                SourceDerivationLimits {
+                    max_artifacts: 4_096,
+                    ..limits()
+                },
+                None,
+            ),
+            Err(SourceDerivationUnavailable::LimitExceeded(
+                SourceDerivationLimit::Artifacts
+            ))
+        );
+        assert_eq!(
+            graph.source_derivation_facts(
+                SourceDerivationLimits {
+                    max_bytes: 1_024,
+                    ..limits()
+                },
+                None,
+            ),
+            Err(SourceDerivationUnavailable::LimitExceeded(
+                SourceDerivationLimit::Bytes
+            ))
+        );
+    }
+
+    #[test]
+    fn exact_path_inspection_ignores_unrelated_artifact_layout_and_adjacency_caps() {
+        let graph = InMemoryGraph::new();
+        let selected = artifact(path("selected.rs"), 1);
+        let mut artifacts = vec![selected.clone()];
+        for index in 0..4_096 {
+            artifacts.push(artifact(path(&format!("other/{index}.rs")), 2));
+        }
+        {
+            let mut ent = graph.entities.write();
+            ent.resolved_tree = ResolvedTree::from_artifacts(artifacts.clone()).unwrap();
+            for artifact in &artifacts {
+                let file = FilePathId::new(artifact.path.as_utf8().unwrap());
+                ent.file_layouts.insert(
+                    file.clone(),
+                    FileLayout {
+                        file_id: file.clone(),
+                        parse_completeness: ParseCompleteness::Full,
+                        imports: ImportSection {
+                            byte_range: 0..0,
+                            items: Vec::new(),
+                        },
+                        regions: Vec::new(),
+                    },
+                );
+                ent.opaque_artifacts.insert(
+                    file.clone(),
+                    OpaqueArtifact {
+                        file_id: file,
+                        content_hash: Hash256::from_bytes([2; 32]),
+                        mime_type: None,
+                        text_preview: None,
+                    },
+                );
+            }
+        }
+        for artifact in &artifacts {
+            insert_relation(&graph, relation(artifact));
+        }
+        assert_eq!(
+            graph.source_derivation_facts(
+                SourceDerivationLimits {
+                    max_artifacts: 4_096,
+                    ..limits()
+                },
+                None
+            ),
+            Err(SourceDerivationUnavailable::LimitExceeded(
+                SourceDerivationLimit::Artifacts
+            )),
+            "an explicit inventory cap is still enforced"
+        );
+        let scoped = graph
+            .source_derivation_facts_with_reserved_relation(
+                SourceDerivationLimits {
+                    max_artifacts: 1,
+                    max_relations: 2,
+                    ..limits()
+                },
+                Some(&[path("selected.rs")]),
+                reserved_id,
+            )
+            .unwrap();
+        assert_eq!(scoped.artifacts, vec![selected]);
+        assert_eq!(scoped.layouts.len(), 1);
+        assert_eq!(scoped.opaque.len(), 1);
+        assert_eq!(scoped.relations.len(), 1);
+        assert_eq!(scoped.reserved_relations.len(), 1);
+        assert_eq!(
+            graph.source_derivation_facts_with_reserved_relation(
+                SourceDerivationLimits {
+                    max_artifacts: 1,
+                    max_relations: 1,
+                    ..limits()
+                },
+                Some(&[path("selected.rs")]),
+                reserved_id,
+            ),
+            Err(SourceDerivationUnavailable::LimitExceeded(
+                SourceDerivationLimit::Relations
+            )),
+            "selected adjacency and reserved lookups still share the relation cap"
+        );
     }
 
     #[test]

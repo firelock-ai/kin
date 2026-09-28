@@ -184,8 +184,13 @@ fn plan_and_commit(
         .context("active repository-v6 workspace is invalid")?;
     // A rollback replaces the complete workspace tree. Graph-owned uncommitted
     // state would be silently destroyed by that, so it is refused rather than
-    // absorbed.
-    if workspace.is_dirty() {
+    // absorbed. Language-server enrichment in the overlay is Kin's derived
+    // state, not uncommitted work: the rollback's semantic plan below is taken
+    // from the whole workspace graph, overlay included, and a daemon re-derives
+    // what the restored tree implies. Refusing on it refused every rollback on
+    // a host where a language server published even one record, such as the
+    // Unverified validation a server that cannot start leaves.
+    if workspace.holds_uncommitted_work() {
         return Err(conflict(format!(
             "workspace {} has graph-owned changes; commit or discard them before rolling back",
             workspace.workspace_id

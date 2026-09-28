@@ -37,6 +37,12 @@ pub struct FileEnrichmentResult {
     /// means the pass did not finish the file, so the caller must not record
     /// the file as enriched.
     pub failed_queries: usize,
+    /// Failed queries whose timeout or protocol retry can clear later. They must
+    /// not become permanently finished merely by exhausting a retry count.
+    pub transient_queries: usize,
+    /// Protocol cancellation/content-change replies within transient queries.
+    /// Kept separate so ledgers do not mislabel these answers as timeouts.
+    pub retryable_protocol_queries: usize,
     /// Questions the server settled for good, which asking again would only
     /// repeat: an answer this build cannot prove or decode
     /// ([`LspError::is_refusal`]), a caller whose call hierarchy reported calls
@@ -217,6 +223,8 @@ enum AfterRefusal {
 #[derive(Default)]
 struct Refusals {
     failed: usize,
+    transient: usize,
+    retryable_protocol: usize,
     refused: usize,
     declined: usize,
     consecutive_timeouts: usize,
@@ -235,6 +243,7 @@ impl Refusals {
             QueryErrorClass::SessionEnded => AfterRefusal::End(error),
             QueryErrorClass::TimedOut => {
                 self.fail(asked, &error);
+                self.transient += 1;
                 self.consecutive_timeouts += 1;
                 if self.consecutive_timeouts >= TIMEOUTS_BEFORE_STOPPING {
                     AfterRefusal::Stop
@@ -258,6 +267,9 @@ impl Refusals {
             QueryErrorClass::Failed => {
                 tracing::debug!(asked, %error, "a query in the file pass failed; the file's other relations stand");
                 self.fail(asked, &error);
+                let retryable = usize::from(error.is_retryable());
+                self.transient += retryable;
+                self.retryable_protocol += retryable;
                 self.consecutive_timeouts = 0;
                 AfterRefusal::Skip
             }
@@ -937,6 +949,14 @@ impl<'i> Asked<'_, 'i> {
                 .and_then(|text| overload_implementation(self.index, dst, text, location))
             {
                 placed.target = Some(crate::call_sites::SiteTarget::Entity(implementation.id));
+                // The same answer names the implementation for ordinary
+                // references too, never the container holding its signature.
+                let kind = if target_uri.contains(self.rel_path) {
+                    "same_file"
+                } else {
+                    "cross_file"
+                };
+                placed.reference = Some((implementation, kind));
                 placed.overload = true;
             }
         }
@@ -1086,9 +1106,11 @@ struct QueryCounts {
     /// Hops that landed on a slot a value flows into, and so proved nothing.
     hop_slots: usize,
     overloads: usize,
-    /// Receiver types asked at TypeScript member calls, and the calls whose
+    /// Receiver types asked at TypeScript member calls, member types asked
+    /// where the receiver has no name to ask about, and the calls whose
     /// receiver may be a union and so prove no single declaration.
     receiver_types_asked: usize,
+    member_types_asked: usize,
     union_receivers: usize,
 }
 
@@ -1495,14 +1517,29 @@ pub async fn enrich_file_definitions_in(
                 // .wrapWithJsonFunction(..)` answered with one class's method
                 // in one session and the other's in the next. Such a call
                 // proves no single declaration.
-                if planned.call
-                    && lexicon == Lexicon::Script
-                    && decided.as_ref().is_some_and(|(targets, _)| {
-                        matches!(targets.first(), Some(crate::call_sites::SiteTarget::Entity(_)))
+                let proven_entity = decided
+                    .as_ref()
+                    .and_then(|(targets, _)| match targets.first() {
+                        Some(crate::call_sites::SiteTarget::Entity(entity)) => Some(*entity),
+                        _ => None,
                     })
-                    && receiver_may_be_a_union(server, &uri, &positions, &lines, (line, col), &mut counts)
+                    .filter(|_| planned.call && lexicon == Lexicon::Script);
+                let may_be_a_union = match proven_entity {
+                    Some(proven) => {
+                        receiver_may_be_a_union(
+                            server,
+                            &uri,
+                            &positions,
+                            &lines,
+                            (line, col),
+                            (entity_index, proven),
+                            &mut counts,
+                        )
                         .await?
-                {
+                    }
+                    None => false,
+                };
+                if may_be_a_union {
                     counts.union_receivers += 1;
                     union_receiver = true;
                     decided = None;
@@ -1663,6 +1700,7 @@ pub async fn enrich_file_definitions_in(
             alias_hop_slots = counts.hop_slots,
             overload_answers = counts.overloads,
             receiver_types_asked = counts.receiver_types_asked,
+            member_types_asked = counts.member_types_asked,
             union_receivers = counts.union_receivers,
             site_answers = site_answers.len(),
             "file definitions pass"
@@ -1672,6 +1710,8 @@ pub async fn enrich_file_definitions_in(
             definitions_resolved,
             positions_queried,
             failed_queries: refusals.failed,
+            transient_queries: refusals.transient,
+            retryable_protocol_queries: refusals.retryable_protocol,
             refused_queries: refusals.refused,
             unprovable: std::mem::take(&mut refusals.unprovable),
             call_hierarchy_complete,
@@ -1801,20 +1841,26 @@ fn casts_to_a_union(lines: &[&str], line: u32, receiver: &str) -> bool {
 
 /// Whether the receiver of the TypeScript member call whose callee starts at
 /// `(line, col)` may have a union type, so the call may run another
-/// constituent's method than the one its definition answer names.
+/// constituent's method than the one its definition answer names, the
+/// declaration of `proven`.
 ///
-/// A receiver written as an identifier is asked `textDocument/typeDefinition`,
-/// which the TypeScript server answers with the declaration of each object
-/// type in a union, and a primitive in it with none. Two declarations or
-/// more may be a union, and so may an answer that could not be had. A
-/// parenthesized receiver is a union when it casts to one. A receiver of any
-/// other shape, such as a call's result, is taken as the answer names it.
+/// A receiver written as a name is asked `textDocument/typeDefinition`, which
+/// the TypeScript server answers with the declaration of each object type in
+/// a union, and a primitive in it with none. Two declarations or more may be
+/// a union, and so may an answer that could not be had. A parenthesized cast
+/// to a union is one as written.
+///
+/// Any other receiver, such as a call's result (`getDriver().wrap(..)`), an
+/// element (`drivers[0].wrap(..)`) or a parenthesized expression, has no name
+/// to ask about, so the member itself is asked instead (see
+/// [`member_type_leaves_the_receiver_open`]).
 async fn receiver_may_be_a_union(
     server: &LspServer,
     uri: &str,
     positions: &crate::source_positions::SourcePositions<'_>,
     lines: &[&str],
     (line, col): (u32, u32),
+    (index, proven): (&EntityIndex, EntityId),
     counts: &mut QueryCounts,
 ) -> Result<bool> {
     let Some((receiver_line, receiver)) = receiver_before(lines, (line, col)) else {
@@ -1822,10 +1868,18 @@ async fn receiver_may_be_a_union(
     };
     let chars: Vec<char> = receiver.chars().collect();
     let identifier = |c: &char| c.is_alphanumeric() || *c == '_' || *c == '$';
-    match chars.last() {
-        Some(')') => return Ok(casts_to_a_union(lines, receiver_line, &receiver)),
-        Some(last) if identifier(last) => {}
-        _ => return Ok(false),
+    if !chars.last().is_some_and(identifier) {
+        if chars.last() == Some(&')') && casts_to_a_union(lines, receiver_line, &receiver) {
+            return Ok(true);
+        }
+        return member_type_leaves_the_receiver_open(
+            server,
+            uri,
+            positions.scalar_position(line, col)?,
+            (index, proven),
+            counts,
+        )
+        .await;
     }
     if !server.has_type_definition() {
         return Ok(true);
@@ -1851,13 +1905,98 @@ async fn receiver_may_be_a_union(
     match answer {
         Ok(types) => Ok(types
             .iter()
-            .map(|location| (location.uri.as_str(), location.range.start.line))
-            .collect::<std::collections::BTreeSet<_>>()
+            .map(|location| {
+                (
+                    location.uri.as_str(),
+                    location.range.start.line,
+                    location.range.start.character,
+                )
+            })
+            .collect::<BTreeSet<_>>()
             .len()
             >= 2),
         Err(error) if error.ends_the_session() => Err(error),
         Err(_) => Ok(true),
     }
+}
+
+/// Whether the member a call names, asked `textDocument/typeDefinition` at
+/// its own token, leaves the receiver's type open: it names the declaration
+/// the call was proven to, `proven`, and another declaration besides, or it
+/// names nothing.
+///
+/// The TypeScript server answers from the member's symbol. Through a
+/// receiver of one type that is the member's own declaration, and a method
+/// with one signature is answered with the declarations of what it returns,
+/// or with the method itself when what it returns has none (`void`, a
+/// primitive). The server takes that path only when the type of the symbol
+/// is the symbol's own (`tryGetReturnTypeOfFunction`). Through a receiver
+/// whose type is a union of types declaring the member apart, the symbol is
+/// a synthetic union property whose type is the union of the constituents'
+/// member types, which has no symbol, so the server answers with each
+/// constituent's own declaration of the member, whatever the members
+/// return: `getDriver().run()`, where `getDriver` returns
+/// `SqliteDriver | NativeDriver`, names both classes' `run` whether they
+/// return `void`, one class, two classes, `this` or a `Promise`. So an
+/// answer that names only the proven declaration, or only declarations of
+/// what the method returns, comes from one declaration of the member, and
+/// one that names the proven declaration and another may be a union. A
+/// method two constituents inherit from one base is one declaration, which
+/// is the one that runs. An intersection of types declaring the member apart
+/// is answered with nothing, as is a member with no symbol, and an answer
+/// that could not be had says no more, so each of those leaves the receiver
+/// open too.
+async fn member_type_leaves_the_receiver_open(
+    server: &LspServer,
+    uri: &str,
+    member: protocol::Position,
+    (index, proven): (&EntityIndex, EntityId),
+    counts: &mut QueryCounts,
+) -> Result<bool> {
+    if !server.has_type_definition() {
+        return Ok(true);
+    }
+    counts.member_types_asked += 1;
+    let answer = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        crate::enrichment::locations_at(
+            server,
+            "textDocument/typeDefinition",
+            uri,
+            member.line,
+            member.character,
+        ),
+    )
+    .await
+    .unwrap_or(Err(LspError::Timeout));
+    let declarations = match answer {
+        Ok(declarations) if !declarations.is_empty() => declarations,
+        Ok(_) => return Ok(true),
+        Err(error) if error.ends_the_session() => return Err(error),
+        Err(_) => return Ok(true),
+    };
+    let mut names_proven = false;
+    let mut positions = BTreeSet::new();
+    for location in &declarations {
+        positions.insert((
+            location.uri.as_str(),
+            location.range.start.line,
+            location.range.start.character,
+        ));
+        if index
+            .find_at(&location.uri, location.range.start.line)
+            .is_some_and(|entity| entity.id == proven)
+        {
+            names_proven = true;
+        }
+    }
+    // `find_at` is a line index, so two constituent methods written on the
+    // same line can both land on `proven`. It is only a conservative test of
+    // whether this answer may name the member, never proof that the other
+    // declarations are that member too. Count their full positions instead:
+    // two columns are two declarations, while an inherited member repeated
+    // at the exact same position is still one.
+    Ok(names_proven && positions.len() > 1)
 }
 
 /// What a call site's callee names when its definition answer is a binding
@@ -2140,6 +2279,56 @@ mod tests {
     use super::identifier_positions_in_line;
     use crate::enrichment::{EntityIndex, EntityRef};
     use kin_model::EntityId;
+
+    #[test]
+    fn timeouts_remain_transient_when_other_failures_are_settled() {
+        let mut outcomes = super::Refusals::default();
+        outcomes.refused(EntityId::new(), "first", crate::LspError::Timeout);
+        outcomes.refused(
+            EntityId::new(),
+            "second",
+            crate::LspError::JsonRpc(r#"{"code":-32603,"message":"panic"}"#.into()),
+        );
+        assert_eq!(outcomes.failed, 2);
+        assert_eq!(outcomes.transient, 1);
+        assert_eq!(outcomes.retryable_protocol, 0);
+    }
+
+    #[test]
+    fn protocol_retry_requests_stay_owed_while_declines_and_refusals_do_not() {
+        let mut outcomes = super::Refusals::default();
+        for code in [-32800, -32801, -32802] {
+            let error = crate::LspError::JsonRpc(
+                serde_json::json!({
+                    "code": code, "message": "try again",
+                })
+                .to_string(),
+            );
+            assert!(matches!(
+                outcomes.refused(EntityId::new(), "definitions", error),
+                super::AfterRefusal::Skip
+            ));
+        }
+        outcomes.refused(
+            EntityId::new(),
+            "references",
+            crate::LspError::Declined {
+                method: "textDocument/references".into(),
+                message: "no identifier found".into(),
+            },
+        );
+        outcomes.refused(
+            EntityId::new(),
+            "definitions",
+            crate::LspError::Protocol("unprovable target".into()),
+        );
+        assert_eq!(outcomes.failed, 3);
+        assert_eq!(outcomes.transient, 3);
+        assert_eq!(outcomes.retryable_protocol, 3);
+        assert_eq!(outcomes.declined, 1);
+        assert_eq!(outcomes.refused, 1);
+        assert_eq!(outcomes.consecutive_timeouts, 0);
+    }
 
     /// The source-line gate in `enrich_file_definitions` skips a line's LSP
     /// round-trips iff `entity_index.find_at(uri, line)` is None. This proves

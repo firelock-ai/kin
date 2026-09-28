@@ -49,6 +49,7 @@ pub const MAX_READER_ADMISSION_SECONDS: u64 = 2_592_000;
 const STARTUP_BOOTSTRAP_HOLDER: &str = "kin-daemon-startup-bootstrap";
 const STARTUP_BOOTSTRAP_REQUEST_ID: &str = "publication-control-v2";
 const MAX_CAS_ATTEMPTS: usize = 32;
+const MAX_RENEWAL_WRITE_ATTEMPTS: usize = 3;
 const MAX_COMPLETED_ROLLOUT_HISTORY: usize = 8;
 const MAX_FLEET_REPOSITORIES: usize = 64;
 
@@ -1630,10 +1631,10 @@ impl PublicationControl {
             let active = require_lease(&stored.record, &request.lease, LeaseKind::Rollout, now)?;
             let mut renewed = active.clone();
             renewed.expires_at = checked_expiry(now, request.ttl_seconds)?;
-            let mut record = stored.record;
+            let mut record = stored.record.clone();
             record.revision = checked_revision(record.revision)?;
             record.active_lease = Some(renewed.clone());
-            match self.store.update(&stored.version, &record) {
+            match self.persist_rollout_renewal(&stored, &record, &request.lease) {
                 Ok(_) => return Ok(renewed),
                 Err(error) if error.is_cas_conflict() => continue,
                 Err(error) => return Err(error),
@@ -1642,6 +1643,73 @@ impl PublicationControl {
         Err(PublicationControlError::Conflict(
             "rollout lease changed during every renewal attempt".to_string(),
         ))
+    }
+
+    /// A conditional PUT can land without its acknowledgment arriving. Re-read
+    /// the exact record before retrying, and never replay the preceding spine
+    /// publication or derive a new transition from a changed control state.
+    fn persist_rollout_renewal(
+        &self,
+        original: &StoredPublicationControlRecord,
+        proposed: &PublicationControlRecord,
+        proof: &LeaseProof,
+    ) -> Result<(), PublicationControlError> {
+        let mut expected = original.version.clone();
+        let mut ambiguous = false;
+        for attempt in 1..=MAX_RENEWAL_WRITE_ATTEMPTS {
+            let now = self.clock.now();
+            require_lease(&original.record, proof, LeaseKind::Rollout, now)?;
+            require_lease(proposed, proof, LeaseKind::Rollout, now)?;
+            let error = match self.store.update(&expected, proposed) {
+                Ok(_) => {
+                    require_lease(proposed, proof, LeaseKind::Rollout, self.clock.now())?;
+                    return Ok(());
+                }
+                Err(error) => error,
+            };
+            if !(matches!(error, PublicationControlError::Store(_))
+                || ambiguous && error.is_cas_conflict())
+            {
+                return Err(error);
+            }
+            ambiguous = true;
+            let observed = self.load_required().map_err(|read_error| {
+                PublicationControlError::Store(format!(
+                    "renewal outcome could not be reconciled: {error}; readback failed: {read_error}"
+                ))
+            })?;
+            self.validate_record(&observed.record)?;
+            require_lease(
+                &observed.record,
+                proof,
+                LeaseKind::Rollout,
+                self.clock.now(),
+            )?;
+            if observed.record == *proposed && observed.version != original.version {
+                return Ok(());
+            }
+            if observed.record != original.record {
+                return Err(PublicationControlError::Fenced(format!(
+                    "rollout fence {} control state changed during renewal recovery",
+                    proof.fence
+                )));
+            }
+            if attempt == MAX_RENEWAL_WRITE_ATTEMPTS {
+                return Err(PublicationControlError::Store(format!(
+                    "renewal outcome remains unconfirmed after {attempt} conditional writes: {error}"
+                )));
+            }
+            // The same original state is still live. A fresh observed CAS
+            // version protects even a concurrent same-bytes object rewrite.
+            expected = observed.version;
+            tracing::warn!(
+                fence = proof.fence,
+                attempt,
+                error = %error,
+                "rollout renewal was not observed; retrying the exact conditional update"
+            );
+        }
+        unreachable!("renewal write attempts are nonzero")
     }
 
     /// Renew the exact rollout proof to the daemon-owned window before one
@@ -3576,6 +3644,20 @@ impl StorageBackendDelegate for PublicationGatedStorageBackend {
     }
 }
 
+#[cfg(test)]
+#[derive(Debug)]
+enum RenewalWriteFault {
+    Before,
+    After,
+    Replace(Box<PublicationControlRecord>),
+    Advance {
+        clock: Arc<test_clock::ManualClock>,
+        seconds: i64,
+        persist: bool,
+    },
+    Unreadable,
+}
+
 /// Deterministic CAS store used by direct API, expiry, retry, and race tests.
 #[derive(Debug, Default)]
 pub struct InMemoryPublicationControlStore {
@@ -3589,10 +3671,22 @@ pub struct InMemoryPublicationControlStore {
     missing_authority: Mutex<Option<String>>,
     #[cfg(test)]
     crash_after_fenced_repositories: Mutex<Option<usize>>,
+    #[cfg(test)]
+    renewal_write_faults: Mutex<std::collections::VecDeque<RenewalWriteFault>>,
+    #[cfg(test)]
+    update_calls: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    load_failure: std::sync::atomic::AtomicBool,
 }
 
 impl PublicationControlStore for InMemoryPublicationControlStore {
     fn load(&self) -> Result<Option<StoredPublicationControlRecord>, PublicationControlError> {
+        #[cfg(test)]
+        if self.load_failure.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(PublicationControlError::Store(
+                "readback unavailable".to_string(),
+            ));
+        }
         let state = self
             .state
             .lock()
@@ -3645,7 +3739,56 @@ impl PublicationControlStore for InMemoryPublicationControlStore {
         let next = version.checked_add(1).ok_or_else(|| {
             PublicationControlError::Store("memory version exhausted u64".to_string())
         })?;
+        #[cfg(test)]
+        let fault = {
+            self.update_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.renewal_write_faults.lock().unwrap().pop_front()
+        };
+        #[cfg(test)]
+        match &fault {
+            Some(RenewalWriteFault::Before) => {
+                return Err(PublicationControlError::Store(
+                    "request timed out before persistence".to_string(),
+                ));
+            }
+            Some(RenewalWriteFault::Replace(replacement)) => {
+                *state = Some(((**replacement).clone(), next));
+                return Err(PublicationControlError::Store(
+                    "request timed out during concurrent update".to_string(),
+                ));
+            }
+            Some(RenewalWriteFault::Advance {
+                clock,
+                seconds,
+                persist,
+            }) => {
+                clock.advance(*seconds);
+                if !persist {
+                    return Err(PublicationControlError::Store(
+                        "request timed out across expiry".to_string(),
+                    ));
+                }
+            }
+            Some(RenewalWriteFault::Unreadable) => {
+                self.load_failure
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                return Err(PublicationControlError::Store(
+                    "request timed out before readback outage".to_string(),
+                ));
+            }
+            _ => {}
+        }
         *state = Some((record.clone(), next));
+        #[cfg(test)]
+        if matches!(
+            fault,
+            Some(RenewalWriteFault::After | RenewalWriteFault::Advance { persist: true, .. })
+        ) {
+            return Err(PublicationControlError::Store(
+                "request timed out after persistence".to_string(),
+            ));
+        }
         Ok(memory_version(next))
     }
 
@@ -3913,13 +4056,25 @@ mod object_store_control {
     const MAX_AUTHORITY_FENCE_OBJECT_BYTES: u64 = 512 * 1024 * 1024;
     const MAX_PUBLICATION_CONTROL_RECORD_BYTES: u64 = 1024 * 1024;
 
+    // Display alone hides the reqwest/hyper/io cause of a transport failure.
+    // Bound both depth and each message without formatting request payloads.
+    pub(super) fn transport_error_chain(error: &dyn std::error::Error) -> String {
+        let mut messages = Vec::new();
+        let mut current = Some(error);
+        for _ in 0..8 {
+            let Some(cause) = current else { break };
+            messages.push(cause.to_string().chars().take(512).collect::<String>());
+            current = cause.source();
+        }
+        messages.join("; caused by: ")
+    }
+
     pub struct ObjectStorePublicationControlStore {
         store: Arc<dyn ObjectStore>,
         prefix: String,
         path: ObjectPath,
         max_authority_fence_object_bytes: u64,
         max_control_record_bytes: u64,
-        fallback_rt: OnceLock<tokio::runtime::Runtime>,
         #[cfg(test)]
         fence_body_residency: std::sync::Mutex<(usize, usize)>,
     }
@@ -3961,7 +4116,6 @@ mod object_store_control {
                 path,
                 max_authority_fence_object_bytes: MAX_AUTHORITY_FENCE_OBJECT_BYTES,
                 max_control_record_bytes: MAX_PUBLICATION_CONTROL_RECORD_BYTES,
-                fallback_rt: OnceLock::new(),
                 #[cfg(test)]
                 fence_body_residency: std::sync::Mutex::new((0, 0)),
             }
@@ -4006,18 +4160,39 @@ mod object_store_control {
             self.fence_body_residency.lock().unwrap().1
         }
 
-        fn block_on<F: Future>(&self, future: F) -> F::Output {
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                tokio::task::block_in_place(|| handle.block_on(future))
-            } else {
-                self.fallback_rt
-                    .get_or_init(|| {
-                        tokio::runtime::Builder::new_current_thread()
-                            .enable_all()
-                            .build()
-                            .expect("publication control runtime")
-                    })
-                    .block_on(future)
+        fn block_on<F: Future + Send>(&self, future: F) -> F::Output
+        where
+            F::Output: Send,
+        {
+            // A pooled HTTP connection's driver belongs to the runtime that
+            // opened it. Keep that driver running between synchronous calls,
+            // including when a caller's temporary runtime has been dropped.
+            // Sharing it avoids a worker pool per control-store instance and
+            // avoids dropping an owned Runtime from an async context.
+            static IO_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+            let runtime = IO_RUNTIME.get_or_init(|| {
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(1)
+                    .enable_all()
+                    .build()
+                    .expect("publication control runtime")
+            });
+            match tokio::runtime::Handle::try_current() {
+                Ok(handle)
+                    if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread =>
+                {
+                    tokio::task::block_in_place(|| runtime.block_on(future))
+                }
+                // Current-thread runtimes cannot hand their worker off with
+                // block_in_place. Borrow the future on a scoped thread instead
+                // of entering a nested runtime or borrowing the caller's driver.
+                Ok(_) => std::thread::scope(|scope| {
+                    scope
+                        .spawn(|| runtime.block_on(future))
+                        .join()
+                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+                }),
+                Err(_) => runtime.block_on(future),
             }
         }
 
@@ -4352,7 +4527,7 @@ mod object_store_control {
                 | object_store::Error::NotModified { .. } => {
                     PublicationControlError::Conflict(error.to_string())
                 }
-                other => PublicationControlError::Store(other.to_string()),
+                other => PublicationControlError::Store(transport_error_chain(&other)),
             }
         }
     }
@@ -4364,8 +4539,9 @@ mod object_store_control {
                 Err(object_store::Error::NotFound { .. }) => return Ok(None),
                 Err(error) => {
                     return Err(PublicationControlError::Store(format!(
-                        "read {}: {error}",
-                        self.path
+                        "read {}: {}",
+                        self.path,
+                        transport_error_chain(&error)
                     )))
                 }
             };
@@ -4383,7 +4559,11 @@ mod object_store_control {
                 )));
             }
             let bytes = self.block_on(result.bytes()).map_err(|error| {
-                PublicationControlError::Store(format!("read {} body: {error}", self.path))
+                PublicationControlError::Store(format!(
+                    "read {} body: {}",
+                    self.path,
+                    transport_error_chain(&error)
+                ))
             })?;
             let record = serde_json::from_slice(&bytes).map_err(|error| {
                 PublicationControlError::Store(format!("decode {}: {error}", self.path))
@@ -4496,6 +4676,51 @@ mod object_store_control {
                 )));
             }
             Ok(())
+        }
+    }
+
+    #[cfg(test)]
+    mod runtime_tests {
+        use super::*;
+
+        #[test]
+        fn control_driver_outlives_temporary_caller_and_store() {
+            let store = ObjectStorePublicationControlStore::new(
+                Arc::new(object_store::memory::InMemory::new()),
+                "fixture",
+            );
+            let caller = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .unwrap();
+            let (release, pending) = tokio::sync::oneshot::channel();
+            let (finished, completion) = std::sync::mpsc::channel();
+            caller.block_on(async {
+                store.block_on(async {
+                    tokio::spawn(async move {
+                        pending.await.unwrap();
+                        finished.send(()).unwrap();
+                    });
+                });
+            });
+            drop(caller);
+            // Connection drivers must still run when no block_on is active.
+            release.send(()).unwrap();
+            completion
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("control driver remains active after the ambient runtime exits");
+            assert!(store.load().unwrap().is_none());
+
+            let current_thread = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            current_thread.block_on(async {
+                assert!(store.load().unwrap().is_none());
+                // Destruction in an async context must not drop a Runtime.
+                drop(store);
+            });
         }
     }
 
@@ -8059,6 +8284,228 @@ mod tests {
             "{expired}"
         );
         assert!(expired.to_string().contains("expired"), "{expired}");
+    }
+
+    fn renewal_fixture() -> (
+        Arc<InMemoryPublicationControlStore>,
+        Arc<ManualClock>,
+        Arc<PublicationControl>,
+        ActivePublicationLease,
+    ) {
+        let store = Arc::new(InMemoryPublicationControlStore::default());
+        let clock = Arc::new(ManualClock::new());
+        let control = control_for_fleet(store.clone(), clock.clone(), READER_A, staging_fleet());
+        let lease = control
+            .acquire_rollout(AcquireRolloutLeaseRequest {
+                ttl_seconds: HOSTED_ROLLOUT_LEASE_SECONDS,
+                ..rollout_request_for_fleet(
+                    staging_fleet(),
+                    "deploy",
+                    "renewal",
+                    Some(reader(READER_A, 300)),
+                )
+            })
+            .unwrap();
+        clock.advance(10);
+        store.update_calls.store(0, Ordering::SeqCst);
+        (store, clock, control, lease)
+    }
+
+    #[test]
+    fn rollout_renewal_reconciles_timeouts_without_double_applying() {
+        // Before persistence, after persistence, and a same-bytes object
+        // rewrite all need exact readback rather than a blind retry.
+        for scenario in 0..3 {
+            let (store, clock, control, lease) = renewal_fixture();
+            let original = store.load().unwrap().unwrap();
+            let fault = match scenario {
+                0 => RenewalWriteFault::Before,
+                1 => RenewalWriteFault::After,
+                _ => RenewalWriteFault::Replace(Box::new(original.record.clone())),
+            };
+            store.renewal_write_faults.lock().unwrap().push_back(fault);
+            let renewed = control
+                .renew_rollout_before_mutation(&proof(&lease))
+                .unwrap();
+            assert_eq!(
+                renewed.expires_at,
+                clock.now() + ChronoDuration::seconds(HOSTED_ROLLOUT_LEASE_SECONDS as i64)
+            );
+            let mut expected = original.record.clone();
+            expected.revision += 1;
+            expected.active_lease = Some(renewed);
+            let durable = store.load().unwrap().unwrap();
+            assert_eq!(
+                durable.record, expected,
+                "only the renewal changes, scenario {scenario}"
+            );
+            assert_ne!(durable.version, original.version);
+            assert_eq!(
+                store.update_calls.load(Ordering::SeqCst),
+                if scenario == 1 { 1 } else { 2 }
+            );
+        }
+    }
+
+    #[test]
+    fn rollout_renewal_refuses_changed_owner_fence_phase_or_release_after_timeout() {
+        for scenario in 0..4 {
+            let (store, clock, control, lease) = renewal_fixture();
+            let mut competing = store.load().unwrap().unwrap().record;
+            competing.revision += 1;
+            match scenario {
+                0 => competing.active_lease.as_mut().unwrap().holder = "another-holder".to_string(),
+                1 => {
+                    competing.last_fence += 1;
+                    competing.active_lease.as_mut().unwrap().fence += 1;
+                }
+                2 => competing.next_reader_identity = Some(READER_B.to_string()),
+                _ => {
+                    // Acquisition still awaits its spine checkpoint. Removing
+                    // the lease alone would make an invalid record, not a
+                    // competing release. Produce the real completed transition
+                    // on a copy, then inject it during the ambiguous PUT.
+                    let released_store = Arc::new(InMemoryPublicationControlStore::default());
+                    released_store.create(&competing).unwrap();
+                    *released_store.authority.lock().unwrap() =
+                        store.authority.lock().unwrap().clone();
+                    let released_control =
+                        control_for_fleet(released_store.clone(), clock, READER_A, staging_fleet());
+                    release(&released_control, &lease);
+                    competing = released_store.load().unwrap().unwrap().record;
+                    assert!(competing.active_lease.is_none());
+                    assert_eq!(
+                        competing.last_completed_rollout.as_ref().unwrap().fence,
+                        lease.fence
+                    );
+                }
+            }
+            control.validate_record(&competing).unwrap();
+            store
+                .renewal_write_faults
+                .lock()
+                .unwrap()
+                .push_back(RenewalWriteFault::Replace(Box::new(competing.clone())));
+            let error = control
+                .renew_rollout_before_mutation(&proof(&lease))
+                .unwrap_err();
+            assert!(
+                matches!(error, PublicationControlError::Fenced(_)),
+                "scenario {scenario}: {error}"
+            );
+            assert_eq!(store.load().unwrap().unwrap().record, competing);
+            assert_eq!(store.update_calls.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn rollout_renewal_refuses_expired_or_unreadable_recovery_and_bounds_outages() {
+        for scenario in 0..3 {
+            let (store, clock, control, lease) = renewal_fixture();
+            let original = store.load().unwrap().unwrap();
+            match scenario {
+                0 => store.renewal_write_faults.lock().unwrap().push_back(
+                    RenewalWriteFault::Advance {
+                        clock,
+                        seconds: HOSTED_ROLLOUT_LEASE_SECONDS as i64 + 1,
+                        persist: false,
+                    },
+                ),
+                1 => store
+                    .renewal_write_faults
+                    .lock()
+                    .unwrap()
+                    .push_back(RenewalWriteFault::Unreadable),
+                _ => {
+                    store.renewal_write_faults.lock().unwrap().extend(
+                        (0..MAX_RENEWAL_WRITE_ATTEMPTS + 1).map(|_| RenewalWriteFault::Before),
+                    )
+                }
+            }
+            let error = control
+                .renew_rollout_before_mutation(&proof(&lease))
+                .unwrap_err();
+            match scenario {
+                0 => assert!(
+                    matches!(error, PublicationControlError::Fenced(_)),
+                    "{error}"
+                ),
+                1 => assert!(error.to_string().contains("readback failed"), "{error}"),
+                _ => assert!(
+                    error.to_string().contains("after 3 conditional writes"),
+                    "{error}"
+                ),
+            }
+            assert_eq!(
+                store.update_calls.load(Ordering::SeqCst),
+                if scenario == 2 {
+                    MAX_RENEWAL_WRITE_ATTEMPTS
+                } else {
+                    1
+                }
+            );
+            store.load_failure.store(false, Ordering::SeqCst);
+            let durable = store.load().unwrap().unwrap();
+            assert_eq!(durable.record, original.record);
+            assert_eq!(durable.version, original.version);
+        }
+    }
+
+    #[test]
+    fn rollout_renewal_does_not_accept_or_retry_an_expired_proposal() {
+        for persisted in [false, true] {
+            let (store, clock, control, lease) = renewal_fixture();
+            let original = store.load().unwrap().unwrap();
+            store
+                .renewal_write_faults
+                .lock()
+                .unwrap()
+                .push_back(RenewalWriteFault::Advance {
+                    clock: clock.clone(),
+                    seconds: 2,
+                    persist: persisted,
+                });
+            let error = control
+                .renew_rollout(RenewRolloutLeaseRequest {
+                    lease: proof(&lease),
+                    ttl_seconds: 1,
+                })
+                .unwrap_err();
+            assert!(
+                matches!(error, PublicationControlError::Fenced(_)),
+                "{error}"
+            );
+            assert!(error.to_string().contains("expired"), "{error}");
+            assert!(
+                lease.expires_at > clock.now(),
+                "the original lease is still live"
+            );
+            assert_eq!(store.update_calls.load(Ordering::SeqCst), 1);
+            let durable = store.load().unwrap().unwrap();
+            if persisted {
+                assert!(durable.record.active_lease.unwrap().expires_at <= clock.now());
+            } else {
+                assert_eq!(durable.record, original.record);
+                assert_eq!(durable.version, original.version);
+            }
+        }
+    }
+
+    #[cfg(feature = "gcs")]
+    #[test]
+    fn publication_transport_diagnostics_keep_the_nested_source() {
+        let error = object_store::Error::Generic {
+            store: "fixture",
+            source: Box::new(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "nested transport deadline",
+            )),
+        };
+        let diagnostic = object_store_control::transport_error_chain(&error);
+        assert!(
+            diagnostic.contains("caused by: nested transport deadline"),
+            "{diagnostic}"
+        );
     }
 
     /// The lease bound to an in-flight mutation is what the Firestore store

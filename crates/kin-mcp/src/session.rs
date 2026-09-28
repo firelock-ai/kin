@@ -418,6 +418,10 @@ pub struct McpTransaction {
     pub scope: String,
     pub state: String,
     pub staged_operations: Vec<McpMutationOperation>,
+    /// Original creation time. Older durable records did not record this, so
+    /// their age is unknown rather than inferred from their latest activity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<Timestamp>,
     /// Canonical digest of the exact staged operation set being committed.
     ///
     /// Daemon-owned repository commits persist `state = "committing"` and
@@ -440,6 +444,76 @@ pub struct McpTransaction {
     /// existed is read as freshly active rather than as instantly expired.
     #[serde(default = "Timestamp::now")]
     pub last_activity_at: Timestamp,
+}
+
+/// Live staged work, kept separate from the workspace's persisted dirty state.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OpenTransactionObservation {
+    pub observed_at: Timestamp,
+    pub items: Vec<OpenStagedTransaction>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OpenStagedTransaction {
+    pub transaction_id: String,
+    pub session_id: String,
+    pub scope: String,
+    pub state: String,
+    pub staged_count: usize,
+    /// Changes when the staged contents change, including same-count edits.
+    pub staged_digest: String,
+    pub created_at: Option<Timestamp>,
+    pub age_seconds: Option<u64>,
+}
+
+impl OpenTransactionObservation {
+    /// One summary constructor for daemon, CLI and in-process MCP. Inputs are
+    /// a held session/transaction observation; no staged payload is exposed.
+    pub fn capture<'a>(
+        now: Timestamp,
+        writable_sessions: impl IntoIterator<Item = String>,
+        transactions: impl IntoIterator<Item = &'a McpTransaction>,
+    ) -> Self {
+        let owners: std::collections::HashSet<_> = writable_sessions
+            .into_iter()
+            .map(|id| canonical_session_key(&id))
+            .collect();
+        let mut items: Vec<_> = transactions
+            .into_iter()
+            .filter(|transaction| {
+                is_unfinished_transaction_state(&transaction.state)
+                    && !transaction.staged_operations.is_empty()
+                    && owners.contains(&canonical_session_key(&transaction.session_id))
+            })
+            .map(|transaction| OpenStagedTransaction {
+                transaction_id: transaction.transaction_id.clone(),
+                session_id: transaction.session_id.clone(),
+                scope: transaction.scope.clone(),
+                state: transaction.state.clone(),
+                staged_count: transaction.staged_operations.len(),
+                staged_digest: kin_blobs::digest(
+                    &serde_json::to_vec(&transaction.staged_operations)
+                        .expect("staged operations serialize to JSON"),
+                )
+                .to_string(),
+                created_at: transaction.created_at.clone(),
+                age_seconds: transaction.created_at.as_ref().map(|created| {
+                    now.0.signed_duration_since(created.0).num_seconds().max(0) as u64
+                }),
+            })
+            .collect();
+        items.sort_by(|left, right| left.transaction_id.cmp(&right.transaction_id));
+        Self {
+            observed_at: now,
+            items,
+        }
+    }
+}
+
+fn canonical_session_key(id: &str) -> String {
+    uuid::Uuid::parse_str(id)
+        .map(|id| id.to_string())
+        .unwrap_or_else(|_| id.to_string())
 }
 
 /// Linearized outcome of an in-process intent registration attempt.
@@ -1912,6 +1986,7 @@ impl SessionRegistry {
             scope: scope.to_string(),
             state: "active".to_string(),
             staged_operations: Vec::new(),
+            created_at: Some(Timestamp::now()),
             commit_payload_hash: None,
             last_activity_at: Timestamp::now(),
         };
@@ -2206,6 +2281,37 @@ impl SessionRegistry {
             .values()
             .cloned()
             .collect()
+    }
+
+    pub fn open_staged_transactions(&self) -> OpenTransactionObservation {
+        // Stage/validate hold transactions before resolving their owner. Keep
+        // the same order so observing status cannot deadlock a lifecycle call.
+        let transactions = self
+            .transactions
+            .lock()
+            .expect("transactions lock poisoned");
+        let agents = self
+            .agent_sessions
+            .lock()
+            .expect("agent_sessions lock poisoned");
+        let legacy = self.sessions.lock().expect("sessions lock poisoned");
+        let mut writable: Vec<_> = agents
+            .values()
+            .filter(|session| session.capabilities.can_write)
+            .map(|session| session.session_id.to_string())
+            .collect();
+        writable.extend(
+            legacy
+                .keys()
+                .filter(|id| {
+                    uuid::Uuid::parse_str(id)
+                        .ok()
+                        .map(SessionId)
+                        .is_none_or(|id| !agents.contains_key(&id))
+                })
+                .cloned(),
+        );
+        OpenTransactionObservation::capture(Timestamp::now(), writable, transactions.values())
     }
 
     /// Replace all transactions in this registry with `transactions`.
@@ -2809,6 +2915,118 @@ mod tests {
             description: String::new(),
             destination: None,
         }
+    }
+
+    #[test]
+    fn open_staged_observation_tracks_real_lifecycle_and_original_age() {
+        let registry = SessionRegistry::new();
+        registry.register("owner", "test");
+        let empty = registry.begin_transaction("owner", "empty").unwrap();
+        assert!(registry.open_staged_transactions().items.is_empty());
+        let staged = registry
+            .stage_transaction(&empty.transaction_id, vec![tiny_operation(0)])
+            .unwrap();
+        assert_eq!(staged.created_at, empty.created_at);
+        let validated = registry
+            .validate_transaction(&empty.transaction_id)
+            .unwrap();
+        assert_eq!(validated.created_at, empty.created_at);
+        let now =
+            Timestamp(empty.created_at.as_ref().unwrap().0 + std::time::Duration::from_secs(90));
+        let observation =
+            OpenTransactionObservation::capture(now, ["owner".to_string()], [&validated]);
+        assert_eq!(observation.items.len(), 1);
+        assert_eq!(observation.items[0].age_seconds, Some(90));
+        assert_eq!(observation.items[0].state, "validated");
+        assert_eq!(observation.items[0].staged_count, 1);
+        registry.commit_transaction(&empty.transaction_id).unwrap();
+        assert!(registry.open_staged_transactions().items.is_empty());
+        let aborted = staged_edit(&registry, "owner");
+        registry.abort_transaction(&aborted.transaction_id).unwrap();
+        assert!(registry.open_staged_transactions().items.is_empty());
+    }
+
+    #[test]
+    fn open_staged_observation_filters_owners_and_preserves_legacy_unknown_age() {
+        let registry = SessionRegistry::new();
+        registry.register("Owner", "test");
+        let staged = staged_edit(&registry, "Owner");
+        let mut legacy_json = serde_json::to_value(&staged).unwrap();
+        legacy_json.as_object_mut().unwrap().remove("created_at");
+        let legacy: McpTransaction = serde_json::from_value(legacy_json).unwrap();
+        let hidden =
+            OpenTransactionObservation::capture(Timestamp::now(), ["owner".into()], [&legacy]);
+        assert!(
+            hidden.items.is_empty(),
+            "legacy session ids are case-sensitive"
+        );
+        let visible =
+            OpenTransactionObservation::capture(Timestamp::now(), ["Owner".into()], [&legacy]);
+        assert_eq!(visible.items[0].created_at, None);
+        assert_eq!(visible.items[0].age_seconds, None);
+        assert!(!serde_json::to_string(&visible)
+            .unwrap()
+            .contains("pub fn value"));
+
+        let session = registry.start_agent_session(
+            "test",
+            "read-only",
+            SessionTransport::Mcp,
+            None,
+            PathBuf::from("/tmp"),
+            SessionCapabilities::default(),
+        );
+        registry.register(&session.session_id.to_string(), "legacy-alias");
+        let mut readonly = staged.clone();
+        readonly.session_id = session.session_id.to_string();
+        registry.replace_transactions(vec![readonly]);
+        assert!(
+            registry.open_staged_transactions().items.is_empty(),
+            "rich read-only capability overrides legacy alias"
+        );
+
+        let mut uuid_owner = staged;
+        uuid_owner.session_id = session.session_id.to_string().to_ascii_uppercase();
+        let visible = OpenTransactionObservation::capture(
+            Timestamp::now(),
+            [session.session_id.to_string()],
+            [&uuid_owner],
+        );
+        assert_eq!(
+            visible.items.len(),
+            1,
+            "UUID owners normalize like lifecycle dispatch"
+        );
+        registry.end_agent_session(&session.session_id);
+        registry.remove(&session.session_id.to_string());
+        assert!(registry.open_staged_transactions().items.is_empty());
+    }
+
+    #[test]
+    fn open_staged_observation_orders_rows_and_identifies_same_count_changes() {
+        let registry = SessionRegistry::new();
+        registry.register("owner", "test");
+        let mut first = staged_edit(&registry, "owner");
+        first.transaction_id = "a".into();
+        first.state = "committing".into();
+        let mut second = first.clone();
+        second.transaction_id = "b".into();
+        second.staged_operations[0].body = Some("changed".into());
+        let observation = OpenTransactionObservation::capture(
+            Timestamp::now(),
+            ["owner".into()],
+            [&second, &first],
+        );
+        assert_eq!(observation.items[0].transaction_id, "a");
+        assert_eq!(observation.items[1].transaction_id, "b");
+        assert_eq!(
+            observation.items[0].staged_count,
+            observation.items[1].staged_count
+        );
+        assert_ne!(
+            observation.items[0].staged_digest,
+            observation.items[1].staged_digest
+        );
     }
 
     #[test]

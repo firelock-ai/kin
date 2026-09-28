@@ -2,6 +2,7 @@
 // Copyright 2026 Firelock, LLC
 
 pub mod admission;
+pub mod call_site_escape;
 pub mod embed;
 pub mod engine;
 pub mod error;
@@ -15,14 +16,19 @@ pub mod types;
 #[cfg(feature = "vector")]
 pub mod vector;
 
+pub use call_site_escape::{
+    focal_escape_evidence, focal_escape_evidence_batch, focal_escape_evidence_in, CensusFile,
+    EscapeCensusGraph, StoreCensus,
+};
 pub use embed::{
-    CodeEmbedder, EmbeddingProducer, EmbeddingProducerSet, ProducedEmbeddingBatch,
-    VectorProducerProvenance,
+    install_model_fetch_gate, CodeEmbedder, EmbeddingProducer, EmbeddingProducerSet,
+    ModelFetchGate, ProducedEmbeddingBatch, VectorProducerProvenance,
 };
 #[cfg(feature = "vector")]
 pub use engine::VectorSalvageStats;
 pub use engine::{
-    EmbeddingStatus, InMemoryGraph, PersistenceEpoch, ProducedSemanticSearch,
+    EmbeddingStatus, EnrichmentContextStatus, EnrichmentStatusError, EnrichmentStatusFacts,
+    FileEnrichmentStatus, InMemoryGraph, PersistenceEpoch, ProducedSemanticSearch,
     ProducedSemanticSearchBatch, ResolvedRetrievalItem, SourceDerivationFacts,
     SourceDerivationLimit, SourceDerivationLimits, SourceDerivationUnavailable,
     SourceEntityBinding, SourceLayoutFact, SourceOpaqueFact, SourceReservedRelation,

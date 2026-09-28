@@ -3,9 +3,9 @@
 
 //! TTY-aware progress output for CLI commands.
 //!
-//! On a terminal: uses `\r` carriage returns for inline updating (smooth UX).
-//! On a pipe/redirect: uses `\n` newlines so each update is a visible line
-//! (e.g., in CI logs, MCP tool output, Claude Code background commands).
+//! On a supported interactive terminal: uses `\r` for inline updating.
+//! With either stream redirected, an unsupported terminal or CI: uses `\n`
+//! newlines so each update is a visible line in the plain output.
 //!
 //! Usage:
 //! ```ignore
@@ -14,21 +14,31 @@
 //! progress.finish(); // prints final newline
 //! ```
 
-use std::io::IsTerminal;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+
+/// Set while a transient line is on stderr, waiting for [`clear_transient`].
+static TRANSIENT_SHOWING: AtomicBool = AtomicBool::new(false);
+
+/// The bytes that erase a transient line: back to column zero, then clear to
+/// the end of the line, which leaves the cursor where the line began.
+const ERASE_TRANSIENT: &str = "\r\x1b[K";
+
+const PLAIN_UPDATE_INTERVAL: Duration = Duration::from_secs(10);
 
 /// TTY-aware progress writer.
 pub struct Progress {
     is_tty: bool,
     /// Terminal width in columns, when stderr is a terminal that reports one.
     width: Option<usize>,
-    /// How many updates have been emitted (for throttling non-TTY output).
-    updates: usize,
+    /// When a plain progress line last reached the output.
+    last_plain_update: Option<Instant>,
 }
 
 impl Progress {
     /// Create a progress writer that targets stderr.
     pub fn stderr() -> Self {
-        let is_tty = std::io::stderr().is_terminal();
+        let is_tty = crate::screen::animation_allowed();
         let width = is_tty
             .then(|| console::Term::stderr().size_checked())
             .flatten()
@@ -36,23 +46,17 @@ impl Progress {
         Self {
             is_tty,
             width,
-            updates: 0,
+            last_plain_update: None,
         }
     }
 
     /// Emit a progress line. On TTY: overwrites the current line with `\r`.
-    /// On non-TTY: prints a new line, but throttled to avoid flooding logs.
+    /// In plain output: prints immediately, then at most every ten seconds.
     pub fn update(&mut self, msg: std::fmt::Arguments<'_>) {
-        self.updates += 1;
-
         if self.is_tty {
             eprint!("{}", rendered_update(true, self.width, &msg.to_string()));
-        } else {
-            // Non-TTY: print every 10th update as a full line
-            // (avoids flooding CI/pipe output with hundreds of lines)
-            if self.updates <= 1 || self.updates.is_multiple_of(10) {
-                eprint!("{}", rendered_update(false, None, &msg.to_string()));
-            }
+        } else if admit_plain_update(&mut self.last_plain_update, Instant::now()) {
+            eprint!("{}", rendered_update(false, None, &msg.to_string()));
         }
     }
 
@@ -76,6 +80,55 @@ impl Progress {
             eprint!("{}", rendered_update(false, None, &msg.to_string()));
         }
     }
+}
+
+/// Plain progress is a heartbeat, independent of how often a caller polls.
+/// Final messages bypass this cadence and always reach the output.
+fn admit_plain_update(last: &mut Option<Instant>, now: Instant) -> bool {
+    if last.is_some_and(|last| now.saturating_duration_since(last) < PLAIN_UPDATE_INTERVAL) {
+        return false;
+    }
+    *last = Some(now);
+    true
+}
+
+impl Progress {
+    /// Finish with a message that stays on screen only until the next
+    /// [`clear_transient`].
+    ///
+    /// On a terminal the message replaces the progress line and the cursor
+    /// stays at its end, with no newline, so the clear can take the whole line
+    /// back and what prints next starts where it began. Off a terminal it is an
+    /// ordinary finished line, the same bytes [`Progress::finish_with`]
+    /// writes, because a log or a captured stream cannot be erased and its
+    /// reader needs the line.
+    ///
+    /// The caller owes a [`clear_transient`] before anything else prints, or
+    /// the next output continues the transient line.
+    pub fn finish_transient(&self, msg: std::fmt::Arguments<'_>) {
+        if self.is_tty {
+            eprint!("{}", rendered_update(true, self.width, &msg.to_string()));
+            TRANSIENT_SHOWING.store(true, Ordering::SeqCst);
+        } else {
+            eprint!("{}", rendered_update(false, None, &msg.to_string()));
+        }
+    }
+}
+
+/// Erase the transient line [`Progress::finish_transient`] left on screen,
+/// if one is showing, and do nothing otherwise.
+///
+/// Safe to call from anywhere and any number of times: only the first call
+/// after a transient line writes anything.
+pub fn clear_transient() {
+    if take_transient(&TRANSIENT_SHOWING) {
+        eprint!("{ERASE_TRANSIENT}");
+    }
+}
+
+/// Take the showing flag, `true` only for the first caller after it was set.
+fn take_transient(flag: &AtomicBool) -> bool {
+    flag.swap(false, Ordering::SeqCst)
 }
 
 /// The exact bytes one progress update writes, as a function of the stream.
@@ -111,6 +164,48 @@ fn rendered_update(is_tty: bool, width: Option<usize>, msg: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plain_progress_uses_elapsed_time_instead_of_poll_count() {
+        let start = Instant::now();
+        for tick_ms in [1, 200, 2000] {
+            let mut last = None;
+            let emitted: Vec<_> = (0..=27_000 / tick_ms)
+                .map(|tick| tick * tick_ms)
+                .filter(|elapsed| {
+                    admit_plain_update(&mut last, start + Duration::from_millis(*elapsed))
+                })
+                .collect();
+            assert_eq!(emitted, [0, 10_000, 20_000], "tick interval {tick_ms} ms");
+        }
+    }
+
+    #[test]
+    fn a_late_plain_heartbeat_does_not_create_catch_up_lines() {
+        let start = Instant::now();
+        let mut last = None;
+        assert!(admit_plain_update(&mut last, start));
+        assert!(!admit_plain_update(
+            &mut last,
+            start + Duration::from_millis(9999)
+        ));
+        assert!(admit_plain_update(
+            &mut last,
+            start + Duration::from_secs(35)
+        ));
+        assert!(!admit_plain_update(
+            &mut last,
+            start + Duration::from_secs(35)
+        ));
+        assert!(!admit_plain_update(
+            &mut last,
+            start + Duration::from_secs(44)
+        ));
+        assert!(admit_plain_update(
+            &mut last,
+            start + Duration::from_secs(45)
+        ));
+    }
 
     /// The erase and the carriage return, each pinned by an assertion that
     /// only its own mutation can fail.
@@ -150,6 +245,22 @@ mod tests {
         assert!(
             piped.ends_with('\n') && !piped.contains('\r'),
             "and it ends its own line rather than returning to the start of one: {piped:?}"
+        );
+    }
+
+    /// A transient line is erased whole, once. The erase returns to column
+    /// zero and clears to the end, so the answer that follows starts on a
+    /// clean line, and a second clear writes nothing that could erase it.
+    #[test]
+    fn a_transient_line_is_erased_once() {
+        assert_eq!(ERASE_TRANSIENT, "\r\x1b[K");
+        let flag = AtomicBool::new(false);
+        assert!(!take_transient(&flag), "nothing showing, nothing to erase");
+        flag.store(true, Ordering::SeqCst);
+        assert!(take_transient(&flag), "a showing line is erased");
+        assert!(
+            !take_transient(&flag),
+            "and only once, so a later clear cannot erase the line printed over it"
         );
     }
 

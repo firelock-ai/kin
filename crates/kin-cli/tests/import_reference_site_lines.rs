@@ -12,7 +12,7 @@
 //!
 //! The cause was one line in the linker: an entity-level import edge cited
 //! `FileImport::site`, the whole statement, for every specifier under it.
-//! `reference_lines` is served from `RelationEvidence::source_span`
+//! A reference row's sites are read from `RelationEvidence::source_span`
 //! (`kin_mcp::handlers::common::relation_reference_lines`), so the statement's
 //! first line is exactly what came back.
 //!
@@ -33,7 +33,7 @@ use kin_index::{
 };
 use kin_model::{
     ArtifactId, Entity, EntityKind, EntityStore, FilePathId, Hash256, LocatedEntry, Relation,
-    RepoPath, TransactionDelta, TreeDelta, TreeEntry,
+    RelationKind, RepoPath, TransactionDelta, TreeDelta, TreeEntry,
 };
 
 const DEFS_PATH: &str = "defs.ts";
@@ -197,6 +197,71 @@ async fn find_import_references(graph: &InMemoryGraph, target: &Entity) -> serde
     serde_json::from_str(text).expect("find_references body is json")
 }
 
+/// The 1-based file lines the collector keys a served import row's sites by,
+/// matched by the importer's entity id.
+///
+/// The wire addresses each site inside its caller and never by a file line,
+/// and this fixture strips entity spans, so a served site cannot say where it
+/// is. The exact lines are pinned here instead, at the collector the row is
+/// served from.
+fn collected_lines(graph: &InMemoryGraph, target: &Entity, served: &serde_json::Value) -> Vec<u32> {
+    kin_mcp::handlers::common::collect_graph_reference_rows(
+        graph,
+        &target.id,
+        &[RelationKind::Imports],
+        None,
+    )
+    .expect("collect reference rows")
+    .into_iter()
+    .find(|row| row.entity_id.as_deref() == served["entity_id"].as_str())
+    .unwrap_or_else(|| panic!("the collector holds no row for the served one: {served:#}"))
+    .reference_lines
+}
+
+/// A served row whose importer the graph holds no span for: `count` sites,
+/// each addressed inside the importer and unable to give an offset or text,
+/// and no file address of any kind.
+fn assert_spanless_sites(row: &serde_json::Value, count: usize, context: &str) {
+    assert_eq!(
+        row["site_count"],
+        serde_json::json!(count),
+        "{context}: {row:#}"
+    );
+    let sites = row["sites"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{context}: `sites` array: {row:#}"));
+    assert_eq!(sites.len(), count, "{context}: {row:#}");
+    for site in sites {
+        assert_eq!(
+            site["line_in_entity"],
+            serde_json::Value::Null,
+            "{context}: {row:#}"
+        );
+        assert_eq!(
+            site["callee"],
+            serde_json::Value::Null,
+            "{context}: {row:#}"
+        );
+        assert_eq!(
+            site["callee_unavailable"], "caller_has_no_span",
+            "{context}: the fixture removes entity spans on purpose: {row:#}"
+        );
+    }
+    for retired in [
+        "file_path",
+        "start_line",
+        "reference_lines",
+        "reference_line_count",
+        "reference_lines_absent_reason",
+        "reference_lines_partial_reason",
+    ] {
+        assert!(
+            row.get(retired).is_none(),
+            "{context}: a reference row carries no `{retired}`: {row:#}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn an_import_row_names_the_specifier_line_not_the_statement_line() {
     let specifier_line = line_of("DEFAULT_STYLE_ID,");
@@ -250,37 +315,34 @@ async fn an_import_row_names_the_specifier_line_not_the_statement_line() {
                 )
             });
 
+        // The wire serves each site inside its importer, and a spanless
+        // importer cannot place one, so the exact line is pinned at the
+        // collector the row is served from.
+        let lines = collected_lines(&graph, &target, row);
         assert_eq!(
-            row["reference_lines"],
-            serde_json::json!([specifier_line]),
+            lines,
+            vec![specifier_line],
             "{arm}: the row must name line {specifier_line}, where `DEFAULT_STYLE_ID` is \
              written, and nothing else: {row:#}"
         );
         assert!(
-            !row["reference_lines"]
-                .as_array()
-                .expect("reference_lines is an array")
-                .contains(&serde_json::json!(statement_line)),
+            !lines.contains(&statement_line),
             "{arm}: line {statement_line} carries a bare `import {{` and no occurrence of the \
              name; reporting it is the defect: {row:#}"
         );
+        assert_spanless_sites(row, 1, &format!("{arm}: one specifier binds the name once"));
         assert_eq!(
-            row["reference_line_count"],
-            serde_json::json!(1),
-            "{arm}: one specifier binds the name once: {row:#}"
-        );
-        assert_eq!(
-            row["reference_lines_absent_reason"],
+            row["sites_absent_reason"],
             serde_json::Value::Null,
             "{arm}: a row that HAS a site must claim no absence: {row:#}"
         );
-        // Non-vacuity: the fixture strips entity spans, so the number above
-        // came from the relation's evidence or from nowhere.
         assert_eq!(
-            row["start_line"],
-            serde_json::Value::Null,
-            "{arm}: the fixture removes entity spans on purpose: {row:#}"
+            row["projection"]["path"], CALLER_PATH,
+            "{arm}: the importer is labelled with the file it is projected into: {row:#}"
         );
+        // Non-vacuity: the fixture strips entity spans and the row carries no
+        // start_line or file line at all (checked above), so the line pinned
+        // at the collector came from the relation's evidence or from nowhere.
     }
 }
 
@@ -319,11 +381,12 @@ async fn no_import_row_ever_names_the_statement_line() {
                 .as_array()
                 .unwrap_or_else(|| panic!("{arm}: `references` array: {body:#}"))
             {
-                let lines = row["reference_lines"]
-                    .as_array()
-                    .expect("reference_lines is an array");
+                // Pinned at the collector: the wire serves each site inside
+                // its importer, which a spanless importer cannot place.
+                let lines = collected_lines(&graph, &target, row);
+                assert_spanless_sites(row, lines.len(), &format!("{arm}: `{name}`"));
                 assert!(
-                    !lines.contains(&serde_json::json!(statement_line)),
+                    !lines.contains(&statement_line),
                     "{arm}: the row for `{name}` names line {statement_line}, which carries a \
                      bare `import {{` and no occurrence of any imported name: {row:#}"
                 );
@@ -406,11 +469,14 @@ async fn a_single_line_import_reports_the_line_it_is_written_on() {
         .find(|row| row["name"] == serde_json::json!(importer.name))
         .unwrap_or_else(|| panic!("no import row for `{}`: {body:#}", importer.name));
 
+    // Pinned at the collector: the wire serves the site inside its importer,
+    // which a spanless importer cannot place.
     assert_eq!(
-        row["reference_lines"],
-        serde_json::json!([1]),
+        collected_lines(&graph, &target, row),
+        vec![1],
         "the whole import is written on line 1, so the specifier's line is line 1: {row:#}"
     );
+    assert_spanless_sites(row, 1, "a single-line import");
 }
 
 /// Two specifiers under one statement do not collapse onto one line.
@@ -455,9 +521,12 @@ async fn the_second_specifier_of_one_statement_reports_its_own_line() {
         .find(|row| row["name"] == serde_json::json!(importer.name))
         .unwrap_or_else(|| panic!("no import row for `{}`: {body:#}", importer.name));
 
+    // Pinned at the collector: the wire serves the site inside its importer,
+    // which a spanless importer cannot place.
+    assert_spanless_sites(row, 1, "the second specifier");
     assert_eq!(
-        row["reference_lines"],
-        serde_json::json!([second_line]),
+        collected_lines(&graph, &target, row),
+        vec![second_line],
         "the second specifier is written on line {second_line}, not on line {first_line} and \
          not on the statement's: {row:#}"
     );

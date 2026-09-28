@@ -23,7 +23,7 @@ one, because the honest label the tool already carried ("treat this as a lower
 bound") is the same label a complete walk carries.
 
 The extension adds checks 4 through 7. A target that steers discovery must also
-survive both response-budget decisions, and each surviving step must carry the
+survive every response page, and each surviving step must carry the
 exact graph-owned call-site lines that make the hop actionable.
 
 Eight checks, on one seeded repository:
@@ -38,10 +38,10 @@ Eight checks, on one seeded repository:
      either half alone is satisfiable by a broken tool
   3  a walk no cap cut publishes none of this, and the keys are ABSENT rather
      than zero, so machinery for incomplete answers never qualifies a complete one
-  4  a wide walk proves `cert_verify` was discovered, then a response-budget
-     cut with that target keeps it and proves the budget actually bit
-  5  the same response budget without a target drops `cert_verify`, beside the
-     targeted arm, so the named question rather than the fixture delivers it
+  4  a wide walk proves `cert_verify` was discovered, then bounded pages with
+     that target preserve every discovered step and parent identity
+  5  the same response budget without a target preserves `cert_verify` across
+     pages too, so response sizing cannot discard discovered evidence
   6  callee steps carry the exact 1-based call sites from their parent files,
      including the cross-module hop and the next step beyond it
   7  the cross-file `send_via_adapter` edge walked backwards reports `send` as
@@ -54,10 +54,13 @@ failure here rather than a silent pass in CI.
 """
 from __future__ import print_function
 
+from trace_pages import TraceAnswer, drain_trace
+
 import argparse
 import functools
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -221,6 +224,64 @@ def fixture_line(source, needle):
 
 SESSION_ADAPTER_CALL_LINE = fixture_line(SESSIONS_SRC, "response = send_via_adapter(")
 ADAPTER_CERT_CALL_LINE = fixture_line(ADAPTERS_SRC, "return cert_verify(")
+
+
+# BEGIN failure evidence excerpt
+# Every suite carries this block byte for byte, because a suite is also copied
+# out and run as a single file. test_failure_excerpt.py keeps the copies equal.
+EVIDENCE_LIMIT = 4000
+EVIDENCE_LINE_LIMIT = 600
+EVIDENCE_PANICS = ("panicked at", "has overflowed its stack")
+EVIDENCE_ESCAPES = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+EVIDENCE_ERROR = re.compile(r"^(?:[\w./-]+:\s*)?(?:error|fatal)\b", re.IGNORECASE)
+EVIDENCE_LOG_ERROR = re.compile(r"\sERROR\s")
+
+
+def failure_excerpt(text, limit=EVIDENCE_LIMIT):
+    """Bounded evidence from a command's output that still says why it failed.
+
+    Output that fits is returned whole. Longer output keeps its opening and its
+    end, and between them every line that carries a Rust panic, with the
+    message line under it, and the last error line, wherever they fall. A
+    warning printed around the error cannot push it out, and a long log cannot
+    cut the panic out. `limit` only ever raises the bound, never lowers it.
+    """
+    text = (text or "").strip()
+    limit = max(int(limit), EVIDENCE_LIMIT)
+    if len(text) <= limit:
+        return text
+    head_end = limit // 4
+    tail_start = len(text) - limit // 2
+    lines = text.split("\n")
+    starts, offset = [], 0
+    panics, errors = [], []
+    for index, line in enumerate(lines):
+        starts.append(offset)
+        offset += len(line) + 1
+        plain = EVIDENCE_ESCAPES.sub("", line).strip()
+        if any(marker in plain for marker in EVIDENCE_PANICS):
+            panics.extend((index, index + 1))
+        if EVIDENCE_ERROR.match(plain) or EVIDENCE_LOG_ERROR.search(plain):
+            errors.append(index)
+    # The first panic and its message, then the last error line, then any
+    # later panics, for as long as the middle's share of the bound lasts.
+    order = panics[:2] + errors[-1:] + panics[2:]
+    budget, kept = limit // 4, set()
+    for index in order:
+        if index >= len(lines) or index in kept:
+            continue
+        start, end = starts[index], starts[index] + len(lines[index])
+        if end <= head_end or start >= tail_start:
+            continue
+        cost = min(len(lines[index]), EVIDENCE_LINE_LIMIT) + 1
+        if cost > budget:
+            continue
+        kept.add(index)
+        budget -= cost
+    middle = [lines[index][:EVIDENCE_LINE_LIMIT] for index in sorted(kept)]
+    parts = [text[:head_end], "[...]"] + middle + (["[...]"] if middle else [])
+    return "\n".join(parts + [text[tail_start:]])
+# END failure evidence excerpt
 
 
 def run(cmd, cwd=None, env=None, timeout=600):
@@ -909,10 +970,10 @@ class Suite(object):
         self.git(["add", "-A"], path)
         rc, out, err = self.git(["commit", "-q", "-m", "fixture"], path)
         if rc != 0:
-            raise RuntimeError("git commit failed: %s" % (err or out)[-300:])
+            raise RuntimeError("git commit failed: %s" % failure_excerpt(err or out))
         rc, out, err = self.kin_run(["init", "."], path)
         if rc != 0:
-            raise RuntimeError("kin init failed: %s" % (err or out)[-300:])
+            raise RuntimeError("kin init failed: %s" % failure_excerpt(err or out))
         self._repo = path
         return path
 
@@ -930,19 +991,18 @@ class Suite(object):
             args += ["--target", target]
         if max_response_chars:
             args += ["--max-response-chars", str(max_response_chars)]
-        rc, out, err = self.kin_run(args, repo)
-        if self.verbose:
-            print("  $ kin %s -> rc=%s" % (" ".join(args[1:]), rc))
-        if rc != 0:
-            return None
+        def fetch(cursor):
+            page_args = args + (["--cursor", cursor] if cursor is not None else [])
+            rc, out, err = self.kin_run(page_args, repo)
+            if rc != 0:
+                raise ValueError("trace command failed: %s" % failure_excerpt(err or out))
+            return json.loads(out), out.strip("\r\n")
         try:
-            payload = EmittedResponse(json.loads(out))
-        except (ValueError, TypeError):
+            return drain_trace(fetch, max_response_chars)
+        except (ValueError, TypeError) as exc:
+            if self.verbose:
+                print("  trace pages unreadable: %s" % exc)
             return None
-        # The bytes the budget governs are the ones this process just printed.
-        # `println!` adds the terminator, and nothing else is written to stdout.
-        payload.emitted_bytes = len(out.strip("\r\n").encode("utf-8"))
-        return payload
 
     def elision_arms(self):
         """One wide premise and a paired target/no-target response cut."""
@@ -1089,28 +1149,35 @@ def elision_premise_not_run(targeted):
     return None
 
 
+def grade_response_pages_preserve_walk(wide, paged, require_target):
+    if not isinstance(wide, dict) or not isinstance(paged, dict):
+        return UNREADABLE, "one response arm is not an object"
+    if len(getattr(paged, "page_bytes", ())) < 2:
+        return UNREADABLE, "the small-budget arm did not exercise a continuation"
+    problem = bounded_subset_problem(paged, wide)
+    if problem:
+        return FAIL, problem
+    if len(paged["chain"]) != len(wide["chain"]):
+        return FAIL, "trace pagination lost discovered steps"
+    problem = parentage_problem(paged, require_target=require_target)
+    if problem:
+        return FAIL, problem
+    if paged.get("steps_omitted", 0) != wide.get("steps_omitted", 0):
+        return FAIL, "trace pagination added traversal omissions"
+    return PASS, "%d pages preserved all %d steps and their parent identities" % (
+        len(paged.page_bytes), len(paged["chain"]))
+
+
 def check_the_named_target_survives_response_elision(suite):
     wide, targeted, _ = suite.elision_arms()
-    if wide is None or targeted is None:
-        return Result("4", UNREADABLE, "the wide or targeted bounded walk returned nothing readable")
-    not_run = elision_premise_not_run(targeted)
-    if not_run:
-        return Result("4", UNREADABLE, "The named branch survives response elision. " + not_run)
-    status, detail = grade_named_target_survives_response_budget(
-        wide, targeted, RESPONSE_BUDGET)
-    return Result("4", status, "The named branch survives response elision. " + detail)
+    status, detail = grade_response_pages_preserve_walk(wide, targeted, True)
+    return Result("4", status, "The named branch survives response paging. " + detail)
 
 
 def check_the_unnamed_budget_drops_the_same_target(suite):
-    wide, targeted, unnamed = suite.elision_arms()
-    if wide is None or targeted is None or unnamed is None:
-        return Result("5", UNREADABLE, "one of the three response-budget arms returned nothing readable")
-    not_run = elision_premise_not_run(targeted)
-    if not_run:
-        return Result("5", UNREADABLE, "The unnamed control loses the same branch. " + not_run)
-    status, detail = grade_unnamed_response_budget_drops_the_target(
-        wide, targeted, unnamed, RESPONSE_BUDGET)
-    return Result("5", status, "The unnamed control loses the same branch. " + detail)
+    wide, _, unnamed = suite.elision_arms()
+    status, detail = grade_response_pages_preserve_walk(wide, unnamed, True)
+    return Result("5", status, "The unnamed control preserves the same branch across pages. " + detail)
 
 
 def check_callee_steps_carry_their_parent_file_sites(suite):
@@ -1304,6 +1371,14 @@ def self_test():
         if want_detail is not None and want_detail not in (got[1] or ""):
             failures.append("%s: %s for the wrong reason, wanted %r in %r" % (
                 label, status, want_detail, got[1]))
+
+    paged = TraceAnswer({"chain":[{"step":1, "parent_step":0,
+                        "entity_id":"one", "entity_name":"one"}]})
+    paged.page_bytes = (1900, 1800)
+    expect("paging preserves every step", grade_response_pages_preserve_walk(dict(paged), paged, False), PASS)
+    lost = TraceAnswer({"chain":[]})
+    lost.page_bytes = paged.page_bytes
+    expect("paging cannot lose a step", grade_response_pages_preserve_walk(dict(paged), lost, False), FAIL)
 
     expect("0 passes an honest clipped walk",
            grade_says_the_absence_proves_nothing(CLIPPED), PASS)

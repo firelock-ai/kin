@@ -3,7 +3,7 @@
 
 # Kin environment variables
 
-This is the authoritative list of supported `KIN_*` environment variables (556 total, 365 correctness-relevant), generated from the central registry in `kin-core`.
+This is the authoritative list of supported `KIN_*` environment variables (558 total, 365 correctness-relevant), generated from the central registry in `kin-core`.
 
 At CLI and daemon startup Kin validates this surface (`KIN_ENV_VALIDATION`, default `warn`):
 
@@ -132,6 +132,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_DAEMON_DISABLE_FILESYSTEM_RECONCILE` | bool | false | correctness | disable daemon filesystem watching and reconcile/sync ingestion so remote graph authority cannot be overwritten by a checkout |
 | `KIN_DAEMON_DISABLE_LSP` | bool | false | correctness | disable LSP enrichment in the daemon, reducing relation coverage |
 | `KIN_DAEMON_EMBED_BATCH_SIZE` | usize | *(unset)* | operational | embedding batch size for daemon-side embed passes |
+| `KIN_DAEMON_EMBED_MEMORY_HOLD_SECS` | seconds>=0 | 1200 | operational | how long a daemon stays up for an embedding pass memory pressure is holding back, so the pass resumes when memory frees; 0 lets it idle out at once |
 | `KIN_DAEMON_EXACT_SOURCE_EXPORT_QUEUE_DEPTH` | usize | 8 | operational | how many exact-source archive exports may wait for the single export slot at once; a request arriving on a full queue is refused at once with a Retry-After rather than holding a connection for the whole wait budget to be told the same thing later. Zero or unparseable keeps one, because a queue that admits nobody is the refusal this replaced |
 | `KIN_DAEMON_EXACT_SOURCE_EXPORT_WAIT_MS` | usize | 3000 | operational | how long one exact-source archive export waits in milliseconds for the daemon's single in-memory export slot before it is refused with a Retry-After. The wait is spent inside the caller's own read bound, so raising it past what one export costs turns a queued clone into a caller timeout instead of an answer. Zero means do not wait, which restores the outright refusal this queue replaced; it is a real value here rather than the unbounded-means-zero convention the millisecond bound knobs use |
 | `KIN_DAEMON_EXISTING_READY_TIMEOUT_SECS` | seconds>=0 | 3 | operational | readiness wait for an already-running daemon |
@@ -156,6 +157,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_DAEMON_STARTUP_LOCK_TIMEOUT_SECS` | seconds>=0 | *(unset)* | operational | how long to wait for the daemon startup lock |
 | `KIN_DAEMON_STOP_TIMEOUT_SECS` | seconds>=0 | 30 | operational | ceiling in seconds kin daemon stop waits for a signaled daemon to exit |
 | `KIN_DAEMON_TEST_HOLD_ENRICHMENT_SWEEP` | bool | 0 | diagnostic | kin-daemon fault injection: refuse to admit the LSP enrichment sweep at start, so cross-file edges never publish and a reference answer is thin rather than late; off by default |
+| `KIN_DAEMON_TEST_STARTUP_GATE` | path | *(unset)* | diagnostic | kin-daemon fault injection: while the named file exists, hold a starting daemon before it opens any state, so it holds its repository with no endpoint published until the file is removed; unset or empty disarms it |
 | `KIN_DAEMON_TEST_STARTUP_HOLD_SECS` | seconds>=0 | *(unset)* | diagnostic | kin-daemon fault injection: hold the endpoint unpublished for N seconds at startup, so a client's startup binding stays PENDING past the tools/call grace and the still-starting disclosure is reachable; unset or zero disarms it |
 | `KIN_DAEMON_UNRESPONSIVE_TIMEOUT_SECS` | seconds>=0 | 20 | operational | how long a daemon that never reported itself warming may answer nothing at all before the client calls it wedged and reports, instead of waiting out KIN_DAEMON_READY_TIMEOUT_SECS. A warming daemon answers /readiness throughout its load and never reaches this. Zero waits the full readiness budget |
 | `KIN_DAEMON_URL` | url | *(unset)* | operational | explicit daemon endpoint URL (skip local discovery) |

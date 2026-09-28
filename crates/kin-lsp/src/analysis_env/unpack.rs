@@ -150,21 +150,31 @@ impl TarLayout {
 /// layout keeps links and it stays inside the tree; anything else is
 /// refused.
 pub fn untar_gz(archive: &Path, destination: &Path, layout: TarLayout) -> Result<Unpacked, String> {
-    let keep_links = layout.links;
     let file =
         std::fs::File::open(archive).map_err(|error| format!("{}: {error}", archive.display()))?;
-    let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(std::io::BufReader::new(file)));
+    let decoder = flate2::read::GzDecoder::new(std::io::BufReader::new(file));
+    unpack_tar(decoder, destination, layout)
+        .map_err(|error| format!("{}: {error}", archive.display()))
+}
+
+fn unpack_tar(
+    reader: impl Read,
+    destination: &Path,
+    layout: TarLayout,
+) -> Result<Unpacked, String> {
+    let keep_links = layout.links;
+    let mut tar = tar::Archive::new(reader);
     std::fs::create_dir_all(destination)
         .map_err(|error| format!("{}: {error}", destination.display()))?;
     let mut total = Unpacked::default();
     let entries = tar
         .entries()
-        .map_err(|error| format!("{} is not a tar archive: {error}", archive.display()))?;
+        .map_err(|error| format!("not a tar archive: {error}"))?;
     for entry in entries {
-        let mut entry = entry.map_err(|error| format!("{}: {error}", archive.display()))?;
+        let mut entry = entry.map_err(|error| format!("tar entry: {error}"))?;
         let name = entry
             .path()
-            .map_err(|error| format!("{}: {error}", archive.display()))?
+            .map_err(|error| format!("tar entry: {error}"))?
             .into_owned();
         let Some(relative) = contained(&name) else {
             // A lone `./` entry names the root itself.
@@ -190,7 +200,7 @@ pub fn untar_gz(archive: &Path, destination: &Path, layout: TarLayout) -> Result
         } else if kind.is_symlink() && keep_links {
             let target = entry
                 .link_name()
-                .map_err(|error| format!("{}: {error}", archive.display()))?
+                .map_err(|error| format!("tar entry: {error}"))?
                 .ok_or_else(|| format!("the link `{}` names no target", name.display()))?
                 .into_owned();
             if !link_stays_inside(&relative, &target) {
@@ -207,7 +217,7 @@ pub fn untar_gz(archive: &Path, destination: &Path, layout: TarLayout) -> Result
         } else if kind.is_hard_link() && keep_links {
             let target = entry
                 .link_name()
-                .map_err(|error| format!("{}: {error}", archive.display()))?
+                .map_err(|error| format!("tar entry: {error}"))?
                 .and_then(|target| contained(&target))
                 .ok_or_else(|| {
                     format!("the hard link `{}` points outside the tree", name.display())
@@ -229,6 +239,152 @@ pub fn untar_gz(archive: &Path, destination: &Path, layout: TarLayout) -> Result
         }
     }
     Ok(total)
+}
+
+/// Read counters identify the decoder's consumed prefix, not an exact corrupt
+/// byte: compressed reads may include buffered lookahead.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct UnpackFailure {
+    pub phase: &'static str,
+    pub compressed_bytes_read: u64,
+    pub decoded_bytes_read: u64,
+    pub reason: String,
+}
+
+struct Counted<'a, R> {
+    inner: R,
+    read: &'a std::cell::Cell<u64>,
+    limit: u64,
+}
+
+impl<R: Read> Read for Counted<'_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let count = self.inner.read(buffer)?;
+        let total = self.read.get().saturating_add(count as u64);
+        self.read.set(total);
+        if total > self.limit {
+            return Err(std::io::Error::other(
+                "archive decoding exceeded its byte limit",
+            ));
+        }
+        Ok(count)
+    }
+}
+
+fn observe_gzip(
+    file: &mut std::fs::File,
+    phase: &'static str,
+    operation: impl FnOnce(&mut dyn Read) -> Result<Unpacked, String>,
+) -> Result<Unpacked, UnpackFailure> {
+    let compressed = std::cell::Cell::new(0);
+    let decoded = std::cell::Cell::new(0);
+    let source = Counted {
+        inner: file,
+        read: &compressed,
+        limit: u64::MAX,
+    };
+    let mut reader = Counted {
+        inner: flate2::read::GzDecoder::new(std::io::BufReader::new(source)),
+        read: &decoded,
+        // Account for tar headers/padding as well as the extracted bytes.
+        limit: MAX_UNPACKED_BYTES + MAX_ENTRIES as u64 * 1024,
+    };
+    let result = operation(&mut reader)
+        .map_err(|reason| (phase, reason))
+        .and_then(|total| {
+            // A tar end marker may precede the gzip checksum. Verify it too.
+            std::io::copy(&mut reader, &mut std::io::sink())
+                .map_err(|error| ("gzip-trailer", error.to_string()))?;
+            Ok(total)
+        });
+    result.map_err(|(phase, reason)| UnpackFailure {
+        phase,
+        compressed_bytes_read: compressed.get(),
+        decoded_bytes_read: decoded.get(),
+        reason,
+    })
+}
+
+#[derive(Default)]
+struct CasePaths {
+    paths: std::collections::BTreeMap<Vec<u8>, PathBuf>,
+    bytes: usize,
+}
+
+impl CasePaths {
+    fn insert(&mut self, relative: &Path) -> Result<(), String> {
+        let mut prefix = PathBuf::new();
+        for component in relative.components() {
+            prefix.push(component);
+            let key = prefix.as_os_str().as_encoded_bytes().to_ascii_lowercase();
+            if let Some(previous) = self.paths.get(&key) {
+                if previous != &prefix {
+                    return Err(format!(
+                        "this case-insensitive destination cannot represent both `{}` and `{}`;                          use a case-sensitive filesystem for KIN_HOME (for a Linux container, a native volume)",
+                        previous.display(), prefix.display()
+                    ));
+                }
+            } else {
+                self.bytes = self.bytes.saturating_add(key.len());
+                if self.bytes > 16 * 1024 * 1024 {
+                    return Err("archive case-compatibility inventory exceeds 16 MiB".into());
+                }
+                self.paths.insert(key, prefix.clone());
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Use the already hashed, open archive. On an insensitive destination, prove
+/// that every name is representable before creating the extraction directory.
+/// The caller owns the parent and removes any incomplete attempt.
+pub(crate) fn untar_gz_checked(
+    file: &mut std::fs::File,
+    destination: &Path,
+    layout: TarLayout,
+    case_insensitive: bool,
+) -> Result<Unpacked, UnpackFailure> {
+    use std::io::{Seek, SeekFrom};
+    if case_insensitive {
+        observe_gzip(file, "destination-compatibility", |reader| {
+            let mut tar = tar::Archive::new(reader);
+            let mut paths = CasePaths::default();
+            for (index, entry) in tar
+                .entries()
+                .map_err(|error| error.to_string())?
+                .enumerate()
+            {
+                if index >= MAX_ENTRIES {
+                    return Err(format!("the archive holds more than {MAX_ENTRIES} entries"));
+                }
+                let entry = entry.map_err(|error| error.to_string())?;
+                let name = entry.path().map_err(|error| error.to_string())?;
+                if let Some(relative) = contained(&name) {
+                    paths.insert(&relative)?;
+                }
+            }
+            Ok(Unpacked::default())
+        })?;
+        file.seek(SeekFrom::Start(0))
+            .map_err(|error| UnpackFailure {
+                phase: "archive-rewind",
+                compressed_bytes_read: 0,
+                decoded_bytes_read: 0,
+                reason: error.to_string(),
+            })?;
+    }
+    // Never reuse an incomplete tree, even though the legacy unpack helper
+    // accepts an existing parent. This path owns every entry it extracts.
+    std::fs::create_dir(destination).map_err(|error| UnpackFailure {
+        phase: "destination-create",
+        compressed_bytes_read: 0,
+        decoded_bytes_read: 0,
+        reason: error.to_string(),
+    })?;
+    observe_gzip(file, "tar-extract", |reader| {
+        unpack_tar(reader, destination, layout)
+    })
 }
 
 #[cfg(unix)]
@@ -390,6 +546,101 @@ mod tests {
         let error = untar_gz(&archive, &data, TarLayout::DATA).unwrap_err();
         assert!(error.contains("Symlink"), "{error}");
         assert_eq!(mode(&data.join("python/bin/python3.12")) & 0o111, 0);
+    }
+
+    #[test]
+    fn case_collisions_are_refused_before_any_extraction() {
+        let dir = Fixture::new("untar-case-conflict");
+        let archive = dir.root.join("x.tar.gz");
+        write_tar_gz(
+            &archive,
+            &[
+                ("python/share/terminfo/E/Eterm-color", b"first"),
+                ("python/share/terminfo/e/eterm-color", b"different"),
+            ],
+        );
+        let destination = dir.root.join("out");
+        let mut file = std::fs::File::open(&archive).unwrap();
+        let error =
+            untar_gz_checked(&mut file, &destination, TarLayout::TOOLCHAIN, true).unwrap_err();
+        assert_eq!(error.phase, "destination-compatibility");
+        assert!(error.reason.contains("case-insensitive"), "{error:?}");
+        assert!(error.reason.contains("KIN_HOME"));
+        assert!(error.compressed_bytes_read > 0);
+        assert!(error.decoded_bytes_read > 0);
+        assert!(!destination.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compatible_checked_toolchains_keep_bytes_links_and_modes() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = Fixture::new("untar-checked-toolchain");
+        let archive = dir.root.join("x.tar.gz");
+        write_toolchain_tar_gz(&archive);
+        let destination = dir.root.join("out");
+        let mut file = std::fs::File::open(&archive).unwrap();
+        let unpacked =
+            untar_gz_checked(&mut file, &destination, TarLayout::TOOLCHAIN, true).unwrap();
+        assert_eq!(unpacked.files, 2);
+        assert_eq!(
+            std::fs::read(destination.join("python/lib/os.py")).unwrap(),
+            b"x = 1\n"
+        );
+        assert_eq!(
+            std::fs::read_link(destination.join("python/bin/python3")).unwrap(),
+            Path::new("python3.12")
+        );
+        assert_eq!(
+            std::fs::metadata(destination.join("python/bin/python3.12"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+    }
+
+    #[test]
+    fn a_checked_archive_never_reuses_an_existing_extraction_tree() {
+        let dir = Fixture::new("untar-checked-existing");
+        let archive = dir.root.join("x.tar.gz");
+        write_tar_gz(&archive, &[("sentinel", b"replacement")]);
+        let destination = dir.root.join("out");
+        std::fs::create_dir(&destination).unwrap();
+        std::fs::write(destination.join("sentinel"), b"other owner").unwrap();
+        let error = untar_gz_checked(
+            &mut std::fs::File::open(archive).unwrap(),
+            &destination,
+            TarLayout::DATA,
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(error.phase, "destination-create");
+        assert_eq!(
+            std::fs::read(destination.join("sentinel")).unwrap(),
+            b"other owner"
+        );
+    }
+
+    #[test]
+    fn checked_extraction_reads_the_gzip_trailer_after_the_tar_end_marker() {
+        let dir = Fixture::new("untar-checked-trailer");
+        let archive = dir.root.join("x.tar.gz");
+        write_tar_gz(&archive, &[("file", b"content")]);
+        let mut bytes = std::fs::read(&archive).unwrap();
+        let crc = bytes.len() - 8;
+        bytes[crc] ^= 1;
+        std::fs::write(&archive, bytes).unwrap();
+        let error = untar_gz_checked(
+            &mut std::fs::File::open(archive).unwrap(),
+            &dir.root.join("out"),
+            TarLayout::DATA,
+            false,
+        )
+        .unwrap_err();
+        assert!(matches!(error.phase, "tar-extract" | "gzip-trailer"));
+        assert!(error.compressed_bytes_read > 0);
     }
 
     #[test]

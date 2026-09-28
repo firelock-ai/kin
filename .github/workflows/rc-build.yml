@@ -577,9 +577,18 @@ jobs:
             Write-Error "kin-daemon.exe missing from $env:ARTIFACT.tar.gz"
             exit 1
           }
+          # A sidecar is the one LF-terminated line sha256sum writes. Set-Content
+          # ends a line with this platform's CRLF, and sha256sum -c on Linux or
+          # macOS then reads a file name ending in CR and finds no such archive,
+          # so write the LF explicitly and read the bytes back.
           foreach ($ArchivePath in @("$env:ARTIFACT.zip", "$env:ARTIFACT.tar.gz")) {
             $Hash = (Get-FileHash -Algorithm SHA256 $ArchivePath).Hash.ToLowerInvariant()
-            "$Hash  $ArchivePath" | Set-Content -Encoding ascii "$ArchivePath.sha256"
+            $Sidecar = "$Hash  $ArchivePath`n"
+            Set-Content -NoNewline -Encoding ascii -Path "$ArchivePath.sha256" -Value $Sidecar
+            if ((Get-Content -Raw -Encoding ascii "$ArchivePath.sha256") -cne $Sidecar) {
+              Write-Error "$ArchivePath.sha256 is not the single LF-terminated line sha256sum -c reads"
+              exit 1
+            }
           }
         env:
           TARGET: ${{ matrix.target }}

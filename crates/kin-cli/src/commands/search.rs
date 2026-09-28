@@ -462,6 +462,17 @@ async fn run_semantic_daemon(
 ) -> Result<()> {
     let layout = crate::commands::require_repository_layout()?;
     let _scope = announce_active_scope(&layout, "search --semantic").await?;
+    // The first semantic query after a daemon start loads the search model
+    // and embeds the query before anything can print.
+    let waiting = crate::screen::LiveLine::start_after(
+        crate::screen::Style::for_stdout(),
+        "Searching",
+        crate::commands::init::LIVE_LINE_DELAY,
+    );
+    if let Some(live) = &waiting {
+        crate::first_run::quiet_daemon_start();
+        live.note("loading the search model and embedding your query");
+    }
     let response = run_daemon_search(
         &layout,
         &DaemonSearchRequest {
@@ -474,8 +485,27 @@ async fn run_semantic_daemon(
             body_limit: Some(limit),
         },
     )
-    .await?;
-    render_daemon_search_response(&layout, &response, false, Some(limit))
+    .await;
+    let response = response?;
+    // An unfinished index says how far it got and why before its rows, from
+    // the daemon's own facts, rather than a bare "no vector matches".
+    let unfinished = response.text_fallback
+        || response
+            .semantic_coverage
+            .as_ref()
+            .is_some_and(|coverage| coverage.indexed < coverage.total);
+    let note = if unfinished {
+        crate::commands::init::semantic_search_note(&layout, response.text_fallback).await
+    } else {
+        None
+    };
+    drop(waiting);
+    if let Some(note) = &note {
+        for line in note {
+            println!("{line}");
+        }
+    }
+    render_daemon_search_response_noted(&layout, &response, false, Some(limit), note.is_some())
 }
 
 async fn run_semantic_daemon_json(
@@ -1370,6 +1400,18 @@ fn render_daemon_search_response(
     show_body: bool,
     body_limit: Option<usize>,
 ) -> Result<()> {
+    render_daemon_search_response_noted(layout, response, show_body, body_limit, false)
+}
+
+/// [`render_daemon_search_response`], told whether the caller already printed
+/// the index's standing in place of the fallback banner.
+fn render_daemon_search_response_noted(
+    layout: &kin_core::KinLayout,
+    response: &DaemonSearchResponse,
+    show_body: bool,
+    body_limit: Option<usize>,
+    noted: bool,
+) -> Result<()> {
     if response.records.is_empty() {
         if response.semantic {
             println!("No matches for '{}'", response.query);
@@ -1384,7 +1426,9 @@ fn render_daemon_search_response(
         return Ok(());
     }
 
-    if response.semantic && response.text_fallback {
+    if response.semantic && response.text_fallback && noted {
+        // The caller's note already said the rows are graph text search.
+    } else if response.semantic && response.text_fallback {
         println!(
             "No vector matches for '{}'; using graph text search fallback:",
             response.query

@@ -7,183 +7,16 @@
 use crate::{IndexedFile, RelationResolution};
 use kin_model::{
     ArtifactId, Entity, EntityId, FilePathId, GraphNodeId, GraphStore, Hash256, Relation,
-    RelationEvidence, RelationId, RelationKind, RelationOrigin,
+    RelationKind, RelationOrigin,
 };
 use kin_parser::ExtractedRelation;
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
-pub const LOCAL_BINDING_DEBT_V1: &str = "local_binding_debt_v1";
-pub const LOCAL_BINDING_DEBT_V2: &str = "local_binding_debt_v2";
-
-/// Includes unknown versions so claimed binding evidence cannot silently become
-/// an ordinary relation when its version is unsupported or malformed.
-pub fn claims_local_binding_debt(relation: &Relation) -> bool {
-    relation.evidence.iter().any(|e| {
-        e.parser_rule
-            .as_deref()
-            .is_some_and(|rule| rule.starts_with("local_binding_debt_"))
-    })
-}
-const MAX_DEBT_BYTES: usize = 2 * 1024 * 1024;
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct LocalBindingObligation {
-    pub retired_relation: Relation,
-    pub source_name: String,
-    /// Immutable body whose real relation established this prior local binding.
-    pub source_digest: Hash256,
-    /// Original occurrence location. V1 omits this because its current and
-    /// original locations coincide; every V2 obligation carries it explicitly.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prior_source_file: Option<FilePathId>,
-    pub target_artifact: ArtifactId,
-    pub target_file: FilePathId,
-    pub target_name: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct LocalBindingDebt {
-    pub source_file: FilePathId,
-    /// Latest complete source observation that explicitly retained these debts.
-    pub observed_source_digest: Hash256,
-    pub obligations: Vec<LocalBindingObligation>,
-}
-
-pub fn local_binding_debt_id(artifact: ArtifactId) -> RelationId {
-    let mut digest = Sha256::new();
-    digest.update(b"kin-local-binding-debt-v1:");
-    digest.update(artifact.0.as_bytes());
-    let hash = digest.finalize();
-    let mut bytes = [0; 16];
-    bytes.copy_from_slice(&hash[..16]);
-    RelationId::from_bytes(bytes)
-}
-
-pub fn build_local_binding_debt(
-    artifact: ArtifactId,
-    mut debt: LocalBindingDebt,
-) -> Result<Relation, String> {
-    if debt.source_file.0.is_empty() || debt.obligations.is_empty() {
-        return Err("binding debt requires a source and at least one obligation".into());
-    }
-    let explicit_prior_locations = debt
-        .obligations
-        .iter()
-        .any(|o| o.prior_source_file.is_some());
-    if explicit_prior_locations {
-        for obligation in &mut debt.obligations {
-            obligation
-                .prior_source_file
-                .get_or_insert_with(|| debt.source_file.clone());
-        }
-    }
-    debt.obligations
-        .sort_by_key(|obligation| obligation.retired_relation.id);
-    let mut previous = None;
-    for obligation in &debt.obligations {
-        let relation = &obligation.retired_relation;
-        let prior_file = obligation
-            .prior_source_file
-            .as_ref()
-            .unwrap_or(&debt.source_file);
-        if prior_file.0.is_empty()
-            || previous == Some(relation.id)
-            || relation.src.as_entity().is_none()
-            || relation.dst.as_entity().is_none()
-            || relation.src == relation.dst
-            || obligation.source_name.is_empty()
-            || obligation.target_name.is_empty()
-            || obligation.target_file.0.is_empty()
-            || obligation.target_file == *prior_file
-            || obligation.target_artifact == artifact
-            || relation
-                .evidence
-                .iter()
-                .filter_map(|e| e.source_span.as_ref())
-                .any(|span| span.file != *prior_file || span.start_byte >= span.end_byte)
-        {
-            return Err(
-                "binding debt contains an invalid or duplicated prior local binding".into(),
-            );
-        }
-        previous = Some(relation.id);
-    }
-    let token = serde_json::to_string(&debt).map_err(|error| error.to_string())?;
-    if token.len() > MAX_DEBT_BYTES {
-        return Err("binding debt exceeds its bounded representation".into());
-    }
-    let node = GraphNodeId::Artifact(artifact);
-    Ok(Relation {
-        id: local_binding_debt_id(artifact),
-        kind: RelationKind::DependsOn,
-        src: node,
-        dst: node,
-        confidence: 1.0,
-        origin: RelationOrigin::Parsed,
-        created_in: None,
-        import_source: None,
-        evidence: vec![RelationEvidence {
-            parser_rule: Some(
-                if explicit_prior_locations {
-                    LOCAL_BINDING_DEBT_V2
-                } else {
-                    LOCAL_BINDING_DEBT_V1
-                }
-                .into(),
-            ),
-            source_path: Some(debt.source_file.0),
-            token: Some(token),
-            occurrence_count: 1,
-            ..RelationEvidence::default()
-        }],
-    })
-}
-
-/// Decode only the exact owned representation; its reserved ID cannot hide a
-/// missing marker, and a marker cannot enroll a different ID or endpoint.
-pub fn decode_local_binding_debt(
-    file: &FilePathId,
-    artifact: ArtifactId,
-    relation: &Relation,
-) -> Result<Option<LocalBindingDebt>, String> {
-    let claims = claims_local_binding_debt(relation);
-    if !claims && relation.id != local_binding_debt_id(artifact) {
-        return Ok(None);
-    }
-    let [evidence] = relation.evidence.as_slice() else {
-        return Err("malformed binding debt evidence".into());
-    };
-    let version = evidence.parser_rule.as_deref();
-    if !matches!(version, Some(LOCAL_BINDING_DEBT_V1 | LOCAL_BINDING_DEBT_V2)) {
-        return Err("unsupported binding debt version".into());
-    }
-    let token = evidence
-        .token
-        .as_deref()
-        .filter(|token| token.len() <= MAX_DEBT_BYTES)
-        .ok_or("missing or oversized binding debt payload")?;
-    let debt: LocalBindingDebt =
-        serde_json::from_str(token).map_err(|error| format!("malformed binding debt: {error}"))?;
-    if debt
-        .obligations
-        .iter()
-        .any(|o| o.prior_source_file.is_some() != (version == Some(LOCAL_BINDING_DEBT_V2)))
-    {
-        return Err("binding debt version and prior source locations disagree".into());
-    }
-    if &debt.source_file != file {
-        return Err("binding debt source path mismatch".into());
-    }
-    let mut expected = build_local_binding_debt(artifact, debt.clone())?;
-    expected.created_in = relation.created_in;
-    if expected != *relation {
-        return Err("binding debt is not the canonical owned payload".into());
-    }
-    Ok(Some(debt))
-}
+// Keep the public indexing API while sharing the exact model-owned wire codec.
+pub use kin_model::binding_debt::{
+    build_local_binding_debt, claims_local_binding_debt, decode_local_binding_debt,
+    local_binding_debt_id, LocalBindingDebt, LocalBindingObligation, LOCAL_BINDING_DEBT_V1,
+    LOCAL_BINDING_DEBT_V2,
+};
 
 /// Move the current location while retaining every historical occurrence byte.
 /// The caller publishes the returned replacement with the exact artifact move.
@@ -484,6 +317,24 @@ pub fn obligation_is_satisfied<G: GraphStore>(
     {
         return Ok(false);
     }
+    // An inferred target is a guess. A current, source-sealed proof of the
+    // exact callee may correct that guess, including to an external symbol.
+    // Stronger origins and unplaced/ambiguous answers keep their obligations.
+    if held.origin == RelationOrigin::Inferred
+        && held.kind == RelationKind::Calls
+        && inferred_calls_are_refined(
+            graph,
+            obligation,
+            old,
+            old_source,
+            current,
+            current_entities,
+            produced,
+            &prior,
+        )?
+    {
+        return Ok(true);
+    }
     let Some(prior_keys) = prior
         .iter()
         .map(|raw| reference_identity(raw, old))
@@ -555,6 +406,240 @@ pub fn obligation_is_satisfied<G: GraphStore>(
         }
     }
     Ok(true)
+}
+
+/// Project a parser-recorded call expression to its actual callee token.
+/// The syntax tree, not containment in an argument list, owns this mapping.
+/// Unsupported call forms remain unproved.
+fn exact_callee_token<'t>(
+    tree: &'t tree_sitter::Tree,
+    site: &kin_model::SourceSpan,
+) -> Option<tree_sitter::Node<'t>> {
+    let call = tree
+        .root_node()
+        .named_descendant_for_byte_range(site.start_byte, site.end_byte)?;
+    if call.start_byte() != site.start_byte
+        || call.end_byte() != site.end_byte
+        || !matches!(call.kind(), "call" | "call_expression")
+        || call.has_error()
+    {
+        return None;
+    }
+    let function = call.child_by_field_name("function")?;
+    let token = match function.kind() {
+        "identifier" | "field_identifier" | "property_identifier" => function,
+        "attribute" => function.child_by_field_name("attribute")?,
+        "member_expression" => function.child_by_field_name("property")?,
+        "field_expression" | "selector_expression" => function.child_by_field_name("field")?,
+        _ => return None,
+    };
+    matches!(
+        token.kind(),
+        "identifier" | "field_identifier" | "property_identifier"
+    )
+    .then_some(token)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn inferred_calls_are_refined<G: GraphStore>(
+    graph: &G,
+    obligation: &LocalBindingObligation,
+    old: &IndexedFile,
+    old_source: &[u8],
+    current: &IndexedFile,
+    current_entities: &[Entity],
+    produced: &[Relation],
+    prior: &[&ExtractedRelation],
+) -> Result<bool, String> {
+    use kin_model::{CallSiteState, ContextValidationState, ResolutionRecord, ResolutionRecordId};
+    let digest = obligation.source_digest;
+    // A rederived weak guess must be retired by the resolver first. Otherwise
+    // clearing its debt would also erase the scheduler's correction signal
+    // while the contradictory inferred occurrence still lives in this view.
+    let held = &obligation.retired_relation;
+    if produced.iter().any(|relation| {
+        relation.kind == RelationKind::Calls
+            && relation.origin == RelationOrigin::Inferred
+            && relation.src == held.src
+            && relation.dst == held.dst
+            && relation.evidence.iter().any(|evidence| {
+                evidence.source_span.as_ref().is_some_and(|span| {
+                    held.evidence
+                        .iter()
+                        .any(|old| old.source_span.as_ref() == Some(span))
+                })
+            })
+    }) {
+        return Ok(false);
+    }
+    if old.file_id != current.file_id
+        || old.blob_hash.0 != digest.0
+        || current.blob_hash.0 != digest.0
+        || kin_blobs::digest(old_source).0 != digest.0
+        || !matches!(old.parse_state, kin_model::ParseState::Valid)
+        || !matches!(current.parse_state, kin_model::ParseState::Valid)
+    {
+        return Ok(false);
+    }
+    let registry = kin_parser::AdapterRegistry::default();
+    let Some(adapter) = registry.get_by_language(current.language) else {
+        return Ok(false);
+    };
+    let tree = adapter
+        .parse(old_source)
+        .map_err(|error| error.to_string())?;
+    let source_owners = crate::RelationSourceIndex::new(current_entities);
+    for raw in prior {
+        let Some(site) = raw
+            .site
+            .as_ref()
+            .map(|site| site.to_source_span(&current.file_id))
+        else {
+            return Ok(false);
+        };
+        // Source equality alone does not let a caller substitute a different
+        // parser occurrence or an entity with a stale behavior fingerprint.
+        if !current.extracted_relations.iter().any(|candidate| {
+            candidate.kind == RelationKind::Calls
+                && candidate.src_name == raw.src_name
+                && candidate.dst_name == raw.dst_name
+                && candidate.receiver == raw.receiver
+                && candidate.site == raw.site
+        }) {
+            return Ok(false);
+        }
+        let Some(token) = exact_callee_token(&tree, &site) else {
+            return Ok(false);
+        };
+        if token.utf8_text(old_source).ok() != raw.dst_name.rsplit(['.', ':']).next() {
+            return Ok(false);
+        }
+        let Some(source) = source_owners.resolve(raw) else {
+            return Ok(false);
+        };
+        let Some(span) = source.span.as_ref() else {
+            return Ok(false);
+        };
+        if kin_model::is_derived_member(source)
+            || source.language != current.language
+            || source.file_origin.as_ref() != Some(&current.file_id)
+            || span.file != current.file_id
+            || !within(span, &site)
+            || source
+                .metadata
+                .extra
+                .get("blob_hash")
+                .and_then(|v| v.as_str())
+                != Some(digest.to_string().as_str())
+            || !current.entities.iter().any(|parsed| {
+                parsed.name == source.name
+                    && parsed.span == source.span
+                    && parsed.fingerprint.behavior_hash == source.fingerprint.behavior_hash
+            })
+        {
+            return Ok(false);
+        }
+        let ledger_id = ResolutionRecordId::call_sites(source.id);
+        let Some(record @ ResolutionRecord::CallSites(_)) = graph
+            .lookup_resolution_record(&ledger_id)
+            .map_err(|e| e.to_string())?
+        else {
+            return Ok(false);
+        };
+        if kin_model::validate_keyed_record(&ledger_id, &record).is_err() {
+            return Ok(false);
+        }
+        let ResolutionRecord::CallSites(ledger) = record else {
+            unreachable!()
+        };
+        if ledger.body_hash != digest || ledger.behavior_hash != source.fingerprint.behavior_hash {
+            return Ok(false);
+        }
+        let validation_id = ResolutionRecordId::context_validation(source.language);
+        let Some(validation_record @ ResolutionRecord::ContextValidation(_)) = graph
+            .lookup_resolution_record(&validation_id)
+            .map_err(|e| e.to_string())?
+        else {
+            return Ok(false);
+        };
+        if kin_model::validate_keyed_record(&validation_id, &validation_record).is_err() {
+            return Ok(false);
+        }
+        let ResolutionRecord::ContextValidation(validation) = validation_record else {
+            unreachable!()
+        };
+        let ContextValidationState::Validated { context } = validation.state else {
+            return Ok(false);
+        };
+        if !context.resolver.starts_with("lsp:")
+            || ResolutionRecordId::proof_context(&context) != ledger.context
+        {
+            return Ok(false);
+        }
+        let Some(context_record) = graph
+            .lookup_resolution_record(&ledger.context)
+            .map_err(|e| e.to_string())?
+        else {
+            return Ok(false);
+        };
+        if context_record != ResolutionRecord::ProofContext(context)
+            || kin_model::validate_keyed_record(&ledger.context, &context_record).is_err()
+            || ledger
+                .validate_backing(span.start_byte, &current.file_id.0, produced)
+                .is_err()
+        {
+            return Ok(false);
+        }
+        let Some((offset, length)) =
+            kin_model::site_key(span.start_byte, token.start_byte(), token.end_byte())
+        else {
+            return Ok(false);
+        };
+        let Some(answer) = ledger.site(offset, length) else {
+            return Ok(false);
+        };
+        let destination = match answer.state {
+            CallSiteState::ProvenTarget { target }
+                if graph
+                    .get_entity(&target)
+                    .map_err(|e| e.to_string())?
+                    .is_some() =>
+            {
+                GraphNodeId::Entity(target)
+            }
+            CallSiteState::ProvenExternal { target }
+                if graph
+                    .lookup_external_reference(&target)
+                    .map_err(|e| e.to_string())?
+                    .is_some_and(|reference| {
+                        reference.id == target && reference.validate().is_ok()
+                    }) =>
+            {
+                GraphNodeId::ExternalReference(target)
+            }
+            _ => return Ok(false),
+        };
+        // Require the edge even for recursion: a ledger's special recursive
+        // exemption does not by itself retire a different old local target.
+        let context_token = ledger.context.context_token();
+        if !produced.iter().any(|edge| {
+            edge.kind == RelationKind::Calls
+                && edge.origin == RelationOrigin::Lsp
+                && edge.src == GraphNodeId::Entity(source.id)
+                && edge.dst == destination
+                && edge.evidence.iter().any(|e| {
+                    e.token.as_deref() == Some(context_token.as_str())
+                        && e.source_span.as_ref().is_some_and(|proof| {
+                            proof.file == current.file_id
+                                && proof.start_byte == token.start_byte()
+                                && proof.end_byte == token.end_byte()
+                        })
+                })
+        }) {
+            return Ok(false);
+        }
+    }
+    Ok(!prior.is_empty())
 }
 
 /// Where a language-server or manual relation's cited token sits in the

@@ -49,6 +49,14 @@ use uuid::Uuid;
 /// this list first, and the scan then demands the trailing-field layout.
 const HUMAN_READABLE_ONLY: &[(&str, &str)] = &[
     (
+        "LocalBindingObligation",
+        "encoded only inside a canonical JSON relation-evidence token, never as a positional field",
+    ),
+    (
+        "LocalBindingDebt",
+        "encoded only as a canonical JSON relation-evidence token, never as a positional field",
+    ),
+    (
         "PolicyOverrides",
         "reconcile preset overrides, serialized to TOML/JSON config only",
     ),

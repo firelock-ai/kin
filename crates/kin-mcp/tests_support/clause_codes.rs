@@ -130,6 +130,10 @@ const SOURCED_ELSEWHERE: &[(&str, &str)] = &[
         "kin-model call_site_reading.rs CallSiteTally::clauses, carried by the call_sites block",
     ),
     (
+        "proof_context_unverified",
+        "kin-model call_site_reading.rs CallSiteTally::clauses, carried by the call_sites block",
+    ),
+    (
         "cross_repo_unavailable",
         "negative.rs cross_repo_unavailable_qualifier, the label for a spine answer naming no code",
     ),

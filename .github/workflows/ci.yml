@@ -1094,6 +1094,12 @@ jobs:
       - name: Test magic-repro case 16's surface reading
         run: python3 scripts/acceptance/test_magic_repro_case16.py
 
+      # Check 19 places each reference site inside its caller and reads the
+      # file on disk at the line that gives. The placement is pure, so it is
+      # graded here, where a pull request can see it.
+      - name: Test magic-repro check 19's site placement
+        run: python3 scripts/acceptance/test_magic_repro_case19.py
+
       # Checks 15, 17 and 21 read conversion coverage through `kin doctor
       # --conversion-source`, and a losing run must keep its root and the
       # responses its checks read. Both rules are pure, so they are graded here,
@@ -1111,6 +1117,12 @@ jobs:
 
       - name: Test acceptance reference diagnostic contracts
         run: python3 scripts/acceptance/test_reference_diagnostic_contract.py
+
+      # Every suite quotes a failed command through one shared excerpt that
+      # keeps a Rust panic and the final error line. acceptance.yml runs the
+      # suites only on main, so the copies and the rule are graded here.
+      - name: Test acceptance failure evidence excerpts
+        run: python3 scripts/acceptance/test_failure_excerpt.py
 
       # Here rather than in `check`, for the reason the step above records: a
       # script step in `check` is a gate `bin/kin-precheck` enumerates and must
@@ -1409,7 +1421,9 @@ jobs:
     if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
     # The heavy-runner switch; see `fast-gate-lint` for what it resolves to.
     runs-on: ${{ vars.KIN_HEAVY_RUNNER || 'ubuntu-latest' }}
-    timeout-minutes: 30
+    # A hang guard, not the speed gate. A 0.8.1 shard finished at 29.8 minutes
+    # against the old 30, and two 0.8.2 shards were cancelled at it half way.
+    timeout-minutes: 45
     env:
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_DEV_DEBUG: "0"

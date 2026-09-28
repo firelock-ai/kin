@@ -16,6 +16,10 @@ use super::graph_health::{inspect_graph, inspect_graph_with_entities};
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum GraphCommandRequest {
     Status,
+    StatusDetailed {
+        #[serde(flatten)]
+        request: kin_mcp::status_pages::StatusRequest,
+    },
     Validate,
     Inspect {
         name: String,
@@ -38,6 +42,9 @@ pub enum GraphCommandRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GraphCommandResponse {
+    /// Atomic selected-source metadata, identical to MCP graph status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enrichment: Option<serde_json::Value>,
     #[serde(default)]
     pub lines: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -303,10 +310,42 @@ pub enum EntitySourceOutcome {
     },
 }
 
+impl GraphCommandResponse {
+    /// Replace the rendered block together with its structured observation.
+    /// Match the renderer's own prior block, never parse diagnostic prose.
+    pub fn with_call_site_observation(&mut self, current: Option<serde_json::Value>) {
+        if let (Some(previous), Some(current)) = (&self.call_sites, &current) {
+            let previous = kin_mcp::call_sites::text_lines(previous);
+            if !previous.is_empty() {
+                if let Some(at) = self
+                    .lines
+                    .windows(previous.len())
+                    .position(|lines| lines == previous)
+                {
+                    self.lines.splice(
+                        at..at + previous.len(),
+                        kin_mcp::call_sites::text_lines(current),
+                    );
+                }
+            }
+        }
+        self.call_sites = current;
+    }
+}
+
 /// `kin graph status [--json]`: a quick health check of the semantic graph.
 pub async fn status(json: bool) -> Result<()> {
+    status_with_request(json, kin_mcp::status_pages::StatusRequest::default()).await
+}
+
+pub async fn status_with_request(
+    json: bool,
+    request: kin_mcp::status_pages::StatusRequest,
+) -> Result<()> {
+    let ceiling = request.ceiling();
     let layout = crate::commands::require_repository_layout()?;
-    let mut response = run_daemon_graph(&layout, &GraphCommandRequest::Status).await?;
+    let mut response =
+        run_daemon_graph(&layout, &GraphCommandRequest::StatusDetailed { request }).await?;
     append_freshness_line(
         &mut response.lines,
         &kin_core::last_admission::read(&layout),
@@ -327,7 +366,11 @@ pub async fn status(json: bool) -> Result<()> {
     if json {
         // The whole response, lines included, so a script reads the same
         // report a person does. A critical issue still exits non-zero.
-        println!("{}", serde_json::to_string_pretty(&response)?);
+        let encoded = serde_json::to_string(&response)?;
+        if encoded.len() > ceiling {
+            anyhow::bail!("status envelope exceeds the response budget; increase --max-chars");
+        }
+        println!("{encoded}");
         if let Some(error) = response.error {
             anyhow::bail!(error);
         }
@@ -608,7 +651,9 @@ where
 /// The words for one graph command's wait.
 fn graph_wait_label(request: &GraphCommandRequest) -> &'static str {
     match request {
-        GraphCommandRequest::Status => "reading the graph for this repository",
+        GraphCommandRequest::Status | GraphCommandRequest::StatusDetailed { .. } => {
+            "reading the graph for this repository"
+        }
         GraphCommandRequest::Validate => "validating the graph for this repository",
         GraphCommandRequest::Inspect { .. } => "looking this entity up in the graph",
         GraphCommandRequest::Source { .. } => "reading this entity's source from the graph",
@@ -693,14 +738,16 @@ pub fn execute_graph_command_for_store(
     host: kin_mcp::WorkingCopySurface<'_>,
 ) -> Result<GraphCommandResponse> {
     match request {
-        GraphCommandRequest::Status => build_graph_status_response_for_store(
-            authority,
-            graph,
-            reconcile,
-            embedding_runtime,
-            census,
-            kin_root,
-        ),
+        GraphCommandRequest::Status | GraphCommandRequest::StatusDetailed { .. } => {
+            build_graph_status_response_for_store(
+                authority,
+                graph,
+                reconcile,
+                embedding_runtime,
+                census,
+                kin_root,
+            )
+        }
         GraphCommandRequest::Validate => {
             build_graph_validate_response_with_census(authority, graph, census, kin_root)
         }
@@ -734,6 +781,7 @@ fn build_conversion_source_response(
         Ok(coverage) => coverage,
         Err(kin_mcp::McpError::Context(refusal) | kin_mcp::McpError::InvalidParams(refusal)) => {
             return Ok(GraphCommandResponse {
+                enrichment: None,
                 lines: Vec::new(),
                 error: Some(refusal),
                 source: None,
@@ -750,6 +798,7 @@ fn build_conversion_source_response(
     };
     let report = ConversionSourceReport::from_coverage(&coverage);
     Ok(GraphCommandResponse {
+        enrichment: None,
         lines: report.summary_lines(),
         error: None,
         source: None,
@@ -1539,6 +1588,7 @@ fn build_graph_status_response_for_store(
     append_health_notes(&mut lines, &health.notes);
 
     Ok(GraphCommandResponse {
+        enrichment: None,
         lines,
         error: (!criticals.is_empty())
             .then(|| format!("{} critical graph health issue(s) found", criticals.len())),
@@ -1830,6 +1880,7 @@ fn build_graph_validate_response_with_census(
     append_health_notes(&mut lines, &health.notes);
 
     Ok(GraphCommandResponse {
+        enrichment: None,
         lines,
         error: (!issues.is_empty()).then(|| format!("{} issue(s) found", issues.len())),
         source: None,
@@ -1853,6 +1904,7 @@ fn build_graph_inspect_response(
         "`kin graph inspect` has no entity record of its own here to show",
     )? {
         return Ok(GraphCommandResponse {
+            enrichment: None,
             error: lines.first().cloned(),
             lines,
             source: None,
@@ -1915,6 +1967,7 @@ fn build_graph_inspect_response(
             )
         };
         return Ok(GraphCommandResponse {
+            enrichment: None,
             lines,
             error: Some(error),
             source: None,
@@ -1974,6 +2027,7 @@ fn build_graph_inspect_response(
     }
 
     Ok(GraphCommandResponse {
+        enrichment: None,
         lines,
         error: None,
         source: None,
@@ -2236,6 +2290,7 @@ pub fn build_graph_source_response(
         Ok(chosen) => chosen,
         Err(lines) => {
             return Ok(GraphCommandResponse {
+                enrichment: None,
                 error: Some(lines.join("\n")),
                 lines,
                 source: None,
@@ -2269,6 +2324,7 @@ pub fn build_graph_source_response(
             lines.push(record.body.clone());
 
             Ok(GraphCommandResponse {
+                enrichment: None,
                 lines,
                 error: None,
                 source: Some(record),
@@ -2280,6 +2336,7 @@ pub fn build_graph_source_response(
             })
         }
         EntitySourceOutcome::NotFound(message) => Ok(GraphCommandResponse {
+            enrichment: None,
             lines: graph_entity_not_found_lines(entity_query),
             error: Some(message),
             source: None,
@@ -2302,6 +2359,7 @@ pub fn build_graph_source_response(
         } => {
             let lines = crate::entity_identity::name_candidate_lines(&query, reason, &candidates);
             Ok(GraphCommandResponse {
+                enrichment: None,
                 error: Some(lines.join("\n")),
                 lines,
                 source: None,
@@ -4792,6 +4850,7 @@ mod tests {
             expected_bytes: Some(crate::embed_model::DEFAULT_EMBED_MODEL_BYTES),
             fetching,
             no_fetch_reason: None,
+            declined: false,
             relocated_hf_home: None,
         }
     }

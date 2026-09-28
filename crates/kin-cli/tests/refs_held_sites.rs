@@ -183,9 +183,52 @@ fn rows<'a>(lines: &'a [String], caller: &str, resolution: &str) -> Vec<&'a str>
         .iter()
         .map(String::as_str)
         .filter(|line| {
-            line.starts_with(&format!("  {caller} @ ")) && line.contains(&format!("({resolution})"))
+            line.starts_with(&format!("  {caller} [")) && line.contains(&format!("({resolution})"))
         })
         .collect()
+}
+
+/// How `kin refs` prints a site of a caller the graph holds no span for. Every
+/// caller here is spanless, so a row prints one of these per site and the
+/// exact lines are pinned at the collector instead, by [`partitioned_lines`].
+const SITE: &str = "+? (caller has no span)";
+
+/// `count` spanless sites, as a row prints them.
+fn sites(count: usize) -> String {
+    format!("sites {}", vec![SITE; count].join(", "))
+}
+
+/// The 1-based file lines of `caller`'s counted and held sites, read from the
+/// collector `kin refs` reads and cut by the rule `kin refs` holds an edge
+/// out of its count by: a receiver-name guess, or an edge below proven that is
+/// not a call (`ReferenceEntry::edge_is_held`).
+///
+/// A row addresses each site inside its caller and never by a file line, and
+/// a spanless caller cannot place one, so this is where the lines each part
+/// holds are pinned; the printed rows are held to the same site counts.
+fn partitioned_lines(
+    graph: &InMemoryGraph,
+    focal: &Entity,
+    caller: &str,
+) -> (Option<Vec<u32>>, Option<Vec<u32>>) {
+    let row = kin_mcp::handlers::common::collect_graph_reference_rows(
+        graph,
+        &focal.id,
+        &kin_mcp::handlers::common::default_reference_kinds(),
+        None,
+    )
+    .expect("collect reference rows")
+    .into_iter()
+    .find(|row| row.name == caller)
+    .unwrap_or_else(|| panic!("the collector holds no row for `{caller}`"));
+    let (counted, held) = kin_mcp::handlers::common::split_reference_row(row, |edge| {
+        edge.receiver_name_guess
+            || (!edge.resolution.is_proven() && edge.kind != RelationKind::Calls)
+    });
+    (
+        counted.map(|row| row.reference_lines),
+        held.map(|row| row.reference_lines),
+    )
 }
 
 #[test]
@@ -240,22 +283,32 @@ fn a_counted_go_caller_prints_only_its_proven_sites() {
     }
 
     for (focal, proven, held) in [
-        (&concrete, "sites 678,723", "sites 649,697"),
-        (&interface, "sites 649,697", "sites 678,723"),
+        (&concrete, [678, 723], [649, 697]),
+        (&interface, [649, 697], [678, 723]),
     ] {
+        assert_eq!(
+            partitioned_lines(&graph, focal, "NewCreateContext"),
+            (Some(proven.to_vec()), Some(held.to_vec())),
+            "{} confirms only what gopls resolved to it",
+            focal.name
+        );
         let lines = refs_lines(&graph, focal);
         let joined = lines.join("\n");
         let counted = rows(&lines, "NewCreateContext", "type_resolved");
         assert_eq!(counted.len(), 1, "{joined}");
         assert!(
-            counted[0].ends_with(proven),
+            counted[0].contains(&format!("(projection: {CREATE_GO})"))
+                && counted[0].ends_with(&sites(proven.len())),
             "{} confirms only what gopls resolved to it: {joined}",
             focal.name
         );
         let guessed = rows(&lines, "NewCreateContext", "name_only");
         assert_eq!(guessed.len(), 1, "{joined}");
         assert!(
-            guessed[0].contains(&format!("{held} (its proven sites are counted above)")),
+            guessed[0].ends_with(&format!(
+                "{} (its proven sites are counted above)",
+                sites(held.len())
+            )),
             "the fan-out's other sites are held and say whose they are: {joined}"
         );
         assert!(
@@ -325,18 +378,29 @@ fn every_proven_python_call_site_stays_counted() {
         graph.upsert_relation(&relation).unwrap();
     }
 
+    assert_eq!(
+        partitioned_lines(&graph, &focal, "HTTPDigestAuth.handle_401"),
+        (Some(vec![262, 281]), None)
+    );
+    assert_eq!(
+        partitioned_lines(&graph, &focal, "Session.send"),
+        (Some(vec![784]), Some(vec![790]))
+    );
     let lines = refs_lines(&graph, &focal);
     let joined = lines.join("\n");
     let parsed = rows(&lines, "HTTPDigestAuth.handle_401", "type_resolved");
     assert_eq!(parsed.len(), 1, "{joined}");
-    assert!(parsed[0].ends_with("sites 262,281"), "{joined}");
+    assert!(parsed[0].ends_with(&sites(2)), "{joined}");
     let counted = rows(&lines, "Session.send", "type_resolved");
     assert_eq!(counted.len(), 1, "{joined}");
-    assert!(counted[0].ends_with("sites 784"), "{joined}");
+    assert!(counted[0].ends_with(&sites(1)), "{joined}");
     let held = rows(&lines, "Session.send", "name_only");
     assert_eq!(held.len(), 1, "{joined}");
     assert!(
-        held[0].ends_with("sites 790 (its proven sites are counted above)"),
+        held[0].ends_with(&format!(
+            "{} (its proven sites are counted above)",
+            sites(1)
+        )),
         "{joined}"
     );
     assert!(
@@ -393,9 +457,14 @@ fn a_caller_with_nothing_this_surface_counts_is_held_whole() {
         joined.contains("No resolved incoming Calls, Imports, References relations, plus 1 unconfirmed candidate not in that count."),
         "{joined}"
     );
+    assert_eq!(
+        partitioned_lines(&graph, &focal, "apiRun"),
+        (None, Some(vec![40, 44])),
+        "nothing of this caller is counted"
+    );
     let held = rows(&lines, "apiRun", "name_only");
     assert_eq!(held.len(), 1, "{joined}");
-    assert!(held[0].ends_with("sites 40,44"), "{joined}");
+    assert!(held[0].ends_with(&sites(2)), "{joined}");
     assert!(
         !held[0].contains("counted above"),
         "nothing of this caller is counted: {joined}"

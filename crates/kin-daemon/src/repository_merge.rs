@@ -120,7 +120,7 @@ fn merge_enrichment(
 /// can be detected at all.
 pub(crate) fn settle_merged_graph(state: &DaemonState) -> Option<String> {
     crate::background_work::record_relation_census(
-        &state.layout,
+        state,
         &state.graph,
         kin_core::relation_census::CensusSource::Commit,
     );
@@ -385,6 +385,9 @@ pub(crate) fn execute(
         authority.workspace_id,
         "merge",
     );
+    // Committed through the daemon's held authority, so the label follows its
+    // own record and the next reader does not reopen the store to load it.
+    crate::api::relabel_held_authority_after_own_commit(state);
 
     drop(persistence);
     drop(graph_mutation);

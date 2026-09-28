@@ -14,7 +14,7 @@ import os from 'node:os';
 import { spawnSync } from 'node:child_process';
 
 import { packageVersion, targetKinVersion, notProvisionedMessage } from '../lib/resolve.mjs';
-import { ensureProvisioned } from '../lib/provision.mjs';
+import { ensureProvisioned, setupFollows } from '../lib/provision.mjs';
 
 const argv = process.argv.slice(2);
 const wantsVersion = argv.includes('--version') || argv.includes('-V');
@@ -26,7 +26,7 @@ function launcherVersionLine(note) {
 let binary = null;
 let provisionError = null;
 try {
-  binary = await ensureProvisioned();
+  binary = await ensureProvisioned({ setupFollows: setupFollows(argv) });
 } catch (error) {
   provisionError = error;
 }

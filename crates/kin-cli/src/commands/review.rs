@@ -18,6 +18,13 @@ pub enum ReviewRequest {
         changes: Option<String>,
         #[serde(default)]
         json: bool,
+        /// List every relation change by name in the text answer instead of
+        /// counting them by origin and kind. The JSON answer ignores it.
+        #[serde(default)]
+        relations: bool,
+        /// Include all human-readable findings and change detail. JSON ignores it.
+        #[serde(default)]
+        details: bool,
     },
     Shadow {
         base: String,
@@ -150,6 +157,10 @@ struct ReviewResultJson {
     file: String,
     findings: Vec<ReviewFindingJson>,
     summary: String,
+    /// The same selected-graph observation the text summary renders. Keep the
+    /// existing editor fields and add this only when the review measured it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enrichment: Option<kin_review::enrichment::EnrichmentObservation>,
 }
 
 async fn run_daemon_review(request: &ReviewRequest) -> Result<ReviewResponse> {
@@ -178,17 +189,30 @@ pub async fn run(
     entities: Option<String>,
     files: Option<String>,
     changes: Option<String>,
+    relations: bool,
+    details: bool,
 ) -> Result<()> {
-    print_review_response(
-        run_daemon_review(&ReviewRequest::Run {
-            change,
-            entities,
-            files,
-            changes,
-            json: false,
-        })
-        .await?,
+    let waiting = crate::screen::LiveLine::start_after(
+        crate::screen::Style::for_stdout(),
+        "Reviewing",
+        crate::commands::init::LIVE_LINE_DELAY,
     );
+    if let Some(live) = &waiting {
+        crate::first_run::quiet_daemon_start();
+        live.note("reading the selected change");
+    }
+    let response = run_daemon_review(&ReviewRequest::Run {
+        change,
+        entities,
+        files,
+        changes,
+        json: false,
+        relations,
+        details,
+    })
+    .await;
+    drop(waiting);
+    print_review_response(response?);
     Ok(())
 }
 
@@ -205,6 +229,8 @@ pub async fn run_json(
             files,
             changes,
             json: true,
+            relations: false,
+            details: false,
         })
         .await?,
     );
@@ -216,6 +242,29 @@ pub async fn execute_review_request(
     graph: &kin_db::InMemoryGraph,
     request: ReviewRequest,
 ) -> Result<ReviewExecution> {
+    execute_review_request_with_source(
+        binding,
+        graph,
+        request,
+        None,
+        kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead,
+    )
+    .await
+}
+
+pub async fn execute_review_request_with_source(
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
+    graph: &kin_db::InMemoryGraph,
+    request: ReviewRequest,
+    repository_authority: Option<&kin_mcp::handlers::RequestRepositoryAuthority>,
+    source_scope: kin_mcp::handlers::common::EntitySourceScope,
+) -> Result<ReviewExecution> {
+    let source = kin_mcp::handlers::review::AnalysisEscapeEvidence::new(
+        graph,
+        repository_authority,
+        source_scope,
+    );
+    let escape_evidence = |targets: &[kin_model::Entity], at| source.observe(targets, at);
     match request {
         ReviewRequest::Run {
             change,
@@ -223,9 +272,20 @@ pub async fn execute_review_request(
             files,
             changes,
             json,
+            relations,
+            details,
         } => Ok(ReviewExecution {
-            response: build_review_run_response(
-                binding, graph, change, entities, files, changes, json,
+            response: build_review_run_response_with_source(
+                binding,
+                graph,
+                change,
+                entities,
+                files,
+                changes,
+                json,
+                relations,
+                details,
+                Some(&escape_evidence),
             )?,
             mutated: false,
         }),
@@ -257,6 +317,8 @@ pub async fn execute_review_request(
     }
 }
 
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 fn build_review_run_response(
     binding: &kin_core::LocalRepositoryAuthorityBinding,
     graph: &kin_db::InMemoryGraph,
@@ -265,9 +327,37 @@ fn build_review_run_response(
     files: Option<String>,
     changes: Option<String>,
     json: bool,
+    relations: bool,
+    details: bool,
 ) -> Result<ReviewResponse> {
-    let (review, file_hint, text_prefix, change_context) =
-        compute_review(binding, graph, change, entities, files, changes)?;
+    build_review_run_response_with_source(
+        binding, graph, change, entities, files, changes, json, relations, details, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_review_run_response_with_source(
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
+    graph: &kin_db::InMemoryGraph,
+    change: Option<String>,
+    entities: Option<String>,
+    files: Option<String>,
+    changes: Option<String>,
+    json: bool,
+    relations: bool,
+    details: bool,
+    escape_evidence: Option<&kin_review::enrichment::EscapeEvidence<'_>>,
+) -> Result<ReviewResponse> {
+    let mut detail_command = review_detail_command(&change, &entities, &files, &changes);
+    let (review, file_hint, text_prefix, change_context) = compute_review_with_source(
+        binding,
+        graph,
+        change,
+        entities,
+        files,
+        changes,
+        escape_evidence,
+    )?;
 
     if json {
         let findings = review
@@ -295,17 +385,275 @@ fn build_review_run_response(
                 file: file_hint,
                 findings,
                 summary,
+                enrichment: review.impact.enrichment.clone(),
             })?),
         });
     }
 
-    let mut text = text_prefix;
-    text.push_str(&kin_review::format_review(&review));
+    let detailed = details || relations;
+    let mut text = if detailed { text_prefix } else { String::new() };
+    text.push_str(&review_text(graph, &review, relations, detailed));
     if let Some((change_id, semantic_change)) = change_context {
-        append_review_provenance(graph, &mut text, &change_id, &semantic_change)?;
+        if !detailed {
+            writeln!(text, "Change: {}", review_line(&semantic_change.message))?;
+            // Pin the default-latest selection so the next command reads the
+            // same change even if another commit arrives in between.
+            detail_command = format!("kin review {change_id} --details");
+        }
+        append_review_provenance(graph, &mut text, &change_id, &semantic_change, detailed)?;
+    }
+    if !detailed {
+        writeln!(text, "Full review: {detail_command}")?;
+        writeln!(text, "Add --relations to include every relation change.")?;
     }
 
     Ok(ReviewResponse { text, json: None })
+}
+
+/// The line a review prints under relation changes it only counted.
+const RELATION_LIST_HINT: &str = "Add --relations to list every relation change by name.";
+
+const REVIEW_MESSAGES_SHOWN: usize = 5;
+
+fn recorded_coverage_message(message: &str) -> std::borrow::Cow<'_, str> {
+    if message.starts_with("New public entity `") || message.starts_with("Modified entity `") {
+        if let Some(entity) = message.strip_suffix(" has no test coverage") {
+            return format!("{entity} has no recorded test coverage").into();
+        }
+    }
+    message.into()
+}
+
+/// Bound individual preview rows too: commit messages and findings may carry
+/// newlines or very long signatures. The detailed answer keeps their full text.
+fn review_line(text: &str) -> String {
+    let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = line.chars();
+    let mut shown: String = chars.by_ref().take(76).collect();
+    if chars.next().is_some() {
+        shown.push_str("...");
+    }
+    shown
+}
+
+fn review_detail_command(
+    change: &Option<String>,
+    entities: &Option<String>,
+    files: &Option<String>,
+    changes: &Option<String>,
+) -> String {
+    let quote = |value: &str| format!("'{}'", value.replace('\'', "'\\''"));
+    let mut command = "kin review".to_string();
+    if let Some(value) = entities {
+        write!(command, " --entities {}", quote(value)).unwrap();
+    } else if let Some(value) = files {
+        write!(command, " --files {}", quote(value)).unwrap();
+    } else if let Some(value) = changes {
+        write!(command, " --changes {}", quote(value)).unwrap();
+    } else if let Some(value) = change {
+        write!(command, " {}", quote(value)).unwrap();
+    }
+    command.push_str(" --details");
+    command
+}
+
+/// A terminal preview, built from the same review as the lossless detail and
+/// JSON answers. The shared review renderer and MCP presentation stay unchanged.
+fn compact_review_text(review: &kin_review::Review) -> String {
+    let mut text = String::from("=== Semantic Review ===\n");
+    writeln!(
+        text,
+        "Overall risk: {:?} (recorded evidence)",
+        review.risk.overall_risk
+    )
+    .unwrap();
+    match review.impact.enrichment.as_ref() {
+        Some(observation) if observation.bounds_answer() => {
+            writeln!(
+                text,
+                "not settled: {} entities pending enrichment; risk may change.",
+                observation.total_pending_entities
+            )
+            .unwrap();
+            writeln!(
+                text,
+                "Impact counts are lower bounds; pending work may not reach this change."
+            )
+            .unwrap();
+            if matches!(
+                observation.scope.as_str(),
+                "selected_graph_repository" | "selected_graph_impact"
+            ) && observation.selected_change.is_none()
+            {
+                writeln!(text, "Run `kin daemon sweep` to retry analysis.").unwrap();
+            } else {
+                writeln!(
+                    text,
+                    "Limits belong to the selected revision; a live sweep cannot settle it."
+                )
+                .unwrap();
+            }
+        }
+        Some(observation) if observation.status == "no_recorded_call_site_debt" => {
+            writeln!(
+                text,
+                "No recorded call-site debt; overall completeness is unverified."
+            )
+            .unwrap();
+        }
+        _ => writeln!(
+            text,
+            "Completeness unavailable; this review does not establish a clear result."
+        )
+        .unwrap(),
+    }
+
+    let (mut added, mut modified, mut removed) = (0, 0, 0);
+    for change in &review.diff.entity_changes {
+        match &change.kind {
+            kin_review::EntityChangeKind::Added(_) => added += 1,
+            kin_review::EntityChangeKind::Modified { .. } => modified += 1,
+            kin_review::EntityChangeKind::Removed { .. } => removed += 1,
+        }
+    }
+    writeln!(
+        text,
+        "\nEntities: {added} added, {modified} modified, {removed} removed"
+    )
+    .unwrap();
+    writeln!(
+        text,
+        "Relations: {} changed; downstream: {} recorded affected entities",
+        review.diff.relation_changes.len(),
+        review.impact.total_affected()
+    )
+    .unwrap();
+    let risk = &review.risk;
+    let groups = [
+        (0, "Breaking", &risk.breaking_changes),
+        (1, "Contract", &risk.contract_violations),
+        (2, "Work", &risk.work_risks),
+        (3, "Coverage", &risk.test_coverage_gaps),
+        (5, "Note", &risk.notes),
+    ];
+    let note_count: usize = groups.iter().map(|(_, _, items)| items.len()).sum();
+    writeln!(
+        text,
+        "Recorded findings: {}; risk notes: {note_count}",
+        review.inline_comments.len()
+    )
+    .unwrap();
+    writeln!(
+        text,
+        "  {} breaking, {} contract, {} coverage, {} work, {} other notes",
+        risk.breaking_changes.len(),
+        risk.contract_violations.len(),
+        risk.test_coverage_gaps.len(),
+        risk.work_risks.len(),
+        risk.notes.len()
+    )
+    .unwrap();
+
+    let mut messages = Vec::new();
+    for (priority, label, items) in groups {
+        for message in items {
+            // Relation removals already have a total above. Prefer actionable
+            // findings over a relation-by-relation repetition in the preview.
+            let priority = if message.starts_with("Relation removed: ") {
+                9
+            } else {
+                priority
+            };
+            messages.push((priority, label, message.as_str()));
+        }
+    }
+    for comment in &review.inline_comments {
+        let (priority, label) = match inline_comment_severity(comment.kind) {
+            "error" => (0, "Finding"),
+            "warning" => (3, "Finding"),
+            _ => (6, "Detail"),
+        };
+        messages.push((priority, label, comment.message.as_str()));
+    }
+    messages.sort_unstable();
+    let mut seen = std::collections::BTreeSet::new();
+    messages.retain(|(_, _, message)| seen.insert(*message));
+    let shown = messages.len().min(REVIEW_MESSAGES_SHOWN);
+    if !messages.is_empty() {
+        writeln!(
+            text,
+            "\nSelected messages ({shown} of {} distinct):",
+            messages.len()
+        )
+        .unwrap();
+        for (_, label, message) in messages.iter().take(shown) {
+            writeln!(
+                text,
+                "{}",
+                review_line(&format!(
+                    "  {label}: {}",
+                    recorded_coverage_message(message)
+                ))
+            )
+            .unwrap();
+        }
+        if messages.len() > shown {
+            writeln!(
+                text,
+                "{} more messages in the full review.",
+                messages.len() - shown
+            )
+            .unwrap();
+        }
+    } else {
+        writeln!(
+            text,
+            "\nNo findings recorded; completeness limits above still apply."
+        )
+        .unwrap();
+    }
+    text
+}
+
+/// A review's text: the summary first, relation endpoints named from the
+/// graph, and relation changes counted by origin and kind unless
+/// `list_relations` asks for each one.
+fn review_text(
+    graph: &kin_db::InMemoryGraph,
+    review: &kin_review::Review,
+    list_relations: bool,
+    details: bool,
+) -> String {
+    if !details {
+        return compact_review_text(review);
+    }
+    // Human coverage wording describes graph evidence. Normalize only the
+    // corresponding findings, preserving source signatures, commit messages,
+    // and the original review used for JSON and MCP.
+    let mut human = review.clone();
+    for message in human
+        .risk
+        .test_coverage_gaps
+        .iter_mut()
+        .chain(human.risk.notes.iter_mut())
+    {
+        *message = recorded_coverage_message(message).into_owned();
+    }
+    for comment in &mut human.inline_comments {
+        if comment.kind == kin_review::InlineCommentKind::CoverageGap {
+            comment.message = recorded_coverage_message(&comment.message).into_owned();
+        }
+    }
+    let namer = |node: &kin_model::GraphNodeId| kin_review::graph_node_name(graph, node);
+    kin_review::format_review_with(
+        &human,
+        &kin_review::ReviewRenderOptions {
+            node_names: Some(&namer),
+            list_all_relations: list_relations,
+            relation_list_hint: Some(RELATION_LIST_HINT),
+            ..Default::default()
+        },
+    )
 }
 
 /// Shadow review JSON payload. The report is flattened so consumers can read
@@ -375,6 +723,7 @@ fn shadow_response_from_report(
     })
 }
 
+#[cfg(test)]
 fn compute_review(
     binding: &kin_core::LocalRepositoryAuthorityBinding,
     graph: &kin_db::InMemoryGraph,
@@ -382,6 +731,23 @@ fn compute_review(
     entities: Option<String>,
     files: Option<String>,
     changes: Option<String>,
+) -> Result<(
+    kin_review::Review,
+    String,
+    String,
+    Option<(kin_model::SemanticChangeId, kin_model::SemanticChange)>,
+)> {
+    compute_review_with_source(binding, graph, change, entities, files, changes, None)
+}
+
+fn compute_review_with_source(
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
+    graph: &kin_db::InMemoryGraph,
+    change: Option<String>,
+    entities: Option<String>,
+    files: Option<String>,
+    changes: Option<String>,
+    escape_evidence: Option<&kin_review::enrichment::EscapeEvidence<'_>>,
 ) -> Result<(
     kin_review::Review,
     String,
@@ -410,7 +776,11 @@ fn compute_review(
         )?;
         writeln!(text)?;
         return Ok((
-            kin_review::SemanticReview::review_entities(&entity_ids, graph)?,
+            kin_review::SemanticReview::review_from_diff_with_source(
+                kin_review::diff_from_entity_ids(graph, &entity_ids)?,
+                graph,
+                escape_evidence,
+            )?,
             String::new(),
             text,
             None,
@@ -426,7 +796,11 @@ fn compute_review(
         }
         writeln!(text)?;
         return Ok((
-            kin_review::SemanticReview::review_files(&file_paths, graph)?,
+            kin_review::SemanticReview::review_from_diff_with_source(
+                kin_review::diff_from_files(graph, &file_paths)?,
+                graph,
+                escape_evidence,
+            )?,
             file_paths.first().cloned().unwrap_or_default(),
             text,
             None,
@@ -450,8 +824,12 @@ fn compute_review(
             semantic_changes.len()
         )?;
         writeln!(text)?;
+        let diff = kin_review::diff_from_changes(&semantic_changes);
+        if diff.is_empty() {
+            return Err(kin_review::ReviewError::NoChanges.into());
+        }
         return Ok((
-            kin_review::SemanticReview::review_changes(&semantic_changes, graph)?,
+            kin_review::SemanticReview::review_from_diff_with_source(diff, graph, escape_evidence)?,
             String::new(),
             text,
             None,
@@ -483,7 +861,12 @@ fn compute_review(
     writeln!(text)?;
 
     let review = if let Some(parent_id) = semantic_change.parents.first() {
-        match kin_review::SemanticReview::create_review(parent_id, &change_id, graph) {
+        match kin_review::SemanticReview::create_review_with_source(
+            parent_id,
+            &change_id,
+            graph,
+            escape_evidence,
+        ) {
             Ok(r) => r,
             // An unmaterializable ref state must surface, not degrade into a
             // live-adjacency review of another era's graph.
@@ -492,12 +875,16 @@ fn compute_review(
             }
             Err(_) => {
                 let diff = kin_review::diff_from_change(&semantic_change);
-                kin_review::SemanticReview::review_from_diff(diff, graph)?
+                kin_review::SemanticReview::review_from_diff_with_source(
+                    diff,
+                    graph,
+                    escape_evidence,
+                )?
             }
         }
     } else {
         let diff = kin_review::diff_from_change(&semantic_change);
-        kin_review::SemanticReview::review_from_diff(diff, graph)?
+        kin_review::SemanticReview::review_from_diff_with_source(diff, graph, escape_evidence)?
     };
 
     Ok((
@@ -513,6 +900,7 @@ fn append_review_provenance(
     text: &mut String,
     change_id: &kin_model::SemanticChangeId,
     semantic_change: &kin_model::SemanticChange,
+    details: bool,
 ) -> Result<()> {
     let approvals = graph.get_approvals_for_change(change_id)?;
     let is_agent_change = semantic_change.author.0.contains("agent")
@@ -524,6 +912,16 @@ fn append_review_provenance(
     let is_approved = approvals
         .iter()
         .any(|a| a.decision == ApprovalDecision::Approved);
+
+    if !details {
+        if is_agent_change || !approvals.is_empty() {
+            writeln!(text, "Provenance: {} approval record(s).", approvals.len())?;
+            if is_agent_change && !is_approved {
+                writeln!(text, "Agent change has no recorded human approval.")?;
+            }
+        }
+        return Ok(());
+    }
 
     if is_agent_change || !approvals.is_empty() {
         writeln!(text)?;
@@ -559,7 +957,11 @@ fn append_review_provenance(
                         )?;
                     }
                     kin_model::EntityDelta::Removed { old } => {
-                        writeln!(text, "  - {} by {}", old.id, semantic_change.author)?;
+                        writeln!(
+                            text,
+                            "  - {} ({:?}) by {}",
+                            old.name, old.kind, semantic_change.author
+                        )?;
                     }
                 }
             }
@@ -823,7 +1225,14 @@ fn plan_note(
 
     let scope = scope
         .as_deref()
-        .map(crate::commands::work::parse_work_scope)
+        .map(|scope| {
+            crate::commands::work::parse_graph_work_scope(
+                graph,
+                scope,
+                "kin review note",
+                crate::commands::external_symbols::REVIEW_SCOPE_WHY,
+            )
+        })
         .transpose()?;
     let rid = parse_review_id(&review_id)?;
     existing_review(graph, rid)?;
@@ -886,7 +1295,14 @@ fn plan_discuss(
 
     let scope = scope
         .as_deref()
-        .map(crate::commands::work::parse_work_scope)
+        .map(|scope| {
+            crate::commands::work::parse_graph_work_scope(
+                graph,
+                scope,
+                "kin review discuss",
+                crate::commands::external_symbols::REVIEW_SCOPE_WHY,
+            )
+        })
         .transpose()?;
     let rid = parse_review_id(&review_id)?;
     existing_review(graph, rid)?;
@@ -1754,6 +2170,54 @@ mod tests {
         assert_eq!(json["review_mutations"], 0);
     }
 
+    /// A review note or discussion is anchored to a repository entity. `kin
+    /// review note` and `kin review discuss` refuse a `--scope` naming a symbol
+    /// outside the repository, by any spelling, before the review is read, in
+    /// the words every scope argument is refused with.
+    #[test]
+    fn review_note_and_discussion_scopes_refuse_an_external_symbol() {
+        let store = crate::commands::external_symbols::fixture::external_store(false);
+        let review_id = kin_model::review::ReviewId::new().to_string();
+        for scope in [
+            store.address(),
+            format!("entity:{}", store.node.id),
+            store.node.id.to_string(),
+        ] {
+            for (request, command) in [
+                (
+                    ReviewRequest::Note {
+                        review_id: review_id.clone(),
+                        body: "who else calls this?".into(),
+                        scope: Some(scope.clone()),
+                        actor: None,
+                    },
+                    "kin review note",
+                ),
+                (
+                    ReviewRequest::Discuss {
+                        review_id: review_id.clone(),
+                        body: "who else calls this?".into(),
+                        scope: Some(scope.clone()),
+                        actor: None,
+                    },
+                    "kin review discuss",
+                ),
+            ] {
+                let error = match plan_review_mutation(&store.graph, request) {
+                    Ok(_) => panic!("{command} anchored a note on {scope}"),
+                    Err(error) => format!("{error:#}"),
+                };
+                assert!(error.contains("Array.map"), "{error}");
+                assert!(error.contains(&format!("`{command}`")), "{error}");
+                assert!(
+                    error.contains(&format!("kin refs {}", store.address())),
+                    "{error}"
+                );
+                assert!(!error.contains("review not found"), "{error}");
+            }
+        }
+    }
+
     /// A review of named entities reads each one's changes. A symbol outside
     /// the repository has none here, and read as a removed entity it would
     /// be reviewed as a deletion that never happened, so `--entities` refuses
@@ -1804,5 +2268,467 @@ mod tests {
             error.contains("names no symbol outside the repository"),
             "{error}"
         );
+    }
+
+    fn spanned_entity(name: &str, file: &str) -> kin_model::Entity {
+        kin_model::Entity {
+            id: kin_model::EntityId::new(),
+            kind: kin_model::EntityKind::Function,
+            name: name.to_string(),
+            language: kin_model::LanguageId::Python,
+            fingerprint: kin_model::SemanticFingerprint {
+                algorithm: kin_model::FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: kin_model::Hash256::from_bytes([1; 32]),
+                signature_hash: kin_model::Hash256::from_bytes([1; 32]),
+                behavior_hash: kin_model::Hash256::from_bytes([1; 32]),
+                equivalence_hash: kin_model::Hash256::from_bytes([0; 32]),
+                stability_score: 1.0,
+            },
+            file_origin: None,
+            span: Some(kin_model::SourceSpan {
+                file: kin_model::FilePathId::new(file),
+                start_byte: 0,
+                end_byte: 1,
+                start_line: 0,
+                start_col: 0,
+                end_line: 1,
+                end_col: 0,
+            }),
+            signature: format!("def {name}(load_defaults=True)"),
+            visibility: kin_model::Visibility::Public,
+            role: kin_model::EntityRole::Source,
+            doc_summary: None,
+            metadata: kin_model::EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        }
+    }
+
+    fn edge(
+        kind: kin_model::RelationKind,
+        origin: kin_model::RelationOrigin,
+        src: &kin_model::Entity,
+        dst: &kin_model::Entity,
+    ) -> kin_model::Relation {
+        kin_model::Relation {
+            id: kin_model::RelationId::new(),
+            kind,
+            src: kin_model::GraphNodeId::Entity(src.id),
+            dst: kin_model::GraphNodeId::Entity(dst.id),
+            confidence: 1.0,
+            origin,
+            created_in: None,
+            import_source: None,
+            evidence: vec![],
+        }
+    }
+
+    /// A one-file parameter rename recorded as the first change after an
+    /// import, so it also carries the edges language-server enrichment added
+    /// across the repository: the shape whose review printed thousands of
+    /// relation lines of raw ids ahead of its summary.
+    fn rename_after_import() -> (kin_db::InMemoryGraph, String, Vec<kin_model::Entity>) {
+        use kin_model::graph::EntityStore as _;
+        use kin_model::{RelationKind, RelationOrigin};
+
+        let graph = kin_db::InMemoryGraph::new();
+        let old = spanned_entity("load_dotenv", "src/flask/cli.py");
+        let mut new = old.clone();
+        new.signature = "def load_dotenv(use_defaults=True)".into();
+        let caller = spanned_entity("run", "src/flask/app.py");
+        let others: Vec<kin_model::Entity> = (0..60)
+            .map(|i| spanned_entity(&format!("view_{i}"), "src/flask/views.py"))
+            .collect();
+
+        let mut relation_deltas = vec![kin_model::RelationDelta::Added {
+            new: edge(RelationKind::Calls, RelationOrigin::Parsed, &caller, &new),
+        }];
+        for (i, other) in others.iter().enumerate() {
+            let kind = if i % 3 == 0 {
+                RelationKind::References
+            } else {
+                RelationKind::UsesType
+            };
+            relation_deltas.push(kin_model::RelationDelta::Added {
+                new: edge(kind, RelationOrigin::Lsp, other, &caller),
+            });
+        }
+
+        graph.upsert_entity(&new).unwrap();
+        graph.upsert_entity(&caller).unwrap();
+        for other in &others {
+            graph.upsert_entity(other).unwrap();
+        }
+
+        let mut change = kin_model::SemanticChange {
+            id: kin_model::SemanticChangeId::from_hash(kin_model::Hash256::from_bytes([0; 32])),
+            parents: vec![],
+            origin: kin_model::ChangeOrigin::Native,
+            timestamp: kin_model::Timestamp::now(),
+            author: kin_model::AuthorId::new("reviewer@example.com"),
+            message: "Rename load_defaults to use_defaults".into(),
+            entity_deltas: vec![kin_model::EntityDelta::Modified {
+                old,
+                new: new.clone(),
+            }],
+            relation_deltas,
+            tree_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
+        };
+        change.id = kin_model::compute_semantic_change_id(&change).unwrap();
+        graph.create_change(&change).unwrap();
+
+        let mut entities = vec![new, caller];
+        entities.extend(others);
+        (graph, change.id.to_string(), entities)
+    }
+
+    fn review_run(
+        graph: &kin_db::InMemoryGraph,
+        change: &str,
+        json: bool,
+        relations: bool,
+        details: bool,
+    ) -> ReviewResponse {
+        let layout = kin_core::KinLayout::new(std::path::PathBuf::from("/nonexistent/.kin"));
+        let binding = absent_binding(&layout);
+        build_review_run_response(
+            &binding,
+            graph,
+            Some(change.to_string()),
+            None,
+            None,
+            None,
+            json,
+            relations,
+            details,
+        )
+        .expect("the review runs")
+    }
+
+    #[test]
+    fn compact_review_bounds_an_import_without_losing_details_or_json_findings() {
+        use kin_model::EntityStore as _;
+
+        let (graph, change, _) = rename_after_import();
+        let id = parse_change_ids(&change).unwrap()[0];
+        let mut imported = graph.get_change(&id).unwrap().unwrap();
+        for delta in &imported.relation_deltas {
+            if let kin_model::RelationDelta::Added { new } = delta {
+                graph.upsert_relation(new).unwrap();
+            }
+        }
+        for i in 0..200 {
+            let entity = spanned_entity(&format!("public_{i:03}"), "src/imported.py");
+            graph.upsert_entity(&entity).unwrap();
+            imported
+                .entity_deltas
+                .push(kin_model::EntityDelta::Added { new: entity });
+        }
+        imported.message = "Import public API\n".repeat(200);
+        imported.id = kin_model::compute_semantic_change_id(&imported).unwrap();
+        graph.create_change(&imported).unwrap();
+        let change = imported.id.to_string();
+
+        let compact = review_run(&graph, &change, false, false, false).text;
+        assert!(
+            compact.lines().count() <= 30,
+            "{} lines:\n{compact}",
+            compact.lines().count()
+        );
+        assert!(
+            compact.find("not settled:").unwrap() < compact.find("Selected messages").unwrap(),
+            "{compact}"
+        );
+        assert!(
+            compact.contains("Entities: 200 added, 1 modified, 0 removed"),
+            "{compact}"
+        );
+        assert!(
+            compact.contains("more messages in the full review"),
+            "{compact}"
+        );
+        assert!(
+            compact.contains(&format!("Full review: kin review {change} --details")),
+            "{compact}"
+        );
+        assert!(!compact.contains("--- Entity Changes ---"), "{compact}");
+        assert!(
+            !compact.contains("No downstream impact detected"),
+            "{compact}"
+        );
+        assert!(
+            compact.contains("Breaking:"),
+            "highest-priority finding must survive: {compact}"
+        );
+
+        let detailed = review_run(&graph, &change, false, false, true).text;
+        assert!(detailed.contains("--- Entity Changes ---"), "{detailed}");
+        assert!(
+            detailed.contains("public_199"),
+            "the last entity must remain reachable"
+        );
+        assert!(detailed.contains("has no recorded test coverage"));
+        assert!(!detailed.contains("has no test coverage"));
+        assert!(detailed.lines().count() > 400);
+
+        let json = review_run(&graph, &change, true, false, false)
+            .json
+            .unwrap();
+        assert_eq!(
+            json,
+            review_run(&graph, &change, true, false, true).json.unwrap()
+        );
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(value["findings"].as_array().unwrap().len() > 200);
+        assert!(json.contains("public_199"));
+    }
+
+    #[test]
+    fn compact_review_keeps_unknown_completeness_and_zero_counts_honest() {
+        let (graph, change, _) = rename_after_import();
+        let layout = kin_core::KinLayout::new(std::path::PathBuf::from("/nonexistent/.kin"));
+        let (mut review, _, _, _) = compute_review(
+            &absent_binding(&layout),
+            &graph,
+            Some(change),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let observation = review.impact.enrichment.clone().unwrap();
+        for status in [
+            None,
+            Some("unknown_future_status"),
+            Some("no_recorded_call_site_debt"),
+        ] {
+            review.impact.enrichment = status.map(|status| {
+                let mut observation = observation.clone();
+                observation.status = status.to_string();
+                observation
+            });
+            review.inline_comments.clear();
+            review.risk.breaking_changes.clear();
+            review.risk.contract_violations.clear();
+            review.risk.work_risks.clear();
+            review.risk.test_coverage_gaps.clear();
+            review.risk.notes.clear();
+            let text = compact_review_text(&review);
+            assert!(
+                text.contains("completeness") || text.contains("Completeness"),
+                "{text}"
+            );
+            assert!(
+                text.contains("unverified") || text.contains("unavailable"),
+                "{text}"
+            );
+            assert!(
+                text.contains("No findings recorded; completeness limits above still apply."),
+                "{text}"
+            );
+            assert!(!text.contains("No downstream impact detected"), "{text}");
+        }
+    }
+
+    #[test]
+    fn detail_hint_keeps_scope_and_legacy_requests_default_to_compact() {
+        assert_eq!(
+            review_detail_command(&None, &None, &Some("src/it's here.py".into()), &None),
+            "kin review --files 'src/it'\\''s here.py' --details"
+        );
+        assert_eq!(
+            review_detail_command(&None, &Some("one,two".into()), &None, &None),
+            "kin review --entities 'one,two' --details"
+        );
+        assert_eq!(
+            review_detail_command(&None, &None, &None, &Some("base,head".into())),
+            "kin review --changes 'base,head' --details"
+        );
+        let request: ReviewRequest =
+            serde_json::from_value(serde_json::json!({"op":"run"})).unwrap();
+        assert!(matches!(
+            request,
+            ReviewRequest::Run {
+                details: false,
+                relations: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_review_leads_with_its_summary_and_counts_relations_by_name_not_id() {
+        let (graph, change, entities) = rename_after_import();
+        let text = review_run(&graph, &change, false, false, true).text;
+
+        let at = |needle: &str| {
+            text.find(needle)
+                .unwrap_or_else(|| panic!("`{needle}` missing from:\n{text}"))
+        };
+        assert!(
+            at("--- Summary ---") < at("--- Entity Changes ---"),
+            "{text}"
+        );
+        assert!(
+            at("--- Entity Changes ---") < at("--- Relation Changes ---"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Relations: 61 changed, 60 of them from language-server enrichment\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "Parsed from source (1):\n  Calls: 1 added\n    + run [src/flask/app.py] -> \
+                 load_dotenv [src/flask/cli.py]\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "From language-server enrichment (60):\n  UsesType: 40 added\n  References: 20 \
+                 added\nAdd --relations to list every relation change by name.\n"
+            ),
+            "{text}"
+        );
+        for entity in &entities {
+            assert!(
+                !text.contains(&entity.id.to_string()),
+                "an entity id reached the review text:\n{text}"
+            );
+        }
+        assert!(!text.contains("entity:"), "{text}");
+    }
+
+    #[test]
+    fn review_relations_names_every_relation_change() {
+        let (graph, change, _) = rename_after_import();
+        let text = review_run(&graph, &change, false, true, false).text;
+
+        for i in 0..60 {
+            assert!(
+                text.contains(&format!(
+                    "    + view_{i} [src/flask/views.py] -> run [src/flask/app.py]\n"
+                )),
+                "view_{i} missing:\n{text}"
+            );
+        }
+        assert!(!text.contains("Add --relations"), "{text}");
+        assert!(!text.contains("entity:"), "{text}");
+    }
+
+    #[test]
+    fn review_enrichment_text_and_json_share_the_selected_observation() {
+        let (graph, change, _) = rename_after_import();
+        let text = review_run(&graph, &change, false, false, true).text;
+        let response = review_run(&graph, &change, true, false, false);
+        let json: serde_json::Value =
+            serde_json::from_str(response.json.as_deref().unwrap()).unwrap();
+        let observation = &json["enrichment"];
+        assert_eq!(observation["status"], "bounded");
+        assert_eq!(observation["scope"], "selected_graph_impact");
+        assert!(observation["selected_change"].is_null());
+        assert!(text.contains("Run `kin daemon sweep` to retry analysis."));
+        assert!(!text.contains("to settle"));
+        let compact = review_run(&graph, &change, false, false, false).text;
+        assert!(compact.contains("Run `kin daemon sweep` to retry analysis."));
+        assert!(!compact.contains("Limits belong to the selected revision"));
+        let total = observation["total_pending_entities"].as_u64().unwrap() as usize;
+        assert!(total > kin_review::PENDING_ENTITIES_NAMED);
+        assert!(text.find("--- Summary ---").unwrap() < text.find("not settled:").unwrap());
+        assert!(text.find("not settled:").unwrap() < text.find("--- Entity Changes ---").unwrap());
+        assert_eq!(text.matches("not settled:").count(), 1);
+        assert_eq!(
+            text.matches("(path:").count(),
+            kin_review::PENDING_ENTITIES_NAMED
+        );
+        for pending in observation["pending_entities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .take(3)
+        {
+            assert!(text.contains(&format!(
+                "{} (path: {})",
+                pending["name"].as_str().unwrap(),
+                pending["projection"]["path"]
+                    .as_str()
+                    .unwrap_or("unavailable")
+            )));
+        }
+        assert!(text.contains(&format!("and {} more", total - 3)));
+    }
+
+    #[test]
+    fn review_enrichment_absent_preserves_the_legacy_json_shape() {
+        let value = serde_json::to_value(ReviewResultJson {
+            file: "src/lib.rs".into(),
+            findings: Vec::new(),
+            summary: "Overall risk: Low; 0 finding(s)".into(),
+            enrichment: None,
+        })
+        .unwrap();
+        let keys: Vec<_> = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, ["file", "findings", "summary"]);
+    }
+
+    /// The editor's existing fields stay stable. Selected enrichment is an
+    /// additive observation, with no relation list whether or not one was asked
+    /// for.
+    #[test]
+    fn review_json_keeps_its_contract() {
+        let (graph, change, _) = rename_after_import();
+        for relations in [false, true] {
+            let response = review_run(&graph, &change, true, relations, false);
+            assert!(response.text.is_empty());
+            let json: serde_json::Value =
+                serde_json::from_str(response.json.as_deref().expect("json answer")).unwrap();
+            let mut keys: Vec<&str> = json
+                .as_object()
+                .expect("an object")
+                .keys()
+                .map(String::as_str)
+                .collect();
+            keys.sort_unstable();
+            assert_eq!(
+                keys,
+                ["enrichment", "file", "findings", "summary"],
+                "{json}"
+            );
+            assert_eq!(json["enrichment"]["scope"], "selected_graph_impact");
+            assert_eq!(json["enrichment"]["status"], "bounded");
+            assert!(
+                json["enrichment"]["total_pending_entities"]
+                    .as_u64()
+                    .unwrap()
+                    > 3
+            );
+            assert!(
+                json["enrichment"]["pending_entities"]
+                    .as_array()
+                    .unwrap()
+                    .len()
+                    <= 20
+            );
+            assert!(
+                json["summary"]
+                    .as_str()
+                    .is_some_and(|summary| summary.starts_with("Overall risk: ")),
+                "{json}"
+            );
+        }
     }
 }

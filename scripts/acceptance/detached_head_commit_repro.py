@@ -99,6 +99,64 @@ class Result(object):
         self.detail = detail
 
 
+# BEGIN failure evidence excerpt
+# Every suite carries this block byte for byte, because a suite is also copied
+# out and run as a single file. test_failure_excerpt.py keeps the copies equal.
+EVIDENCE_LIMIT = 4000
+EVIDENCE_LINE_LIMIT = 600
+EVIDENCE_PANICS = ("panicked at", "has overflowed its stack")
+EVIDENCE_ESCAPES = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+EVIDENCE_ERROR = re.compile(r"^(?:[\w./-]+:\s*)?(?:error|fatal)\b", re.IGNORECASE)
+EVIDENCE_LOG_ERROR = re.compile(r"\sERROR\s")
+
+
+def failure_excerpt(text, limit=EVIDENCE_LIMIT):
+    """Bounded evidence from a command's output that still says why it failed.
+
+    Output that fits is returned whole. Longer output keeps its opening and its
+    end, and between them every line that carries a Rust panic, with the
+    message line under it, and the last error line, wherever they fall. A
+    warning printed around the error cannot push it out, and a long log cannot
+    cut the panic out. `limit` only ever raises the bound, never lowers it.
+    """
+    text = (text or "").strip()
+    limit = max(int(limit), EVIDENCE_LIMIT)
+    if len(text) <= limit:
+        return text
+    head_end = limit // 4
+    tail_start = len(text) - limit // 2
+    lines = text.split("\n")
+    starts, offset = [], 0
+    panics, errors = [], []
+    for index, line in enumerate(lines):
+        starts.append(offset)
+        offset += len(line) + 1
+        plain = EVIDENCE_ESCAPES.sub("", line).strip()
+        if any(marker in plain for marker in EVIDENCE_PANICS):
+            panics.extend((index, index + 1))
+        if EVIDENCE_ERROR.match(plain) or EVIDENCE_LOG_ERROR.search(plain):
+            errors.append(index)
+    # The first panic and its message, then the last error line, then any
+    # later panics, for as long as the middle's share of the bound lasts.
+    order = panics[:2] + errors[-1:] + panics[2:]
+    budget, kept = limit // 4, set()
+    for index in order:
+        if index >= len(lines) or index in kept:
+            continue
+        start, end = starts[index], starts[index] + len(lines[index])
+        if end <= head_end or start >= tail_start:
+            continue
+        cost = min(len(lines[index]), EVIDENCE_LINE_LIMIT) + 1
+        if cost > budget:
+            continue
+        kept.add(index)
+        budget -= cost
+    middle = [lines[index][:EVIDENCE_LINE_LIMIT] for index in sorted(kept)]
+    parts = [text[:head_end], "[...]"] + middle + (["[...]"] if middle else [])
+    return "\n".join(parts + [text[tail_start:]])
+# END failure evidence excerpt
+
+
 def run(cmd, cwd=None, env=None, timeout=900):
     process = subprocess.Popen(
         cmd, cwd=cwd, env=env,
@@ -159,21 +217,21 @@ def grade_commit_refused_the_old_way(commit_text):
 def grade_detached_commit_landed(rc, commit_text):
     if grade_commit_refused_the_old_way(commit_text):
         return (FAIL, "the pre-fix refusal is still shipping: %s"
-                % " ".join((commit_text or "").split())[-160:])
+                % " ".join(failure_excerpt(commit_text).split()))
     if rc != 0:
         return (FAIL, "kin commit exited %s: %s"
-                % (rc, " ".join((commit_text or "").split())[-160:]))
+                % (rc, " ".join(failure_excerpt(commit_text).split())))
     if "Created semantic change" not in (commit_text or ""):
         return (UNREADABLE,
                 "kin commit exited 0 but named no change, so nothing can be read from it")
     if "on branch" in commit_text:
         return (FAIL,
                 "a detached commit named a branch, so a branch was invented: %s"
-                % " ".join(commit_text.split())[:160])
+                % " ".join(failure_excerpt(commit_text).split()))
     if "detached HEAD" not in commit_text:
         return (FAIL,
                 "a detached commit did not say where it went: %s"
-                % " ".join(commit_text.split())[:160])
+                % " ".join(failure_excerpt(commit_text).split()))
     return (PASS, "the commit landed and named the detached head")
 
 
@@ -186,13 +244,13 @@ def grade_branch_commit_landed(rc, commit_text, branch):
     """
     if rc != 0:
         return (FAIL, "kin commit exited %s: %s"
-                % (rc, " ".join((commit_text or "").split())[-160:]))
+                % (rc, " ".join(failure_excerpt(commit_text).split())))
     if "on branch '%s'" % branch not in (commit_text or ""):
         return (FAIL, "a commit on %s did not name it: %s"
-                % (branch, " ".join((commit_text or "").split())[:160]))
+                % (branch, " ".join(failure_excerpt(commit_text).split())))
     if "detached HEAD" in commit_text:
         return (FAIL, "a commit on a branch reported a detached head: %s"
-                % " ".join(commit_text.split())[:160])
+                % " ".join(failure_excerpt(commit_text).split()))
     return (PASS, "the commit landed on %s and said so" % branch)
 
 
@@ -328,13 +386,13 @@ class Suite(object):
         if arc != 0:
             return (arc, (aout or "") + (aerr or ""),
                     "kin admit exited %s, so nothing admitted the working copy: %s"
-                    % (arc, ((aerr or aout) or "")[-200:]))
+                    % (arc, failure_excerpt(aerr or aout)))
         rc, out, err = self.kin_run(repo, ["status"])
         text = out or ""
         if rc != 0:
             return (rc, text + (err or ""),
                     "kin status exited %s after an admission that succeeded: %s"
-                    % (rc, ((err or out) or "")[-200:]))
+                    % (rc, failure_excerpt(err or out)))
         # The positive control on the state, not on the answer. If this read
         # were still unmeasured the banner would say so, and every grader below
         # would be reading durable authority alone while believing otherwise.
@@ -347,7 +405,7 @@ class Suite(object):
     def git(self, repo, args, timeout=300):
         rc, out, err = run(["git"] + args, cwd=repo, env=self.env, timeout=timeout)
         if rc != 0:
-            raise RuntimeError("git %s failed: %s" % (" ".join(args), (err or out)[-300:]))
+            raise RuntimeError("git %s failed: %s" % (" ".join(args), failure_excerpt(err or out)))
         return out
 
     def repo(self, name, detach):
@@ -385,7 +443,7 @@ class Suite(object):
                 raise RuntimeError("the detached fixture is still on a branch")
         rc, out, err = self.kin_run(path, ["init", "."])
         if rc != 0:
-            raise RuntimeError("kin init failed: %s" % ((err or out)[-400:]))
+            raise RuntimeError("kin init failed: %s" % failure_excerpt(err or out))
         self._repos[name] = path
         return path
 
@@ -467,7 +525,7 @@ def check_no_branch_moved(suite):
     rc, out, err = suite.kin_run(repo, ["branch", "list"])
     if rc != 0:
         return Result("no_branch_moved", UNREADABLE,
-                      "kin branch list exited %s: %s" % (rc, (err or out)[-200:]))
+                      "kin branch list exited %s: %s" % (rc, failure_excerpt(err or out)))
     status, detail = grade_no_branch_moved(OBSERVED.get("branches_before"),
                                            branch_targets(out))
     return Result("no_branch_moved", status, detail)

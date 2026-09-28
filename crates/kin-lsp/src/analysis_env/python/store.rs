@@ -41,6 +41,50 @@ pub fn unique_suffix() -> String {
     )
 }
 
+/// An exclusively created attempt directory. A suffix is only a candidate:
+/// create_dir decides ownership even across reused PIDs or PID namespaces.
+/// Only the directory this attempt claimed is removed on drop.
+pub(crate) struct OwnedAttempt(pub(crate) PathBuf);
+
+impl OwnedAttempt {
+    pub(crate) fn new(parent: &Path) -> Result<Self, String> {
+        Self::claim(parent, unique_suffix)
+    }
+
+    fn claim(parent: &Path, mut suffix: impl FnMut() -> String) -> Result<Self, String> {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("{}: {error}", parent.display()))?;
+        for _ in 0..128 {
+            let path = parent.join(format!(".attempt-{}", suffix()));
+            #[cfg(unix)]
+            let builder = {
+                use std::os::unix::fs::DirBuilderExt;
+
+                let mut builder = std::fs::DirBuilder::new();
+                builder.mode(0o700);
+                builder
+            };
+            #[cfg(not(unix))]
+            let builder = std::fs::DirBuilder::new();
+            match builder.create(&path) {
+                Ok(()) => return Ok(Self(path)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(format!("{}: {error}", path.display())),
+            }
+        }
+        Err(format!(
+            "{}: could not claim an exclusive archive attempt",
+            parent.display()
+        ))
+    }
+}
+
+impl Drop for OwnedAttempt {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// Move a staged directory to its final name. When another writer published
 /// the same content first, theirs is kept and the staged copy removed.
 pub fn publish_dir(staging: &Path, destination: &Path) -> Result<(), String> {
@@ -612,5 +656,29 @@ mod tests {
             ]
         );
         assert!(a.is_file(), "the store itself is untouched");
+    }
+}
+
+#[cfg(test)]
+mod attempt_tests {
+    use super::*;
+
+    #[test]
+    fn a_reused_process_suffix_cannot_reuse_another_attempt() {
+        let fixture = crate::adapters::repo_scan::Fixture::new("archive-attempt");
+        let other = fixture.root.join(".attempt-reused");
+        std::fs::create_dir(&other).unwrap();
+        std::fs::write(other.join("sentinel"), b"owned elsewhere").unwrap();
+        let mut candidates = ["reused", "fresh"].into_iter();
+        let attempt =
+            OwnedAttempt::claim(&fixture.root, || candidates.next().unwrap().into()).unwrap();
+        let owned = attempt.0.clone();
+        assert_ne!(owned, other);
+        drop(attempt);
+        assert!(!owned.exists());
+        assert_eq!(
+            std::fs::read(other.join("sentinel")).unwrap(),
+            b"owned elsewhere"
+        );
     }
 }

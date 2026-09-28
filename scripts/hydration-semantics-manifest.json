@@ -388,7 +388,7 @@
     },
     {
       "file": "crates/kin-index/src/occurrence.rs",
-      "digest": "sha256:492ff78d95be9a9af89923efd7cbaa931e448c4a8464ccb751fe4d20969a0bba",
+      "digest": "sha256:52c63c0a2bdb7152d180910a2f2c7d8462fd7d52484143a56ba376975dcca5c1",
       "owner": "kin-index",
       "reason": "Authors and validates durable per-occurrence resolution bound to original evidence, logical edge identity and endpoints, including deterministic canonical merge semantics."
     }
@@ -396,8 +396,8 @@
   "same_epoch_changes": [
     {
       "file": "crates/kin-index/src/occurrence.rs",
-      "digest": "sha256:492ff78d95be9a9af89923efd7cbaa931e448c4a8464ccb751fe4d20969a0bba",
-      "reason": "The previously added certificate wrapper, proof retirement helper and tests do not change historical replay. The retirement helper is used only by the daemon's LSP union; existing replay functions are unchanged. Version 31 is independently required by the Python workspace-scope upgrade."
+      "digest": "sha256:52c63c0a2bdb7152d180910a2f2c7d8462fd7d52484143a56ba376975dcca5c1",
+      "reason": "The previously added certificate wrapper, proof retirement helper and tests do not change historical replay. The retirement helper is used only by the daemon's LSP union; existing replay functions are unchanged. Version 31 is independently required by the Python workspace-scope upgrade. The later move of the proof record, its evidence digest and its validation into kin_model::parser_occurrence, so repository authority can recognize source-sealed parser withdrawals, keeps the same rules and field checks; a test pins the shared confidence tiers to the resolution ladder, and replay output is unchanged."
     }
   ]
 }

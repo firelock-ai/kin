@@ -249,7 +249,9 @@ pub fn admit_semantic_git_import(
     plan: &SemanticGitImportPlan,
     blob_store: &BlobStore,
 ) -> Result<AdmittedSemanticGitImportPlan> {
-    plan.validate(blob_store)?;
+    // Admission already re-derives and compares the complete held plan while
+    // its exact trees are live. Keep that validation in the same walk instead
+    // of rebuilding every commit once here and again to derive its policy.
     build_admitted_semantic_git_import_plan(plan, blob_store)
 }
 
@@ -404,8 +406,8 @@ fn derive_admitted_semantic_git_history(
             // The re-derivation has to reproduce the held plan at every
             // position before its tree is trusted for admission, the same
             // comparison `SemanticGitImportPlan::validate` makes, so a plan
-            // that drifted from its raw objects is refused here as well as
-            // there rather than admitted from a tree it never described.
+            // that drifted from its raw objects is refused before admission
+            // can return a tree or policy it never described.
             //
             // What this grades is everything the walk derives for itself: the
             // tree deltas, the parents, the timestamp, author and message, the
@@ -436,9 +438,16 @@ fn derive_admitted_semantic_git_history(
     if deriver.derived != plan.changes.len()
         || deriver.policies.len() != plan.changes.len()
         || derived.commits != plan.changes.len()
+        || plan.aliases.len() != derived.commits
+        || plan.commit_tree_hashes != derived.commit_tree_hashes
+        || plan.content != derived.content
+        || plan.workspace_seed != derived.workspace_seed
+        || plan.ref_mutations != derived.ref_mutations
+        || plan.default_ref_mutation != derived.default_ref_mutation
     {
         return Err(GitError::InvalidSnapshot(
-            "not every imported commit produced one admitted change, alias, and policy".to_string(),
+            "semantic Git import plan does not match its deterministic raw-object derivation"
+                .to_string(),
         ));
     }
 

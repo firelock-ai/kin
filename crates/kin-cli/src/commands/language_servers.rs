@@ -521,6 +521,42 @@ pub(crate) fn install_commands_for(missing: &[LanguageId]) -> Vec<String> {
 /// narrow it to the repository's languages with [`LanguageScope::select`]
 /// first: a Go-only repository used to get rust-analyzer and a global pyright
 /// as well, and a Rust-only one exited 1 over four languages it does not use.
+/// The `setup.toml` table and key that record whether Kin may install the
+/// language servers a repository needs.
+///
+/// `kin setup` asks once, outside any repository, and records the answer here.
+/// `kin clone` and `kin init` read it, because only they know the repository's
+/// languages, and install exactly those servers before linking. With nothing
+/// recorded they install nothing and name the command that does.
+const INSTALL_CONSENT_TABLE: &str = "language_servers";
+const INSTALL_CONSENT_KEY: &str = "install";
+
+/// The recorded answer: `Some(true)` for yes, `Some(false)` for no, `None`
+/// when nobody was asked.
+pub(crate) fn recorded_install_consent(kin_home: &Path) -> Option<bool> {
+    let value = crate::commands::projection::recorded_setup_value(
+        kin_home,
+        INSTALL_CONSENT_TABLE,
+        INSTALL_CONSENT_KEY,
+    )?;
+    match value.as_str() {
+        "yes" => Some(true),
+        "no" => Some(false),
+        _ => None,
+    }
+}
+
+/// Record the answer to "install language servers when a repository needs
+/// one?".
+pub(crate) fn record_install_consent(kin_home: &Path, consent: bool) -> anyhow::Result<()> {
+    crate::commands::projection::record_setup_value(
+        kin_home,
+        INSTALL_CONSENT_TABLE,
+        INSTALL_CONSENT_KEY,
+        if consent { "yes" } else { "no" },
+    )
+}
+
 pub(crate) fn missing_enrichable_languages() -> Vec<LanguageId> {
     LANGUAGE_SERVERS
         .iter()
@@ -2041,6 +2077,16 @@ pub(crate) const RESTART_AFTER_INSTALL: &str =
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_install_consent_round_trips_through_setup_toml() {
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(recorded_install_consent(home.path()), None, "never asked");
+        record_install_consent(home.path(), true).unwrap();
+        assert_eq!(recorded_install_consent(home.path()), Some(true));
+        record_install_consent(home.path(), false).unwrap();
+        assert_eq!(recorded_install_consent(home.path()), Some(false));
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn async_provisioning_worker_failure_is_not_an_install_report() {

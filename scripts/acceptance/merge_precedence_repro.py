@@ -88,6 +88,7 @@ import argparse
 import functools
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -187,6 +188,64 @@ OURS_PAIR = b"pub fn alpha(count: u64) {}\npub fn beta(count: u64) {}\n"
 THEIRS_PAIR = b"pub fn alpha(v: i32) {}\npub fn beta(v: i32) {}\n"
 
 
+# BEGIN failure evidence excerpt
+# Every suite carries this block byte for byte, because a suite is also copied
+# out and run as a single file. test_failure_excerpt.py keeps the copies equal.
+EVIDENCE_LIMIT = 4000
+EVIDENCE_LINE_LIMIT = 600
+EVIDENCE_PANICS = ("panicked at", "has overflowed its stack")
+EVIDENCE_ESCAPES = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+EVIDENCE_ERROR = re.compile(r"^(?:[\w./-]+:\s*)?(?:error|fatal)\b", re.IGNORECASE)
+EVIDENCE_LOG_ERROR = re.compile(r"\sERROR\s")
+
+
+def failure_excerpt(text, limit=EVIDENCE_LIMIT):
+    """Bounded evidence from a command's output that still says why it failed.
+
+    Output that fits is returned whole. Longer output keeps its opening and its
+    end, and between them every line that carries a Rust panic, with the
+    message line under it, and the last error line, wherever they fall. A
+    warning printed around the error cannot push it out, and a long log cannot
+    cut the panic out. `limit` only ever raises the bound, never lowers it.
+    """
+    text = (text or "").strip()
+    limit = max(int(limit), EVIDENCE_LIMIT)
+    if len(text) <= limit:
+        return text
+    head_end = limit // 4
+    tail_start = len(text) - limit // 2
+    lines = text.split("\n")
+    starts, offset = [], 0
+    panics, errors = [], []
+    for index, line in enumerate(lines):
+        starts.append(offset)
+        offset += len(line) + 1
+        plain = EVIDENCE_ESCAPES.sub("", line).strip()
+        if any(marker in plain for marker in EVIDENCE_PANICS):
+            panics.extend((index, index + 1))
+        if EVIDENCE_ERROR.match(plain) or EVIDENCE_LOG_ERROR.search(plain):
+            errors.append(index)
+    # The first panic and its message, then the last error line, then any
+    # later panics, for as long as the middle's share of the bound lasts.
+    order = panics[:2] + errors[-1:] + panics[2:]
+    budget, kept = limit // 4, set()
+    for index in order:
+        if index >= len(lines) or index in kept:
+            continue
+        start, end = starts[index], starts[index] + len(lines[index])
+        if end <= head_end or start >= tail_start:
+            continue
+        cost = min(len(lines[index]), EVIDENCE_LINE_LIMIT) + 1
+        if cost > budget:
+            continue
+        kept.add(index)
+        budget -= cost
+    middle = [lines[index][:EVIDENCE_LINE_LIMIT] for index in sorted(kept)]
+    parts = [text[:head_end], "[...]"] + middle + (["[...]"] if middle else [])
+    return "\n".join(parts + [text[tail_start:]])
+# END failure evidence excerpt
+
+
 def run(cmd, cwd=None, env=None, timeout=600, stdin=None):
     proc = subprocess.Popen(
         cmd, cwd=cwd, env=env,
@@ -279,18 +338,18 @@ def grade_refusal_names_both_decisions(stderr, path, entity_names):
     if not isinstance(stderr, str) or not stderr.strip():
         return UNREADABLE, "the refusal printed nothing at all"
     if path not in stderr:
-        return FAIL, "the refusal does not name the file %s: %r" % (path, stderr[-400:])
+        return FAIL, "the refusal does not name the file %s: %r" % (path, failure_excerpt(stderr))
     missing = [name for name in entity_names if name not in stderr]
     if missing:
         return FAIL, (
             "the refusal does not name the entity decision(s) %s: %r"
-            % (", ".join(missing), stderr[-400:])
+            % (", ".join(missing), failure_excerpt(stderr))
         )
     absent = [flag for flag in ("--theirs", "--ours") if flag not in stderr]
     if absent:
         return FAIL, (
             "the refusal does not name the %s side(s) that were chosen: %r"
-            % (", ".join(absent), stderr[-400:])
+            % (", ".join(absent), failure_excerpt(stderr))
         )
     return PASS, "the refusal names %s and both decisions" % (path,)
 
@@ -370,25 +429,25 @@ class Suite(object):
         self.git(["add", "-A"], path)
         rc, out, err = self.git(["commit", "-q", "-m", "base"], path)
         if rc != 0:
-            raise RuntimeError("git commit failed: %s" % (err or out)[-300:])
+            raise RuntimeError("git commit failed: %s" % failure_excerpt(err or out))
 
         self.git(["switch", "-q", "-c", "feature"], path)
         self._write(path, files, 2)
         self.git(["add", "-A"], path)
         rc, out, err = self.git(["commit", "-q", "-m", "feature work"], path)
         if rc != 0:
-            raise RuntimeError("git commit failed on feature: %s" % (err or out)[-300:])
+            raise RuntimeError("git commit failed on feature: %s" % failure_excerpt(err or out))
 
         self.git(["switch", "-q", "main"], path)
         self._write(path, files, 1)
         self.git(["add", "-A"], path)
         rc, out, err = self.git(["commit", "-q", "-m", "main work"], path)
         if rc != 0:
-            raise RuntimeError("git commit failed on main: %s" % (err or out)[-300:])
+            raise RuntimeError("git commit failed on main: %s" % failure_excerpt(err or out))
 
         rc, out, err = self.kin_run(["init", "."], path)
         if rc != 0:
-            raise RuntimeError("kin init failed in %s: %s" % (path, (err or out)[-300:]))
+            raise RuntimeError("kin init failed in %s: %s" % (path, failure_excerpt(err or out)))
         # `kin init` can leave a pending semantic overlay, and a merge refuses to
         # publish into a workspace holding one. It happens on the Python fixtures
         # and not on the Rust ones, so a builder that skipped this worked for
@@ -445,7 +504,7 @@ class Suite(object):
     def conflicts(self, repo):
         rc, out, err = self.kin_run(["conflicts", "--json"], repo)
         if rc != 0:
-            raise RuntimeError("kin conflicts --json failed: %s" % (err or out)[-300:])
+            raise RuntimeError("kin conflicts --json failed: %s" % failure_excerpt(err or out))
         return json.loads(out)
 
     def entity_conflict(self, report, name):
@@ -472,7 +531,7 @@ class Suite(object):
     def head_change(self, repo):
         rc, out, err = self.kin_run(["log", "-n", "1"], repo)
         if rc != 0:
-            raise RuntimeError("kin log failed: %s" % (err or out)[-300:])
+            raise RuntimeError("kin log failed: %s" % failure_excerpt(err or out))
         for line in out.splitlines():
             stripped = line.strip()
             if stripped.startswith("change "):
@@ -515,15 +574,15 @@ def _settle_the_mixed_merge(suite):
     entity = suite.entity_conflict(suite.conflicts(repo), "base")
     rc, out, err = suite.kin_run(["resolve", "--theirs", entity], repo)
     if rc != 0:
-        raise RuntimeError("settling the entity failed: %s" % (err or out)[-300:])
+        raise RuntimeError("settling the entity failed: %s" % failure_excerpt(err or out))
     rc, out, err = suite.kin_run(["resolve", "--all-ours"], repo)
     if rc != 0:
-        raise RuntimeError("the bulk settle failed: %s" % (err or out)[-300:])
+        raise RuntimeError("the bulk settle failed: %s" % failure_excerpt(err or out))
     rc, out, err = suite.kin_run(["resolve", "--continue"], repo)
     published = rc == 0
     log = suite.kin_run(["log", "-n", "1"], repo)[1] if published else ""
     suite._mixed = {"repo": repo, "published": published, "log": log,
-                    "detail": (err or out)[-400:]}
+                    "detail": failure_excerpt(err or out)}
     return suite._mixed
 
 
@@ -560,15 +619,15 @@ def check_refusal(suite):
     rc, out, err = suite.kin_run(["resolve", "--theirs", alpha], repo)
     if rc != 0:
         return Result("refusal", UNREADABLE,
-                      "%s settling alpha failed: %s" % (TICKET, (err or out)[-300:]))
+                      "%s settling alpha failed: %s" % (TICKET, failure_excerpt(err or out)))
     rc, out, err = suite.kin_run(["resolve", "--ours", beta], repo)
     if rc != 0:
         return Result("refusal", UNREADABLE,
-                      "%s settling beta failed: %s" % (TICKET, (err or out)[-300:]))
+                      "%s settling beta failed: %s" % (TICKET, failure_excerpt(err or out)))
     rc, out, err = suite.kin_run(["resolve", "--all-ours"], repo)
     if rc != 0:
         return Result("refusal", UNREADABLE,
-                      "%s the bulk settle failed: %s" % (TICKET, (err or out)[-300:]))
+                      "%s the bulk settle failed: %s" % (TICKET, failure_excerpt(err or out)))
     rc, out, err = suite.kin_run(["resolve", "--continue"], repo)
     if rc == 0:
         return Result("refusal", FAIL,
@@ -590,12 +649,12 @@ def check_uniform(suite):
     rc, out, err = suite.kin_run(["resolve", "--all-theirs"], repo)
     if rc != 0:
         return Result("uniform", UNREADABLE,
-                      "%s the uniform settle failed: %s" % (TICKET, (err or out)[-300:]))
+                      "%s the uniform settle failed: %s" % (TICKET, failure_excerpt(err or out)))
     rc, out, err = suite.kin_run(["resolve", "--continue"], repo)
     if rc != 0:
         return Result("uniform", FAIL,
                       "%s an ordinary uniform merge no longer publishes: %s"
-                      % (TICKET, (err or out)[-300:]))
+                      % (TICKET, failure_excerpt(err or out)))
     verdicts = [
         ("lib", grade_bytes(suite.read_bytes(repo, "src/lib.rs"), THEIRS_LIB, "src/lib.rs")),
         ("shared", grade_bytes(suite.read_bytes(repo, "shared.txt"), THEIRS_SHARED,
@@ -826,7 +885,7 @@ def grade_abort_frees_workspace(rc, out, err):
         return (UNREADABLE, "`kin resolve --abort` produced no exit code")
     problems = []
     if rc != 0:
-        problems.append("abandoning was refused: %s" % text[-160:].strip())
+        problems.append("abandoning was refused: %s" % failure_excerpt(text))
     if "has moved since the merge opened" not in text:
         problems.append("it does not say the workspace moved")
     if "is unchanged at the recorded restore point" in text:
@@ -864,7 +923,7 @@ def grade_continue_still_refuses(rc, out, err):
     if rc == 0:
         return (FAIL, "settling was accepted while conflicts were still outstanding")
     if "unresolved conflict" not in text:
-        return (FAIL, "the refusal does not name what is outstanding: %s" % text[-160:].strip())
+        return (FAIL, "the refusal does not name what is outstanding: %s" % failure_excerpt(text))
     return (PASS, "settling still refuses while conflicts remain, and says how many")
 
 
@@ -904,7 +963,7 @@ def grade_merge_record_aborted(rc, out, err):
         return (UNREADABLE, "`kin conflicts --json` produced no record to read")
     if rc != 0:
         return (FAIL, "reading the post-abort merge record failed: %s"
-                % ((err or out)[-160:].strip()))
+                % failure_excerpt(err or out))
     try:
         payload = json.loads(text)
     except (TypeError, ValueError):
@@ -1033,7 +1092,7 @@ def grade_name_selector(rc, out, err, marker):
     if rc is None:
         return (UNREADABLE, "the selector run produced no exit code")
     if rc != 0:
-        return (FAIL, "a bare entity name was refused: %s" % ((err or out)[-200:]).strip())
+        return (FAIL, "a bare entity name was refused: %s" % failure_excerpt(err or out))
     if marker not in (out or "") and marker not in (err or ""):
         return (PASS, "the bare name settled")
     return (PASS, "the bare name settled")
@@ -1048,9 +1107,9 @@ def grade_ambiguous_name_refuses_with_candidates(rc, out, err):
     if rc == 0:
         return (FAIL, "an ambiguous name settled something instead of refusing")
     if "matches 2 recorded merge conflicts" not in text:
-        return (FAIL, "the refusal does not say how many it matched: %s" % text[-200:].strip())
+        return (FAIL, "the refusal does not say how many it matched: %s" % failure_excerpt(text))
     if "pkg/one.py" not in text or "pkg/two.py" not in text:
-        return (FAIL, "the refusal does not name both candidates: %s" % text[-200:].strip())
+        return (FAIL, "the refusal does not name both candidates: %s" % failure_excerpt(text))
     return (PASS, "an ambiguous name refuses and names both candidates")
 
 

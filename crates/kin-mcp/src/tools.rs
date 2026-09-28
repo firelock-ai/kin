@@ -79,26 +79,12 @@ fn context_max_chars_property() -> serde_json::Value {
     })
 }
 
-/// `trace_data_flow`'s own spelling of the same budget.
-///
-/// The words say target, not ceiling, because the route does not refuse: below
-/// the size of its smallest retained walk it ships that walk over the budget and
-/// discloses the overrun, and a caller who read "may occupy" as a hard cap was
-/// told a number the response does not keep.
+/// The trace pager's hard byte ceiling, including its complete page envelope.
 fn trace_max_chars_property() -> serde_json::Value {
     serde_json::json!({
         "type": "integer",
         "description": format!(
-            "UTF-8 bytes of JSON text, the `_kin` envelope included, that the walk cuts this \
-             response toward (default {default}, clamped {min}..{max}, the same budget every \
-             retrieval tool answers under). It is a target, not a hard ceiling. The tool drops \
-             bodies before edges and never returns an empty chain for a walk that found steps: a \
-             cut chain keeps at least one step, and `elisions.chain` accounts for every step the \
-             walk reached. When even that smallest walk, with its identity, its required \
-             disclosures and the `_kin` envelope, does not fit, the tool answers with it anyway \
-             and says so under `response_over_budget`. A focal or `target` several owners share \
-             is held to the budget instead and refused when it cannot fit. `max_chars` is the \
-             same parameter under the name the other retrieval tools use.",
+            "Hard UTF-8 JSON byte ceiling including the envelope (default {default}, clamped {min}..{max}). Larger traces and ambiguous candidate lists return next_cursor. Repeat the same query with cursor to resume. Oversized semantic fields carry lossless record_fragment chunks; requested bodies and steps are never discarded to fit. max_chars is an alias.",
             default = crate::budget::RESPONSE_DEFAULT_MAX_CHARS,
             min = crate::budget::RESPONSE_MIN_MAX_CHARS,
             max = crate::budget::RESPONSE_MAX_MAX_CHARS,
@@ -702,6 +688,7 @@ fn registered_tools() -> ToolsListResult {
                     "type": "object",
                     "properties": {
                         "focal": { "type": "string", "description": "Focal entity UUID or exact entity name to start tracing from" },
+                        "cursor": { "type": "string", "maxLength": 256, "description": "Opaque next_cursor from the prior trace page. Repeat the same focal and traversal arguments; only the byte budget may change. Changed graph/scope or expired snapshot requires restarting without cursor." },
                         "depth": { "type": "integer", "description": "Maximum traversal depth from the focal (default 3, capped at 8)", "default": 3, "minimum": 1, "maximum": 8 },
                         "direction": {
                             "type": "string",
@@ -764,7 +751,8 @@ fn registered_tools() -> ToolsListResult {
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "answer_only": { "type": "boolean", "description": "Return reference rows and trust limits. False restores detailed coverage and candidates.", "default": false },
+                        "cursor": { "type": "string", "maxLength": 256, "description": "Continue a frozen reference answer with its next_cursor and the same query and filters. Byte budgets may change. An expired or stale cursor requires a fresh query." },
+                        "answer_only": { "type": "boolean", "description": "Return reference rows, named call-site candidates and trust limits. False restores detailed coverage and every candidate.", "default": false },
                         "max_chars": max_chars_property(),
                         "compact": { "type": "boolean", "description": "If true (default), omit ranking explanation and per-signal breakdowns and return one shape per hit. Pass false (or explain: true) to get the breakdowns back.", "default": true },
                         "entity_id": { "type": "string", "description": "Exact entity UUID, or external_reference:<uuid> for a symbol outside the repository. Optional if query is provided." },
@@ -781,7 +769,7 @@ fn registered_tools() -> ToolsListResult {
                         },
                         "min_resolution": {
                             "type": "string",
-                            "description": "Weakest resolution a row may carry and still be counted in `references` and `total_upstream`. Defaults to import_scoped, so the headline is the proven subset. A row under the floor is not dropped: it moves to `candidates` whole, keeping its resolution and site lines. Pass name_only to count every row in the headline instead, or type_resolved to keep only rows whose destination the graph proved outright.",
+                            "description": "Weakest resolution a row may carry and still be counted in `references` and `total_upstream`. Defaults to import_scoped, so the headline is the proven subset. A row under the floor is not dropped: it moves to `candidates` whole, keeping its resolution and sites. Pass name_only to count every row in the headline instead, or type_resolved to keep only rows whose destination the graph proved outright.",
                             "enum": ["name_only", "import_scoped", "type_resolved"],
                             "default": "import_scoped"
                         }
@@ -1636,7 +1624,17 @@ fn registered_tools() -> ToolsListResult {
                 annotations: read_only("Graph status"),
                 input_schema: serde_json::json!({
                     "type": "object",
-                    "properties": {},
+                    "properties": {
+                        "dependencies": {"type":"array","maxItems":1024,"items":{"type":"string"},"description":"Exact projection paths whose admitted source and recorded call-site proof must be accounted for. No source bodies are returned."},
+                        "cursor": {"type":"string","maxLength":512,"description":"Continue the same selected-source observation with the same dependencies."},
+                        "max_chars": {
+                            "type": "integer",
+                            "default": crate::budget::RESPONSE_DEFAULT_MAX_CHARS,
+                            "minimum": crate::budget::RESPONSE_MIN_MAX_CHARS,
+                            "maximum": crate::budget::RESPONSE_MAX_MAX_CHARS,
+                            "description": "Hard UTF-8 JSON byte ceiling, including the envelope. Follow next_cursor with the same dependencies; oversized metadata records are refused rather than truncated."
+                        }
+                    },
                     "additionalProperties": false
                 }),
             },

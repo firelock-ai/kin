@@ -378,9 +378,19 @@ fn codes_past_unswept_call_sites<'f>(answer: &Value, factor: &'f str) -> Vec<&'f
                 .keys()
                 .all(|reason| reason.ends_with("language-server enrichment is switched off"))
     });
+    // The block counts every caller in the store that could call the focal,
+    // and a caller whose body holds no call has no site for a resolver to
+    // prove, so it is not among the unproven. The excuse holds while no site
+    // exists and no caller is owed, stale or unverified: every caller left is
+    // either one with no call or one only switched-off enrichment leaves
+    // unproven.
+    let count = |key: &str| block[key].as_u64().unwrap_or(0);
     let unswept = block["sites"] == 0
         && callers > 0
-        && block["callers_unproven_no_resolver"] == block["callers"]
+        && count("callers_owed_derivation") == 0
+        && count("callers_owed_enrichment") == 0
+        && count("callers_stale") == 0
+        && count("callers_unverified") == 0
         && switched_off;
     factor
         .split("; ")
@@ -2483,6 +2493,7 @@ fn an_upgrade_refuses_to_strand_a_stash_and_changes_nothing() {
     .unwrap();
     succeed(&runtime, &repo, &["stash", "push", "--yes"]);
     succeed(&runtime, &repo, &["daemon", "stop"]);
+    settle_runtime_authority(&repo);
     let before = tree_digest(&repo.join(".kin"));
 
     let refused = kin(&runtime, &repo, &["upgrade"]);
@@ -2502,6 +2513,91 @@ fn an_upgrade_refuses_to_strand_a_stash_and_changes_nothing() {
     let report = json(&runtime, &repo, &["upgrade", "--json"]);
     assert_eq!(report["state"], "upgraded", "{report}");
     assert_eq!(report["workspace_dirty"], true, "{report}");
+}
+
+/// The same refusal after a daemon its shutdown watchdog ended. With no
+/// shutdown grace the watchdog ends the daemon without the release that clears
+/// its owner stamp, which is how a loaded host ended the daemon the test above
+/// stops, and the refused upgrade then cleared that stamp when it released the
+/// runtime authority. That read as a changed store. The baseline is taken with
+/// the lock at rest, so the store, the lock included, must still be unchanged.
+#[test]
+fn an_upgrade_refusal_after_a_watchdog_ended_daemon_changes_nothing() {
+    let root = tempdir().expect("temp root");
+    unpack(root.path());
+    let repo = root.path().join("clean");
+    let runtime = IsolatedDaemonRuntime::new(&repo);
+
+    fs::write(
+        repo.join("pkg/c.py"),
+        "def triple(value):\n    return value * 3\n",
+    )
+    .unwrap();
+    let pushed = runtime
+        .kin_command()
+        .args(["stash", "push", "--yes"])
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("KIN_EMBED_BACKEND", "cpu")
+        .env("KIN_DAEMON_AUTO_EMBED", "0")
+        .env("KIN_DAEMON_DISABLE_LSP", "1")
+        .env("KIN_DAEMON_READY_TIMEOUT_SECS", "180")
+        .env("KIN_DAEMON_BIN", runtime.daemon_bin())
+        .env("KIN_DAEMON_SHUTDOWN_GRACE_SECS", "0")
+        .current_dir(&repo)
+        .output()
+        .expect("run kin stash push");
+    assert!(
+        pushed.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&pushed.stderr)
+    );
+    succeed(&runtime, &repo, &["daemon", "stop"]);
+    settle_runtime_authority(&repo);
+    let before = tree_digest(&repo.join(".kin"));
+
+    let refused = kin(&runtime, &repo, &["upgrade"]);
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("refs/kin/stash/") && stderr.contains("Nothing was changed"),
+        "{stderr}"
+    );
+    assert_same_store(
+        &before,
+        &tree_digest(&repo.join(".kin")),
+        "a refused upgrade after a watchdog-ended daemon changed the store",
+    );
+}
+
+/// Put `.kin/daemon.lock` at rest before a whole-store baseline is taken.
+///
+/// The lock's bytes say how its last holder ended, not what the store holds.
+/// A daemon that finishes its own shutdown clears its owner stamp on the way
+/// out. One ended by its shutdown watchdog or by a signal exits without
+/// running that release and leaves its stamp, and this harness gives a daemon
+/// three seconds of shutdown grace, so on a loaded host that is the ordinary
+/// ending. The next holder of the runtime authority overwrites the stamp and
+/// clears it on release, and `kin upgrade` takes that authority before it
+/// plans. A refusal after such an ending therefore read as a changed store,
+/// although nothing the store holds had moved.
+///
+/// Taking and releasing the authority here, as every holder does, makes the
+/// baseline the released lock whichever way the daemon ended, so the whole
+/// tree, the lock included, is still compared byte for byte. The authority
+/// must be free: a daemon that outlived its stop fails here rather than later.
+fn settle_runtime_authority(repo: &Path) {
+    let authority = kin_cli::daemon_client::acquire_repository_runtime_authority_within(
+        &repo.join(".kin"),
+        Duration::from_secs(1),
+    )
+    .expect("acquire the runtime authority")
+    .expect("a stopped daemon still holds the runtime authority");
+    drop(authority);
+    assert_eq!(
+        fs::read(repo.join(".kin/daemon.lock")).expect("read the released runtime lock"),
+        b"",
+        "releasing the runtime authority left an owner stamp"
+    );
 }
 
 /// An upgrade stopped at the last moment before its commit leaves every byte
@@ -3326,4 +3422,658 @@ fn python_scope_upgrade_reuses_compatible_persisted_vectors() {
     .unwrap();
     assert!(loaded.attached, "{loaded:?}");
     assert_eq!(reopened.embedding_status().indexed, 1);
+}
+
+/// Whether the graph this store's workspace selects carries checked binding
+/// history, read from a freshly opened repository authority with no daemon
+/// serving the store.
+fn workspace_lineage_checked(repo: &Path) -> bool {
+    let layout = kin_core::KinLayout::new(repo.join(".kin"));
+    let (manager, _) = kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout)
+        .unwrap()
+        .open_manager_with_payload_stats()
+        .unwrap();
+    let lease = manager.read_authority();
+    let workspace = lease.metadata().workspaces[0].workspace_id;
+    lease
+        .workspace_graph_snapshot(&workspace)
+        .unwrap()
+        .expect("the workspace has a committed graph")
+        .verified_binding_history
+        .is_some()
+}
+
+/// What a daemon's start says it recorded, in the checkpoint's own words.
+const DAEMON_START_CHECKPOINT: &str =
+    "The Kin daemon recorded this change when it started on this store";
+
+/// Every change a daemon's start recorded, with its first parent, in id
+/// order, read from a freshly opened repository authority with no daemon
+/// serving the store.
+fn daemon_start_checkpoints(
+    repo: &Path,
+) -> Vec<(
+    kin_model::SemanticChangeId,
+    Option<kin_model::SemanticChangeId>,
+)> {
+    let layout = kin_core::KinLayout::new(repo.join(".kin"));
+    let (manager, _) = kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout)
+        .unwrap()
+        .open_manager_with_payload_stats()
+        .unwrap();
+    let lease = manager.read_authority();
+    let mut checkpoints: Vec<_> = lease
+        .snapshot()
+        .changes
+        .values()
+        .filter(|change| change.message.contains(DAEMON_START_CHECKPOINT))
+        .map(|change| (change.id, change.parents.first().copied()))
+        .collect();
+    checkpoints.sort();
+    checkpoints
+}
+
+/// The change `refs/heads/main` names, read from a freshly opened repository
+/// authority with no daemon serving the store.
+fn main_head(repo: &Path) -> kin_model::SemanticChangeId {
+    let layout = kin_core::KinLayout::new(repo.join(".kin"));
+    let (manager, _) = kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout)
+        .unwrap()
+        .open_manager_with_payload_stats()
+        .unwrap();
+    let lease = manager.read_authority();
+    let main = kin_model::RefName::branch(b"main").unwrap();
+    let reference = lease
+        .metadata()
+        .ref_state
+        .refs
+        .iter()
+        .find(|reference| reference.name == main)
+        .expect("the store has a main branch")
+        .target
+        .clone();
+    lease.resolve_target_change_id(&reference).unwrap()
+}
+
+/// Bring an unpacked published store to the shape a store has once another
+/// process moved it after its lineage was checked, a pull or a clone the
+/// commonest: its record reads current, every head and its workspace hold
+/// exactly this build's derivation, and its workspace graph carries no checked
+/// binding history. `kin upgrade` re-derives it, then an ordinary commit,
+/// which checks nothing, ends the lineage that upgrade started.
+fn end_the_lineage_of_an_upgraded_store(repo: &Path) {
+    use kin_cli::commands::upgrade::{upgrade_store, UpgradeHooks};
+    use kin_model::{
+        OperationId, RefExpectation, RefMutation, RefName, RefTarget, RefUpdatePolicy,
+        RepositoryTransaction, REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+    };
+
+    let layout = kin_core::KinLayout::new(repo.join(".kin"));
+    let author = kin_model::AuthorId::new("Kin Fixture <fixture@example.invalid>");
+    let upgraded = upgrade_store(&layout, author.clone(), &UpgradeHooks::default(), &|_| {})
+        .expect("the published store upgrades");
+    assert_eq!(upgraded.binding_history_checked, Some(true));
+    let (manager, _) = kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout)
+        .unwrap()
+        .open_manager_with_payload_stats()
+        .unwrap();
+    let lease = manager.read_authority();
+    let roots = lease.roots().clone();
+    let repository_id = lease.metadata().repository_id.clone();
+    drop(lease);
+    manager
+        .commit_repository_transaction(RepositoryTransaction {
+            schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+            operation_id: OperationId::new(),
+            repository_id,
+            expected_generation: roots.generation,
+            expected_roots: roots,
+            actor: author,
+            reason: "an ordinary commit that checks no binding history".to_string(),
+            external_objects: Vec::new(),
+            git_authority_delta: None,
+            changes: Vec::new(),
+            aliases: Vec::new(),
+            ref_mutations: vec![RefMutation {
+                name: RefName::branch(b"lineage-probe").unwrap(),
+                expected: RefExpectation::MustNotExist,
+                new_target: Some(RefTarget::symbolic(RefName::branch(b"main").unwrap())),
+                policy: RefUpdatePolicy::FastForwardOnly,
+            }],
+            default_ref_mutation: None,
+            workspace_mutation: None,
+            local_overlay_delta: None,
+            merge_transaction_delta: None,
+            sealed_observation: None,
+            collaboration_delta: None,
+        })
+        .expect("an ordinary commit lands");
+    drop(manager);
+    assert_eq!(
+        kin_core::hydration_semantics::standing(&layout).label(),
+        "current"
+    );
+    assert!(
+        !workspace_lineage_checked(repo),
+        "the ordinary commit was meant to end the lineage"
+    );
+}
+
+/// A store whose every head and whose workspace already hold exactly this
+/// build's derivation, and whose lineage something else ended, is checked by
+/// the first daemon an ordinary command starts, before that daemon opens it,
+/// and no head moves: the start records no change, so the store is never
+/// ahead of a peer for a commit nobody made. The uncommitted edit stays
+/// uncommitted work, the record is untouched, a reference answer certifies,
+/// and a later start has nothing to do.
+///
+/// Falsify by leaving the daemon's start out: the lineage stays unproven.
+/// Falsify the head rule by letting the start record a lineage-start change:
+/// main moves.
+#[test]
+fn a_daemon_start_checks_a_store_whose_lineage_ended_without_moving_a_head() {
+    let root = tempdir().expect("temp root");
+    unpack(root.path());
+    let repo = root.path().join("dirty");
+    let layout = kin_core::KinLayout::new(repo.join(".kin"));
+    let runtime = IsolatedDaemonRuntime::new(&repo);
+    end_the_lineage_of_an_upgraded_store(&repo);
+    let record = fs::read(layout.kindb_hydration_semantics_path()).unwrap();
+    let head_before = main_head(&repo);
+
+    // An ordinary command starts the daemon. Nothing here asks for an upgrade.
+    succeed(&runtime, &repo, &["graph", "status"]);
+    succeed(&runtime, &repo, &["daemon", "stop"]);
+
+    assert!(
+        workspace_lineage_checked(&repo),
+        "the daemon's start left the workspace's binding history unproven; its log:\n{}",
+        daemon_log_tail(&repo)
+    );
+    assert_eq!(main_head(&repo), head_before, "the start moved main");
+    assert!(daemon_start_checkpoints(&repo).is_empty());
+    assert_eq!(
+        fs::read(layout.kindb_hydration_semantics_path()).unwrap(),
+        record,
+        "a re-qualification rewrote the hydration record"
+    );
+    let status = kin_status(&runtime, &repo);
+    assert!(!status.contains("binding history: unchecked"), "{status}");
+
+    // The uncommitted edit is still served as uncommitted work.
+    let found: Value =
+        serde_json::from_str(&succeed(&runtime, &repo, &["search", "sextuple", "--json"]))
+            .expect("search emits JSON");
+    assert!(
+        found.as_array().expect("search rows").iter().any(|row| {
+            row["name"] == "sextuple" && row["file"] == "web/lib.mjs" && row["line"] == 5
+        }),
+        "the uncommitted declaration must answer at its current line: {found}"
+    );
+    // The answer the lineage exists for certifies, through a daemon started by
+    // the MCP server, which finds the lineage checked and records nothing.
+    certified_references(&runtime, &repo, "double");
+    succeed(&runtime, &repo, &["daemon", "stop"]);
+    assert_eq!(main_head(&repo), head_before);
+    assert!(daemon_start_checkpoints(&repo).is_empty());
+    assert!(workspace_lineage_checked(&repo));
+}
+
+/// A store that reads current and serves state another build derived, as a
+/// store an earlier release of the same replay semantics wrote does, is left
+/// exactly where it is by a daemon's start: no head moves, nothing is
+/// recorded, and the lineage stays unproven. `kin status` says so and names
+/// `kin upgrade`, which then re-derives and checks it.
+///
+/// Falsify by letting the start re-derive differing state: main moves onto a
+/// checkpoint.
+#[test]
+fn a_daemon_start_leaves_state_another_build_derived_to_kin_upgrade() {
+    let root = tempdir().expect("temp root");
+    unpack(root.path());
+    let repo = root.path().join("dirty");
+    let layout = kin_core::KinLayout::new(repo.join(".kin"));
+    let runtime = IsolatedDaemonRuntime::new(&repo);
+    kin_core::hydration_semantics::stamp_staged(&layout).expect("restamp the fixture store");
+    assert!(!workspace_lineage_checked(&repo));
+    let head_before = main_head(&repo);
+
+    succeed(&runtime, &repo, &["graph", "status"]);
+    succeed(&runtime, &repo, &["daemon", "stop"]);
+    assert_eq!(main_head(&repo), head_before, "the start moved main");
+    assert!(daemon_start_checkpoints(&repo).is_empty());
+    assert!(!workspace_lineage_checked(&repo));
+    assert!(
+        daemon_log_tail(&repo).contains("moves no head"),
+        "the start must say why it left the store; its log:\n{}",
+        daemon_log_tail(&repo)
+    );
+
+    let status = kin_status(&runtime, &repo);
+    assert!(
+        status.contains("⚠ binding history: unchecked")
+            && status.contains("Remedy: run `kin upgrade`"),
+        "kin status must name the remedy for an unchecked store: {status}"
+    );
+
+    let report = json(&runtime, &repo, &["upgrade", "--json"]);
+    assert_eq!(report["state"], "requalified", "{report}");
+    assert_eq!(report["binding_history_checked"], true, "{report}");
+    let status = kin_status(&runtime, &repo);
+    assert!(!status.contains("binding history: unchecked"), "{status}");
+}
+
+/// The daemon-start entry point, called directly: it writes nothing on a store
+/// whose semantics are behind, nothing on a store the re-qualification
+/// protects, and nothing on a store whose lineage is already checked, and each
+/// refusal says why so the daemon's log can name `kin upgrade`.
+#[test]
+fn a_daemon_start_writes_nothing_where_it_does_not_re_qualify() {
+    use kin_cli::commands::upgrade::{
+        requalify_at_daemon_start, upgrade_store, DaemonStartRequalification, UpgradeHooks,
+        UpgradeState,
+    };
+
+    let root = tempdir().expect("temp root");
+    unpack(root.path());
+    let quiet = |_: &str| {};
+    // Every open by this build records the history validation it checked the
+    // store under, so each baseline is the store as an ordinary read left it.
+    let settled_digest = |repo: &Path| {
+        let layout = kin_core::KinLayout::new(repo.join(".kin"));
+        drop(
+            kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout)
+                .unwrap()
+                .open_manager_with_payload_stats()
+                .unwrap(),
+        );
+        tree_digest(&repo.join(".kin"))
+    };
+
+    // Behind: the store keeps the remedy every surface names.
+    let repo = root.path().join("clean");
+    let layout = kin_core::KinLayout::new(repo.join(".kin"));
+    let before = settled_digest(&repo);
+    let behind = requalify_at_daemon_start(&layout, &quiet);
+    assert!(
+        matches!(&behind, DaemonStartRequalification::NotAttempted(reason) if reason.contains("behind")),
+        "{behind:?}"
+    );
+    assert_same_store(
+        &before,
+        &tree_digest(&repo.join(".kin")),
+        "a daemon's start changed a store whose semantics are behind",
+    );
+
+    // Protected: a store holding a second workspace is one the plan refuses,
+    // so the start refuses it from the envelope alone.
+    let protected = root.path().join("dirty");
+    let protected_layout = kin_core::KinLayout::new(protected.join(".kin"));
+    add_a_second_workspace(&protected);
+    kin_core::hydration_semantics::stamp_staged(&protected_layout)
+        .expect("restamp the fixture store");
+    let before = settled_digest(&protected);
+    let refused = requalify_at_daemon_start(&protected_layout, &quiet);
+    assert!(
+        matches!(&refused, DaemonStartRequalification::NotAttempted(reason)
+            if reason.contains("2 workspace(s)")),
+        "{refused:?}"
+    );
+    assert_same_store(
+        &before,
+        &tree_digest(&protected.join(".kin")),
+        "a daemon's start changed a store the re-qualification protects",
+    );
+
+    // Current, serving state another build derived: the start moves no head,
+    // so it writes nothing and names the command that re-derives it.
+    kin_core::hydration_semantics::stamp_staged(&layout).expect("restamp the fixture store");
+    assert!(!workspace_lineage_checked(&repo));
+    let before = settled_digest(&repo);
+    let differs = requalify_at_daemon_start(&layout, &quiet);
+    assert!(
+        matches!(&differs, DaemonStartRequalification::Unfinished(reason)
+            if reason.contains("moves no head") && reason.contains("kin upgrade")),
+        "{differs:?}"
+    );
+    assert_same_store(
+        &before,
+        &tree_digest(&repo.join(".kin")),
+        "a daemon's start changed a store serving state another build derived",
+    );
+
+    // Checked: the command re-qualifies the current store, and a start then
+    // reads the envelope, finds the lineage and changes nothing.
+    let author = kin_model::AuthorId::new("Kin Fixture <fixture@example.invalid>");
+    let requalified = upgrade_store(&layout, author, &UpgradeHooks::default(), &quiet)
+        .expect("the command re-qualifies the store");
+    assert_eq!(requalified.state, UpgradeState::Requalified);
+    assert_eq!(requalified.binding_history_checked, Some(true));
+    let before = tree_digest(&repo.join(".kin"));
+    let checked = requalify_at_daemon_start(&layout, &quiet);
+    assert!(
+        matches!(checked, DaemonStartRequalification::AlreadyChecked),
+        "{checked:?}"
+    );
+    assert_same_store(
+        &before,
+        &tree_digest(&repo.join(".kin")),
+        "a daemon's start changed a store whose lineage is checked",
+    );
+}
+
+/// A daemon re-qualifies a store only while it holds the repository's runtime
+/// authority, which one process holds at a time. While another process holds
+/// it, as a daemon part way through a re-qualification or `kin upgrade` does,
+/// no second start re-qualifies anything: the store keeps its generation, its
+/// unproven lineage and every head. Once it is released, the next start does
+/// the work, which shows the hold was the only thing in the way.
+#[test]
+fn no_daemon_start_re_qualifies_beside_a_held_runtime_authority() {
+    let root = tempdir().expect("temp root");
+    unpack(root.path());
+    let repo = root.path().join("clean");
+    let runtime = IsolatedDaemonRuntime::new(&repo);
+    end_the_lineage_of_an_upgraded_store(&repo);
+    let generation = authority_generation(&repo);
+    let head = main_head(&repo);
+
+    let held = kin_cli::daemon_client::acquire_repository_runtime_authority(&repo.join(".kin"))
+        .expect("acquire the runtime authority")
+        .expect("nothing else holds the runtime authority");
+    // A daemon started directly, as a spawn would start it, cannot take the
+    // authority, so it refuses to start and runs nothing.
+    let refused = runtime
+        .daemon_command()
+        .args(["--port", "0", "--repo"])
+        .arg(&repo)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("KIN_EMBED_BACKEND", "cpu")
+        .env("KIN_DAEMON_AUTO_EMBED", "0")
+        .env("KIN_DAEMON_DISABLE_LSP", "1")
+        .current_dir(&repo)
+        .output()
+        .expect("run the daemon");
+    assert!(
+        !refused.status.success(),
+        "a daemon started beside a held runtime authority: stderr={}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert_eq!(authority_generation(&repo), generation);
+    assert_eq!(main_head(&repo), head);
+    assert!(!workspace_lineage_checked(&repo));
+    assert!(daemon_start_checkpoints(&repo).is_empty());
+
+    drop(held);
+    succeed(&runtime, &repo, &["graph", "status"]);
+    succeed(&runtime, &repo, &["daemon", "stop"]);
+    assert!(
+        workspace_lineage_checked(&repo),
+        "the start after the release must re-qualify the store; its log:\n{}",
+        daemon_log_tail(&repo)
+    );
+    assert_eq!(main_head(&repo), head, "the start moved main");
+}
+
+/// Started the ordinary way, by a command that needs a daemon, on port 0, a
+/// daemon that finds a store to re-qualify says so through the startup
+/// progress a waiting client reads, before it publishes an endpoint or opens
+/// any state, and finishes the work once nothing holds it back.
+///
+/// The hold is the repository authority lock, which the test takes before the
+/// daemon starts and releases once the client has read the phase. The daemon's
+/// check waits on it like any reader would. No clock decides anything.
+///
+/// Falsify by leaving the startup record out: the client reads only the
+/// spawning phase until the daemon has opened.
+#[test]
+fn an_autostarted_daemon_reports_its_requalification_and_finishes_it() {
+    let root = tempdir().expect("temp root");
+    unpack(root.path());
+    let repo = root.path().join("clean");
+    let kin_root = repo.join(".kin");
+    let layout = kin_core::KinLayout::new(kin_root.clone());
+    let runtime = IsolatedDaemonRuntime::new(&repo);
+    end_the_lineage_of_an_upgraded_store(&repo);
+    let head = main_head(&repo);
+
+    let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout).unwrap();
+    let held = binding
+        .freeze_existing_read_only(Duration::from_secs(10))
+        .expect("hold the repository authority lock");
+
+    let stdout_path = root.path().join("autostart.stdout");
+    let stderr_path = root.path().join("autostart.stderr");
+    let mut command = runtime
+        .kin_command()
+        .args(["graph", "status"])
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("KIN_EMBED_BACKEND", "cpu")
+        .env("KIN_DAEMON_AUTO_EMBED", "0")
+        .env("KIN_DAEMON_DISABLE_LSP", "1")
+        .env("KIN_DAEMON_READY_TIMEOUT_SECS", "180")
+        .env("KIN_DAEMON_BIN", runtime.daemon_bin())
+        .current_dir(&repo)
+        .stdout(Stdio::from(fs::File::create(&stdout_path).unwrap()))
+        .stderr(Stdio::from(fs::File::create(&stderr_path).unwrap()))
+        .spawn_owned()
+        .expect("spawn kin graph status");
+
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let phase = loop {
+        let phase = kin_cli::daemon_client::daemon_startup_progress(&kin_root).phase;
+        if phase.contains("binding history") {
+            break phase;
+        }
+        assert!(
+            Instant::now() < deadline && command.try_wait().expect("poll the command").is_none(),
+            "the start never reported its binding-history check: last phase {phase:?}, stderr={}",
+            fs::read_to_string(&stderr_path).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(
+        phase.contains("checking this store's binding history"),
+        "{phase}"
+    );
+    assert!(
+        !kin_root.join(kin_daemon_spawn::PORT_FILE_NAME).exists(),
+        "no endpoint may be published before the check and its commit"
+    );
+    // Read through the hold itself: a second open would wait on the lock it
+    // holds.
+    let workspace = held.authority().metadata().workspaces[0].workspace_id;
+    assert!(
+        held.authority()
+            .workspace_graph_snapshot(&workspace)
+            .unwrap()
+            .expect("the workspace has a committed graph")
+            .verified_binding_history
+            .is_none(),
+        "nothing is committed while held"
+    );
+
+    drop(held);
+    let deadline = Instant::now() + Duration::from_secs(300);
+    let status = loop {
+        if let Some(status) = command.try_wait().expect("poll the command") {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the command did not finish once the hold was released"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert!(
+        status.success(),
+        "kin graph status failed: stdout={} stderr={}",
+        fs::read_to_string(&stdout_path).unwrap_or_default(),
+        fs::read_to_string(&stderr_path).unwrap_or_default()
+    );
+    assert!(
+        kin_cli::daemon_client::read_startup_requalification(&kin_root).is_none(),
+        "the startup record ends with the start"
+    );
+    succeed(&runtime, &repo, &["daemon", "stop"]);
+    assert!(
+        workspace_lineage_checked(&repo),
+        "the start must finish the re-qualification once released; its log:\n{}",
+        daemon_log_tail(&repo)
+    );
+    assert_eq!(main_head(&repo), head, "the start moved main");
+    assert!(daemon_start_checkpoints(&repo).is_empty());
+}
+
+/// Start a daemon directly on `repo` with its endpoint held unpublished, and
+/// wait until the repository lock it holds and its own startup record name it.
+/// With `gate`, it is also held before it opens or re-qualifies anything, for
+/// as long as that file exists.
+#[cfg(unix)]
+fn spawn_starting_daemon(
+    runtime: &IsolatedDaemonRuntime,
+    repo: &Path,
+    gate: Option<&Path>,
+) -> common::RuntimeOwnedChild {
+    let mut command = runtime.daemon_command();
+    if let Some(gate) = gate {
+        fs::write(gate, b"held").expect("arm the startup gate");
+        command.env("KIN_DAEMON_TEST_STARTUP_GATE", gate);
+    }
+    let mut daemon = command
+        .args(["--port", "0", "--repo"])
+        .arg(repo)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("KIN_EMBED_BACKEND", "cpu")
+        .env("KIN_DAEMON_AUTO_EMBED", "0")
+        .env("KIN_DAEMON_DISABLE_LSP", "1")
+        .env("KIN_DAEMON_TEST_STARTUP_HOLD_SECS", "300")
+        .current_dir(repo)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn_owned()
+        .expect("spawn a daemon");
+    let kin_root = repo.join(".kin");
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        if let kin_cli::daemon_client::StartingDaemonOwner::Starting(owner) =
+            kin_cli::daemon_client::starting_daemon_owner(&kin_root)
+        {
+            if owner.identity().pid() == daemon.id() {
+                return daemon;
+            }
+        }
+        assert!(
+            daemon.try_wait().expect("poll the daemon").is_none(),
+            "the daemon exited before it held the repository; its log:\n{}",
+            daemon_log_tail(repo)
+        );
+        assert!(
+            Instant::now() < deadline,
+            "the daemon never held the repository"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// `kin daemon stop --json` against a daemon that has published no endpoint,
+/// which must name that daemon stopped and leave it gone.
+#[cfg(unix)]
+fn stop_starting_daemon(
+    runtime: &IsolatedDaemonRuntime,
+    repo: &Path,
+    daemon: &mut common::RuntimeOwnedChild,
+) {
+    let report = json(runtime, repo, &["daemon", "stop", "--json"]);
+    assert_eq!(report["all_stopped"], true, "{report}");
+    assert_eq!(
+        report["stopped"][0]["pid"].as_u64(),
+        Some(u64::from(daemon.id())),
+        "{report}"
+    );
+    assert_eq!(report["stopped"][0]["result"], "stopped", "{report}");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while daemon.try_wait().expect("poll the daemon").is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "the stopped daemon is still running"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// A stop that lands while a starting daemon re-qualifies its store, before
+/// it opens state or publishes an endpoint, stops that daemon, and the store
+/// then opens as either the authority it had or the one the re-qualification
+/// committed, never anything between. The next start finishes the work.
+///
+/// The first stop lands while a gate this test controls holds the start before
+/// the re-qualification begins, so it always lands before any write. The
+/// second is not held and lands wherever the re-qualification has reached.
+///
+/// Falsify by resolving the stop from `daemon.pid` alone: it reports nothing
+/// running and the daemon finishes the work the stop claimed to prevent.
+#[cfg(unix)]
+#[test]
+fn a_stop_during_startup_requalification_leaves_the_old_or_the_committed_authority() {
+    let root = tempdir().expect("temp root");
+    unpack(root.path());
+    let repo = root.path().join("clean");
+    let kin_root = repo.join(".kin");
+    let runtime = IsolatedDaemonRuntime::new(&repo);
+    end_the_lineage_of_an_upgraded_store(&repo);
+    let generation = authority_generation(&repo);
+    let head = main_head(&repo);
+    assert!(!workspace_lineage_checked(&repo));
+
+    let gate = root.path().join("gate");
+    let mut daemon = spawn_starting_daemon(&runtime, &repo, Some(&gate));
+    stop_starting_daemon(&runtime, &repo, &mut daemon);
+    fs::remove_file(&gate).expect("disarm the startup gate");
+    assert_eq!(authority_generation(&repo), generation);
+    assert_eq!(main_head(&repo), head);
+    assert!(!workspace_lineage_checked(&repo));
+
+    let mut daemon = spawn_starting_daemon(&runtime, &repo, None);
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut reported = false;
+    loop {
+        match kin_cli::daemon_client::read_startup_requalification(&kin_root) {
+            Some(record) if record.requalifying => {
+                eprintln!("stopping mid re-qualification at: {}", record.step);
+                break;
+            }
+            Some(_) => reported = true,
+            // Past the whole re-qualification before this poll saw it: the stop
+            // then lands in the held endpoint window after the commit.
+            None if reported => {
+                eprintln!("the re-qualification finished before the stop");
+                break;
+            }
+            None => {}
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the start never reached its re-qualification"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    stop_starting_daemon(&runtime, &repo, &mut daemon);
+    // No head moves either way: the re-qualification records no change.
+    assert_eq!(main_head(&repo), head);
+    if workspace_lineage_checked(&repo) {
+        assert!(authority_generation(&repo) > generation);
+    } else {
+        assert_eq!(authority_generation(&repo), generation);
+        assert_eq!(main_head(&repo), head);
+    }
+
+    succeed(&runtime, &repo, &["graph", "status"]);
+    succeed(&runtime, &repo, &["daemon", "stop"]);
+    assert!(
+        workspace_lineage_checked(&repo),
+        "the next start must finish the re-qualification; its log:\n{}",
+        daemon_log_tail(&repo)
+    );
 }

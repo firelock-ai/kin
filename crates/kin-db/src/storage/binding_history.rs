@@ -390,6 +390,11 @@ fn selected_binding(scope: &WorkspaceSnapshotBinding) -> Result<Hash256, KinDbEr
 }
 
 impl BindingHistoryWitness {
+    /// The workspace whose selected graph this witness proves.
+    pub fn workspace_id(&self) -> kin_model::WorkspaceId {
+        self.scope.workspace_id
+    }
+
     fn validate_lineage(&self, metadata: &PersistedRepositoryAuthority) -> Result<(), KinDbError> {
         if self.proof.is_empty() || self.proof.len() > metadata.operation_log.len() {
             return Err(invalid("unqualified or incomplete operation lineage"));

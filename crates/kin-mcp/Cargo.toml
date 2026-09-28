@@ -9,6 +9,10 @@ license.workspace = true
 description = "MCP server for Kin: assistant-neutral integration"
 repository.workspace = true
 
+[features]
+# Thread-local host observations for downstream fixture isolation.
+test-support = []
+
 [dependencies]
 kin-core = { workspace = true }
 kin-daemon-spawn = { workspace = true }

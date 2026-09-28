@@ -110,19 +110,32 @@ impl RoundTrip {
     }
 }
 
+/// How long the probed server's one tool call may wait for its daemon to
+/// become ready before it answers that the daemon is still starting.
+///
+/// A server waits for its daemon within each call's readiness budget, which
+/// is minutes by default because an agent's call is worth waiting for. A setup
+/// run is not an agent: it wants a verdict on the entry it just wrote, and a
+/// still-starting answer is a verdict. So the probe hands the server this
+/// shorter budget through [`kin_mcp::DAEMON_PATIENCE_ENV`], and sizes its own
+/// kill deadline against it below.
+pub(crate) const SERVER_READINESS_BUDGET: Duration = Duration::from_secs(45);
+
 /// How long one client's launch may take before it is killed.
 ///
 /// The server answers `initialize` and `tools/list` immediately by design, and
-/// bounds a `tools/call` that races its startup daemon binding before answering
-/// that the daemon is still starting. This leaves room for that grace plus
-/// process start and exit, and nothing more.
+/// waits at most [`SERVER_READINESS_BUDGET`] on a `tools/call` that races its
+/// startup daemon binding before answering that the daemon is still starting.
+/// This leaves room for that wait plus process start and exit, and nothing
+/// more.
 ///
-/// Derived from the server's own constant rather than restated, because the two
-/// cannot be allowed to drift: a budget shorter than the grace kills the client
-/// mid-wait, and the run then reports a deadline where the server was about to
-/// hand back an accurate account of a daemon that was still coming up.
+/// Derived from the budget the probe hands the server rather than restated,
+/// because the two cannot be allowed to drift: a budget shorter than the
+/// server's wait kills the client mid-wait, and the run then reports a
+/// deadline where the server was about to hand back an accurate account of a
+/// daemon that was still coming up.
 pub(crate) const PER_CLIENT_BUDGET: Duration =
-    kin_mcp::FIRST_TOOLS_CALL_STARTUP_BIND_GRACE.saturating_add(Duration::from_secs(10));
+    SERVER_READINESS_BUDGET.saturating_add(Duration::from_secs(10));
 
 /// How long the whole verification step may take across every client.
 ///
@@ -401,6 +414,13 @@ fn run_session(
     for (name, value) in &launch.env {
         command.env(name, value);
     }
+    // After the entry's own environment, because this probe is its own client
+    // with its own deadline: a longer readiness budget in the entry is right
+    // for the agent it serves and would outlast [`PER_CLIENT_BUDGET`] here.
+    command.env(
+        kin_mcp::DAEMON_PATIENCE_ENV,
+        SERVER_READINESS_BUDGET.as_secs().to_string(),
+    );
 
     let mut child = command.spawn().map_err(|error| {
         (
@@ -955,8 +975,8 @@ mod tests {
     #[test]
     fn the_client_budget_outlasts_the_wait_the_mcp_server_is_allowed_to_take() {
         assert!(
-            PER_CLIENT_BUDGET > kin_mcp::FIRST_TOOLS_CALL_STARTUP_BIND_GRACE,
-            "a per-client budget inside the server's own grace kills the client mid-wait"
+            PER_CLIENT_BUDGET > SERVER_READINESS_BUDGET,
+            "a per-client budget inside the server's own readiness wait kills the client mid-wait"
         );
         assert!(
             TOTAL_BUDGET >= PER_CLIENT_BUDGET,

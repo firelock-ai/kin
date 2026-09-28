@@ -2647,13 +2647,25 @@ mod tests {
             ),
             vec!["explain must be a boolean".to_string()]
         );
+        // Status now declares a paged byte budget, but its closed schema still
+        // refuses response-shape aliases it does not advertise.
+        assert!(validate(
+            "kin_graph_status",
+            &Map::from_iter([("max_chars".to_string(), json!(4000))])
+        )
+        .is_empty());
         assert_eq!(
             validate(
                 "kin_graph_status",
-                &Map::from_iter([("max_chars".to_string(), json!(4000))])
+                &Map::from_iter([("max_response_chars".to_string(), json!(4000))])
             ),
-            vec!["does not take max_chars".to_string()]
+            vec!["does not take max_response_chars".to_string()]
         );
+        assert!(!validate(
+            "kin_graph_status",
+            &Map::from_iter([("max_chars".to_string(), json!("4000"))])
+        )
+        .is_empty());
     }
 
     /// A hint naming a tool reads as a spelling that reaches it both through

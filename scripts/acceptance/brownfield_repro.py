@@ -115,6 +115,8 @@ Python and JavaScript), FIR-2441 (JavaScript import specifiers, the positive con
 
 from __future__ import print_function
 
+from trace_pages import mcp_references, mcp_trace
+
 import argparse
 import functools
 import json
@@ -196,6 +198,11 @@ REAL_CALLER_ONE_LINE = 784
 REAL_CALLER_TWO = "HTTPDigestAuth.handle_401"
 REAL_CALLER_TWO_FILE = "src/requests/auth.py"
 REAL_CALLER_TWO_LINE = 312
+# What each call site calls, as the pinned lines above write it. A row quotes the
+# text at a site with the call's argument list cut, so these are what `callee`
+# reads, or a dotted tail of it when the span behind the site is the bare name.
+REAL_CALLER_ONE_CALL = "adapter.send"
+REAL_CALLER_TWO_CALL = "r.connection.send"
 
 # Entities the shipped build offered as callers of HTTPAdapter.send that call no such
 # thing. Every one is a bare-name match on `send`. They are the negative control: a
@@ -292,6 +299,13 @@ APP_HANDLE_FABRICATED = [
 APP_HANDLE_GENUINE_EXTERNAL = "ObjectConstructor.create"
 
 
+def fabricated_app_handle_callee(name):
+    # Display spelling can differ across declarations and external symbols.
+    # The forbidden escapeHtml target also occurs as escapeHTML in Express.
+    return any(name_matches(str(name or "").casefold(), bad.casefold())
+               for bad in APP_HANDLE_FABRICATED)
+
+
 def genuine_external_callee(name, entity_id, parent_step):
     return (name == APP_HANDLE_GENUINE_EXTERNAL
             and str(entity_id or "").startswith("external_reference:")
@@ -336,6 +350,64 @@ print = functools.partial(print, flush=True)
 
 def strip_ansi(text):
     return ANSI.sub("", text or "")
+
+
+# BEGIN failure evidence excerpt
+# Every suite carries this block byte for byte, because a suite is also copied
+# out and run as a single file. test_failure_excerpt.py keeps the copies equal.
+EVIDENCE_LIMIT = 4000
+EVIDENCE_LINE_LIMIT = 600
+EVIDENCE_PANICS = ("panicked at", "has overflowed its stack")
+EVIDENCE_ESCAPES = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+EVIDENCE_ERROR = re.compile(r"^(?:[\w./-]+:\s*)?(?:error|fatal)\b", re.IGNORECASE)
+EVIDENCE_LOG_ERROR = re.compile(r"\sERROR\s")
+
+
+def failure_excerpt(text, limit=EVIDENCE_LIMIT):
+    """Bounded evidence from a command's output that still says why it failed.
+
+    Output that fits is returned whole. Longer output keeps its opening and its
+    end, and between them every line that carries a Rust panic, with the
+    message line under it, and the last error line, wherever they fall. A
+    warning printed around the error cannot push it out, and a long log cannot
+    cut the panic out. `limit` only ever raises the bound, never lowers it.
+    """
+    text = (text or "").strip()
+    limit = max(int(limit), EVIDENCE_LIMIT)
+    if len(text) <= limit:
+        return text
+    head_end = limit // 4
+    tail_start = len(text) - limit // 2
+    lines = text.split("\n")
+    starts, offset = [], 0
+    panics, errors = [], []
+    for index, line in enumerate(lines):
+        starts.append(offset)
+        offset += len(line) + 1
+        plain = EVIDENCE_ESCAPES.sub("", line).strip()
+        if any(marker in plain for marker in EVIDENCE_PANICS):
+            panics.extend((index, index + 1))
+        if EVIDENCE_ERROR.match(plain) or EVIDENCE_LOG_ERROR.search(plain):
+            errors.append(index)
+    # The first panic and its message, then the last error line, then any
+    # later panics, for as long as the middle's share of the bound lasts.
+    order = panics[:2] + errors[-1:] + panics[2:]
+    budget, kept = limit // 4, set()
+    for index in order:
+        if index >= len(lines) or index in kept:
+            continue
+        start, end = starts[index], starts[index] + len(lines[index])
+        if end <= head_end or start >= tail_start:
+            continue
+        cost = min(len(lines[index]), EVIDENCE_LINE_LIMIT) + 1
+        if cost > budget:
+            continue
+        kept.add(index)
+        budget -= cost
+    middle = [lines[index][:EVIDENCE_LINE_LIMIT] for index in sorted(kept)]
+    parts = [text[:head_end], "[...]"] + middle + (["[...]"] if middle else [])
+    return "\n".join(parts + [text[tail_start:]])
+# END failure evidence excerpt
 
 
 def run(cmd, cwd=None, env=None, timeout=900):
@@ -389,36 +461,170 @@ def name_matches(candidate, wanted):
     return False
 
 
-# One "LSP cold sweep complete" accounting line, ANSI already stripped. The
+# One cold-sweep terminal accounting line, ANSI already stripped. The
 # fields arrived with kin#985; a line without `enriched=` is an older build.
-SWEEP_COMPLETE_LINE = re.compile(r"LSP cold sweep complete\s+(?P<fields>.*)$")
+SWEEP_COMPLETE_LINE = re.compile(
+    r"LSP cold sweep (?P<finish>complete|ended with incomplete enrichment|"
+    r"interrupted; unfinished work remains owed)\s+(?P<fields>.*)$")
 SWEEP_FIELD = re.compile(r"(?P<key>[a-z_]+)=(?P<value>[a-z0-9]+)")
 
 
 def sweep_lines(log_text):
-    """Every cold-sweep completion line in a daemon log, as field dicts."""
+    """Read each attempt independently, preserving an unterminated latest start."""
     out = []
+
+    def attempt(started=False):
+        return {"started": started, "held_back_files": [], "held_back_named_count": 0,
+                "visited_files": set(), "skipped_files": set(), "deferred_files": set(),
+                "unlocated_gap": False}
+
+    current = attempt()
     for line in strip_ansi(log_text).splitlines():
+        if "LSP cold sweep started, enriching all entities" in line:
+            current = attempt(True)
+            continue
+        if any(message in line for message in (
+                "LSP completion marker refused", "the enriched-file sets and the visited count disagree",
+                "this sweep did not publish everything it offered",
+                "could not publish this sweep's enrichment",
+                "held this sweep's enrichment while a merge is open")):
+            current["unlocated_gap"] = True
+        if "not recording these files as enriched" in line:
+            named = re.search(r"\bnamed=", line)
+            count = re.search(r"\bfiles=(\d+)\b", line)
+            try:
+                names, _ = json.JSONDecoder().raw_decode(line[named.end():]) if named else (None, 0)
+                if (not isinstance(names, list) or not names
+                        or not all(isinstance(name, str) and name for name in names)
+                        or len(set(names)) != len(names) or count is None
+                        or current["held_back_named_count"]):
+                    raise ValueError("unnamed, duplicate or malformed held-back files")
+                current["held_back_files"] = names
+                current["held_back_named_count"] = int(count.group(1))
+            except (ValueError, TypeError):
+                current["unlocated_gap"] = True
+        visited = any(message in line for message in (
+            "sweep enriched file", "sweep enriched NOTHING for this file"))
+        skipped = any(message in line for message in (
+            "sweep skipped an already-enriched file",
+            "sweep skipped a file repository authority records as finished"))
+        deferred = "sweep deferred an owed file:" in line
+        if visited or skipped or deferred:
+            path = re.search(r'\bfile=("(?:\\.|[^"\\])*"|[^\s]+)', line)
+            if path:
+                value = path.group(1)
+                try:
+                    value = json.loads(value) if value.startswith('"') else value
+                    key = "visited_files" if visited else ("skipped_files" if skipped else "deferred_files")
+                    if not isinstance(value, str) or not value or (not visited and value in current[key]):
+                        raise ValueError("missing or repeated file event")
+                    current[key].add(value)
+                except ValueError:
+                    current["unlocated_gap"] = True
+            else:
+                current["unlocated_gap"] = True
         match = SWEEP_COMPLETE_LINE.search(line)
         if not match:
             continue
-        fields = {}
+        fields = dict(current, finish=match.group("finish"))
         for pair in SWEEP_FIELD.finditer(match.group("fields")):
             value = pair.group("value")
+            key = pair.group("key")
+            if key in fields:
+                fields["unlocated_gap"] = True
             if value in ("true", "false"):
-                fields[pair.group("key")] = (value == "true")
+                fields[key] = (value == "true")
             elif value.isdigit():
-                fields[pair.group("key")] = int(value)
+                fields[key] = int(value)
         out.append(fields)
+        current = attempt()
+    if current["started"]:
+        out.append(dict(current, finish="running"))
     return out
 
 
-def sweep_verdict(lines):
+def sweep_has_no_new_evidence(line):
+    """A current-context skip needs no new publication; attempted work does.
+
+    The daemon validates the resolver context and each finished file's ledgers
+    before logging a skip. Validation failure reasks the file or ends the pass.
+    Require the current zero-work fields explicitly, so an older/partial record
+    cannot borrow this exception to the publication requirement.
+    """
+    zero = ("relations", "enriched", "held_back", "definitions_over_budget",
+            "query_failures", "ledgers", "ledgers_refused", "retired_proofs",
+            "retired_references", "retracted_records", "completed_sites", "settled_failed")
+    return (type(line.get("published")) is bool
+            and all(type(line.get(key)) is int and line[key] == 0 for key in zero)
+            and not line["visited_files"])
+
+
+def dependency_sweep_verdict(line, dependencies):
+    """Admit named dependencies completed or revalidated by the latest attempt.
+
+    Per-file visit messages can describe partial work. They establish membership,
+    not success: exact final accounting and the complete held-back complement
+    establish which visits finished. The warning names at most twenty files.
+    """
+    def refuse(reason):
+        return False, "dependency enrichment unproven: " + reason
+
+    if not dependencies or not line.get("started"):
+        return refuse("missing dependencies or latest sweep start")
+    counts = ("files", "total_files", "enriched", "already_enriched", "held_back", "owed",
+              "owed_deferred", "server_unavailable", "source_unreadable", "unsupported_language",
+              "definitions_over_budget", "query_failures", "not_visited", "unaccounted")
+    if any(type(line.get(key)) is not int for key in counts):
+        return refuse("latest attempt has missing or malformed tally fields")
+    if (line.get("finish") not in ("complete", "ended with incomplete enrichment")
+            or line.get("ended_early") is not False
+            or line.get("unlocated_gap")):
+        return refuse("latest attempt is unfinished or has an unnamed gap")
+    reused = sweep_has_no_new_evidence(line)
+    if line.get("published") is not True and not reused:
+        return refuse("latest attempt offered new evidence without publication")
+    if any(line[key] for key in ("server_unavailable", "source_unreadable",
+                                "unsupported_language", "definitions_over_budget",
+                                "not_visited", "unaccounted")):
+        return refuse("latest attempt has blocked, unvisited or unaccounted work")
+    held = set(line["held_back_files"])
+    visited, skipped = line["visited_files"], line["skipped_files"]
+    deferred = line["deferred_files"]
+    owed = held | deferred
+    if (line["held_back_named_count"] != len(held)
+            or len(held) != line["held_back"] or len(deferred) != line["owed_deferred"]
+            or line["owed"] != len(owed)):
+        return refuse("held-back/deferred names are incomplete, capped or disagree with the tally")
+    if (line["files"] != line["enriched"] + line["already_enriched"]
+            or line["total_files"] != line["files"] + line["held_back"] + line["owed_deferred"]
+            or len(visited) != line["enriched"] + line["held_back"]
+            or len(skipped) != line["already_enriched"] or visited & skipped
+            or deferred & (visited | skipped)
+            or not held.issubset(visited) or (line["query_failures"] and not held)):
+        return refuse("file visits and completed/held-back accounting disagree")
+    blocked = set(dependencies) & owed
+    if blocked:
+        return refuse("required files held back or deferred: " + ", ".join(sorted(blocked)))
+    missing = set(dependencies) - (visited | skipped)
+    if missing:
+        return refuse("dependencies absent from the latest attempt: " + ", ".join(sorted(missing)))
+    detail = "dependency files completed: " + ", ".join(dependencies)
+    if owed or line["finish"] != "complete":
+        detail += "; global sweep remains incomplete; held-back or deferred files: " + ", ".join(sorted(owed))
+    elif reused:
+        detail += "; current-context markers revalidated; no new evidence required publication"
+    else:
+        detail += "; latest sweep has complete published file accounting"
+    return True, detail
+
+
+def sweep_verdict(lines, dependencies=None):
     """Decide whether recall assertions may run over a store's sweep record.
 
-    `lines` is sweep_lines() of the fixture's daemon log. Admits recall only when
-    some completed sweep enriched at least one file and left nothing blocked,
-    unvisited, interrupted, or unaccounted. A line missing the tally fields is
+    `lines` is sweep_lines() of the fixture's daemon log. Without dependencies,
+    admits recall when the latest sweep enriched or revalidated its files and left
+    nothing blocked, unvisited, interrupted, or unaccounted. Explicit dependencies
+    use exact latest-attempt accounting without certifying the entire fixture. A line missing the tally fields is
     exempted LOUDLY rather than silently, and a missing field never defaults to a
     passing zero: absence refuses, because an absent key defaulting to zero is the
     exact class of check that cannot fail.
@@ -431,34 +637,61 @@ def sweep_verdict(lines):
     pre-985 has stopped enforcing without saying so; this one now says so.
     """
     if not lines:
-        return (False, "daemon.log records no completed sweep; the graph was "
+        return (False, "daemon.log records no finished sweep attempt; the graph was "
                        "never enriched or the log is unreadable")
+    if dependencies is not None:
+        return dependency_sweep_verdict(lines[-1], dependencies)
+    if lines[-1].get("finish") == "running":
+        return False, "the latest sweep has started but not finished"
     required = ("enriched", "server_unavailable", "source_unreadable",
                 "not_visited", "unaccounted", "ended_early")
     tallied = [ln for ln in lines if all(k in ln for k in required)]
     if not tallied:
+        if lines[-1].get("finish") != "complete":
+            return (False, "the last sweep ended unfinished and carries no complete tally; "
+                           "it cannot establish a clean enriched fixture")
         return (True, "sweep completion lines carry no tally fields; recall gate "
                       "not enforceable, checks run ungated. Cause is EITHER a "
                       "pre-985 build OR a post-985 sweep triggered via "
                       "POST /lsp/sweep, whose completion line skips 985's "
                       "accounting; do not read this as proof of build age")
-    for ln in tallied:
-        if (ln["enriched"] > 0 and ln["server_unavailable"] == 0
+    # A later incomplete tally must not borrow an earlier clean verdict.
+    if not all(key in lines[-1] for key in required):
+        return False, "the latest sweep lacks the tally earlier attempts recorded"
+    latest = lines[-1]
+    if (latest.get("finish") == "complete" and latest.get("owed") == 0
+            and sweep_has_no_new_evidence(latest)):
+        # The same exact file accounting used for scoped reads proves every
+        # file on a complete warm pass, rather than accepting aggregate zeros.
+        ok, detail = dependency_sweep_verdict(latest, tuple(sorted(latest["skipped_files"])))
+        if ok:
+            return True, ("sweep revalidated all %d files under current-context markers; "
+                          "no new evidence required publication" % latest["files"])
+        return ok, detail
+    for ln in lines[-1:]:
+        if (ln.get("finish", "complete") == "complete"
+                and ln["enriched"] > 0 and ln["server_unavailable"] == 0
                 and ln["source_unreadable"] == 0 and ln["not_visited"] == 0
-                and ln["unaccounted"] == 0 and not ln["ended_early"]):
+                and ln["unaccounted"] == 0 and not ln["ended_early"]
+                and not any(ln.get(key, 0) for key in
+                            ("held_back", "owed", "owed_deferred", "query_failures",
+                             "definitions_over_budget", "unsupported_language"))
+                and ln.get("published", True)):
             return (True, "sweep concluded clean: enriched=%d of files=%s, "
                           "nothing blocked or unvisited"
                     % (ln["enriched"], ln.get("files", "?")))
-    worst = max(tallied, key=lambda ln: (ln["server_unavailable"]
-                                         + ln["source_unreadable"]
-                                         + ln["not_visited"] + ln["unaccounted"]))
-    return (False, "no clean completed sweep: best evidence enriched=%s "
+    worst = lines[-1]
+    return (False, "no clean completed sweep: last attempt enriched=%s "
                    "server_unavailable=%s source_unreadable=%s not_visited=%s "
-                   "unaccounted=%s ended_early=%s; recall against this graph "
+                   "unaccounted=%s ended_early=%s held_back=%s owed=%s "
+                   "query_failures=%s finish=%s held_back_files=%s; recall against this graph "
                    "would attribute the gap to the wrong ticket"
             % (worst.get("enriched"), worst.get("server_unavailable"),
                worst.get("source_unreadable"), worst.get("not_visited"),
-               worst.get("unaccounted"), worst.get("ended_early")))
+               worst.get("unaccounted"), worst.get("ended_early"),
+               worst.get("held_back", "unrecorded"), worst.get("owed", "unrecorded"),
+               worst.get("query_failures", "unrecorded"), worst.get("finish"),
+               worst.get("held_back_files", [])))
 
 
 class Suite(object):
@@ -513,6 +746,12 @@ class Suite(object):
         payload is a JSON string inside content[0].text; reading fields off the
         outer result object returns empty for every one of them.
         """
+        if tool in ("trace_data_flow", "find_references"):
+            try:
+                read = mcp_trace if tool == "trace_data_flow" else mcp_references
+                return read(self.kin, repo, self.env, args, timeout)
+            except ValueError as exc:
+                raise ProbeError(str(exc))
         env = dict(self.env)
         env["KIN_MCP_REPO"] = repo
         proc = subprocess.Popen(
@@ -553,7 +792,7 @@ class Suite(object):
                 resp = obj
         if resp is None:
             raise ProbeError("mcp %s returned no id=2 frame (stderr tail: %s)"
-                             % (tool, strip_ansi(err)[-200:].replace("\n", " ")))
+                             % (tool, failure_excerpt(strip_ansi(err)).replace("\n", " ")))
         if "error" in resp:
             raise ProbeError("mcp %s error: %s"
                              % (tool, json.dumps(resp["error"])[:200]))
@@ -594,7 +833,7 @@ class Suite(object):
                 os.makedirs(path)
             rc, out, err = self.git(["init", "-q", "."], cwd=path)
             if rc != 0:
-                raise ProbeError("git init failed in %s: %s" % (path, (err or out)[-200:]))
+                raise ProbeError("git init failed in %s: %s" % (path, failure_excerpt(err or out)))
         rc, _out, _err = self.git(["cat-file", "-e", spec["commit"] + "^{commit}"],
                                   cwd=path)
         if rc != 0:
@@ -608,7 +847,7 @@ class Suite(object):
             if rc != 0:
                 raise ProbeError("fetch of %s %s failed: %s"
                                  % (spec["url"], spec["commit"][:12],
-                                    (err or out).strip()[-200:]))
+                                    failure_excerpt(err or out)))
         return path
 
     def fixture(self, name):
@@ -630,7 +869,7 @@ class Suite(object):
         os.makedirs(path)
         rc, out, err = self.git(["init", "-q", "-b", "main", "."], cwd=path)
         if rc != 0:
-            raise ProbeError("git init failed: %s" % (err or out)[-200:])
+            raise ProbeError("git init failed: %s" % failure_excerpt(err or out))
         archive = subprocess.Popen(
             ["git", "--git-dir", os.path.join(cache, ".git"),
              "archive", spec["tree"]],
@@ -645,14 +884,14 @@ class Suite(object):
             raise ProbeError("replaying tree %s failed (archive rc=%s, tar rc=%s): %s"
                              % (spec["tree"][:12], archive.returncode,
                                 untar.returncode,
-                                uerr.decode("utf-8", "replace")[-200:]))
+                                failure_excerpt(uerr.decode("utf-8", "replace"))))
         rc, out, err = self.git(["add", "-A"], cwd=path)
         if rc != 0:
-            raise ProbeError("git add failed: %s" % (err or out)[-200:])
+            raise ProbeError("git add failed: %s" % failure_excerpt(err or out))
         rc, out, err = self.git(
             ["commit", "-q", "-m", "%s at %s" % (name, spec["commit"][:12])], cwd=path)
         if rc != 0:
-            raise ProbeError("git commit failed: %s" % (err or out)[-200:])
+            raise ProbeError("git commit failed: %s" % failure_excerpt(err or out))
         rc, out, err = self.git(["rev-parse", "HEAD^{tree}"], cwd=path)
         got = out.strip()
         if rc != 0 or got != spec["tree"]:
@@ -692,7 +931,7 @@ class Suite(object):
         self.fixtures[name] = path
         rc, out, err = self.kin_run(["init", "."], path)
         if rc != 0:
-            raise ProbeError("kin init failed in %s: %s" % (path, (err or out)[-300:]))
+            raise ProbeError("kin init failed in %s: %s" % (path, failure_excerpt(err or out)))
         return path
 
     def shutdown(self):
@@ -748,18 +987,19 @@ class Suite(object):
         info["entities"] = int(head.group(1)) if head else None
         if info["entities"] is None:
             raise ProbeError("kin graph status rc=%d printed no entity counter: %s"
-                             % (rc, text.strip()[-200:]))
+                             % (rc, failure_excerpt(text)))
         return info
 
-    def sweep_gate(self, name):
+    def sweep_gate(self, name, dependencies=None):
         """Block recall assertions until the fixture's enrichment sweep provably ran.
 
         `kin init` has printed "complete (0/66 files)" over a sweep whose language
         server never started, and a recall check against that graph passes its
         negative controls vacuously: zero counted references contains no impostor.
         kin#985 made the sweep write a full accounting line, so this reads the
-        fixture's own daemon.log and refuses the check unless some completed sweep
-        enriched files and left nothing blocked, unvisited, or unaccounted.
+        fixture's own daemon.log and refuses unless the latest sweep qualifies the
+        required scope. An explicit dependency set includes every positive and
+        negative control's source; unrelated held-back files remain disclosed.
 
         KNOWN EXPOSURE, unfixed on purpose: this trusts that every sweep line in a
         fixture's daemon.log describes THAT fixture. A daemon serving more than one
@@ -775,8 +1015,10 @@ class Suite(object):
         runs keep their historical semantics; the exemption is printed, never
         silent.
         """
-        if name in self.sweep_gates:
-            ok, detail = self.sweep_gates[name]
+        dependencies = tuple(sorted(set(dependencies))) if dependencies is not None else None
+        cache_key = (name, dependencies)
+        if cache_key in self.sweep_gates:
+            ok, detail = self.sweep_gates[cache_key]
             if ok:
                 return detail
             raise ProbeError(detail)
@@ -799,17 +1041,20 @@ class Suite(object):
             if sweep_lines(text) or time.time() >= deadline:
                 break
             time.sleep(1)
-        ok, detail = sweep_verdict(sweep_lines(text))
+        ok, detail = sweep_verdict(sweep_lines(text), dependencies)
         detail = "fixture %s: %s" % (name, detail)
-        self.sweep_gates[name] = (ok, detail)
+        self.sweep_gates[cache_key] = (ok, detail)
         print("kin-brownfield-repro: %s" % detail)
         if not ok:
             raise ProbeError(detail)
         return detail
 
-    def references(self, name, query):
+    def references(self, name, query, max_chars=None):
         repo = self.fixture(name)
-        payload = self.cached(repo, "find_references", {"query": query})
+        args = {"query": query}
+        if max_chars is not None:
+            args["max_chars"] = max_chars
+        payload = self.cached(repo, "find_references", args)
         if not (payload.get("focal_entity") or {}).get("id"):
             negative = payload.get("negative") or {}
             raise ProbeError(
@@ -856,6 +1101,193 @@ def find_row(rows, wanted):
         if name_matches(row.get("name"), wanted):
             return row
     return None
+
+
+def projection_path(row):
+    """The file a reference row's caller is projected into, or None.
+
+    A row names its caller by `entity_id` and serves the caller's file only as
+    `projection.path`, the projection it is and never an address.
+    """
+    projection = row.get("projection") if isinstance(row, dict) else None
+    path = projection.get("path") if isinstance(projection, dict) else None
+    return path if isinstance(path, str) and path else None
+
+
+def malformed_sites(row):
+    """Why a reference row's `sites` cannot be read, or None when they can.
+
+    Absent `sites` reads as no sites. Present, they are a list of objects whose
+    `line_in_entity` is null or a non-negative integer and whose `callee` is null
+    or text, and `site_count`, when present, counts them.
+    """
+    sites = row.get("sites")
+    if sites is None:
+        return None
+    if not isinstance(sites, list):
+        return "sites is %r, not a list" % (sites,)
+    for site in sites:
+        if not isinstance(site, dict):
+            return "a site is %r, not an object" % (site,)
+        offset = site.get("line_in_entity")
+        if offset is not None and (type(offset) is not int or offset < 0):
+            return "a site's line_in_entity is %r" % (offset,)
+        callee = site.get("callee")
+        if callee is not None and not isinstance(callee, str):
+            return "a site's callee is %r" % (callee,)
+    count = row.get("site_count")
+    if count is not None and (type(count) is not int or count != len(sites)):
+        return "site_count %r does not count %d site(s)" % (count, len(sites))
+    return None
+
+
+def module_span_lines(suite, repo, row):
+    """Read a module's current projection span without requesting its file body.
+
+    `graph inspect --json` exposes metadata and refuses to print stale spans.
+    This is the pinned-fixture materialization boundary, not a source fallback.
+    """
+    entity_id = row["entity_id"]
+    try:
+        rc, out, err = suite.kin_run(["graph", "inspect", entity_id, "--json"], repo,
+                                    timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ProbeError("graph inspect(%s) metadata unavailable: %s" % (entity_id, exc))
+    try:
+        record = json.loads(out)
+    except (ValueError, TypeError):
+        raise ProbeError("graph inspect(%s) did not return metadata JSON" % entity_id)
+    lines = record.get("lines") if isinstance(record, dict) else None
+    if (rc != 0 or not isinstance(record, dict) or record.get("error")
+            or not isinstance(lines, list) or any(not isinstance(line, str) for line in lines)):
+        raise ProbeError("graph inspect(%s) metadata unavailable: %s" % (entity_id, err))
+    lines = [line.strip() for line in lines]
+    identities = [line.removeprefix("ID: ") for line in lines if line.startswith("ID: ")]
+    files = [line.removeprefix("File: ") for line in lines if line.startswith("File: ")]
+    entities = [line for line in lines if line.startswith("Entity: ")]
+    spans = [line for line in lines if line.startswith("Span: ")]
+    expected_kind = str(row.get("kind", "")).lower()
+    match = re.fullmatch(r"Span: lines ([0-9]+)-([0-9]+)", spans[0]) if len(spans) == 1 else None
+    if (identities != [entity_id] or files != [projection_path(row)] or len(entities) != 1
+            or not entities[0].lower().endswith("(%s)" % expected_kind) or not match):
+        raise ProbeError("graph inspect(%s) has no exact current module identity and span" % entity_id)
+    start, end = map(int, match.groups())
+    if start < 1 or end < start:
+        raise ProbeError("graph inspect(%s) has an invalid module span" % entity_id)
+    return start, end
+
+
+def site_file_lines(suite, repo, row, call=None):
+    """Each site of a reference row as `(file line, site)`, the line None when unplaced.
+
+    A row addresses every site inside its caller, as `line_in_entity` counted from
+    0 at the caller's first line, and carries no file line. This suite's ground
+    truth is a file line in a pinned upstream tree, so the line is computed here,
+    at that boundary and nowhere else: `get_entity_source`'s 1-based `start_line`
+    plus the site's `line_in_entity`. Its entity-only body must contain that
+    offset, and, when supplied, the pinned call text on that line. A site Kin
+    cannot place inside its caller has no file line. Module/File rows instead
+    use metadata-only current spans; this helper never requests their bodies.
+
+    Raises ProbeError when the sites or the caller's record cannot be read, which
+    the caller reports as ungraded rather than as a wrong line.
+    """
+    problem = malformed_sites(row)
+    if problem:
+        raise ProbeError("%s: %s" % (row.get("name"), problem))
+    sites = row.get("sites") or []
+    if not sites:
+        return []
+    entity_id = row.get("entity_id")
+    if not isinstance(entity_id, str) or not entity_id:
+        raise ProbeError("%s carries sites and no entity_id to place them by"
+                         % row.get("name"))
+    if str(row.get("kind", "")).lower() in ("module", "file"):
+        if call is not None:
+            raise ProbeError("a module's metadata cannot prove pinned call text")
+        start, end = module_span_lines(suite, repo, row)
+        return [(start + site["line_in_entity"]
+                 if site.get("line_in_entity") is not None
+                 and start + site["line_in_entity"] <= end else None, site)
+                for site in sites]
+    record = suite.cached(repo, "get_entity_source", {"entity_id": entity_id})
+    start = record.get("start_line") if isinstance(record, dict) else None
+    body = record.get("body") if isinstance(record, dict) else None
+    if type(start) is not int or start < 1 or not isinstance(body, str):
+        raise ProbeError("get_entity_source(%s) carries no positive start_line and body"
+                         % entity_id)
+    body_lines = body.splitlines()
+    placed = []
+    for site in sites:
+        offset = site.get("line_in_entity")
+        in_body = (offset is not None and offset < len(body_lines)
+                   and (call is None or call in body_lines[offset]))
+        placed.append((start + offset if in_body else None, site))
+    return placed
+
+
+def callee_is_call(callee, call):
+    """Whether a site's quoted `callee` is the pinned call, or a dotted tail of it.
+
+    The quote is cut from the evidence span that starts first on its line: the
+    whole call expression when the parser recorded one (`adapter.send`), the bare
+    name when only a language server did (`send`). Both are the pinned call.
+    Anything else, or no quote at all, is not.
+    """
+    if not isinstance(callee, str) or not callee.strip():
+        return False
+    callee = callee.strip()
+    return callee == call or call.endswith("." + callee)
+
+
+def sites_label(row):
+    """A reference row's sites, for a message: `+N `callee`` each, or the reason for none."""
+    sites = row.get("sites")
+    if not isinstance(sites, list) or not sites:
+        return "none (%s)" % (row.get("sites_absent_reason") or "no reason given")
+
+    def one(site):
+        site = site if isinstance(site, dict) else {}
+        offset = site.get("line_in_entity")
+        callee = site.get("callee")
+        text = ("`%s`" % callee if isinstance(callee, str)
+                else "(%s)" % (site.get("callee_unavailable") or "no text"))
+        return "+%s %s" % ("?" if offset is None else offset, text)
+
+    return ", ".join(one(site) for site in sites)
+
+
+def grade_pinned_call_site(res, suite, repo, row, caller, call, path, line):
+    """Grade a counted caller's row against its pinned call site.
+
+    PASS needs the caller projected into the pinned file and one site that lands
+    on the pinned file line AND quotes the pinned call there, which is what the
+    old absolute `reference_lines` membership proved plus the text Kin now reads
+    at the site.
+    """
+    projected = projection_path(row)
+    if projected != path:
+        res.bad("%s is counted, but its row is projected into %r, not %s, so its sites "
+                "cannot be the call at %s:%d" % (caller, projected, path, path, line))
+        return
+    try:
+        placed = site_file_lines(suite, repo, row, call)
+    except ProbeError as exc:
+        res.unknown("%s is counted, but its sites cannot be placed in %s: %s"
+                    % (caller, path, exc))
+        return
+    on_line = [site for file_line, site in placed if file_line == line]
+    if any(callee_is_call(site.get("callee"), call) for site in on_line):
+        res.ok("%s counted with a site at %s:%d quoting `%s` (sites %s)"
+               % (caller, path, line, call, sites_label(row)))
+    elif on_line:
+        res.bad("%s is counted with a site at %s:%d, but the text Kin quotes there is not "
+                "the call `%s`: sites %s" % (caller, path, line, call, sites_label(row)))
+    else:
+        res.bad("%s is counted but its sites are %s, placing at file line(s) %s, not the "
+                "call site at %s:%d"
+                % (caller, sites_label(row),
+                   [file_line for file_line, _site in placed] or "[]", path, line))
 
 
 # The words a class state can carry, closed. `present` is the one state that
@@ -1165,8 +1597,17 @@ def check_2(suite):
     res = Result("2", "FIR-2464", "Session.send counts as a real caller of "
                                   "HTTPAdapter.send")
     try:
-        suite.sweep_gate("requests")
-        payload = suite.references("requests", HTTPADAPTER_SEND)
+        suite.sweep_gate("requests", (
+            "src/requests/sessions.py", "src/requests/adapters.py",
+            "tests/testserver/server.py", "tests/test_requests.py", "tests/test_lowlevel.py"))
+        # Recall and the negative control require the complete returned row set,
+        # not the agent profile's smaller default response. Keep all relation
+        # kinds and refuse a still-bounded answer rather than infer absence.
+        payload = suite.references("requests", HTTPADAPTER_SEND, max_chars=60000)
+        if (budget_cut(payload) or payload.get("truncated")
+                or (payload.get("_kin") or {}).get("response", {}).get("bounded")):
+            raise ProbeError("reference response remains bounded at max_chars=60000; "
+                             "missing callers and the negative control cannot be graded")
     except ProbeError as exc:
         res.unknown(str(exc))
         return res
@@ -1175,24 +1616,18 @@ def check_2(suite):
     counted_row = find_row(counted, REAL_CALLER_ONE)
     withheld_row = find_row(withheld, REAL_CALLER_ONE)
     if counted_row is not None:
-        lines = counted_row.get("reference_lines") or []
-        if REAL_CALLER_ONE_LINE in lines:
-            res.ok("%s counted as a reference with reference_lines %s"
-                   % (REAL_CALLER_ONE, lines))
-        else:
-            res.bad("%s is counted but its reference_lines are %s, not the call site "
-                    "at %s:%d"
-                    % (REAL_CALLER_ONE, lines or "[]", REAL_CALLER_ONE_FILE,
-                       REAL_CALLER_ONE_LINE))
+        grade_pinned_call_site(res, suite, suite.fixture("requests"), counted_row,
+                               REAL_CALLER_ONE, REAL_CALLER_ONE_CALL,
+                               REAL_CALLER_ONE_FILE, REAL_CALLER_ONE_LINE)
         if counted_row.get("resolution") == "name_only":
             res.bad("%s is counted but still resolution=name_only, so the count "
                     "rests on a bare-name match" % REAL_CALLER_ONE)
     elif withheld_row is not None:
         res.bad("%s is withheld as a same-name candidate (resolution=%r, "
-                "reference_lines=%s) and excluded from total_upstream=%r; the real "
+                "sites %s) and excluded from total_upstream=%r; the real "
                 "call site is %s:%d"
                 % (REAL_CALLER_ONE, withheld_row.get("resolution"),
-                   withheld_row.get("reference_lines") or "[]", total,
+                   sites_label(withheld_row), total,
                    REAL_CALLER_ONE_FILE, REAL_CALLER_ONE_LINE))
     else:
         res.bad("%s appears in neither references nor candidates; total_upstream=%r, "
@@ -1227,7 +1662,7 @@ def check_3(suite):
     res = Result("3", "FIR-2464", "HTTPDigestAuth.handle_401 reaches "
                                   "HTTPAdapter.send through r.connection")
     try:
-        suite.sweep_gate("requests")
+        suite.sweep_gate("requests", ("src/requests/auth.py", "src/requests/adapters.py"))
         payload = suite.references("requests", HTTPADAPTER_SEND)
     except ProbeError as exc:
         res.unknown(str(exc))
@@ -1236,13 +1671,9 @@ def check_3(suite):
     counted_row = find_row(counted, REAL_CALLER_TWO)
     withheld_row = find_row(withheld, REAL_CALLER_TWO)
     if counted_row is not None:
-        lines = counted_row.get("reference_lines") or []
-        if REAL_CALLER_TWO_LINE in lines:
-            res.ok("%s counted with reference_lines %s" % (REAL_CALLER_TWO, lines))
-        else:
-            res.bad("%s is counted but its reference_lines are %s, not the call site "
-                    "at %s:%d" % (REAL_CALLER_TWO, lines or "[]",
-                                  REAL_CALLER_TWO_FILE, REAL_CALLER_TWO_LINE))
+        grade_pinned_call_site(res, suite, suite.fixture("requests"), counted_row,
+                               REAL_CALLER_TWO, REAL_CALLER_TWO_CALL,
+                               REAL_CALLER_TWO_FILE, REAL_CALLER_TWO_LINE)
     elif withheld_row is not None:
         res.bad("%s exists only as a withheld candidate (resolution=%r); the two-hop "
                 "receiver call at %s:%d is real and must count"
@@ -1390,9 +1821,10 @@ def complete_trace_clips(suite, repo, payload, steps):
             # whether Kin surfaced an edge at all, not whether it counted it, so
             # the witness has to answer on the same terms the walk does.
             witnessed.append(name)
-            if relation["resolution"] == "name_only":
+            if (relation["resolution"] == "name_only"
+                    or steps[index - 1].get("resolution") == "name_only"):
                 continue
-            if not any(name_matches(name, bad) for bad in APP_HANDLE_FABRICATED):
+            if not fabricated_app_handle_callee(name):
                 continue
             if genuine_external_callee(name, dst, 0):
                 continue
@@ -1525,8 +1957,7 @@ def check_4(suite):
                                                       or "step %d" % parent)
 
     fabricated_counted = sorted({"%s (%s)" % (n, descent(s)) for n, s in counted
-                                 if any(name_matches(n, f)
-                                        for f in APP_HANDLE_FABRICATED)
+                                 if fabricated_app_handle_callee(n)
                                  and not genuine_external_callee(
                                      n, s.get("entity_id"), s.get("parent_step"))})
     fabricated_counted.extend("%s (focused trace confirmation)" % step_name(row)
@@ -1839,7 +2270,7 @@ def rescue_fixture(suite):
     os.makedirs(repo)
     rc, _out, err = suite.git(["init", "-q", "-b", "main", "."], cwd=repo)
     if rc != 0:
-        raise ProbeError("git init refused the fixture: %s" % err[:400])
+        raise ProbeError("git init refused the fixture: %s" % failure_excerpt(err))
     stream = []
     for index in range(1, RESCUE_FIXTURE_COMMITS + 1):
         body = ("def f%d():\n    return %d\n" % (index, index)).encode()
@@ -1860,11 +2291,11 @@ def rescue_fixture(suite):
     _, err = proc.communicate(b"".join(stream))
     if proc.returncode != 0:
         raise ProbeError("git fast-import refused the fixture: %s"
-                         % err.decode("utf-8", "replace")[:400])
+                         % failure_excerpt(err.decode("utf-8", "replace")))
     rc, _out, err = suite.git(["reset", "-q", "--hard", "main"], cwd=repo)
     if rc != 0:
         raise ProbeError("git reset refused the imported history: %s"
-                         % err[:400])
+                         % failure_excerpt(err))
     return root, repo
 
 
@@ -2306,9 +2737,14 @@ def express_export_reference_body(payload, export):
         if not isinstance(body, dict):
             raise ProbeError("reference section is not an object")
         focal = body.get("focal_entity")
+        # The focal is addressed by id with its file only as the labelled
+        # projection, as every row is. A focal still carrying `file_path` is
+        # the retired shape and establishes no identity.
         if (not isinstance(focal, dict)
                 or any(not isinstance(focal.get(key), str) or not focal[key]
-                       for key in ("id", "name", "kind", "file_path"))):
+                       for key in ("id", "name", "kind"))
+                or projection_path(focal) is None
+                or "file_path" in focal):
             raise ProbeError("reference response carries no valid focal identity")
         if focal["id"] in identities:
             raise ProbeError("duplicate reference focal identity")
@@ -2316,7 +2752,7 @@ def express_export_reference_body(payload, export):
         if sectioned and (body.get("entity_id") != focal["id"]
                           or body.get("owner_qualified_name") != focal["name"]):
             raise ProbeError("reference section label disagrees with its focal identity")
-        if (focal["name"] == export and focal["file_path"] == "lib/express.js"
+        if (focal["name"] == export and projection_path(focal) == "lib/express.js"
                 and focal["kind"].lower() == "constant"):
             matches.append(body)
     if len(matches) != 1:
@@ -2327,10 +2763,9 @@ def express_export_reference_body(payload, export):
             or any(not isinstance(row, dict) for row in body["references"])):
         raise ProbeError("selected export carries malformed reference rows")
     for row in body["references"]:
-        lines = row.get("reference_lines")
-        if lines is not None and (not isinstance(lines, list)
-                                  or any(type(line) is not int or line < 1 for line in lines)):
-            raise ProbeError("selected export carries malformed reference lines")
+        problem = malformed_sites(row)
+        if problem:
+            raise ProbeError("selected export carries malformed reference sites: %s" % problem)
     return body
 
 
@@ -2345,13 +2780,20 @@ def check_11(suite):
 
     The class is pinned here because the symptom stopped reproducing without an
     attributable fix, and an unattributed fix can regress unattributably. Nothing
-    else in this suite reads `reference_lines` on a module-sourced row.
+    else in this suite reads the sites of a module-sourced row.
 
     `no_evidence_span` is trustworthy as a label, which is what makes this check
     cheap: `relation_reference_lines` has exactly two outcomes per evidence span,
     a line inside the caller's file or a counted `outside_caller_file`, with no
-    third uncounted drop. So an empty list here means the parser recorded no
+    third uncounted drop. So an empty `sites` here means the parser recorded no
     position, never that the projection hid one.
+
+    A row now names each site inside its caller, as `line_in_entity` counted from
+    the module's first line, and serves the file only as `projection.path`. The
+    pinned line is a file line, so `site_file_lines` places each site in the file
+    through the module's current metadata span from `graph inspect --json`.
+    The module's own body is the whole file and is never requested, so its
+    `callee` is usually null and is not graded here; the line is the whole claim.
     """
     res = Result("11", "FIR-2758", "module-sourced consumers carry their site lines")
     repo = suite.fixture("express")
@@ -2369,7 +2811,7 @@ def check_11(suite):
             return res
         counted, _withheld = upstream_rows(payload)
         row = next((r for r in counted
-                    if r.get("file_path") == caller_file
+                    if projection_path(r) == caller_file
                     and str(r.get("kind", "")).lower() == "module"), None)
         if row is None:
             res.bad("%s: no module-sourced row for %s among %d counted row(s); the "
@@ -2377,15 +2819,21 @@ def check_11(suite):
                     "this check"
                     % (export, caller_file, len(counted)))
             continue
-        lines = row.get("reference_lines") or []
+        try:
+            placed = site_file_lines(suite, repo, row)
+        except ProbeError as exc:
+            res.unknown("%s: the %s module's sites cannot be placed in the file: %s"
+                        % (export, caller_file, exc))
+            continue
+        lines = [file_line for file_line, _site in placed]
         if line in lines:
-            res.ok("%s: %s module names line %d" % (export, caller_file, line))
+            res.ok("%s: %s module names line %d (sites %s)"
+                   % (export, caller_file, line, sites_label(row)))
         else:
-            res.bad("%s: %s module is counted but its reference_lines are %s, not "
-                    "the site at line %d (absent reason %r); the consumer is found "
-                    "and cannot be jumped to"
-                    % (export, caller_file, lines or "[]", line,
-                       row.get("reference_lines_absent_reason")))
+            res.bad("%s: %s module is counted but its sites are %s, placing at file "
+                    "line(s) %s, not the site at line %d; the consumer is found and "
+                    "cannot be jumped to"
+                    % (export, caller_file, sites_label(row), lines or "[]", line))
     return res
 
 
@@ -2433,6 +2881,11 @@ def self_test():
     expect("an external create reached through another step is not exempt",
            genuine_external_callee("ObjectConstructor.create",
                                    "external_reference:b7e8d69d", 2), False)
+
+    expect("uppercase external spelling is still a forbidden descendant",
+           fabricated_app_handle_callee("escapeHTML"), True)
+    expect("unrelated spelling is not a forbidden descendant",
+           fabricated_app_handle_callee("escapeHTMLish"), False)
 
     # The shipped v0.5.42 find_references shape: negative refuses, completeness
     # certifies. One payload, two verdicts, which is the defect FIR-2463 names.
@@ -2579,6 +3032,29 @@ def self_test():
     expect("an empty log refuses recall", sweep_verdict([])[0], False)
     expect("one clean line among dead ones admits recall",
            sweep_verdict(sweep_lines(dead_server + "\n" + clean))[0], True)
+    incomplete = clean.replace("LSP cold sweep complete",
+                               "LSP cold sweep ended with incomplete enrichment").replace(
+                                   "enriched=37", "enriched=36") + " held_back=1 owed=1 query_failures=1"
+    named = ('not recording these files as enriched files=1 '
+             'named=["tests/test_requests.py"] first_reason=query exceeded its budget\n')
+    incomplete_records = sweep_lines(named + incomplete)
+    expect("an incomplete attempt is readable", len(incomplete_records), 1)
+    expect("an incomplete attempt remains refused", sweep_verdict(incomplete_records)[0], False)
+    expect("the refusal identifies the held-back file",
+           "tests/test_requests.py" in sweep_verdict(incomplete_records)[1], True)
+    expect("old complete wording cannot hide held-back work",
+           sweep_verdict(sweep_lines(clean + " held_back=1 owed=1 query_failures=1"))[0], False)
+    interrupted = incomplete.replace("ended with incomplete enrichment",
+                                      "interrupted; unfinished work remains owed").replace(
+                                          "ended_early=false", "ended_early=true")
+    expect("the interrupted terminal shape is read and refused",
+           (len(sweep_lines(interrupted)), sweep_verdict(sweep_lines(interrupted))[0]), (1, False))
+    expect("an unfinished attempt cannot borrow earlier completion",
+           sweep_verdict(sweep_lines(clean + "\n" + incomplete))[0], False)
+    expect("a later completed retry can establish readiness",
+           sweep_verdict(sweep_lines(incomplete + "\n" + clean))[0], True)
+    expect("incomplete text cannot take the old untallied exemption",
+           sweep_verdict(sweep_lines("LSP cold sweep ended with incomplete enrichment files=1"))[0], False)
     pre985 = "LSP cold sweep complete files=37 total_files=37 relations=4441"
     ok985, detail985 = sweep_verdict(sweep_lines(pre985))
     expect("a pre-tally line exempts rather than refuses", ok985, True)
@@ -2587,6 +3063,121 @@ def self_test():
     ansi_clean = "\x1b[32mINFO\x1b[0m kin_daemon::daemon: " + clean
     expect("ANSI colour never hides a clean sweep",
            sweep_verdict(sweep_lines(ansi_clean))[0], True)
+
+    # A partial sweep can qualify a check's complete dependency set, never the
+    # whole fixture. Visits alone are insufficient: held-back visits also log
+    # "enriched file" when they produced some relations.
+    start = "LSP cold sweep started, enriching all entities\n"
+    visits = ("sweep enriched file file=src/requests/auth.py relations=3\n"
+              "sweep enriched NOTHING for this file file=src/requests/adapters.py\n"
+              "sweep enriched file file=tests/test_requests.py relations=2\n")
+    partial = ("LSP cold sweep ended with incomplete enrichment files=2 total_files=3 "
+               "enriched=2 already_enriched=0 held_back=1 owed=1 owed_deferred=0 "
+               "server_unavailable=0 source_unreadable=0 unsupported_language=0 "
+               "definitions_over_budget=0 query_failures=2 not_visited=0 unaccounted=0 "
+               "ended_early=false published=true")
+    partial_log = start + visits + named + partial
+    deps = ("src/requests/auth.py", "src/requests/adapters.py")
+    records = sweep_lines(partial_log)
+    ok, detail = sweep_verdict(records, deps)
+    expect("unrelated held-back work admits only actually visited dependencies", ok, True)
+    expect("scoped admission discloses the globally incomplete sweep",
+           "global sweep remains incomplete" in detail and "tests/test_requests.py" in detail, True)
+    expect("the same partial sweep remains globally refused", sweep_verdict(records)[0], False)
+    expect("an unknown dependency cannot borrow the complement count",
+           sweep_verdict(records, ("never_visited.py",))[0], False)
+    expect("a held-back dependency cannot pass despite a positive visit line",
+           sweep_verdict(records, ("tests/test_requests.py",))[0], False)
+    expect("a capped warning cannot certify the unlisted complement",
+           sweep_verdict(sweep_lines(partial_log.replace("files=1 named=", "files=21 named=")), deps)[0], False)
+    expect("an earlier attempt cannot lend a missing dependency visit",
+           sweep_verdict(sweep_lines(partial_log + "\n" + start + named + partial), deps)[0], False)
+    retry = (partial.replace("ended with incomplete enrichment", "complete")
+             .replace("files=2 total_files=3", "files=3 total_files=3")
+             .replace("enriched=2", "enriched=3").replace("held_back=1", "held_back=0")
+             .replace("owed=1", "owed=0").replace("query_failures=2", "query_failures=0"))
+    expect("a later full retry supplies its own dependency proof",
+           sweep_verdict(sweep_lines(partial_log + "\n" + start + visits + retry),
+                         ("tests/test_requests.py",))[0], True)
+    expect("a new unterminated attempt invalidates earlier file proof",
+           sweep_verdict(sweep_lines(partial_log + "\n" + start), deps)[0], False)
+    expect("a new unterminated attempt also invalidates the global clean verdict",
+           sweep_verdict(sweep_lines(clean + "\n" + start))[0], False)
+    expect("an unnamed stale-input holdback cannot be scoped away",
+           sweep_verdict(sweep_lines(start + visits + named
+               + "not recording these files as enriched: inputs moved\n" + partial), deps)[0], False)
+    expect("an unpublished attempt cannot qualify dependencies",
+           sweep_verdict(sweep_lines(partial_log.replace("published=true", "published=false")), deps)[0], False)
+    expect("a dependency must be seen during a properly bounded attempt",
+           sweep_verdict(sweep_lines(visits + named + partial), deps)[0], False)
+    expect("missing field never means zero for dependency accounting",
+           sweep_verdict(sweep_lines(partial_log.replace(" owed_deferred=0", "")), deps)[0], False)
+    expect("a terminal without tally cannot borrow a prior full tally",
+           sweep_verdict(sweep_lines(clean + "\nLSP cold sweep complete files=1"))[0], False)
+    for field in ("source_unreadable", "server_unavailable", "unsupported_language",
+                  "owed_deferred", "not_visited", "unaccounted", "definitions_over_budget"):
+        expect("an unlocated %s gap refuses dependency proof" % field,
+               sweep_verdict(sweep_lines(partial_log.replace(field + "=0", field + "=1")), deps)[0], False)
+
+    # A warm reopen revalidates current-context markers without new evidence.
+    # Its zero publication is different from an attempted write that failed.
+    zero_work = (" relations=0 ledgers=0 ledgers_refused=0 retired_proofs=0"
+                 " retired_references=0 retracted_records=0 completed_sites=0 settled_failed=0")
+    warm = (partial.replace("ended with incomplete enrichment", "complete")
+            .replace("files=2 total_files=3", "files=2 total_files=2")
+            .replace("enriched=2", "enriched=0").replace("already_enriched=0", "already_enriched=2")
+            .replace("held_back=1", "held_back=0").replace("owed=1", "owed=0")
+            .replace("query_failures=2", "query_failures=0").replace("published=true", "published=false")
+            + zero_work)
+    skips = ("sweep skipped an already-enriched file file=src/requests/auth.py\n"
+             "sweep skipped a file repository authority records as finished file=src/requests/adapters.py\n")
+    warm_log = start + skips + warm
+    expect("a fully revalidated no-op sweep admits global recall",
+           sweep_verdict(sweep_lines(warm_log))[0], True)
+    expect("a no-op that also published its validation is accepted",
+           sweep_verdict(sweep_lines(warm_log.replace("published=false", "published=true")))[0], True)
+    expect("a warm dependency is proved by its own current skip",
+           sweep_verdict(sweep_lines(warm_log), deps)[0], True)
+    expect("no-op aggregate counters cannot invent dependency membership",
+           sweep_verdict(sweep_lines(warm_log), ("absent.py",))[0], False)
+    expect("missing skip events cannot certify a no-op globally",
+           sweep_verdict(sweep_lines(start + warm))[0], False)
+    expect("an unterminated warm reopen cannot reuse an earlier finish",
+           sweep_verdict(sweep_lines(warm_log + "\n" + start))[0], False)
+    for field in ("relations", "ledgers", "ledgers_refused", "retired_proofs",
+                  "retired_references", "retracted_records", "completed_sites", "settled_failed"):
+        for replacement in ("", " " + field + "=1"):
+            expect("no-op refuses missing or new %s evidence: %r" % (field, replacement),
+                   sweep_verdict(sweep_lines(warm_log.replace(" " + field + "=0", replacement)))[0], False)
+    for refusal in ("LSP completion marker refused after publication",
+                    "could not publish this sweep's enrichment; the relations stay live",
+                    "held this sweep's enrichment while a merge is open"):
+        expect("a failed validation/publication cannot borrow current skip markers: " + refusal,
+               sweep_verdict(sweep_lines(start + skips + refusal + "\n" + warm))[0], False)
+    expect("a failed resolver revalidation cannot qualify old markers",
+           sweep_verdict(sweep_lines(warm_log.replace("server_unavailable=0", "server_unavailable=2")))[0], False)
+
+    deferred = ("sweep deferred an owed file: its language-server queries got no answer "
+                "file=tests/test_requests.py retry_in_s=654\n")
+    warm_partial = (warm.replace("sweep complete", "sweep ended with incomplete enrichment")
+                    .replace("total_files=2", "total_files=3").replace("owed=0", "owed=1")
+                    .replace("owed_deferred=0", "owed_deferred=1"))
+    warm_partial_log = start + skips + deferred + warm_partial
+    expect("named unrelated deferred debt permits only revalidated dependencies",
+           sweep_verdict(sweep_lines(warm_partial_log), deps)[0], True)
+    expect("a required deferred file stays unreadable",
+           sweep_verdict(sweep_lines(warm_partial_log), ("tests/test_requests.py",))[0], False)
+    expect("a globally incomplete warm sweep stays refused",
+           sweep_verdict(sweep_lines(warm_partial_log))[0], False)
+    expect("an omitted deferred file cannot qualify the complement",
+           sweep_verdict(sweep_lines(start + skips + warm_partial), deps)[0], False)
+    expect("unaccounted owed files cannot qualify the complement",
+           sweep_verdict(sweep_lines(warm_partial_log.replace("owed=1", "owed=2")), deps)[0], False)
+    expect("a deferred file cannot also count as a completed skip",
+           sweep_verdict(sweep_lines(warm_partial_log.replace(
+               "file=tests/test_requests.py", "file=src/requests/auth.py")), deps)[0], False)
+    expect("duplicate deferred events refuse ambiguous accounting",
+           sweep_verdict(sweep_lines(start + skips + deferred + deferred + warm_partial), deps)[0], False)
 
     for line in failures:
         print("SELF-TEST FAIL %s" % line)
@@ -2690,10 +3281,10 @@ def main(argv):
                 res = fn(suite)
             except ProbeError as exc:
                 res = Result(check_id, "?", "probe failure")
-                res.unknown(str(exc)[:300])
+                res.unknown(failure_excerpt(str(exc)))
             except Exception as exc:
                 res = Result(check_id, "?", "harness failure")
-                res.unknown("%s: %s" % (type(exc).__name__, str(exc)[:300]))
+                res.unknown("%s: %s" % (type(exc).__name__, failure_excerpt(str(exc))))
             # A check that falls off its own end returns None, and None then blows up
             # three stages later on an attribute nobody can trace back to the check
             # that caused it. Measured: a rebase moved one check's `return res` onto

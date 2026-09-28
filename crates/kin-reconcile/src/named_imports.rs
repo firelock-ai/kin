@@ -359,6 +359,49 @@ fn accepted<G: GraphStore>(
     Ok(true)
 }
 
+/// A repeated exact named-import payload is fresh evidence only when every
+/// original occurrence is independently resolved again against the admitted
+/// source and target bodies, and that exact payload is staged for publication.
+/// A confidence value or a remembered factory certificate alone is not enough.
+pub(crate) fn independently_reproves<G: GraphStore>(
+    graph: &G,
+    source: &IndexedFile,
+    retired: &Relation,
+    observations: &[NamedImportObservation],
+    delta: &TransactionDelta,
+) -> Result<bool> {
+    let Some(current) = exact(graph, retired.id, delta)? else {
+        return Ok(false);
+    };
+    if !crate::binding_debt::repeats_withdrawn_guess(&current, retired) {
+        return Ok(false);
+    }
+    let Some(target) = current.dst.as_entity() else {
+        return Ok(false);
+    };
+    let Some(target) = entity(graph, target, delta)? else {
+        return Ok(false);
+    };
+    let Some(target_file) = target.file_origin else {
+        return Ok(false);
+    };
+    let Some(sites) = owned_occurrences(&current, source, &target_file.0, observations)? else {
+        return Ok(false);
+    };
+    if sites
+        .iter()
+        .any(|site| site.target != current.dst.as_entity())
+    {
+        return Ok(false);
+    }
+    for site in sites {
+        if !accepted(graph, source, site, std::slice::from_ref(&current), delta)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// Run after ordinary settlement. Inputs are freshly reparsed unchanged sources
 /// and the actual admitted relation overlay from this transaction, not raw
 /// linker candidates. Every error refuses the entire unpublished delta.

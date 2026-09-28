@@ -13,6 +13,11 @@
 //! terminal a phase redraws in place and leaves one completed line behind with
 //! its elapsed time; off a terminal each phase prints a start line and an end
 //! line, and in-phase detail is throttled so a pipe is not flooded.
+//!
+//! A command that draws its own progress can ask for the compact ladder
+//! instead, with [`compact_admission_progress`]: it prints nothing, and hands
+//! each step it enters to the command, which shows one line for the whole
+//! admission.
 
 use std::cell::RefCell;
 use std::fmt::Arguments;
@@ -52,6 +57,39 @@ thread_local! {
     /// whether a direct call from the commit or a `tracing` event a subscriber
     /// layer forwards, is made from that thread's own call stack.
     static ACTIVE_LADDER: RefCell<Option<Arc<Mutex<Ladder>>>> = const { RefCell::new(None) };
+}
+
+/// Receives each step a compact ladder enters: the step's 1-based number and
+/// the ladder's total.
+pub type AdmissionStepObserver = Arc<dyn Fn(usize, usize) + Send + Sync>;
+
+/// The observer every ladder this process starts reports to instead of
+/// stderr, when a command installed one.
+static COMPACT_OBSERVER: Mutex<Option<AdmissionStepObserver>> = Mutex::new(None);
+
+/// Make every admission ladder this process starts from now on compact, or
+/// restore the full ladder with `None`.
+///
+/// A compact ladder writes nothing: no numbered stage lines, no in-phase
+/// detail and no closing total. It calls `observer` as it enters each step,
+/// so a command that shows its own progress line can show how far admission
+/// has reached. The journal a killed conversion is read back from is kept
+/// either way, because it is the record, not the display.
+///
+/// Read when a ladder starts, so a ladder already running keeps the form it
+/// started with.
+pub fn compact_admission_progress(observer: Option<AdmissionStepObserver>) {
+    if let Ok(mut installed) = COMPACT_OBSERVER.lock() {
+        *installed = observer;
+    }
+}
+
+/// The observer a ladder starting now reports to, if any.
+fn installed_compact_observer() -> Option<AdmissionStepObserver> {
+    COMPACT_OBSERVER
+        .lock()
+        .ok()
+        .and_then(|observer| observer.clone())
 }
 
 /// Report progress within whatever admission phase is currently open on the
@@ -102,6 +140,13 @@ struct Ladder {
     /// and `SIGKILL` runs no destructor, so the only phase report that survives
     /// a kill is one already written to disk when it lands.
     journal: Option<Arc<InitAttemptJournal>>,
+    /// Where a compact ladder reports each step it enters. `Some` means this
+    /// ladder writes nothing to stderr at all.
+    compact: Option<AdmissionStepObserver>,
+    /// Lines and redraws this ladder wrote, so a test can prove a compact
+    /// ladder wrote none.
+    #[cfg(test)]
+    writes: std::cell::Cell<usize>,
 }
 
 impl PhaseProgress {
@@ -112,6 +157,13 @@ impl PhaseProgress {
     /// take the slot and hand it back on drop, which is the same discipline a
     /// single ladder already keeps.
     pub(crate) fn new(total: usize) -> Self {
+        Self::with_compact(total, installed_compact_observer())
+    }
+
+    /// [`Self::new`] with the compact observer named rather than read from the
+    /// process, so a test can drive a compact ladder without installing one
+    /// for every other test in the process.
+    fn with_compact(total: usize, compact: Option<AdmissionStepObserver>) -> Self {
         let ladder = Arc::new(Mutex::new(Ladder {
             total,
             is_tty: std::io::stderr().is_terminal(),
@@ -122,6 +174,9 @@ impl PhaseProgress {
             started: Instant::now(),
             in_phase: false,
             journal: None,
+            compact,
+            #[cfg(test)]
+            writes: std::cell::Cell::new(0),
         }));
         let _ = ACTIVE_LADDER.try_with(|active| {
             if let Ok(mut active) = active.try_borrow_mut() {
@@ -212,6 +267,11 @@ impl PhaseProgress {
     #[cfg(test)]
     pub(crate) fn detail_updates(&self) -> usize {
         self.ladder.lock().expect("ladder lock").detail_updates
+    }
+
+    #[cfg(test)]
+    fn writes(&self) -> usize {
+        self.ladder.lock().expect("ladder lock").writes.get()
     }
 }
 
@@ -335,6 +395,10 @@ impl Ladder {
         if let Some(journal) = &self.journal {
             journal.enter_phase(self.index, self.label);
         }
+        if let Some(observer) = &self.compact {
+            observer(self.index, self.total);
+            return;
+        }
         if self.is_tty {
             self.write(format_args!(
                 "{ERASE_LINE}  [{:>2}/{}] {}...",
@@ -408,6 +472,11 @@ impl Ladder {
     }
 
     fn write(&self, args: Arguments<'_>) {
+        if self.compact.is_some() {
+            return;
+        }
+        #[cfg(test)]
+        self.writes.set(self.writes.get() + 1);
         let mut stderr = std::io::stderr().lock();
         // Progress is advisory: a closed or full stderr must never fail an
         // admission that is otherwise proceeding correctly.
@@ -416,6 +485,11 @@ impl Ladder {
     }
 
     fn writeln(&self, args: Arguments<'_>) {
+        if self.compact.is_some() {
+            return;
+        }
+        #[cfg(test)]
+        self.writes.set(self.writes.get() + 1);
         let mut stderr = std::io::stderr().lock();
         let _ = stderr.write_fmt(args);
         let _ = stderr.write_all(b"\n");
@@ -607,6 +681,46 @@ mod tests {
             1,
             "only the installing thread's report may advance the phase line"
         );
+    }
+
+    /// A compact ladder writes nothing and hands every step to its observer.
+    ///
+    /// This is what lets `kin clone` and `kin init` show one "Reading history"
+    /// line with a step count in place of sixteen numbered stages. Falsified
+    /// by dropping the early return in `write`, which puts the stage lines
+    /// back under the command's own line.
+    #[test]
+    fn a_compact_ladder_writes_nothing_and_reports_each_step() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let observer: AdmissionStepObserver = {
+            let seen = Arc::clone(&seen);
+            Arc::new(move |step, total| seen.lock().unwrap().push((step, total)))
+        };
+        {
+            let mut progress = PhaseProgress::with_compact(3, Some(observer));
+            progress.begin("first");
+            progress.detail(format_args!("1/2"));
+            assert!(
+                crate::report_admission_progress("4096/6413 changes validated"),
+                "a compact ladder still takes an event, so nobody prints it for it"
+            );
+            progress.begin("second");
+            progress.begin("third");
+            progress.finish("admitted");
+            assert_eq!(progress.writes(), 0, "a compact ladder wrote to stderr");
+        }
+        assert_eq!(*seen.lock().unwrap(), vec![(1, 3), (2, 3), (3, 3)]);
+    }
+
+    /// The full ladder still writes, so the compact switch cannot quietly
+    /// become the default.
+    #[test]
+    fn the_full_ladder_still_writes_its_stages() {
+        let mut progress = PhaseProgress::with_compact(2, None);
+        progress.begin("first");
+        progress.begin("second");
+        progress.finish("admitted");
+        assert!(progress.writes() >= 4, "{} writes", progress.writes());
     }
 
     #[test]

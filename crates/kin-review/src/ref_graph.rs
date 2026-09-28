@@ -45,6 +45,7 @@ pub struct GraphAtRef<'a, G> {
     ancestry: HashSet<SemanticChangeId>,
     entities: HashMap<EntityId, Entity>,
     relations: HashMap<RelationId, Relation>,
+    resolution_records: HashMap<kin_model::ResolutionRecordId, kin_model::ResolutionRecord>,
     // BTree-keyed with relation-id-sorted edge lists: every traversal is
     // deterministic by construction, independent of replay or hash order.
     outgoing: BTreeMap<EntityId, Vec<RelationId>>,
@@ -219,6 +220,7 @@ impl<'a, G: GraphStore> GraphAtRef<'a, G> {
             ancestry,
             entities: state.entities,
             relations: state.relations,
+            resolution_records: state.resolution_records,
             outgoing,
             incoming,
             severed,
@@ -253,6 +255,48 @@ pub fn collect_ancestry<G: GraphStore>(
 }
 
 impl<G: GraphStore> ImpactGraph for GraphAtRef<'_, G> {
+    fn enrichment_observation(
+        &self,
+    ) -> Result<Option<crate::enrichment::EnrichmentObservation>, ReviewError> {
+        Ok(Some(crate::enrichment::observe_committed_graph(
+            &self.entities,
+            &self.resolution_records,
+            self.at,
+        )))
+    }
+
+    fn impact_enrichment_observation(
+        &self,
+        targets: &[Entity],
+        unknown_target: bool,
+    ) -> Result<Option<crate::enrichment::EnrichmentObservation>, ReviewError> {
+        Ok(Some(crate::enrichment::observe_committed_impact(
+            &self.entities,
+            &self.resolution_records,
+            self.at,
+            targets,
+            unknown_target,
+        )))
+    }
+
+    fn impact_enrichment_observation_with_source(
+        &self,
+        targets: &[Entity],
+        unknown_target: bool,
+        escape_evidence: Option<&crate::enrichment::EscapeEvidence<'_>>,
+    ) -> Result<Option<crate::enrichment::EnrichmentObservation>, ReviewError> {
+        Ok(Some(
+            crate::enrichment::observe_committed_impact_with_source(
+                &self.entities,
+                &self.resolution_records,
+                self.at,
+                targets,
+                unknown_target,
+                escape_evidence,
+            ),
+        ))
+    }
+
     fn call_shape_parse_coverage_complete(&self) -> Result<bool, ReviewError> {
         let source_files = self
             .entities
@@ -528,6 +572,88 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn committed_enrichment_disclosure_uses_its_own_entities_and_ledgers() {
+        let live = InMemoryGraph::new();
+        let at = SemanticChangeId::from_hash(Hash256::from_bytes([0x7b; 32]));
+        let mut entity = test_entity("pending_at_commit");
+        entity.span = Some(kin_model::SourceSpan {
+            file: FilePathId::new("src/committed.py"),
+            start_byte: 0,
+            end_byte: 3,
+            start_line: 0,
+            start_col: 0,
+            end_line: 0,
+            end_col: 3,
+        });
+        let snapshot = GraphAtRef::from_state(
+            &live,
+            at,
+            HashSet::from([at]),
+            ResolvedGraphState {
+                entities: HashMap::from([(entity.id, entity.clone())]),
+                ..ResolvedGraphState::default()
+            },
+        );
+        let observation = snapshot.enrichment_observation().unwrap().unwrap();
+        assert_eq!(observation.scope, "committed_graph");
+        assert_eq!(observation.selected_change, Some(at));
+        assert_eq!(observation.total_pending_entities, 1);
+        // HEAD has no such entity, but its empty graph cannot clear committed debt.
+        assert_eq!(
+            crate::enrichment::observe_selected_graph(&live)
+                .unwrap()
+                .total_pending_entities,
+            0
+        );
+
+        let context = kin_model::ProofContext {
+            language: entity.language,
+            resolver: "lsp:test".into(),
+            resolver_version: "1".into(),
+            configuration_hash: Hash256::from_bytes([0; 32]),
+            environment_hash: Hash256::from_bytes([0; 32]),
+            environment_summary: "test".into(),
+        };
+        let validation =
+            kin_model::ResolutionRecord::ContextValidation(kin_model::ContextValidation {
+                language: entity.language,
+                state: kin_model::ContextValidationState::Validated {
+                    context: context.clone(),
+                },
+            });
+        let ledger = kin_model::ResolutionRecord::CallSites(kin_model::CallSiteLedger {
+            caller: entity.id,
+            behavior_hash: entity.fingerprint.behavior_hash,
+            body_hash: Hash256::from_bytes([0; 32]),
+            context: kin_model::ResolutionRecordId::proof_context(&context),
+            census: 0,
+            sites: vec![],
+        });
+        let settled = GraphAtRef::from_state(
+            &live,
+            at,
+            HashSet::from([at]),
+            ResolvedGraphState {
+                entities: HashMap::from([(entity.id, entity.clone())]),
+                resolution_records: HashMap::from([
+                    (ledger.id(), ledger),
+                    (validation.id(), validation),
+                ]),
+                ..ResolvedGraphState::default()
+            },
+        );
+        // A newer live entity with missing evidence cannot become historical debt.
+        live.upsert_entity(&entity).unwrap();
+        assert!(crate::enrichment::observe_selected_graph(&live)
+            .unwrap()
+            .bounds_answer());
+        assert_eq!(
+            settled.enrichment_observation().unwrap().unwrap().status,
+            "no_recorded_call_site_debt"
+        );
     }
 
     #[test]

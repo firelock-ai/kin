@@ -15,7 +15,16 @@ pub(crate) fn restore_exact_authority(state: &DaemonState) {
     let result = (|| -> crate::Result<()> {
         let context =
             crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(state)?;
-        let authority = context.open()?;
+        // The authority the daemon holds for the current publication, not an
+        // open of this call's own. Every commit the daemon makes calls this
+        // right after publishing, and an open decodes the whole persisted
+        // authority and re-verifies every body in repository CAS to read back
+        // the workspace graph the commit just wrote. The held authority is
+        // served only while `authority.json` reads as it did before it was
+        // loaded, so a publication by another writer is still read fresh.
+        let authority = crate::api::held_repository_authority(state).map_err(|(_, message)| {
+            crate::error::DaemonError::Graph(kin_db::KinDbError::StorageError(message))
+        })?;
         let lease = authority.read_authority();
         if let Some(snapshot) = lease.workspace_graph_snapshot(&context.workspace_id())? {
             let graph = kin_db::InMemoryGraph::from_snapshot_without_text_index(snapshot)?;
@@ -55,12 +64,12 @@ impl Drop for Derivation<'_> {
             if let Ok(bytes) = self.state.blobs.read(&hash) {
                 return Ok(Some(bytes));
             }
-            let context =
-                crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(
-                    self.state,
-                )
-                .map_err(|error| kin_db::KinDbError::StorageError(error.to_string()))?;
-            context.open()?.load_source_blob(digest)
+            // A body is read by its content address, so the authority the daemon
+            // already holds answers it exactly as a fresh open would, without
+            // decoding the whole store once per body staging no longer holds.
+            crate::api::held_repository_authority(self.state)
+                .map_err(|(_, message)| kin_db::KinDbError::StorageError(message))?
+                .load_source_blob(digest)
         };
         if let Err(error) = self.state.graph.qualify_binding_history_derivation(
             &self.before,
@@ -329,6 +338,9 @@ pub(crate) fn capture_session_materialization(
             .commit_repository_transaction(transaction)?
     };
     state.record_repository_authority_commit(receipt.generation)?;
+    // Committed through the daemon's held authority, so the label follows its
+    // own record and the next reader does not reopen the store to load it.
+    crate::api::relabel_held_authority_after_own_commit(state);
     if let Some((actor, event)) = loss_event {
         use kin_model::graph::ProvenanceStore as _;
         if let Some(actor) = actor {

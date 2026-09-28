@@ -1039,24 +1039,27 @@ pub struct ReferenceRow {
     pub entity_id: Option<String>,
     pub name: String,
     pub kind: Option<String>,
+    /// The file this caller is projected into. Served only under
+    /// `projection.path`, never as an address: the caller's address is its
+    /// entity id, and its sites are addressed inside it.
     pub file_path: Option<String>,
-    /// 1-based line where the REFERENCING ENTITY begins -- the caller's
-    /// definition, not the reference itself. Useful for locating the caller;
-    /// useless for locating the usage. See `reference_lines`.
-    pub start_line: Option<u32>,
-    /// 1-based lines of the actual reference sites inside this caller, ascending
-    /// and deduplicated, taken from each relation's own
-    /// `RelationEvidence::source_span`.
+    /// The reference sites inside this caller, one per line, ascending and
+    /// deduplicated, taken from each relation's own
+    /// `RelationEvidence::source_span`. Keyed by the site's 1-based line in
+    /// the caller's file, which is how sites from several edges of one caller
+    /// are merged and split. The key is internal and never served: a row
+    /// serves each site through [`Self::site_addresses`], inside the caller.
     ///
-    /// This exists because `start_line` alone forced agents to DERIVE call-site
-    /// positions by counting forward from a function's start, which is wrong
-    /// twice over: it assumes the agent can see the body it is counting through,
-    /// and it compounds any staleness in the definition's own span. The reference
-    /// site is a graph fact, so it is served as one. Empty when the parser
-    /// recorded no span for any contributing edge, which is honest absence rather
-    /// than a derived guess -- and `reference_lines_absent` then names which
-    /// absence it is.
+    /// The reference site is a graph fact, so it is served as one. Empty when
+    /// the parser recorded no span for any contributing edge, which is honest
+    /// absence rather than a derived guess -- and `reference_lines_absent` then
+    /// names which absence it is.
     pub reference_lines: Vec<u32>,
+    /// Each site of `reference_lines`, addressed inside the caller: its line
+    /// counted from 0 at the caller's first line, and the text at the site
+    /// cut from the caller's own body. Keyed as `reference_lines` is, so a row
+    /// split by its edges serves exactly the sites it kept.
+    pub site_addresses: std::collections::BTreeMap<u32, ReferenceSite>,
     /// Why this row's `reference_lines` are a lower bound rather than the whole
     /// set, and `None` when every kind behind the row came from a producer that
     /// records each site.
@@ -1158,8 +1161,12 @@ pub struct ReferenceEdge {
     /// a proven override. Both of its legs are proven.
     pub via_override_of: Option<String>,
     /// 1-based site lines inside the caller's own file, from this edge's own
-    /// evidence.
+    /// evidence. Internal keys, never served: see
+    /// [`ReferenceRow::reference_lines`].
     pub lines: Vec<u32>,
+    /// The evidence spans behind `lines`, which a surface cuts each site's
+    /// text from and addresses inside the caller.
+    pub spans: Vec<SourceSpan>,
     /// Spans this edge carried that named another file.
     pub outside_caller_file: usize,
     /// Why this edge's lines cannot license a site total, and `None` when they
@@ -1183,6 +1190,7 @@ impl ReferenceEdge {
             receiver_name_guess: kin_index::resolution::is_receiver_name_guess(rel),
             via_override_of: None,
             lines: tally.lines,
+            spans: tally.spans,
             outside_caller_file: tally.outside_caller_file,
             site_contract_gap: edge_site_contract_gap(rel),
         }
@@ -1336,6 +1344,197 @@ fn finish_reference_row(row: &mut ReferenceRow, spans_outside_caller_file: usize
     } else {
         Some(ReferenceLinesAbsent::NoEvidenceSpan)
     };
+}
+
+/// One reference site, addressed inside the caller that holds it, the way a
+/// call-site row and an external call's site are addressed: never by a file
+/// line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReferenceSite {
+    /// The site's line, counted from 0 at the caller's first line, as a
+    /// numbered body counts its `+N` offsets. `None` when the site does not
+    /// sit inside the caller's span.
+    pub line_in_entity: Option<u32>,
+    /// The text at the site, cut from the caller's own body, or why it could
+    /// not be. A call's argument list is left out, so the text names what is
+    /// called, as a call-site row's `callee` does.
+    pub callee: std::result::Result<String, &'static str>,
+}
+
+impl ReferenceSite {
+    /// A site no body reader addressed. Only a row assembled outside the
+    /// collectors carries one.
+    pub fn unaddressed() -> Self {
+        Self {
+            line_in_entity: None,
+            callee: Err("site_not_addressed"),
+        }
+    }
+
+    /// The site as a row serves it: `line_in_entity` and `callee`, and
+    /// `callee_unavailable` naming why when `callee` is null.
+    pub fn to_json(&self) -> serde_json::Value {
+        let mut value = serde_json::json!({
+            "line_in_entity": self.line_in_entity,
+            "callee": self.callee.as_ref().ok(),
+        });
+        if let Err(reason) = &self.callee {
+            value["callee_unavailable"] = serde_json::json!(reason);
+        }
+        value
+    }
+}
+
+/// The sites a row serves, in its `reference_lines` order, each addressed
+/// inside the caller.
+pub fn served_reference_sites(row: &ReferenceRow) -> Vec<&ReferenceSite> {
+    static UNADDRESSED: std::sync::OnceLock<ReferenceSite> = std::sync::OnceLock::new();
+    row.reference_lines
+        .iter()
+        .map(|line| {
+            row.site_addresses
+                .get(line)
+                .unwrap_or_else(|| UNADDRESSED.get_or_init(ReferenceSite::unaddressed))
+        })
+        .collect()
+}
+
+/// Address each site of `lines` inside `caller`, cutting its text from the
+/// caller's own body through `text`.
+///
+/// `spans` pairs every evidence span behind the sites with the kind of edge
+/// that recorded it. A line several spans share, a language server's range
+/// and the parser's call expression for one call, is served once, from the
+/// span that starts first and, of those, reaches furthest. A call's argument
+/// list is cut from its text, so the site reads as the call-site ledger reads
+/// the same call. Nothing here reads a file: the text comes from the body the
+/// caller's graph record resolves to.
+pub fn address_reference_sites<T: super::external_symbols::SiteText + ?Sized>(
+    caller: &Entity,
+    lines: &[u32],
+    spans: &[(RelationKind, SourceSpan)],
+    text: &T,
+) -> std::collections::BTreeMap<u32, ReferenceSite> {
+    let mut chosen: std::collections::BTreeMap<u32, &(RelationKind, SourceSpan)> =
+        std::collections::BTreeMap::new();
+    for entry in spans {
+        let line = presentation_line(entry.1.start_line);
+        if !lines.contains(&line) {
+            continue;
+        }
+        chosen
+            .entry(line)
+            .and_modify(|held| {
+                let (held_start, held_end) = (held.1.start_byte, held.1.end_byte);
+                if (entry.1.start_byte, std::cmp::Reverse(entry.1.end_byte))
+                    < (held_start, std::cmp::Reverse(held_end))
+                {
+                    *held = entry;
+                }
+            })
+            .or_insert(entry);
+    }
+    chosen
+        .into_iter()
+        .map(|(line, (kind, span))| {
+            let line_in_entity = caller
+                .span
+                .as_ref()
+                .filter(|caller_span| caller_span.file == span.file)
+                .and_then(|caller_span| span.start_line.checked_sub(caller_span.start_line));
+            // Where the site sits against the caller's span is decided here,
+            // from the graph, so every body reader gives the same reason for a
+            // site it cannot quote; only a site inside the caller is read.
+            let callee = match caller.span.as_ref() {
+                None => Err("caller_has_no_span"),
+                Some(caller_span)
+                    if caller_span.file != span.file
+                        || span.start_byte < caller_span.start_byte
+                        || span.end_byte > caller_span.end_byte
+                        || span.end_byte < span.start_byte =>
+                {
+                    Err("site_outside_caller")
+                }
+                Some(_) => text.quote(caller, span).map(|quoted| {
+                    if *kind == RelationKind::Calls {
+                        call_callee_text(&quoted)
+                    } else {
+                        quoted
+                    }
+                }),
+            };
+            (
+                line,
+                ReferenceSite {
+                    line_in_entity,
+                    callee,
+                },
+            )
+        })
+        .collect()
+}
+
+/// The callee of a call expression's text: the text with its trailing
+/// argument list cut, and a trailing block argument before that, so
+/// `app.get("/items")` reads `app.get`, `a.b(c).d(e)` reads `a.b(c).d` and
+/// `with_context(io) { ... }` reads `with_context`. Brackets inside string
+/// literals are skipped. Text that does not end in such a group, or that
+/// would cut to nothing, is returned whole.
+pub fn call_callee_text(text: &str) -> String {
+    let mut rest = text.trim_end();
+    for close in ['}', ')'] {
+        if let Some(cut) = trailing_group_start(rest, close) {
+            let head = rest[..cut].trim_end();
+            if !head.is_empty() {
+                rest = head;
+            }
+        }
+    }
+    rest.to_string()
+}
+
+/// Where the bracket group that closes at the end of `text` opens, when
+/// `text` ends in `close` and that group is at the top level.
+fn trailing_group_start(text: &str, close: char) -> Option<usize> {
+    if !text.ends_with(close) {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut last_open = None;
+    for (at, ch) in text.char_indices() {
+        if let Some(open_quote) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == open_quote {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '"' | '\'' | '`' => quote = Some(ch),
+            '(' | '[' | '{' => {
+                if depth == 0 {
+                    last_open = Some(at);
+                }
+                depth += 1;
+            }
+            ')' | ']' | '}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 && at + ch.len_utf8() == text.len() {
+                    let open = last_open?;
+                    let opener = text[open..].chars().next()?;
+                    let pairs = matches!((opener, ch), ('(', ')') | ('[', ']') | ('{', '}'));
+                    return pairs.then_some(open);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Why a reference row carries no site lines.
@@ -1770,6 +1969,9 @@ fn merge_dispatch_row(held: &mut ReferenceRow, incoming: ReferenceRow) {
     held.reference_lines.extend(incoming.reference_lines);
     held.reference_lines.sort_unstable();
     held.reference_lines.dedup();
+    for (line, site) in incoming.site_addresses {
+        held.site_addresses.entry(line).or_insert(site);
+    }
     merge_site_contract_gap(
         &mut held.reference_lines_partial,
         incoming.reference_lines_partial,
@@ -1935,25 +2137,145 @@ enum ReferenceBodies {
     Omit,
 }
 
-/// The snippet a reference row carries, or `None` when the caller is absent
-/// from the current workspace and the row is skipped.
-fn reference_row_snippet<G: GraphStore>(
+/// A caller's exact body as a reference answer holds it while it addresses
+/// the caller's sites: the resolved bytes and the span of the body inside
+/// them, or why the body could not be read.
+type CallerBody = std::result::Result<(Arc<Vec<u8>>, SourceSpan), &'static str>;
+
+/// What a reference row reads of its caller: the snippet the row may carry,
+/// and the exact body its sites are cut from, from one resolution of the
+/// caller's source. `None` when the caller is absent from the current
+/// workspace and the row is skipped.
+fn reference_row_source<G: GraphStore>(
     held: &HeldSourceAuthority<'_, G>,
     entity: &Entity,
     bodies: ReferenceBodies,
     source_scope: EntitySourceScope,
-) -> Result<Option<Option<String>>> {
+) -> Result<Option<(Option<String>, CallerBody)>> {
     match bodies {
         ReferenceBodies::Project => {
-            match read_bounded_entity_snippet_held(held, entity, source_scope) {
-                Ok(snippet) => Ok(Some(snippet)),
-                Err(error) if is_absent_at_generation(&error) => Ok(None),
-                Err(error) => Err(error),
-            }
+            let resolved = match resolve_entity_source_authority(held, entity, source_scope) {
+                Ok(resolved) => resolved,
+                Err(error) if is_absent_at_generation(&error) => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            let Some((source, bytes, span)) = resolved else {
+                return Ok(Some((None, Err("caller_source_unavailable"))));
+            };
+            let snippet = excerpt_resolved_source(
+                entity,
+                source,
+                &bytes,
+                &span,
+                RETRIEVAL_SNIPPET_MAX_LINES,
+                RETRIEVAL_SNIPPET_MAX_CHARS,
+            )?
+            .map(|source| source.body);
+            Ok(Some((snippet, Ok((bytes, span)))))
         }
-        ReferenceBodies::Omit => {
-            Ok(entity_present_at_workspace_head_held(held, entity)?.then_some(None))
+        ReferenceBodies::Omit => Ok(entity_present_at_workspace_head_held(held, entity)?
+            .then_some((None, Err("caller_source_not_read")))),
+    }
+}
+
+/// The text at `site`, cut from the caller's resolved body, or why it cannot
+/// be: the one cut every reference surface makes, so `find_references` and
+/// `kin refs` quote a site identically.
+fn quote_caller_body(
+    caller: &Entity,
+    site: &SourceSpan,
+    body: Option<&CallerBody>,
+) -> std::result::Result<String, &'static str> {
+    let Some(caller_span) = caller.span.as_ref() else {
+        return Err("caller_has_no_span");
+    };
+    let (bytes, body) = match body {
+        Some(Ok((bytes, body))) => (bytes, body),
+        Some(Err(reason)) => return Err(reason),
+        None => return Err("caller_source_unavailable"),
+    };
+    if site.file != caller_span.file
+        || site.start_byte < body.start_byte
+        || site.end_byte > body.end_byte
+        || site.end_byte < site.start_byte
+    {
+        return Err("site_outside_caller");
+    }
+    bytes
+        .get(site.start_byte..site.end_byte)
+        .and_then(|text| std::str::from_utf8(text).ok())
+        .map(str::to_string)
+        .ok_or("site_outside_caller")
+}
+
+/// The text at a caller's sites, cut from the bodies a reference collection
+/// already resolved for its snippets, so no caller is read twice.
+struct ResolvedCallerBodies<'a>(&'a HashMap<EntityId, CallerBody>);
+
+impl super::external_symbols::SiteText for ResolvedCallerBodies<'_> {
+    fn quote(
+        &self,
+        caller: &Entity,
+        site: &SourceSpan,
+    ) -> std::result::Result<String, &'static str> {
+        quote_caller_body(caller, site, self.0.get(&caller.id))
+    }
+}
+
+/// The text at a caller's sites for a surface that did not read its callers'
+/// bodies while collecting them, `kin refs` among them: each caller's body is
+/// resolved once, on its first site, through the same held authority and the
+/// same cut `find_references` uses, at the source scope the answer reads at.
+pub struct HeldCallerText<'held, 'store, G: GraphStore> {
+    held: &'held HeldSourceAuthority<'store, G>,
+    scope: EntitySourceScope,
+    bodies: std::cell::RefCell<HashMap<EntityId, CallerBody>>,
+}
+
+impl<'held, 'store, G: GraphStore> HeldCallerText<'held, 'store, G> {
+    pub fn new(held: &'held HeldSourceAuthority<'store, G>, scope: EntitySourceScope) -> Self {
+        Self {
+            held,
+            scope,
+            bodies: std::cell::RefCell::new(HashMap::new()),
         }
+    }
+}
+
+impl<G: GraphStore> super::external_symbols::SiteText for HeldCallerText<'_, '_, G> {
+    fn quote(
+        &self,
+        caller: &Entity,
+        site: &SourceSpan,
+    ) -> std::result::Result<String, &'static str> {
+        let mut bodies = self.bodies.borrow_mut();
+        let body = bodies.entry(caller.id).or_insert_with(|| {
+            // The read reports what it read through a thread-local the
+            // surrounding answer may already have taken for its own body, so
+            // it is put back as this read found it.
+            let prior = LAST_READ_SOURCE.with(|cell| cell.get());
+            let body = match resolve_entity_source_authority(self.held, caller, self.scope) {
+                Ok(Some((_, bytes, span))) => Ok((bytes, span)),
+                Ok(None) | Err(_) => Err("caller_source_unavailable"),
+            };
+            LAST_READ_SOURCE.with(|cell| cell.set(prior));
+            body
+        });
+        quote_caller_body(caller, site, Some(body))
+    }
+}
+
+/// The text at a caller's sites when the answer holds no body reader: every
+/// site says so rather than being quoted from anywhere else.
+pub struct NoCallerText;
+
+impl super::external_symbols::SiteText for NoCallerText {
+    fn quote(
+        &self,
+        _caller: &Entity,
+        _site: &SourceSpan,
+    ) -> std::result::Result<String, &'static str> {
+        Err("caller_source_unavailable")
     }
 }
 
@@ -2066,6 +2388,17 @@ fn collect_reference_rows<G: GraphStore>(
     // surfaces have: deriving authority and committed state per row pays a full
     // authority recovery and a whole-history replay once per caller found.
     let held = HeldSourceAuthority::new(store, repository_authority);
+    // Each caller's source is resolved once however many edges it holds: the
+    // snippet its row carries and the body its sites are cut from come from
+    // that one read. A caller the workspace no longer holds is remembered, so
+    // its other edges skip it without reading it again.
+    let mut caller_bodies: HashMap<EntityId, CallerBody> = HashMap::new();
+    let mut absent_callers: HashSet<EntityId> = HashSet::new();
+    let mut callers: HashMap<EntityId, Entity> = HashMap::new();
+    // Every evidence span behind a caller's sites, with the kind of edge that
+    // recorded it, so each site is addressed inside the caller once the row
+    // is whole.
+    let mut site_spans: HashMap<EntityId, Vec<(RelationKind, SourceSpan)>> = HashMap::new();
 
     for rel in
         kin_index::relation_read::relations_for_read(store, entity_id).map_err(McpError::graph)?
@@ -2083,6 +2416,9 @@ fn collect_reference_rows<G: GraphStore>(
         if source_entity_id == *entity_id {
             continue;
         }
+        if absent_callers.contains(&source_entity_id) {
+            continue;
+        }
         let Some(entity) = store
             .get_entity(&source_entity_id)
             .map_err(McpError::graph)?
@@ -2096,9 +2432,23 @@ fn collect_reference_rows<G: GraphStore>(
         // reported as one. Failing the whole reference set over it -- the shape
         // this had -- made `find_references` unusable on any repository that
         // ever deleted a file.
-        let Some(snippet) = reference_row_snippet(&held, &entity, bodies, source_scope)? else {
-            continue;
+        let snippet = if caller_bodies.contains_key(&source_entity_id) {
+            None
+        } else {
+            match reference_row_source(&held, &entity, bodies, source_scope)? {
+                Some((snippet, body)) => {
+                    caller_bodies.insert(source_entity_id, body);
+                    snippet
+                }
+                None => {
+                    absent_callers.insert(source_entity_id);
+                    continue;
+                }
+            }
         };
+        callers
+            .entry(source_entity_id)
+            .or_insert_with(|| entity.clone());
         let entry = grouped
             .entry(source_entity_id)
             .or_insert_with(|| ReferenceRow {
@@ -2106,8 +2456,8 @@ fn collect_reference_rows<G: GraphStore>(
                 name: entity.name.clone(),
                 kind: Some(format!("{:?}", entity.kind)),
                 file_path: file_path.clone(),
-                start_line: entity_presentation_start_line(&entity),
                 reference_lines: Vec::new(),
+                site_addresses: std::collections::BTreeMap::new(),
                 reference_lines_partial: None,
                 reference_lines_absent: None,
                 signature: Some(entity.signature.clone()),
@@ -2127,18 +2477,19 @@ fn collect_reference_rows<G: GraphStore>(
         if entry.file_path.is_none() {
             entry.file_path = file_path;
         }
-        if entry.start_line.is_none() {
-            entry.start_line = entity_presentation_start_line(&entity);
-        }
         if entry.signature.is_none() {
             entry.signature = Some(entity.signature.clone());
         }
         // Every edge contributing to this row carries its own site span, so a
         // caller that references the target several times reports all of its
         // sites rather than the first. Only spans inside the referencing
-        // entity's own file are taken: a cross-file evidence span would be a
-        // line number the row's `file_path` does not explain.
+        // entity's own file are taken: a cross-file evidence span cannot be
+        // addressed inside the caller.
         for edge in reference_edges(&rel, entity.file_origin.as_ref()) {
+            site_spans
+                .entry(source_entity_id)
+                .or_default()
+                .extend(edge.spans.iter().map(|span| (edge.kind, span.clone())));
             entry.reference_lines.extend(edge.lines.iter().copied());
             *spans_outside_caller_file
                 .entry(source_entity_id)
@@ -2194,15 +2545,32 @@ fn collect_reference_rows<G: GraphStore>(
             if !RelationResolution::of(&rel).is_proven() {
                 continue;
             }
+            if absent_callers.contains(&source_entity_id) {
+                continue;
+            }
             let Some(entity) = store
                 .get_entity(&source_entity_id)
                 .map_err(McpError::graph)?
             else {
                 continue;
             };
-            let Some(snippet) = reference_row_snippet(&held, &entity, bodies, source_scope)? else {
-                continue;
+            let snippet = if caller_bodies.contains_key(&source_entity_id) {
+                None
+            } else {
+                match reference_row_source(&held, &entity, bodies, source_scope)? {
+                    Some((snippet, body)) => {
+                        caller_bodies.insert(source_entity_id, body);
+                        snippet
+                    }
+                    None => {
+                        absent_callers.insert(source_entity_id);
+                        continue;
+                    }
+                }
             };
+            callers
+                .entry(source_entity_id)
+                .or_insert_with(|| entity.clone());
             let file_path = entity.file_origin.as_ref().map(|path| path.0.clone());
             let entry = grouped
                 .entry(source_entity_id)
@@ -2211,8 +2579,8 @@ fn collect_reference_rows<G: GraphStore>(
                     name: entity.name.clone(),
                     kind: Some(format!("{:?}", entity.kind)),
                     file_path,
-                    start_line: entity_presentation_start_line(&entity),
                     reference_lines: Vec::new(),
+                    site_addresses: std::collections::BTreeMap::new(),
                     reference_lines_partial: None,
                     reference_lines_absent: None,
                     signature: Some(entity.signature.clone()),
@@ -2228,6 +2596,10 @@ fn collect_reference_rows<G: GraphStore>(
                     edges: Vec::new(),
                 });
             let tally = relation_reference_lines(&rel, entity.file_origin.as_ref());
+            site_spans
+                .entry(source_entity_id)
+                .or_default()
+                .extend(tally.spans.iter().map(|span| (rel.kind, span.clone())));
             entry.reference_lines.extend(tally.lines.iter().copied());
             *spans_outside_caller_file
                 .entry(source_entity_id)
@@ -2260,6 +2632,11 @@ fn collect_reference_rows<G: GraphStore>(
         }
     }
 
+    // Each site is addressed inside its caller once the row is whole: its line
+    // counted from the caller's first line and the text at it, cut from the
+    // body read above. A membership-only read resolved no body, and serves no
+    // row, so it addresses nothing.
+    let text = ResolvedCallerBodies(&caller_bodies);
     let mut rows = Vec::with_capacity(grouped.len());
     for (source_entity_id, mut row) in grouped {
         let outside = spans_outside_caller_file
@@ -2267,6 +2644,19 @@ fn collect_reference_rows<G: GraphStore>(
             .copied()
             .unwrap_or(0);
         finish_reference_row(&mut row, outside);
+        if bodies == ReferenceBodies::Project {
+            if let Some(caller) = callers.get(&source_entity_id) {
+                row.site_addresses = address_reference_sites(
+                    caller,
+                    &row.reference_lines,
+                    site_spans
+                        .get(&source_entity_id)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]),
+                    &text,
+                );
+            }
+        }
         rows.push(row);
     }
     Ok(rows)
@@ -2331,6 +2721,8 @@ fn proven_override_bases<G: GraphStore>(
 pub struct RelationSpanTally {
     /// 1-based site lines inside the referencing entity's own file.
     pub lines: Vec<u32>,
+    /// The spans behind `lines`, in the order the evidence carried them.
+    pub spans: Vec<SourceSpan>,
     /// Spans that named a different file and were therefore not reportable under
     /// this row. Counted rather than discarded so an empty `lines` can be
     /// explained.
@@ -2354,6 +2746,7 @@ pub fn reference_edges(
                 receiver_name_guess: group.receiver_name_guess,
                 via_override_of: None,
                 lines: tally.lines,
+                spans: tally.spans,
                 outside_caller_file: tally.outside_caller_file,
                 site_contract_gap: if group.qualification_missing {
                     Some(ReferenceLinesPartial::OccurrenceQualificationUnavailable)
@@ -2381,11 +2774,13 @@ fn span_reference_lines<'a>(
 ) -> RelationSpanTally {
     let mut tally = RelationSpanTally {
         lines: Vec::new(),
+        spans: Vec::new(),
         outside_caller_file: 0,
     };
     for span in sites {
         if caller_file.is_none_or(|file| &span.file == file) {
             tally.lines.push(presentation_line(span.start_line));
+            tally.spans.push(span.clone());
         } else {
             tally.outside_caller_file += 1;
         }
@@ -2411,6 +2806,7 @@ pub fn relation_reference_lines(
 ) -> RelationSpanTally {
     let mut tally = RelationSpanTally {
         lines: Vec::new(),
+        spans: Vec::new(),
         outside_caller_file: 0,
     };
     for span in rel
@@ -2420,6 +2816,7 @@ pub fn relation_reference_lines(
     {
         if caller_file.is_none_or(|file| &span.file == file) {
             tally.lines.push(presentation_line(span.start_line));
+            tally.spans.push(span.clone());
         } else {
             tally.outside_caller_file += 1;
         }
@@ -3384,17 +3781,29 @@ pub fn read_entity_source_excerpt_detailed_held<G: GraphStore>(
     max_chars: usize,
     scope: EntitySourceScope,
 ) -> Result<Option<ExactEntitySource>> {
-    let Some((mut source, bytes, span)) = resolve_entity_source_authority(held, entity, scope)?
-    else {
+    let Some((source, bytes, span)) = resolve_entity_source_authority(held, entity, scope)? else {
         return Ok(None);
     };
-    let text = std::str::from_utf8(&bytes).map_err(|error| {
+    excerpt_resolved_source(entity, source, &bytes, &span, max_lines, max_chars)
+}
+
+/// The bounded excerpt of a body [`resolve_entity_source_authority`] already
+/// resolved, so a reader that needs the exact bytes as well resolves once.
+fn excerpt_resolved_source(
+    entity: &Entity,
+    mut source: ExactEntitySource,
+    bytes: &[u8],
+    span: &SourceSpan,
+    max_lines: usize,
+    max_chars: usize,
+) -> Result<Option<ExactEntitySource>> {
+    let text = std::str::from_utf8(bytes).map_err(|error| {
         graph_source_gap(format!(
             "artifact {:?} at {} is not valid UTF-8 for semantic source: {error}",
             source.artifact_id, source.path
         ))
     })?;
-    let excerpt = excerpt_from_span_bytes(&bytes, &span, max_lines, max_chars);
+    let excerpt = excerpt_from_span_bytes(bytes, span, max_lines, max_chars);
     let body = if excerpt
         .as_ref()
         .is_some_and(|excerpt| !should_expand_excerpt(entity, excerpt))
@@ -3584,14 +3993,282 @@ pub fn derived_generator_source_at<G: GraphStore>(
     Ok(value)
 }
 
+// ── Whether a focal escapes as a value ────────────────────────────────────
+
+impl<G: GraphStore> HeldSourceAuthority<'_, G> {
+    /// Whether each focal, spelled by its call names, may escape as a value,
+    /// one answer per focal in order, against the graph `scope` selects: at
+    /// the workspace head, the store's entities, ledgers and relations over
+    /// the held workspace tree; at a committed change, the graph replayed
+    /// there through this authority's memo. One batch census
+    /// ([`kin_db::focal_escape_evidence_batch`]) reads each file once, by its
+    /// blob identity through this authority, which verifies each digest.
+    /// Exact file bytes are an internal boundary of the census: nothing it
+    /// reads reaches a payload.
+    pub(crate) fn escape_evidence_batch(
+        &self,
+        scope: EntitySourceScope,
+        focals: &[(&Entity, Vec<String>)],
+    ) -> Vec<kin_model::FocalEscape> {
+        match scope {
+            EntitySourceScope::WorkspaceHead => {
+                kin_db::focal_escape_evidence_batch(&HeadCensus { held: self }, focals)
+            }
+            EntitySourceScope::At(change) => match self.graph_at(&change) {
+                Ok(state) => {
+                    kin_db::focal_escape_evidence_batch(&StateCensus::new(self, &state), focals)
+                }
+                Err(_) => vec![
+                    kin_model::FocalEscape::Unknown {
+                        reason: "the graph at the selected change could not be replayed",
+                    };
+                    focals.len()
+                ],
+            },
+        }
+    }
+}
+
+/// The exact bytes of a census file, read by its blob identity through the
+/// held authority, which verifies the digest.
+fn census_file_bytes<G: GraphStore>(
+    held: &HeldSourceAuthority<'_, G>,
+    file: &kin_db::call_site_escape::CensusFile,
+    max_bytes: usize,
+) -> Option<Vec<u8>> {
+    if file.len.is_some_and(|len| len > max_bytes) {
+        return None;
+    }
+    let authority = held.authority().ok()?;
+    let bytes = match held.source.as_ref() {
+        Some(source) => source.load_source_blob_bounded(authority, file.blob, max_bytes as u64),
+        None => authority
+            .load_source_blob_bounded(file.blob, max_bytes as u64)
+            .map(Arc::new),
+    }
+    .ok()?;
+    (bytes.len() <= max_bytes).then(|| bytes.as_ref().clone())
+}
+
+/// The census files of `tree` in `languages`, each with the length `len_of`
+/// gives it.
+fn census_files_of(
+    tree: &kin_model::ResolvedTree,
+    languages: &[kin_model::LanguageId],
+    len_of: &dyn Fn(&kin_model::FilePathId) -> Option<usize>,
+) -> Option<Vec<kin_db::call_site_escape::CensusFile>> {
+    let mut files = Vec::new();
+    for artifact in tree.artifacts() {
+        let TreeEntry::Blob { hash, .. } = artifact.entry else {
+            continue;
+        };
+        // The extension can be classified without interpreting raw filename
+        // bytes. Refuse unreadable source paths only within this census's
+        // language domain; never silently omit a possible escaped value.
+        let bytes = artifact.path.as_bytes();
+        let language = bytes
+            .iter()
+            .rposition(|byte| *byte == b'.')
+            .and_then(|at| std::str::from_utf8(&bytes[at..]).ok())
+            .and_then(kin_model::language_of_path)
+            .filter(|language| languages.contains(language));
+        let Some(language) = language else { continue };
+        let path = kin_model::FilePathId::new(artifact.path.as_utf8()?);
+        let len = len_of(&path);
+        files.push(kin_db::call_site_escape::CensusFile {
+            path,
+            language,
+            blob: hash,
+            len,
+        });
+    }
+    Some(files)
+}
+
+/// The head graph for the census: the held workspace tree, and the store's
+/// entities, ledgers, validation records and relations.
+struct HeadCensus<'h, 'store, G: GraphStore> {
+    held: &'h HeldSourceAuthority<'store, G>,
+}
+
+impl<G: GraphStore> kin_db::call_site_escape::EscapeCensusGraph for HeadCensus<'_, '_, G> {
+    fn census_files(
+        &self,
+        languages: &[kin_model::LanguageId],
+    ) -> Option<Vec<kin_db::call_site_escape::CensusFile>> {
+        let sample = self.held.workspace_sample().ok()?;
+        let store = self.held.store;
+        census_files_of(&sample.tree, languages, &|path| {
+            store
+                .get_file_layout(path)
+                .ok()
+                .flatten()
+                .and_then(|layout| layout_len(&layout))
+        })
+    }
+
+    fn file_bytes(
+        &self,
+        file: &kin_db::call_site_escape::CensusFile,
+        max_bytes: usize,
+    ) -> Option<Vec<u8>> {
+        census_file_bytes(self.held, file, max_bytes)
+    }
+
+    fn entities_in(&self, path: &kin_model::FilePathId) -> Option<Vec<Entity>> {
+        self.held
+            .store
+            .query_entities(&EntityFilter {
+                file_path: Some(path.clone()),
+                ..Default::default()
+            })
+            .ok()
+    }
+
+    fn call_site_ledger(&self, caller: EntityId) -> Option<kin_model::CallSiteLedger> {
+        self.held
+            .store
+            .lookup_resolution_record(&kin_model::ResolutionRecordId::call_sites(caller))
+            .ok()
+            .flatten()
+            .and_then(|record| record.as_call_sites().cloned())
+    }
+
+    fn context_validation(
+        &self,
+        language: kin_model::LanguageId,
+    ) -> Option<kin_model::ContextValidation> {
+        self.held
+            .store
+            .lookup_resolution_record(&kin_model::ResolutionRecordId::context_validation(language))
+            .ok()
+            .flatten()
+            .and_then(|record| record.as_context_validation().cloned())
+    }
+
+    fn import_evidence_into(&self, target: EntityId) -> Option<Vec<kin_model::RelationEvidence>> {
+        let relations = self.held.store.get_all_relations_for_entity(&target).ok()?;
+        Some(imports_into(relations.iter(), target))
+    }
+}
+
+/// The evidence of every `Imports` edge among `relations` that lands on
+/// `target`.
+fn imports_into<'r>(
+    relations: impl Iterator<Item = &'r kin_model::Relation>,
+    target: EntityId,
+) -> Vec<kin_model::RelationEvidence> {
+    relations
+        .filter(|relation| {
+            relation.kind == RelationKind::Imports && relation.dst.as_entity() == Some(target)
+        })
+        .flat_map(|relation| relation.evidence.iter().cloned())
+        .collect()
+}
+
+/// The length a file's layout records: the end of its last region.
+fn layout_len(layout: &kin_model::layout::FileLayout) -> Option<usize> {
+    layout
+        .regions
+        .iter()
+        .map(|region| match region {
+            kin_model::layout::SourceRegion::EntityRef { byte_range, .. }
+            | kin_model::layout::SourceRegion::Trivia { byte_range } => byte_range.end,
+        })
+        .chain(std::iter::once(layout.imports.byte_range.end))
+        .max()
+}
+
+/// A committed generation for the census: the replayed state's tree,
+/// entities, relations and resolution records, with file bytes read through
+/// the held authority.
+struct StateCensus<'h, 'store, G: GraphStore> {
+    held: &'h HeldSourceAuthority<'store, G>,
+    state: &'h kin_model::graph::ResolvedGraphState,
+    by_file: HashMap<String, Vec<Entity>>,
+}
+
+impl<'h, 'store, G: GraphStore> StateCensus<'h, 'store, G> {
+    fn new(
+        held: &'h HeldSourceAuthority<'store, G>,
+        state: &'h kin_model::graph::ResolvedGraphState,
+    ) -> Self {
+        let mut by_file: HashMap<String, Vec<Entity>> = HashMap::new();
+        for entity in state.entities.values() {
+            if let Some(file) = entity.file_origin.as_ref() {
+                by_file
+                    .entry(file.0.clone())
+                    .or_default()
+                    .push(entity.clone());
+            }
+        }
+        Self {
+            held,
+            state,
+            by_file,
+        }
+    }
+}
+
+impl<G: GraphStore> kin_db::call_site_escape::EscapeCensusGraph for StateCensus<'_, '_, G> {
+    fn census_files(
+        &self,
+        languages: &[kin_model::LanguageId],
+    ) -> Option<Vec<kin_db::call_site_escape::CensusFile>> {
+        census_files_of(&self.state.tree, languages, &|_| None)
+    }
+
+    fn file_bytes(
+        &self,
+        file: &kin_db::call_site_escape::CensusFile,
+        max_bytes: usize,
+    ) -> Option<Vec<u8>> {
+        census_file_bytes(self.held, file, max_bytes)
+    }
+
+    fn entities_in(&self, path: &kin_model::FilePathId) -> Option<Vec<Entity>> {
+        Some(self.by_file.get(&path.0).cloned().unwrap_or_default())
+    }
+
+    fn call_site_ledger(&self, caller: EntityId) -> Option<kin_model::CallSiteLedger> {
+        self.state
+            .resolution_records
+            .get(&kin_model::ResolutionRecordId::call_sites(caller))
+            .and_then(|record| record.as_call_sites().cloned())
+    }
+
+    fn context_validation(
+        &self,
+        language: kin_model::LanguageId,
+    ) -> Option<kin_model::ContextValidation> {
+        self.state
+            .resolution_records
+            .get(&kin_model::ResolutionRecordId::context_validation(language))
+            .and_then(|record| record.as_context_validation().cloned())
+    }
+
+    fn import_evidence_into(&self, target: EntityId) -> Option<Vec<kin_model::RelationEvidence>> {
+        Some(imports_into(self.state.relations.values(), target))
+    }
+}
+
 /// Read the exact graph span, refusing an oversized body before copying it.
 pub fn read_entity_source_exact<G: GraphStore>(
     held: &HeldSourceAuthority<'_, G>,
     entity: &Entity,
     max_bytes: usize,
 ) -> Result<Option<ExactEntitySource>> {
-    let Some((mut source, bytes, span)) =
-        resolve_entity_source_authority(held, entity, EntitySourceScope::WorkspaceHead)?
+    read_entity_source_exact_at(held, entity, max_bytes, EntitySourceScope::WorkspaceHead)
+}
+
+/// Read an exact entity span from the source scope selected with the graph.
+pub fn read_entity_source_exact_at<G: GraphStore>(
+    held: &HeldSourceAuthority<'_, G>,
+    entity: &Entity,
+    max_bytes: usize,
+    scope: EntitySourceScope,
+) -> Result<Option<ExactEntitySource>> {
+    let Some((mut source, bytes, span)) = resolve_entity_source_authority(held, entity, scope)?
     else {
         return Ok(None);
     };
@@ -4758,12 +5435,8 @@ pub fn unanchored_annotation_target<G: GraphStore>(
     store: &G,
     target: &str,
 ) -> Result<Option<UnanchoredTarget>> {
-    use super::external_symbols::{is_external_address, lookup_external_symbol};
-    if is_external_address(target) {
-        return Ok(Some(match lookup_external_symbol(store, target)? {
-            Some(node) => UnanchoredTarget::External(node),
-            None => UnanchoredTarget::UnknownExternalAddress(target.trim().to_string()),
-        }));
+    if let Some(external) = external_scope_target(store, target)? {
+        return Ok(Some(external));
     }
     let Ok(kin_model::AnnotationTarget::Scope(kin_model::WorkScope::Entity(entity_id))) =
         parse_annotation_target(target)
@@ -4777,12 +5450,37 @@ pub fn unanchored_annotation_target<G: GraphStore>(
     {
         return Ok(None);
     }
-    Ok(Some(
-        match lookup_external_symbol(store, &entity_id.to_string())? {
+    Ok(Some(UnanchoredTarget::NotInGraph(entity_id)))
+}
+
+/// Whether a scope names a symbol outside the repository, and what: the
+/// symbol, named by its `external_reference:` address, as an `entity:` scope or
+/// by its bare id, or an `external_reference:` address this graph holds no
+/// symbol under. `None` for every other scope, including an entity id nothing
+/// carries, which the caller parses and answers as it always did.
+///
+/// It detects what [`external_scope_refusal`] refuses, and hands back the
+/// symbol itself, so `kin_annotation_add` can tell it from an entity id nothing
+/// carries and the CLI's scope arguments can name it in their own words.
+///
+/// [`external_scope_refusal`]: super::external_symbols::external_scope_refusal
+pub fn external_scope_target<G: GraphStore>(
+    store: &G,
+    scope: &str,
+) -> Result<Option<UnanchoredTarget>> {
+    use super::external_symbols::{is_external_address, lookup_external_symbol};
+    if is_external_address(scope) {
+        return Ok(Some(match lookup_external_symbol(store, scope)? {
             Some(node) => UnanchoredTarget::External(node),
-            None => UnanchoredTarget::NotInGraph(entity_id),
-        },
-    ))
+            None => UnanchoredTarget::UnknownExternalAddress(scope.trim().to_string()),
+        }));
+    }
+    let Ok(Some(kin_model::WorkScope::Entity(entity_id))) = recognize_work_scope(scope.trim())
+    else {
+        return Ok(None);
+    };
+    // A bare uuid names an entity first, so an id both carry stays the entity.
+    Ok(lookup_external_symbol(store, &entity_id.to_string())?.map(UnanchoredTarget::External))
 }
 
 pub fn parse_single_work_scope(s: &str) -> Result<kin_model::WorkScope> {
@@ -5301,5 +5999,505 @@ mod interface_implementation_file_tests {
         }
         .files()
         .is_empty());
+    }
+}
+
+#[cfg(test)]
+mod census_source_bounds_tests {
+    use super::*;
+
+    #[test]
+    fn raw_source_paths_keep_callback_candidates_in_all_census_providers() {
+        use crate::call_sites::fixture::{ledger, proof_context, spanned_entity};
+        use kin_model::{ChangeStore, EntityStore, ResolutionRecord, ResolutionRecordDelta};
+        let cases: &[(&[u8], bool, bool)] = &[
+            (b"assets/\xff.png", false, false),
+            (b"other/\xff.py", false, false),
+            (b"src/\xff.ts", false, true),
+            (b"src/\xff.js", false, true),
+            (b"src/\xff.ts", true, false),
+        ];
+        for &(raw_path, symlink, unknown) in cases {
+            let directory = tempfile::tempdir().unwrap();
+            let repository_id = kin_model::RepositoryId::new("raw-census-paths").unwrap();
+            let workspace_id = kin_model::WorkspaceId::new();
+            let backend = Arc::new(kin_db::LocalFileBackend::new(directory.path()));
+            let manager = Arc::new(
+                kin_db::RepositoryAuthorityManager::open(
+                    repository_id.clone(),
+                    Arc::clone(&backend),
+                )
+                .unwrap(),
+            );
+            let blobs = kin_blobs::BlobStore::new(directory.path().join("fixture-hashes")).unwrap();
+            let target_body = "export function target() { return 1; }";
+            let caller_body = "export function consumer(callback: () => void) { callback(); }";
+            let content = format!("{target_body}\n{caller_body}\n");
+            let source_hash =
+                Hash256::from_bytes(*blobs.write(content.as_bytes()).unwrap().as_bytes());
+            manager
+                .save_source_blob(source_hash, content.as_bytes())
+                .unwrap();
+            let escaped = b"export const escaped = target;";
+            let escaped_hash = Hash256::from_bytes(*blobs.write(escaped).unwrap().as_bytes());
+            manager.save_source_blob(escaped_hash, escaped).unwrap();
+            let target = spanned_entity(
+                "target",
+                "app.ts",
+                kin_model::LanguageId::TypeScript,
+                0,
+                target_body,
+            );
+            let mut caller = spanned_entity(
+                "consumer",
+                "app.ts",
+                kin_model::LanguageId::TypeScript,
+                target_body.len() + 1,
+                caller_body,
+            );
+            caller.metadata.extra.insert(
+                kin_parser::extract::EMBEDDING_BODY_PREVIEW_KEY.into(),
+                serde_json::json!(caller_body),
+            );
+            let context = proof_context(kin_model::LanguageId::TypeScript, "raw-source-test");
+            let mut target_sites = ledger(&target, target_body, context.id(), vec![]);
+            let mut caller_sites = ledger(&caller, caller_body, context.id(), vec![]);
+            if let ResolutionRecord::CallSites(sites) = &mut target_sites {
+                sites.body_hash = source_hash;
+            }
+            if let ResolutionRecord::CallSites(sites) = &mut caller_sites {
+                sites.body_hash = source_hash;
+                sites.census = 1;
+                sites.sites = vec![kin_model::CallSite {
+                    offset: caller_body.rfind("callback").unwrap() as u32,
+                    length: "callback".len() as u32,
+                    state: kin_model::CallSiteState::Binding { may_call: None },
+                }];
+            }
+            let records = vec![
+                context.clone(),
+                ResolutionRecord::ContextValidation(kin_model::ContextValidation {
+                    language: kin_model::LanguageId::TypeScript,
+                    state: kin_model::ContextValidationState::Validated {
+                        context: context.as_proof_context().unwrap().clone(),
+                    },
+                }),
+                target_sites,
+                caller_sites,
+            ];
+            let policy = kin_model::SharedAdmissionPolicy::empty(0);
+            let mut change = kin_model::SemanticChange {
+                id: kin_model::SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+                parents: vec![],
+                timestamp: kin_model::Timestamp::now(),
+                author: kin_model::AuthorId::new("census-test"),
+                message: "admit raw source path census fixture".into(),
+                entity_deltas: vec![
+                    kin_model::EntityDelta::Added {
+                        new: target.clone(),
+                    },
+                    kin_model::EntityDelta::Added {
+                        new: caller.clone(),
+                    },
+                ],
+                relation_deltas: vec![],
+                tree_deltas: vec![
+                    kin_model::TreeDelta::Added {
+                        artifact_id: kin_model::ArtifactId::new(),
+                        new: kin_model::LocatedEntry::new(
+                            kin_model::RepoPath::from_utf8("app.ts").unwrap(),
+                            kin_model::TreeEntry::blob(source_hash, false),
+                        ),
+                    },
+                    kin_model::TreeDelta::Added {
+                        artifact_id: kin_model::ArtifactId::new(),
+                        new: kin_model::LocatedEntry::new(
+                            kin_model::RepoPath::from_bytes(raw_path).unwrap(),
+                            if symlink {
+                                kin_model::TreeEntry::symlink(escaped_hash)
+                            } else {
+                                kin_model::TreeEntry::blob(escaped_hash, false)
+                            },
+                        ),
+                    },
+                ],
+                admission_policy_delta: Some(kin_model::AdmissionPolicyDelta::initialize(
+                    policy.clone(),
+                )),
+                projected_files: vec![],
+                spec_link: None,
+                evidence: vec![],
+                risk_summary: None,
+                origin: kin_model::ChangeOrigin::Native,
+                external_reference_deltas: vec![],
+                resolution_record_deltas: records
+                    .into_iter()
+                    .map(|new| ResolutionRecordDelta::Added { new })
+                    .collect(),
+            };
+            change.id = kin_model::compute_semantic_change_id(&change).unwrap();
+            let graph = kin_db::InMemoryGraph::new();
+            graph
+                .apply_transaction_delta(&kin_model::TransactionDelta {
+                    entity_deltas: change.entity_deltas.clone(),
+                    tree_deltas: change.tree_deltas.clone(),
+                    resolution_record_deltas: change.resolution_record_deltas.clone(),
+                    ..Default::default()
+                })
+                .unwrap();
+            graph.create_change(&change).unwrap();
+            kin_core::initialize_repository_authority(
+                &manager,
+                repository_id.clone(),
+                workspace_id,
+                kin_model::AdmissionCase::Sensitive,
+                kin_model::RefName::branch(b"main").unwrap(),
+                policy,
+                Some(change.clone()),
+            )
+            .unwrap();
+            let binding = kin_core::LocalRepositoryAuthorityBinding::from_parts(
+                repository_id.clone(),
+                workspace_id,
+                backend,
+            );
+            let active = Arc::new(ActiveRepositoryAuthority::from_shared(
+                Arc::clone(&manager),
+                repository_id,
+                workspace_id,
+            ));
+            let source = RequestRepositoryAuthority::already_open(binding, active);
+            let held = HeldSourceAuthority::new(&graph, Some(&source));
+            let names = kin_model::focal_call_names(&target);
+            let direct =
+                kin_db::focal_escape_evidence(&graph, &target, &names, &|file, max_bytes| {
+                    manager
+                        .load_source_blob_bounded(file.blob, max_bytes as u64)
+                        .ok()
+                        .flatten()
+                });
+            let head = held
+                .escape_evidence_batch(
+                    EntitySourceScope::WorkspaceHead,
+                    &[(&target, names.clone())],
+                )
+                .pop()
+                .unwrap();
+            let historical = held
+                .escape_evidence_batch(EntitySourceScope::At(change.id), &[(&target, names)])
+                .pop()
+                .unwrap();
+            for (provider, escape) in [
+                ("store", direct),
+                ("head", head),
+                ("historical", historical),
+            ] {
+                assert_eq!(
+                    matches!(escape, kin_model::FocalEscape::Unknown { .. }),
+                    unknown,
+                    "{provider}, {raw_path:?}, symlink={symlink}: {escape:?}"
+                );
+                assert_eq!(escape.may_escape(), unknown, "{provider}: {escape:?}");
+                let scan = crate::call_sites::scan_focal(
+                    &graph,
+                    &target,
+                    &crate::call_sites::NoSiteText,
+                    escape,
+                )
+                .unwrap();
+                assert_eq!(
+                    scan.candidates.len(),
+                    usize::from(unknown),
+                    "{provider}, {raw_path:?}: {:?}",
+                    scan.candidates
+                );
+                if unknown {
+                    assert_eq!(scan.candidates[0].caller, caller.id);
+                    assert_eq!(
+                        scan.candidates[0].state,
+                        kin_model::call_site_reading::SiteStateKind::Binding
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn census_cas_reads_preserve_unknown_lengths_and_shared_bounds() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository_id = kin_model::RepositoryId::new("census-bounds").unwrap();
+        let workspace_id = kin_model::WorkspaceId::new();
+        let backend = Arc::new(kin_db::LocalFileBackend::new(directory.path()));
+        let manager = Arc::new(
+            kin_db::RepositoryAuthorityManager::open(repository_id.clone(), Arc::clone(&backend))
+                .unwrap(),
+        );
+        let hashes = kin_blobs::BlobStore::new(directory.path().join("fixture-hashes")).unwrap();
+        let first = b"selected historical source";
+        let second = b"different admitted source";
+        let first_hash = Hash256::from_bytes(*hashes.write(first).unwrap().as_bytes());
+        let second_hash = Hash256::from_bytes(*hashes.write(second).unwrap().as_bytes());
+        manager.save_source_blob(first_hash, first).unwrap();
+        manager.save_source_blob(second_hash, second).unwrap();
+        let active = Arc::new(ActiveRepositoryAuthority::from_shared(
+            manager,
+            repository_id.clone(),
+            workspace_id,
+        ));
+        let binding = kin_core::LocalRepositoryAuthorityBinding::from_parts(
+            repository_id,
+            workspace_id,
+            backend,
+        );
+        let source = RequestRepositoryAuthority::already_open(binding, active)
+            .with_hosted_source_projection_budget(
+                64,
+                first.len() as u64 + second.len() as u64 - 1,
+                8,
+            );
+        let graph = kin_db::InMemoryGraph::new();
+        let held = HeldSourceAuthority::new(&graph, Some(&source));
+        let file = kin_db::call_site_escape::CensusFile {
+            path: kin_model::FilePathId::new("selected.py"),
+            language: kin_model::LanguageId::Python,
+            blob: first_hash,
+            // Committed graphs need no layout length to read a small exact CAS body.
+            len: None,
+        };
+        assert!(census_file_bytes(&held, &file, first.len() - 1).is_none());
+        assert_eq!(
+            census_file_bytes(&held, &file, first.len()).unwrap(),
+            first.to_vec()
+        );
+        assert!(
+            census_file_bytes(&held, &file, first.len() - 1).is_none(),
+            "a cached blob still respects the census allowance"
+        );
+        let other = kin_db::call_site_escape::CensusFile {
+            blob: second_hash,
+            ..file.clone()
+        };
+        assert!(
+            census_file_bytes(&held, &other, 64).is_none(),
+            "local reads share the aggregate request allowance"
+        );
+        let malformed_length = kin_db::call_site_escape::CensusFile {
+            len: Some(65),
+            ..file
+        };
+        assert!(census_file_bytes(&held, &malformed_length, 64).is_none());
+    }
+}
+
+#[cfg(test)]
+mod reference_site_tests {
+    use super::{address_reference_sites, call_callee_text, ReferenceSite};
+    use crate::handlers::external_symbols::{quote_site, SiteText};
+    use kin_model::entity::{Entity, SourceSpan};
+    use kin_model::relation::RelationKind;
+    use kin_model::FilePathId;
+
+    const FILE: &str = "src/caller.py";
+    /// The file the caller sits in: a comment line, then the caller's body
+    /// from its second line.
+    const SOURCE: &str = "# helpers\n\
+                          def caller():\n    \
+                          a = target(1)\n    \
+                          b = mod.target(2) + target(3)\n    \
+                          return a\n";
+
+    fn span(text: &str, nth: usize, line: u32) -> SourceSpan {
+        let start = SOURCE
+            .match_indices(text)
+            .nth(nth)
+            .map(|(at, _)| at)
+            .unwrap_or_else(|| panic!("{text} #{nth} is not in the fixture"));
+        SourceSpan {
+            file: FilePathId::new(FILE),
+            start_byte: start,
+            end_byte: start + text.len(),
+            start_line: line,
+            start_col: 0,
+            end_line: line,
+            end_col: 0,
+        }
+    }
+
+    fn caller() -> Entity {
+        let mut entity = crate::call_sites::fixture::spanned_entity(
+            "caller",
+            FILE,
+            kin_model::LanguageId::Python,
+            0,
+            "",
+        );
+        let start = SOURCE.find("def caller").unwrap();
+        entity.span = Some(SourceSpan {
+            file: FilePathId::new(FILE),
+            start_byte: start,
+            end_byte: SOURCE.len(),
+            start_line: 1,
+            start_col: 0,
+            end_line: 4,
+            end_col: 0,
+        });
+        entity
+    }
+
+    /// The caller's body as its graph record resolves to it.
+    struct Body;
+
+    impl SiteText for Body {
+        fn quote(&self, caller: &Entity, site: &SourceSpan) -> Result<String, &'static str> {
+            let start = caller.span.as_ref().unwrap().start_byte;
+            quote_site(caller, site, &SOURCE[start..], start)
+        }
+    }
+
+    /// A caller no body reader can read.
+    struct NoBody;
+
+    impl SiteText for NoBody {
+        fn quote(&self, _caller: &Entity, _site: &SourceSpan) -> Result<String, &'static str> {
+            Err("caller_source_unavailable")
+        }
+    }
+
+    #[test]
+    fn each_site_is_addressed_inside_its_caller_with_the_text_that_names_the_call() {
+        let caller = caller();
+        let spans = vec![
+            (RelationKind::Calls, span("target(1)", 0, 2)),
+            (RelationKind::Calls, span("mod.target(2)", 0, 3)),
+            // A language server's range for the same call the parser recorded:
+            // one site per line, cut from the span that starts first and
+            // reaches furthest.
+            (RelationKind::Calls, span("target", 1, 3)),
+            (RelationKind::References, span("# helpers", 0, 0)),
+        ];
+        // Keyed by the site's 1-based line in the file, as a row holds them.
+        let sites = address_reference_sites(&caller, &[1, 3, 4], &spans, &Body);
+        assert_eq!(
+            sites.get(&1),
+            Some(&ReferenceSite {
+                line_in_entity: None,
+                callee: Err("site_outside_caller"),
+            }),
+            "a site above the caller keeps no line: {sites:?}"
+        );
+        assert_eq!(
+            sites.get(&3),
+            Some(&ReferenceSite {
+                line_in_entity: Some(1),
+                callee: Ok("target".to_string()),
+            }),
+        );
+        assert_eq!(
+            sites.get(&4),
+            Some(&ReferenceSite {
+                line_in_entity: Some(2),
+                callee: Ok("mod.target".to_string()),
+            }),
+        );
+        assert_eq!(sites.len(), 3, "one site per line: {sites:?}");
+
+        // Only the lines the row holds are addressed, so a row split by its
+        // edges serves exactly the sites it kept.
+        let kept = address_reference_sites(&caller, &[3], &spans, &Body);
+        assert_eq!(kept.keys().copied().collect::<Vec<_>>(), vec![3]);
+
+        // With no body to read, a site keeps its line and says why it has no
+        // text.
+        let unread = address_reference_sites(&caller, &[3], &spans, &NoBody);
+        assert_eq!(
+            unread[&3].to_json(),
+            serde_json::json!({
+                "line_in_entity": 1,
+                "callee": null,
+                "callee_unavailable": "caller_source_unavailable",
+            })
+        );
+    }
+
+    /// A caller counted for its proven sites and held for the rest is served as
+    /// two rows, and each row serves exactly the sites it kept: the proven
+    /// ones in the counted row and the guessed ones in the held row, each
+    /// addressed inside the caller. The gh CLI shape, `NewCreateContext`
+    /// reaching `Repository.RepoOwner`, with its lines moved into one caller.
+    #[test]
+    fn a_split_row_serves_exactly_the_sites_it_kept() {
+        use super::{split_reference_row, ReferenceEdge, ReferenceRow};
+        use kin_index::RelationResolution;
+        let edge = |resolution, guess, lines: &[u32]| ReferenceEdge {
+            kind: RelationKind::Calls,
+            resolution,
+            receiver_name_guess: guess,
+            via_override_of: None,
+            lines: lines.to_vec(),
+            spans: Vec::new(),
+            outside_caller_file: 0,
+            site_contract_gap: None,
+        };
+        let site = |line: u32| ReferenceSite {
+            line_in_entity: Some(line - 600),
+            callee: Ok(format!("call{line}")),
+        };
+        let row = ReferenceRow {
+            entity_id: Some("caller".into()),
+            name: "NewCreateContext".into(),
+            kind: Some("Function".into()),
+            file_path: Some("pkg/cmd/pr/shared/params.go".into()),
+            reference_lines: vec![649, 678, 697, 723],
+            site_addresses: [649, 678, 697, 723]
+                .into_iter()
+                .map(|line| (line, site(line)))
+                .collect(),
+            reference_lines_partial: None,
+            reference_lines_absent: None,
+            signature: None,
+            snippet: None,
+            relation_kinds: vec![RelationKind::Calls],
+            resolution: Some(RelationResolution::TypeResolved),
+            via_override_of: None,
+            receiver_name_guess: false,
+            role: None,
+            edges: vec![
+                edge(RelationResolution::TypeResolved, false, &[678, 723]),
+                edge(RelationResolution::NameOnly, true, &[649, 678, 697, 723]),
+            ],
+        };
+        let (counted, held) = split_reference_row(row, |edge| edge.receiver_name_guess);
+        let served = |row: &ReferenceRow| {
+            super::served_reference_sites(row)
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(served(&counted.unwrap()), vec![site(678), site(723)]);
+        assert_eq!(served(&held.unwrap()), vec![site(649), site(697)]);
+    }
+
+    #[test]
+    fn a_calls_text_drops_its_argument_list_and_nothing_else() {
+        for (text, callee) in [
+            ("target(1)", "target"),
+            ("app.get(\"/items\")", "app.get"),
+            ("a.b(c).d(e)", "a.b(c).d"),
+            ("f(g(x))", "f"),
+            ("foo(a)(b)", "foo(a)"),
+            ("vec::<u8>(len)", "vec::<u8>"),
+            ("items[T](x)", "items[T]"),
+            ("with_context(io) { run() }", "with_context"),
+            ("list.map { it }", "list.map"),
+            ("f(\")\")", "f"),
+            ("client\n  .get(url)", "client\n  .get"),
+            // Nothing to cut, or a cut that would leave nothing: the text as it
+            // stands.
+            ("target", "target"),
+            ("(handler)", "(handler)"),
+            ("f(\"unterminated)", "f(\"unterminated)"),
+        ] {
+            assert_eq!(call_callee_text(text), callee, "{text:?}");
+        }
     }
 }

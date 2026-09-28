@@ -11,8 +11,7 @@
 //!
 //! - [`GraphSiteFacts`] answers the reading's questions from a [`GraphStore`]:
 //!   the ledger under [`ResolutionRecordId::call_sites`], the proof context
-//!   each language's resolver runs under now, as the process that runs the
-//!   resolvers published it with [`publish_current_proof_contexts`], and why
+//!   validated in the selected graph for each language, and why
 //!   no resolver can prove a language's sites, from whether that process
 //!   switched enrichment off ([`publish_enrichment_switched_off`]) and the
 //!   language-server readiness it probed
@@ -29,7 +28,7 @@
 //! caller's own body through the caller-body reader the answer already holds.
 //! Never a file line.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use kin_model::entity::{Entity, SourceSpan};
 use kin_model::graph::GraphStore;
@@ -46,6 +45,11 @@ pub const CALL_SITES_KEY: &str = "call_sites";
 
 /// Site rows one block serves before it says how many it withheld.
 pub const CALL_SITE_ROWS_MAX: usize = 50;
+
+/// Illustrative unsettled candidates in a reference answer. Counts, reasons
+/// and clauses still describe the full scan; samples must leave room for the
+/// proven reference rows and their qualifications at the default budget.
+pub const CALL_SITE_CANDIDATE_SAMPLE_MAX: usize = 5;
 
 /// Files with owed callers a store-wide block names before it says how many
 /// more there are.
@@ -76,9 +80,8 @@ static PUBLISHED_CONTEXTS: std::sync::RwLock<Option<ProofContexts>> = std::sync:
 /// Published by the process that starts the resolvers, when one starts,
 /// because knowing the context needs the resolver running and a query path
 /// must not spawn one. A ledger proven under any other context reads as
-/// stale. Until this is called every context is unknown, and unknown reads no
-/// ledger as stale, which is the reading a process that never looked should
-/// give. A language the map does not name is unknown in the same way.
+/// stale to the scheduler. This compatibility publication is not read authority:
+/// readers use the selected graph's durable context-validation records.
 pub fn publish_current_proof_contexts(contexts: HashMap<LanguageId, ResolutionRecordId>) {
     if let Ok(mut slot) = PUBLISHED_CONTEXTS.write() {
         *slot = Some(contexts);
@@ -94,32 +97,11 @@ pub fn published_current_proof_contexts() -> Option<HashMap<LanguageId, Resoluti
         .and_then(|contexts| contexts.clone())
 }
 
-/// The contexts a reader consults: a test's own, when it declared some, and
-/// the published ones otherwise.
-fn current_contexts() -> Option<ProofContexts> {
-    #[cfg(test)]
-    if let Some(contexts) = test_support::context_override() {
-        return Some(contexts);
-    }
-    published_current_proof_contexts()
-}
-
 /// Lets a test state which proof context each language's resolver runs
 /// under. Thread-local, so it holds for the test that set it whether the
 /// suite runs threaded or one process per test.
 #[cfg(test)]
 pub(crate) mod test_support {
-    use super::{LanguageId, ProofContexts, ResolutionRecordId};
-    use std::cell::RefCell;
-
-    thread_local! {
-        static CONTEXTS: RefCell<Option<ProofContexts>> = const { RefCell::new(None) };
-    }
-
-    pub(crate) fn context_override() -> Option<ProofContexts> {
-        CONTEXTS.with(|contexts| contexts.borrow().clone())
-    }
-
     thread_local! {
         static SWITCHED_OFF: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
     }
@@ -142,27 +124,6 @@ pub(crate) mod test_support {
     #[must_use = "binding the guard is what keeps the declared answer in force"]
     pub(crate) fn scoped_enrichment_switched_off(switched_off: bool) -> SwitchedOffGuard {
         SwitchedOffGuard(SWITCHED_OFF.with(|slot| slot.replace(Some(switched_off))))
-    }
-
-    /// Restores the previous contexts on drop, including on unwind.
-    pub(crate) struct ContextGuard(Option<ProofContexts>);
-
-    impl Drop for ContextGuard {
-        fn drop(&mut self) {
-            CONTEXTS.with(|slot| *slot.borrow_mut() = self.0.take());
-        }
-    }
-
-    /// Declare, for the rest of this scope, that each language's resolver
-    /// runs under exactly the context paired with it.
-    #[must_use = "binding the guard is what keeps the declared contexts in force"]
-    pub(crate) fn scoped_proof_contexts(
-        contexts: &[(LanguageId, ResolutionRecordId)],
-    ) -> ContextGuard {
-        ContextGuard(CONTEXTS.with(|slot| {
-            slot.borrow_mut()
-                .replace(contexts.iter().copied().collect())
-        }))
     }
 }
 
@@ -213,6 +174,7 @@ pub fn no_resolver_for(
             reason: reason.clone(),
         }),
         Some(LanguageServerReadiness::Usable) => None,
+        Some(LanguageServerReadiness::Disabled) => Some(NoResolver::EnrichmentOff),
         None if !ENRICHABLE_LANGUAGES.contains(&language) => Some(NoResolver::NoLanguageServer),
         None => None,
     }
@@ -230,18 +192,15 @@ pub fn no_resolver_for(
 /// qualifies the answer instead.
 pub struct GraphSiteFacts<'s, G: GraphStore + ?Sized> {
     store: &'s G,
-    contexts: Option<ProofContexts>,
     switched_off: Option<bool>,
     readiness: Option<kin_core::reference_coverage::LanguageServerReadinessMap>,
 }
 
 impl<'s, G: GraphStore + ?Sized> GraphSiteFacts<'s, G> {
-    /// Facts about `store`, under the proof contexts and resolver
-    /// availability published now.
+    /// Facts about `store`, under its own recorded context validation.
     pub fn new(store: &'s G) -> Self {
         Self {
             store,
-            contexts: current_contexts(),
             switched_off: enrichment_switched_off(),
             readiness: crate::edge_coverage::published_language_server_readiness(),
         }
@@ -258,7 +217,31 @@ impl<G: GraphStore + ?Sized> CallSiteFacts for GraphSiteFacts<'_, G> {
     }
 
     fn current_context(&self, language: LanguageId) -> Option<ResolutionRecordId> {
-        self.contexts.as_ref()?.get(&language).copied()
+        self.store
+            .lookup_resolution_record(&ResolutionRecordId::context_validation(language))
+            .ok()
+            .flatten()
+            .and_then(|record| {
+                record
+                    .as_context_validation()
+                    .and_then(|validation| validation.current_context())
+            })
+    }
+
+    fn context_unverified_reason(&self, language: LanguageId) -> String {
+        match self
+            .store
+            .lookup_resolution_record(&ResolutionRecordId::context_validation(language))
+        {
+            Ok(Some(kin_model::ResolutionRecord::ContextValidation(
+                kin_model::ContextValidation {
+                    state: kin_model::ContextValidationState::Unverified { reason },
+                    ..
+                },
+            ))) => reason,
+            Err(_) => "the selected graph's proof-context validation could not be read".into(),
+            _ => "the selected graph has no recorded proof-context validation".into(),
+        }
     }
 
     fn no_resolver(&self, language: LanguageId) -> Option<NoResolver> {
@@ -332,7 +315,10 @@ fn site_row<T: SiteText + ?Sized>(
     if let Err(reason) = callee {
         row["callee_unavailable"] = json!(reason);
     }
-    if matches!(reading, CallerSites::Stale(_)) {
+    if matches!(
+        reading,
+        CallerSites::Stale(_) | CallerSites::Unverified { .. }
+    ) {
         row["recorded_state"] = json!(site.state.wire());
     }
     row
@@ -342,7 +328,8 @@ fn site_row<T: SiteText + ?Sized>(
 /// ledger holds, at most [`CALL_SITE_ROWS_MAX`] of them.
 ///
 /// `reading` says what stands between the reader and the focal's ledger:
-/// `current`, `owed_enrichment`, `owed_derivation`, `proof_context_stale` or
+/// `current`, `owed_enrichment`, `owed_derivation`, `proof_context_stale`,
+/// `proof_context_unverified` or
 /// `no_sites` for a focal with no source text. An owed focal has no rows,
 /// because how many sites it holds is not known.
 pub fn focal_block<G: GraphStore + ?Sized, T: SiteText + ?Sized>(
@@ -375,6 +362,10 @@ pub fn focal_block<G: GraphStore + ?Sized, T: SiteText + ?Sized>(
     // its resolver runs under now, and naming it adds nothing.
     if let CallerSites::Stale(ledger) = &reading {
         block["stale_context"] = json!(ledger.context.to_string());
+    }
+    if let CallerSites::Unverified { ledger, reason } = &reading {
+        block["unverified_context"] = json!(ledger.context.to_string());
+        block["validation_reason"] = json!(reason);
     }
     block
 }
@@ -464,7 +455,7 @@ pub fn owed_outside<G: GraphStore + ?Sized>(
     store: &G,
     language: LanguageId,
     inside: &std::collections::HashSet<String>,
-    focal_name: &str,
+    names: &[String],
 ) -> Option<Vec<OwedFile>> {
     let filter = kin_model::graph::EntityFilter {
         languages: Some(vec![language]),
@@ -476,7 +467,7 @@ pub fn owed_outside<G: GraphStore + ?Sized>(
         .filter(|entity| {
             entity.span.as_ref().is_some_and(|span| {
                 !inside.contains(&span.file.0) && span.start_byte < span.end_byte
-            }) && could_name_focal(entity, focal_name)
+            }) && could_name_focal(entity, names)
         })
         .collect();
     Some(owed_files(store, &outside))
@@ -486,34 +477,44 @@ pub fn owed_outside<G: GraphStore + ?Sized>(
 /// with gaps, so its preview no longer proves what the body leaves out.
 const WHOLE_BODY_PREVIEW_CHARS: usize = 8000;
 
-/// The names a call site may spell to reach `focal_name`: each segment of it.
-///
-/// The graph names a member by its owner, `Session.send` or `Store::open`,
-/// and a call spells the member, `self.send(...)`, or only the owner, as a
-/// constructor call `HTTPAdapter()` reaches `HTTPAdapter.__init__`. So a body
-/// is searched for every segment, never for the qualified name, which no call
-/// spells: searching for it ruled out every owed caller of a method.
-pub fn focal_call_names(focal_name: &str) -> impl Iterator<Item = &str> {
-    focal_name
-        .split(['.', ':'])
-        .filter(|segment| !segment.is_empty())
-}
+pub use kin_model::{calling_languages, focal_call_names, FocalEscape};
 
-/// Whether `entity`'s body could spell a name a call to `focal_name` uses,
-/// read off its parse-time preview: false only when that preview is the whole
-/// body and spells none of them.
-pub fn could_name_focal(entity: &Entity, focal_name: &str) -> bool {
-    let Some(preview) = entity
+/// The body preview the parser keeps on `entity`, when it is the whole body:
+/// every identifier the body holds, with its whitespace collapsed. `None` for
+/// an entity with no preview, or one cut short because the body is longer
+/// than [`WHOLE_BODY_PREVIEW_CHARS`].
+pub fn whole_body_preview(entity: &Entity) -> Option<&str> {
+    entity
         .metadata
         .extra
         .get(kin_parser::extract::EMBEDDING_BODY_PREVIEW_KEY)
         .and_then(Value::as_str)
-    else {
+        .filter(|preview| preview.chars().count() <= WHOLE_BODY_PREVIEW_CHARS)
+}
+
+/// Whether `entity`'s body could spell one of `names`, the names a call to
+/// the focal is spelled with (see [`focal_call_names`]), read off its
+/// parse-time preview: false only when that preview is the whole body and
+/// spells none of them. A focal with no call name rules nothing out.
+pub fn could_name_focal(entity: &Entity, names: &[String]) -> bool {
+    let names: Vec<&str> = names
+        .iter()
+        .map(String::as_str)
+        .filter(|name| !name.is_empty())
+        .collect();
+    if names.is_empty() {
         return true;
-    };
-    preview.chars().count() > WHOLE_BODY_PREVIEW_CHARS
-        || focal_call_names(focal_name).any(|name| preview.contains(name))
-        || focal_call_names(focal_name).next().is_none()
+    }
+    let preview = entity
+        .metadata
+        .extra
+        .get(kin_parser::extract::EMBEDDING_BODY_PREVIEW_KEY)
+        .and_then(Value::as_str);
+    match preview {
+        None => true,
+        Some(preview) if preview.chars().count() > WHOLE_BODY_PREVIEW_CHARS => true,
+        Some(preview) => names.iter().any(|name| preview.contains(name)),
+    }
 }
 
 /// The clause a family block carries while callers outside its scope are
@@ -629,7 +630,761 @@ pub fn store_block_over<G: GraphStore + ?Sized>(store: &G, entities: &[Entity]) 
     block
 }
 
+// ── Which unsettled sites anywhere in the store could be calls to one focal ──
+
+/// The scope of a block taken over every caller in the store whose body
+/// could call the focal by name, or through a value when the focal escapes.
+pub const NAMED_SCOPE: &str = "the store's callers that could call the focal";
+
+/// A site reader that holds no text, for a surface with no graph-held body to
+/// read. Every site it is asked about reads as unknown, so every rule that
+/// needs text keeps the site.
+pub struct NoSiteText;
+
+impl SiteText for NoSiteText {
+    fn quote(&self, _caller: &Entity, _site: &SourceSpan) -> Result<String, &'static str> {
+        Err("caller_text_not_held")
+    }
+}
+
+/// `entity`'s exact text from its first byte, read through `text`, or `None`
+/// when the reader cannot give it.
+fn exact_text<T: SiteText + ?Sized>(text: &T, entity: &Entity) -> Option<String> {
+    let span = entity.span.as_ref()?;
+    text.quote(
+        entity,
+        &SourceSpan {
+            file: span.file.clone(),
+            start_byte: span.start_byte,
+            end_byte: span.end_byte,
+            start_line: 0,
+            start_col: 0,
+            end_line: 0,
+            end_col: 0,
+        },
+    )
+    .ok()
+}
+
+/// Whether `text` is one identifier, the shape of a placeable callee token.
+fn is_identifier(text: &str) -> bool {
+    let mut chars = text.chars();
+    chars
+        .next()
+        .is_some_and(|first| first.is_alphabetic() || first == '_' || first == '$')
+        && chars
+            .all(|character| character.is_alphanumeric() || character == '_' || character == '$')
+}
+
+/// A call site anywhere in the store that could be a call to a focal but is
+/// not settled.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct CandidateSite {
+    /// The caller holding the site.
+    pub caller: EntityId,
+    /// The caller's name, as the graph names it.
+    pub caller_name: String,
+    /// The caller's file, as the graph names it. Served as
+    /// `projection.path`: a projection of the caller, never its address,
+    /// which is `caller`.
+    #[serde(rename = "projection", serialize_with = "serialize_projection")]
+    pub caller_file: Option<String>,
+    /// The site's line counted from 0 at the caller's first line, when the
+    /// caller's text was read.
+    pub line_in_entity: Option<u64>,
+    /// The site's callee token, when the site has one and the caller's text
+    /// was read. `None` for a site with no placeable callee.
+    pub callee: Option<String>,
+    /// What a reader serves for the site.
+    pub state: SiteStateKind,
+    /// The site's own reason: the unresolved reason, the server failure or
+    /// the not-in-build reason.
+    pub state_reason: Option<String>,
+    /// Why it can reach the focal (see [`kin_model::site_could_call_at`]).
+    pub reason: &'static str,
+}
+
+/// A candidate's file as the labelled projection every reference row serves:
+/// `{"path": ...}`.
+fn serialize_projection<S: serde::Serializer>(
+    path: &Option<String>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    use serde::ser::SerializeMap;
+    let mut projection = serializer.serialize_map(Some(1))?;
+    projection.serialize_entry("path", path)?;
+    projection.end()
+}
+
+/// A caller a store-wide scan read, with its reading narrowed to its settled
+/// sites and the unsettled ones that could call the focal.
+#[derive(Debug, Clone)]
+pub struct ScannedCaller {
+    pub entity: Entity,
+    pub reading: CallerSites,
+}
+
+/// What a store-wide reading of one focal's possible callers found.
+#[derive(Debug, Clone)]
+pub struct FocalScan {
+    /// The names a call to the focal is spelled with.
+    pub names: Vec<String>,
+    /// Whether the focal may be held as a value.
+    pub escape: FocalEscape,
+    /// Every unsettled site that could be a call to the focal, in caller
+    /// file, caller name and site order.
+    pub candidates: Vec<CandidateSite>,
+    /// Every caller whose body could call the focal by name, or through a
+    /// value when it escapes, or that a proven site calls it from, each read
+    /// through the one site-state reading and narrowed.
+    pub callers: Vec<ScannedCaller>,
+    /// Callers some proven site calls the focal from.
+    pub proven_callers: HashSet<EntityId>,
+    kept: HashSet<(EntityId, u32, u32)>,
+    judged: HashSet<EntityId>,
+}
+
+impl FocalScan {
+    /// Whether `site` of `caller` could be a call to the focal. A caller the
+    /// scan ruled out by its whole body holds no such site.
+    pub fn keeps(&self, caller: EntityId, site: &CallSite) -> bool {
+        self.judged.contains(&caller) && self.kept.contains(&(caller, site.offset, site.length))
+    }
+
+    /// Whether the scan read `caller`.
+    pub fn read(&self, caller: EntityId) -> bool {
+        self.judged.contains(&caller)
+    }
+
+    /// The tally over every caller the scan read, narrowed.
+    pub fn tally(&self) -> CallSiteTally {
+        let mut tally = CallSiteTally::default();
+        for caller in &self.callers {
+            tally.add(&caller.reading);
+        }
+        tally
+    }
+
+    /// Callers read that no current ledger describes.
+    pub fn callers_without_current_ledger(&self) -> usize {
+        self.callers
+            .iter()
+            .filter(|caller| {
+                !matches!(
+                    caller.reading,
+                    CallerSites::Current(_) | CallerSites::NoSites
+                )
+            })
+            .count()
+    }
+}
+
+/// Caller bodies a store-wide reading reads to judge sites while the focal
+/// is contained, past which a site keeps whatever text would have ruled out.
+pub const SCAN_TEXT_READS_MAX: usize = 500;
+
+/// The census answer of a reading that took no census: unknown, which every
+/// rule reads as escaping.
+pub const NO_CENSUS: FocalEscape = FocalEscape::Unknown {
+    reason: "no escape census was taken for this reading",
+};
+
+/// Read every caller in the store that could be a call to `focal`, through
+/// the one site-state reading, and keep each unsettled site the rule of
+/// [`kin_model::site_could_call_at`] keeps under `escape`, the census answer
+/// for the focal (see
+/// [`crate::handlers::common::HeldSourceAuthority::escape_evidence_batch`]).
+///
+/// While the focal may escape, every unsettled site of every caller in the
+/// calling languages is kept and no text is needed to decide; `text` then
+/// only fills the callee and line of the rows a block serves. While it is
+/// contained, a caller whose whole preview spells none of its call names
+/// holds no site that could call it (the census saw no dynamic access in
+/// the domain), and the rest are judged by their exact text, read through
+/// `text`. A reader that holds no text keeps every site text would have
+/// ruled out.
+pub fn scan_focal<G: GraphStore + ?Sized, T: SiteText + ?Sized>(
+    store: &G,
+    focal: &Entity,
+    text: &T,
+    escape: FocalEscape,
+) -> crate::error::Result<FocalScan> {
+    let names = focal_call_names(focal);
+    let escapes = escape.may_escape();
+    let proven_callers: HashSet<EntityId> = store
+        .get_all_relations_for_entity(&focal.id)
+        .map_err(crate::error::McpError::graph)?
+        .iter()
+        .filter(|relation| {
+            relation.kind == kin_model::RelationKind::Calls
+                && relation.dst.as_entity() == Some(focal.id)
+        })
+        .filter_map(|relation| relation.src.as_entity())
+        .collect();
+    let entities = store
+        .query_entities(&kin_model::graph::EntityFilter {
+            languages: Some(calling_languages(focal.language)),
+            ..Default::default()
+        })
+        .map_err(crate::error::McpError::graph)?;
+    let facts = GraphSiteFacts::new(store);
+    let mut scan = FocalScan {
+        names,
+        escape,
+        candidates: Vec::new(),
+        callers: Vec::new(),
+        proven_callers,
+        kept: HashSet::new(),
+        judged: HashSet::new(),
+    };
+    if matches!(scan.escape, FocalEscape::NonCallable { .. }) {
+        // Proven reference edges remain in the answer. This proof only rules
+        // unproven call sites out of the focal's call domain.
+        return Ok(scan);
+    }
+    // Each kept site with its caller's index in `scan.callers` and its key,
+    // so rows sort by site and the served ones can be addressed after.
+    let mut kept_sites: Vec<(CandidateSite, usize, (u32, u32))> = Vec::new();
+    for entity in entities {
+        let Some(span) = entity
+            .span
+            .as_ref()
+            .filter(|span| span.start_byte < span.end_byte)
+        else {
+            continue;
+        };
+        let file = span.file.0.clone();
+        if !escapes
+            && !could_name_focal(&entity, &scan.names)
+            && !scan.proven_callers.contains(&entity.id)
+        {
+            continue;
+        }
+        let reading = read_caller_sites(&facts, &entity);
+        scan.judged.insert(entity.id);
+        let Some(ledger) = reading.ledger() else {
+            scan.callers.push(ScannedCaller { entity, reading });
+            continue;
+        };
+        let recorded_only = !matches!(reading, CallerSites::Current(_));
+        // While the focal is contained, text decides which sites could call
+        // it. While it may escape, every unsettled site stays whatever the
+        // text says, and the text of a caller that could spell a call name is
+        // still read so a site whose callee spells it is told apart from one
+        // kept only because the focal may be held as a value. That is what
+        // puts the named sites first, where a reader looks.
+        let could_name = could_name_focal(&entity, &scan.names);
+        let body = if (!escapes || could_name)
+            && ledger
+                .sites
+                .iter()
+                .any(|site| recorded_only || !SiteStateKind::of(&site.state).is_settled())
+        {
+            exact_text(text, &entity)
+        } else {
+            None
+        };
+        let spelling = body.as_deref().or_else(|| whole_body_preview(&entity));
+        let mut keys = Vec::new();
+        for site in &ledger.sites {
+            // A ledger under another context or none recorded its states
+            // under a proof that may not hold, so a site it recorded as
+            // settled is judged as a site with no answer, by its text.
+            let judged = if recorded_only && SiteStateKind::of(&site.state).is_settled() {
+                CallSite {
+                    state: kin_model::CallSiteState::Unresolved {
+                        reason: kin_model::UnresolvedReason::NoAnswer,
+                    },
+                    ..site.clone()
+                }
+            } else {
+                site.clone()
+            };
+            let at = body
+                .as_deref()
+                .and_then(|body| kin_model::site_text(site, body));
+            let Some(mut why) =
+                kin_model::site_could_call_at(&judged, at, &scan.names, spelling, escapes)
+            else {
+                continue;
+            };
+            // A caller whose body could spell a call name but whose text was
+            // not read (past the read bound) may hold a named site; saying it
+            // is kept only because the focal escapes would be a guess.
+            if escapes
+                && could_name
+                && body.is_none()
+                && why == kin_model::call_site_reading::REACH_FOCAL_ESCAPES
+            {
+                why = kin_model::call_site_reading::REACH_TEXT_UNKNOWN;
+            }
+            keys.push(site.key());
+            kept_sites.push((
+                CandidateSite {
+                    caller: entity.id,
+                    caller_name: entity.name.clone(),
+                    caller_file: Some(file.clone()),
+                    line_in_entity: body.as_deref().and_then(|body| line_in(body, site)),
+                    callee: at.filter(|text| is_identifier(text)).map(str::to_string),
+                    state: reading.site_kind(site),
+                    state_reason: site_state_reason(&site.state),
+                    reason: why,
+                },
+                scan.callers.len(),
+                site.key(),
+            ));
+        }
+        let kept: HashSet<(u32, u32)> = keys.iter().copied().collect();
+        for (offset, length) in keys {
+            scan.kept.insert((entity.id, offset, length));
+        }
+        let narrowed = reading.retain_sites(|site| {
+            (!recorded_only && SiteStateKind::of(&site.state).is_settled())
+                || kept.contains(&site.key())
+        });
+        scan.callers.push(ScannedCaller {
+            entity,
+            reading: narrowed,
+        });
+    }
+    kept_sites.sort_by(|(left, _, left_key), (right, _, right_key)| {
+        (
+            reach_rank(left.reason),
+            &left.caller_file,
+            &left.caller_name,
+            left.caller,
+            left_key,
+        )
+            .cmp(&(
+                reach_rank(right.reason),
+                &right.caller_file,
+                &right.caller_name,
+                right.caller,
+                right_key,
+            ))
+    });
+    // The rows a block serves are addressed inside their callers even when
+    // no text was needed to keep them.
+    let mut bodies: HashMap<usize, Option<String>> = HashMap::new();
+    for (row, caller, (offset, length)) in kept_sites.iter_mut().take(CALL_SITE_ROWS_MAX) {
+        if row.line_in_entity.is_some() {
+            continue;
+        }
+        let body = bodies
+            .entry(*caller)
+            .or_insert_with(|| exact_text(text, &scan.callers[*caller].entity));
+        if let Some(body) = body.as_deref() {
+            let site = CallSite {
+                offset: *offset,
+                length: *length,
+                state: kin_model::CallSiteState::ProvenOutside,
+            };
+            row.line_in_entity = line_in(body, &site);
+            row.callee = kin_model::site_text(&site, body)
+                .filter(|text| is_identifier(text))
+                .map(str::to_string);
+        }
+    }
+    scan.candidates = kept_sites.into_iter().map(|(row, _, _)| row).collect();
+    Ok(scan)
+}
+
+/// How strongly a kept site's reason ties it to the focal, strongest first:
+/// its callee spells a call name, then its caller's body does, then it could
+/// reach the focal only through access the text cannot name, and last it is
+/// kept only because the focal may be held as a value. Rows sort by this
+/// before file, so the sites a reader should check come before the ones every
+/// unsettled site in the store would be.
+pub fn reach_rank(reason: &str) -> u8 {
+    match reason {
+        kin_model::call_site_reading::REACH_CALLEE_SPELLS => 0,
+        kin_model::call_site_reading::REACH_BODY_SPELLS => 1,
+        kin_model::call_site_reading::REACH_FOCAL_ESCAPES => 3,
+        _ => 2,
+    }
+}
+
+/// The line of `site` inside a caller whose exact text is `body`, counted
+/// from 0 at its first line.
+fn line_in(body: &str, site: &CallSite) -> Option<u64> {
+    body.get(..site.offset as usize)
+        .map(|before| before.matches('\n').count() as u64)
+}
+
+/// Every unsettled site in the store that could be a call to `focal`, read
+/// from ledgers alone, with no text reader and no census: the focal reads as
+/// escaping, so every unsettled site of the calling languages is kept.
+/// [`unsettled_sites_naming_with`] is the same reading with the graph-held
+/// text and the census an answer holds.
+pub fn unsettled_sites_naming<G: GraphStore + ?Sized>(
+    store: &G,
+    focal: &Entity,
+) -> crate::error::Result<Vec<CandidateSite>> {
+    unsettled_sites_naming_with(store, focal, &NoSiteText, NO_CENSUS)
+}
+
+/// [`unsettled_sites_naming`] with `text`, the reader of callers' graph-held
+/// text the answer already holds, under `escape`, its census for the focal.
+pub fn unsettled_sites_naming_with<G: GraphStore + ?Sized, T: SiteText + ?Sized>(
+    store: &G,
+    focal: &Entity,
+    text: &T,
+    escape: FocalEscape,
+) -> crate::error::Result<Vec<CandidateSite>> {
+    Ok(scan_focal(store, focal, text, escape)?.candidates)
+}
+
+/// Why the store's ledgers alone do not settle who calls a focal.
+pub const UNSETTLED_CANDIDATE_SITES: &str = "unsettled_candidate_sites";
+/// A ledger in scope was not proven under the selected graph's validated
+/// context for its language.
+pub const LEDGER_NOT_UNDER_CURRENT_CONTEXT: &str = "ledger_not_under_current_context";
+/// A proven site in scope names an entity the graph no longer holds.
+pub const PROVEN_TARGET_NOT_LIVE: &str = "proven_target_not_live";
+/// A file in scope holds call expressions no ledger attributes to a caller.
+pub const UNATTRIBUTED_EXPRESSIONS: &str = "unattributed_expressions";
+/// The selected graph holds no validated proof context for the focal's
+/// language, or for a caller's.
+pub const NO_VALIDATED_CONTEXT: &str = "no_validated_context";
+/// A caller whose body could call the focal has no ledger at all: its
+/// derivation or enrichment is owed, or no resolver can prove its sites.
+pub const CALLERS_WITHOUT_LEDGER: &str = "callers_without_ledger";
+
+/// Whether the store's call-site ledgers alone settle who calls a focal.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct CallsEvidence {
+    /// True only when every condition below holds.
+    pub settled: bool,
+    /// Store-wide unsettled sites that could be calls to the focal.
+    pub candidates: Vec<CandidateSite>,
+    /// Why it is not settled, each once, in this order:
+    /// [`UNSETTLED_CANDIDATE_SITES`], [`CALLERS_WITHOUT_LEDGER`],
+    /// [`NO_VALIDATED_CONTEXT`], [`LEDGER_NOT_UNDER_CURRENT_CONTEXT`],
+    /// [`PROVEN_TARGET_NOT_LIVE`], [`UNATTRIBUTED_EXPRESSIONS`].
+    pub unsettled_because: Vec<&'static str>,
+    /// Callers whose ledgers were read.
+    pub callers_read: usize,
+    /// Whether the focal may be held as a value, which widens which sites
+    /// could call it.
+    pub escape: FocalEscape,
+}
+
+/// Whether the store's call-site ledgers alone settle who calls `focal`,
+/// with no text reader (see [`unsettled_sites_naming`]).
+pub fn calls_evidence_for<G: GraphStore + ?Sized>(
+    store: &G,
+    focal: &Entity,
+) -> crate::error::Result<CallsEvidence> {
+    calls_evidence_for_with(store, focal, &NoSiteText, NO_CENSUS)
+}
+
+/// [`calls_evidence_for`] with `text`, the reader of callers' graph-held
+/// text the answer already holds, under `escape`, its census for the focal.
+///
+/// Candidate rows are narrowed by which sites could call the focal. The
+/// replacement proof separately audits every entity and file in the potential
+/// calling-language domain, including empty ledgers and files with no candidate
+/// rows. Never the import family, and never an empty tally read as settled. It
+/// is settled only when:
+///
+/// 1. no unsettled site anywhere could be a call to the focal;
+/// 2. no caller that could call it lacks a ledger;
+/// 3. every ledger in scope was proven under the selected graph's validated
+///    context for its language, the focal's own language included;
+/// 4. every proven target in those ledgers names an entity the graph holds;
+/// 5. every graph-owned file in the potential calling-language domain
+///    attributes each parsed call expression to a caller: its ledgers'
+///    censuses add up to the parse-side count stamped on the file. An
+///    unavailable inventory or a file with no parse census is not complete.
+pub fn calls_evidence_for_with<G: GraphStore + ?Sized, T: SiteText + ?Sized>(
+    store: &G,
+    focal: &Entity,
+    text: &T,
+    escape: FocalEscape,
+) -> crate::error::Result<CallsEvidence> {
+    let scan = scan_focal(store, focal, text, escape)?;
+    Ok(calls_evidence_from(store, focal, &scan))
+}
+
+/// [`calls_evidence_for_with`] over a scan the answer already took.
+pub fn calls_evidence_from<G: GraphStore + ?Sized>(
+    store: &G,
+    focal: &Entity,
+    scan: &FocalScan,
+) -> CallsEvidence {
+    let facts = GraphSiteFacts::new(store);
+    let mut because: Vec<&'static str> = Vec::new();
+    let mut add = |reason: &'static str| {
+        if !because.contains(&reason) {
+            because.push(reason);
+        }
+    };
+    if !scan.candidates.is_empty() {
+        add(UNSETTLED_CANDIDATE_SITES);
+    }
+    // Candidate rows are a result, not a completeness census. An empty stale
+    // ledger or an unattributed expression produces no row but still prevents
+    // replacing the store's binding proof. Audit the full calling-language
+    // domain, including entities the name filter correctly omitted from rows.
+    let in_scope: Vec<ScannedCaller> = match store.query_entities(&kin_model::graph::EntityFilter {
+        languages: Some(calling_languages(focal.language)),
+        ..Default::default()
+    }) {
+        Ok(entities) => entities
+            .into_iter()
+            .map(|entity| {
+                let reading = read_caller_sites(&facts, &entity);
+                ScannedCaller { entity, reading }
+            })
+            .collect(),
+        Err(_) => {
+            add(UNATTRIBUTED_EXPRESSIONS);
+            Vec::new()
+        }
+    };
+    if in_scope.iter().any(|caller| {
+        matches!(
+            caller.reading,
+            CallerSites::OwedDerivation
+                | CallerSites::OwedEnrichment
+                | CallerSites::NoResolver { .. }
+        )
+    }) {
+        add(CALLERS_WITHOUT_LEDGER);
+    }
+    if facts.current_context(focal.language).is_none() {
+        add(NO_VALIDATED_CONTEXT);
+    }
+    let mut files: BTreeMap<String, ()> = BTreeMap::new();
+    // The resolved tree also holds admitted files with no entity rows. Their
+    // missing parse-side census is a gap, not evidence of zero expressions.
+    match store.resolved_tree_snapshot() {
+        Ok(Some(tree)) => {
+            let languages = calling_languages(focal.language);
+            for artifact in tree.artifacts() {
+                if !matches!(artifact.entry, kin_model::TreeEntry::Blob { .. }) {
+                    continue;
+                }
+                // Extensions are ASCII even when the filename is not UTF-8.
+                // Classify that suffix first: an unrelated raw-byte asset is
+                // outside this proof, but an unreadable source path is a gap.
+                let bytes = artifact.path.as_bytes();
+                let language = bytes
+                    .iter()
+                    .rposition(|byte| *byte == b'.')
+                    .and_then(|at| std::str::from_utf8(&bytes[at..]).ok())
+                    .and_then(kin_model::language_of_path);
+                if !language.is_some_and(|language| languages.contains(&language)) {
+                    continue;
+                }
+                let Some(path) = artifact.path.as_utf8() else {
+                    add(UNATTRIBUTED_EXPRESSIONS);
+                    continue;
+                };
+                files.insert(path.to_owned(), ());
+            }
+        }
+        _ => add(UNATTRIBUTED_EXPRESSIONS),
+    }
+    let mut callers_read = 0usize;
+    for caller in &in_scope {
+        // NoSites is valid only with its file's zero-call census. Keep that
+        // file in the audit even though it has no ledger and no candidate.
+        if let Some(file) = caller
+            .entity
+            .file_origin
+            .as_ref()
+            .or_else(|| caller.entity.span.as_ref().map(|span| &span.file))
+        {
+            files.insert(file.0.clone(), ());
+        }
+        let Some(ledger) = caller.reading.ledger() else {
+            continue;
+        };
+        callers_read += 1;
+        match &caller.reading {
+            CallerSites::Current(_) => {}
+            CallerSites::Unverified { .. } => add(NO_VALIDATED_CONTEXT),
+            _ => add(LEDGER_NOT_UNDER_CURRENT_CONTEXT),
+        }
+        // The full reading retains every proven target, including sites
+        // unrelated to the focal whose liveness still supports this proof.
+        if ledger.sites.iter().any(|site| match site.state {
+            kin_model::CallSiteState::ProvenTarget { target }
+            | kin_model::CallSiteState::ProvenDeclaration {
+                declaration: target,
+                ..
+            } => !matches!(store.get_entity(&target), Ok(Some(_))),
+            _ => false,
+        }) {
+            add(PROVEN_TARGET_NOT_LIVE);
+        }
+    }
+    for file in files.keys() {
+        if !file_attributes_every_call(store, &facts, file) {
+            add(UNATTRIBUTED_EXPRESSIONS);
+            break;
+        }
+    }
+    CallsEvidence {
+        settled: because.is_empty(),
+        candidates: scan.candidates.clone(),
+        unsettled_because: because,
+        callers_read,
+        escape: scan.escape.clone(),
+    }
+}
+
+/// Whether every call expression the parser read in `file` belongs to a
+/// ledger: the censuses of its entities' current ledgers add up to at least
+/// the parse-side count stamped on the file. A file with no parse-side count,
+/// or with an entity whose ledger is not current, cannot show it.
+fn file_attributes_every_call<G: GraphStore + ?Sized>(
+    store: &G,
+    facts: &GraphSiteFacts<'_, G>,
+    file: &str,
+) -> bool {
+    let Ok(entities) = store.query_entities(&kin_model::graph::EntityFilter {
+        file_path: Some(kin_model::FilePathId::new(file)),
+        ..Default::default()
+    }) else {
+        return false;
+    };
+    let Some(parsed) = entities.iter().find_map(|entity| {
+        entity
+            .metadata
+            .extra
+            .get(kin_model::call_site_reading::FILE_PARSED_CALL_SITES_KEY)
+            .and_then(Value::as_u64)
+    }) else {
+        return false;
+    };
+    let mut census = 0u64;
+    for entity in &entities {
+        match read_caller_sites(facts, entity) {
+            CallerSites::Current(ledger) => census += u64::from(ledger.census),
+            CallerSites::NoSites => {}
+            _ => return false,
+        }
+    }
+    census >= parsed
+}
+
+/// The block `find_references` serves for a focal: the tally over every
+/// caller in the store that could call it, narrowed to the sites that could,
+/// and one row per unsettled site that could be a call to it, at most
+/// [`CALL_SITE_CANDIDATE_SAMPLE_MAX`] of them. The block is unsettled exactly while its
+/// clauses name something, and any candidate row is such a site.
+pub fn named_block(scan: &FocalScan) -> Value {
+    let tally = scan.tally();
+    let mut block = block_json(&tally, NAMED_SCOPE);
+    block["call_names"] = json!(scan.names);
+    block["focal_escape"] = json!(scan.escape);
+    block["candidate_count"] = json!(scan.candidates.len());
+    let mut by_reason: BTreeMap<&str, usize> = BTreeMap::new();
+    for candidate in &scan.candidates {
+        *by_reason.entry(candidate.reason).or_default() += 1;
+    }
+    block["candidates_by_reason"] = json!(by_reason);
+    block["candidates"] = json!(scan
+        .candidates
+        .iter()
+        .take(CALL_SITE_CANDIDATE_SAMPLE_MAX)
+        .collect::<Vec<_>>());
+    let withheld = scan
+        .candidates
+        .len()
+        .saturating_sub(CALL_SITE_CANDIDATE_SAMPLE_MAX);
+    if withheld > 0 {
+        block["candidates_withheld"] = json!(withheld);
+    }
+    block
+}
+
 // ── Text ──────────────────────────────────────────────────────────────────
+
+/// Candidate rows a terminal answer lists before saying how many more.
+pub const CANDIDATE_LINES_MAX: usize = 20;
+
+/// The unsettled call sites a store-wide reading kept, in plain words for a
+/// person at a terminal: the ones whose callee or caller body spells the
+/// focal's name, each at its caller and its line in that caller, then every
+/// other one counted by why it is kept. Empty when the reading kept none.
+pub fn candidate_lines(scan: &FocalScan, focal_name: &str) -> Vec<String> {
+    use kin_model::call_site_reading::{
+        REACH_BODY_SPELLS, REACH_CALLEE_SPELLS, REACH_FOCAL_ESCAPES,
+    };
+    if scan.candidates.is_empty() {
+        return Vec::new();
+    }
+    let names_it = |reason: &str| reason == REACH_CALLEE_SPELLS || reason == REACH_BODY_SPELLS;
+    let named: Vec<&CandidateSite> = scan
+        .candidates
+        .iter()
+        .filter(|candidate| names_it(candidate.reason))
+        .collect();
+    let mut lines = vec![format!(
+        "Unproven call sites that could call {focal_name}: {}.",
+        scan.candidates.len()
+    )];
+    if !named.is_empty() {
+        lines.push(format!(
+            "  {} name {focal_name}, so check them first:",
+            named.len()
+        ));
+        for candidate in named.iter().take(CANDIDATE_LINES_MAX) {
+            let at = candidate
+                .line_in_entity
+                .map(|line| format!(", line {line} in it"))
+                .unwrap_or_default();
+            let callee = candidate
+                .callee
+                .as_deref()
+                .map(|callee| format!(" calls {callee}"))
+                .unwrap_or_default();
+            let why = candidate
+                .state_reason
+                .as_deref()
+                .map(|reason| format!(" ({})", reason.replace('_', " ")))
+                .unwrap_or_default();
+            lines.push(format!(
+                "    {}{at}{callee}, {}{why}",
+                candidate.caller_name,
+                candidate.state.wire().replace('_', " ")
+            ));
+        }
+        if named.len() > CANDIDATE_LINES_MAX {
+            lines.push(format!(
+                "    and {} more that name it.",
+                named.len() - CANDIDATE_LINES_MAX
+            ));
+        }
+    }
+    let mut rest: BTreeMap<&str, usize> = BTreeMap::new();
+    for candidate in scan.candidates.iter().filter(|c| !names_it(c.reason)) {
+        *rest.entry(candidate.reason).or_default() += 1;
+    }
+    for (reason, count) in rest {
+        let line = if reason == REACH_FOCAL_ESCAPES {
+            let census = match &scan.escape {
+                FocalEscape::Unknown { reason } => {
+                    format!("this graph cannot rule that out ({reason})")
+                }
+                FocalEscape::Escapes { reason } => format!("it may be ({reason})"),
+                FocalEscape::Contained { .. } | FocalEscape::NonCallable { .. } => {
+                    "it is not".to_string()
+                }
+            };
+            format!(
+                "  {count} more could reach it only if {focal_name} is held as a value, and {census}."
+            )
+        } else {
+            format!("  {count} more are kept because of {reason}.")
+        };
+        lines.push(line);
+    }
+    lines
+}
 
 /// A share as a whole percentage, the way a terminal line states it.
 fn percent(share: Option<f64>) -> String {
@@ -874,7 +1629,22 @@ pub(crate) mod fixture {
         entities: &[&Entity],
         records: Vec<ResolutionRecord>,
     ) {
+        // This fixture admits a resolver's completed evidence, including its
+        // validation. Tests for legacy/missing validation remove that record.
+        let validations: Vec<_> = records
+            .iter()
+            .filter_map(|record| record.as_proof_context())
+            .map(|context| {
+                ResolutionRecord::ContextValidation(kin_model::ContextValidation {
+                    language: context.language,
+                    state: kin_model::ContextValidationState::Validated {
+                        context: context.clone(),
+                    },
+                })
+            })
+            .collect();
         let mut records = records;
+        records.extend(validations);
         records.sort_by_key(|record| !matches!(record, ResolutionRecord::ProofContext(_)));
         let records: Vec<ResolutionRecord> = records
             .into_iter()
@@ -921,6 +1691,313 @@ mod tests {
         CallSiteState, ExternalReference, ExternalReferenceDelta, TransactionDelta,
         UnresolvedReason,
     };
+
+    fn census_entity(
+        name: &str,
+        file: &str,
+        language: LanguageId,
+        body: &str,
+        parsed: u64,
+    ) -> Entity {
+        let mut entity = spanned_entity(name, file, language, 0, body);
+        entity.metadata.extra.insert(
+            kin_model::call_site_reading::FILE_PARSED_CALL_SITES_KEY.into(),
+            json!(parsed),
+        );
+        entity
+    }
+
+    #[test]
+    fn calls_evidence_audits_empty_stale_and_unverified_domain_ledgers() {
+        use kin_model::{ResolutionRecord, ResolutionRecordDelta};
+        for unverified in [false, true] {
+            let store = InMemoryGraph::new();
+            let focal = census_entity(
+                "target",
+                "target.ts",
+                LanguageId::TypeScript,
+                "function target() {}",
+                0,
+            );
+            // JavaScript can call TypeScript. Its absent validation must not be
+            // hidden by the focal language's independently valid context.
+            let caller_language = if unverified {
+                LanguageId::JavaScript
+            } else {
+                LanguageId::TypeScript
+            };
+            let caller = census_entity(
+                "unrelated",
+                "caller.js",
+                caller_language,
+                "function unrelated() {}",
+                0,
+            );
+            let focal_context = proof_context(LanguageId::TypeScript, "current");
+            let caller_context = proof_context(caller_language, "current");
+            let caller_record = ledger(&caller, "", caller_context.id(), vec![]);
+            admit(
+                &store,
+                &[&focal, &caller],
+                vec![
+                    focal_context.clone(),
+                    ledger(&focal, "", focal_context.id(), vec![]),
+                ],
+            );
+            admit(
+                &store,
+                &[],
+                vec![caller_context.clone(), caller_record.clone()],
+            );
+            assert!(calls_evidence_for(&store, &focal).unwrap().settled);
+            let changes = if unverified {
+                let old = store
+                    .lookup_resolution_record(&ResolutionRecordId::context_validation(
+                        caller_language,
+                    ))
+                    .unwrap()
+                    .unwrap();
+                vec![ResolutionRecordDelta::Removed { old }]
+            } else {
+                let old_context = proof_context(caller_language, "old");
+                let mut old_ledger = caller_record.clone();
+                let ResolutionRecord::CallSites(record) = &mut old_ledger else {
+                    unreachable!()
+                };
+                record.context = old_context.id();
+                vec![
+                    ResolutionRecordDelta::Added { new: old_context },
+                    ResolutionRecordDelta::Modified {
+                        old: caller_record,
+                        new: old_ledger,
+                    },
+                ]
+            };
+            store
+                .apply_transaction_delta(&TransactionDelta {
+                    resolution_record_deltas: changes,
+                    ..Default::default()
+                })
+                .unwrap();
+            let evidence = calls_evidence_for(&store, &focal).unwrap();
+            assert!(evidence.candidates.is_empty());
+            assert!(!evidence.settled);
+            assert!(
+                evidence.unsettled_because.contains(&if unverified {
+                    NO_VALIDATED_CONTEXT
+                } else {
+                    LEDGER_NOT_UNDER_CURRENT_CONTEXT
+                }),
+                "{evidence:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn calls_evidence_audits_unattributed_files_omitted_from_candidate_rows() {
+        for proven_outside in [false, true] {
+            let store = InMemoryGraph::new();
+            let focal = census_entity(
+                "target",
+                "target.ts",
+                LanguageId::TypeScript,
+                "function target() {}",
+                0,
+            );
+            let body = "function unrelated() { external(); hidden(); }";
+            let mut caller =
+                census_entity("unrelated", "caller.ts", LanguageId::TypeScript, body, 2);
+            caller.metadata.extra.insert(
+                kin_parser::extract::EMBEDDING_BODY_PREVIEW_KEY.into(),
+                json!(body),
+            );
+            let context = proof_context(LanguageId::TypeScript, "current");
+            admit(
+                &store,
+                &[&focal, &caller],
+                vec![
+                    context.clone(),
+                    ledger(&focal, "", context.id(), vec![]),
+                    ledger(
+                        &caller,
+                        body,
+                        context.id(),
+                        if proven_outside {
+                            vec![("external", CallSiteState::ProvenOutside)]
+                        } else {
+                            vec![]
+                        },
+                    ),
+                ],
+            );
+            let scan = scan_focal(
+                &store,
+                &focal,
+                &NoSiteText,
+                FocalEscape::Contained {
+                    entities_checked: 2,
+                },
+            )
+            .unwrap();
+            assert!(scan.candidates.is_empty());
+            assert!(
+                !scan
+                    .callers
+                    .iter()
+                    .any(|scanned| scanned.entity.id == caller.id),
+                "the unrelated preview is omitted from focal candidate rows"
+            );
+            let evidence = calls_evidence_from(&store, &focal, &scan);
+            assert!(!evidence.settled);
+            assert!(
+                evidence
+                    .unsettled_because
+                    .contains(&UNATTRIBUTED_EXPRESSIONS),
+                "{evidence:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn calls_evidence_includes_calling_domain_files_without_entities() {
+        let store = InMemoryGraph::new();
+        let focal = census_entity(
+            "target",
+            "target.ts",
+            LanguageId::TypeScript,
+            "function target() {}",
+            0,
+        );
+        let context = proof_context(LanguageId::TypeScript, "current");
+        admit(
+            &store,
+            &[&focal],
+            vec![context.clone(), ledger(&focal, "", context.id(), vec![])],
+        );
+        assert!(calls_evidence_for(&store, &focal).unwrap().settled);
+        store
+            .apply_transaction_delta(&TransactionDelta {
+                tree_deltas: vec![kin_model::TreeDelta::Added {
+                    artifact_id: kin_model::ArtifactId::new(),
+                    new: kin_model::LocatedEntry::new(
+                        kin_model::RepoPath::from_utf8("unattributed.js").unwrap(),
+                        kin_model::TreeEntry::blob(
+                            kin_model::Hash256::from_bytes([0x61; 32]),
+                            false,
+                        ),
+                    ),
+                }],
+                ..Default::default()
+            })
+            .unwrap();
+        let evidence = calls_evidence_for(&store, &focal).unwrap();
+        assert!(evidence.candidates.is_empty());
+        assert!(!evidence.settled);
+        assert!(
+            evidence
+                .unsettled_because
+                .contains(&UNATTRIBUTED_EXPRESSIONS),
+            "{evidence:?}"
+        );
+    }
+
+    #[test]
+    fn calls_evidence_raw_byte_paths_only_bound_calling_domain_blobs() {
+        let cases: &[(&[u8], bool, bool)] = &[
+            (b"assets/\xff.png", false, true),
+            (b"other/\xff.py", false, true),
+            (b"src/\xff.ts", false, false),
+            (b"src/\xff.js", false, false),
+            (b"src/\xff.ts", true, true),
+            (b"src/linked.ts", true, true),
+        ];
+        for &(path, symlink, settled) in cases {
+            let store = InMemoryGraph::new();
+            let focal = census_entity(
+                "target",
+                "target.ts",
+                LanguageId::TypeScript,
+                "function target() {}",
+                0,
+            );
+            let context = proof_context(LanguageId::TypeScript, "current");
+            admit(
+                &store,
+                &[&focal],
+                vec![context.clone(), ledger(&focal, "", context.id(), vec![])],
+            );
+            let hash = kin_model::Hash256::from_bytes([0x62; 32]);
+            store
+                .apply_transaction_delta(&TransactionDelta {
+                    tree_deltas: vec![kin_model::TreeDelta::Added {
+                        artifact_id: kin_model::ArtifactId::new(),
+                        new: kin_model::LocatedEntry::new(
+                            kin_model::RepoPath::from_bytes(path).unwrap(),
+                            if symlink {
+                                kin_model::TreeEntry::symlink(hash)
+                            } else {
+                                kin_model::TreeEntry::blob(hash, false)
+                            },
+                        ),
+                    }],
+                    ..Default::default()
+                })
+                .unwrap();
+            let evidence = calls_evidence_for(&store, &focal).unwrap();
+            assert_eq!(
+                evidence.settled, settled,
+                "{path:?}, symlink={symlink}: {evidence:?}"
+            );
+            assert!(evidence.candidates.is_empty());
+            assert_eq!(
+                evidence
+                    .unsettled_because
+                    .contains(&UNATTRIBUTED_EXPRESSIONS),
+                !settled
+            );
+        }
+    }
+
+    #[test]
+    fn calls_evidence_keeps_true_no_sites_and_current_empty_ledgers_settled() {
+        for empty_ledger in [false, true] {
+            let store = InMemoryGraph::new();
+            let focal = census_entity(
+                "target",
+                "target.ts",
+                LanguageId::TypeScript,
+                "function target() {}",
+                0,
+            );
+            let caller = census_entity(
+                "unrelated",
+                "caller.ts",
+                LanguageId::TypeScript,
+                "function unrelated() {}",
+                0,
+            );
+            let context = proof_context(LanguageId::TypeScript, "current");
+            let mut records = vec![context.clone()];
+            if empty_ledger {
+                records.extend([
+                    ledger(&focal, "", context.id(), vec![]),
+                    ledger(&caller, "", context.id(), vec![]),
+                ]);
+            }
+            admit(&store, &[&focal, &caller], records);
+            let facts = GraphSiteFacts::new(&store);
+            if !empty_ledger {
+                assert!(matches!(
+                    read_caller_sites(&facts, &caller),
+                    CallerSites::NoSites
+                ));
+            }
+            let evidence = calls_evidence_for(&store, &focal).unwrap();
+            assert!(evidence.settled, "{evidence:?}");
+            assert!(evidence.candidates.is_empty());
+            assert_eq!(evidence.callers_read, if empty_ledger { 2 } else { 0 });
+        }
+    }
 
     /// Why no resolver can prove a language's sites, from what was published:
     /// a switched-off daemon first, then the probe's word per language, and
@@ -974,9 +2051,9 @@ mod tests {
     const BODY: &str = "def run(data):\n    helper(data)\n    json.dumps(data)\n    handler(data)\n    mystery(data)\n";
 
     /// The caller's own body, as the answer's body reader would hand it over.
-    struct Body(&'static str);
+    struct Body<'a>(&'a str);
 
-    impl SiteText for Body {
+    impl SiteText for Body<'_> {
         fn quote(&self, caller: &Entity, site: &SourceSpan) -> Result<String, &'static str> {
             let span = caller.span.as_ref().ok_or("caller_has_no_span")?;
             quote_site(caller, site, self.0, span.start_byte)
@@ -1055,6 +2132,27 @@ mod tests {
     }
 
     #[test]
+    fn non_callable_binding_removes_uncertain_calls_without_weakening_the_strict_audit() {
+        let fixture = fixture(false);
+        let before = scan_focal(&fixture.store, &fixture.helper, &Body(BODY), NO_CENSUS).unwrap();
+        assert!(!before.callers.is_empty());
+        let proof = FocalEscape::NonCallable {
+            reason: "the selected parser census proves a scalar binding",
+            entities_checked: 2,
+        };
+        let scan = scan_focal(&fixture.store, &fixture.helper, &Body(BODY), proof).unwrap();
+        assert!(scan.candidates.is_empty());
+        assert!(scan.callers.is_empty());
+        assert_eq!(scan.proven_callers, before.proven_callers);
+        let block = named_block(&scan);
+        assert_eq!(block["settled"], true);
+        assert_eq!(block["focal_escape"]["escape"], "non_callable");
+        let strict = calls_evidence_from(&fixture.store, &fixture.helper, &scan);
+        assert!(!strict.settled);
+        assert!(strict.unsettled_because.contains(&CALLERS_WITHOUT_LEDGER));
+    }
+
+    #[test]
     fn a_focal_with_a_ledger_serves_one_row_per_site_addressed_inside_the_focal() {
         let fixture = fixture(true);
         let block = focal_block(&fixture.store, &fixture.run, &Body(BODY));
@@ -1113,6 +2211,179 @@ mod tests {
     }
 
     #[test]
+    fn a_site_whose_callee_spells_the_focal_is_listed_before_escape_only_sites() {
+        use kin_model::call_site_reading::{REACH_CALLEE_SPELLS, REACH_FOCAL_ESCAPES};
+        let fixture = fixture(true);
+        let focal = spanned_entity(
+            "mystery",
+            "lib.py",
+            LanguageId::Python,
+            0,
+            "def mystery(data):\n    pass\n",
+        );
+        // A census that cannot rule escape out keeps every unsettled site, and
+        // the one whose callee spells the focal's name still comes first.
+        let escape = FocalEscape::Unknown {
+            reason: "dynamic reflective access in the domain",
+        };
+        let scan = scan_focal(&fixture.store, &focal, &Body(BODY), escape).unwrap();
+        let rows: Vec<(Option<&str>, &str)> = scan
+            .candidates
+            .iter()
+            .map(|candidate| (candidate.callee.as_deref(), candidate.reason))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (Some("mystery"), REACH_CALLEE_SPELLS),
+                (Some("handler"), REACH_FOCAL_ESCAPES),
+            ]
+        );
+        let block = named_block(&scan);
+        assert_eq!(block["candidate_count"], 2, "{block}");
+        assert_eq!(
+            block["candidates_by_reason"][REACH_CALLEE_SPELLS], 1,
+            "{block}"
+        );
+        assert_eq!(
+            block["candidates_by_reason"][REACH_FOCAL_ESCAPES], 1,
+            "{block}"
+        );
+    }
+
+    #[test]
+    fn named_candidate_samples_preserve_the_full_census_and_uncertainty() {
+        for site_count in [0, 3, 5, 613] {
+            let store = InMemoryGraph::new();
+            let body = format!("def run():\n{}", "    mystery()\n".repeat(site_count));
+            let caller = spanned_entity("run", "app.py", LanguageId::Python, 0, &body);
+            let focal = spanned_entity(
+                "mystery",
+                "lib.py",
+                LanguageId::Python,
+                0,
+                "def mystery(): pass\n",
+            );
+            let context = proof_context(LanguageId::Python, "current");
+            let records = vec![
+                context.clone(),
+                ledger(
+                    &caller,
+                    &body,
+                    context.id(),
+                    (0..site_count)
+                        .map(|_| {
+                            (
+                                "mystery",
+                                CallSiteState::Unresolved {
+                                    reason: UnresolvedReason::NoAnswer,
+                                },
+                            )
+                        })
+                        .collect(),
+                ),
+            ];
+            admit(&store, &[&caller], records);
+            let scan = scan_focal(
+                &store,
+                &focal,
+                &Body(&body),
+                FocalEscape::Unknown {
+                    reason: "dynamic reflective access in the domain",
+                },
+            )
+            .unwrap();
+            assert_eq!(scan.candidates.len(), site_count);
+            let block = named_block(&scan);
+            // Sampling presentation must not change any whole-scan truth.
+            for (key, value) in block_json(&scan.tally(), NAMED_SCOPE).as_object().unwrap() {
+                assert_eq!(&block[key], value, "{key}, {site_count}");
+            }
+            let kept = site_count.min(5);
+            assert_eq!(block["candidates"], json!(&scan.candidates[..kept]));
+            assert_eq!(block["candidate_count"], site_count);
+            assert_eq!(
+                block["candidates_withheld"].as_u64().unwrap_or(0),
+                (site_count - kept) as u64
+            );
+            assert_eq!(
+                block["candidates_by_reason"]
+                    .as_object()
+                    .unwrap()
+                    .values()
+                    .map(|count| count.as_u64().unwrap())
+                    .sum::<u64>(),
+                site_count as u64
+            );
+            if site_count > 0 {
+                assert_eq!(block["settled"], false);
+                assert!(!block["clauses"].as_array().unwrap().is_empty());
+                assert_eq!(block["sites"], site_count);
+            } else {
+                assert!(block.get("candidates_withheld").is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn a_terminal_lists_the_named_candidates_and_counts_the_rest() {
+        let fixture = fixture(true);
+        let focal = spanned_entity(
+            "mystery",
+            "lib.py",
+            LanguageId::Python,
+            0,
+            "def mystery(data):\n    pass\n",
+        );
+        let escape = FocalEscape::Unknown {
+            reason: "dynamic reflective access in the domain",
+        };
+        let scan = scan_focal(&fixture.store, &focal, &Body(BODY), escape).unwrap();
+        assert_eq!(
+            candidate_lines(&scan, "mystery"),
+            vec![
+                "Unproven call sites that could call mystery: 2.".to_string(),
+                "  1 name mystery, so check them first:".to_string(),
+                "    run, line 4 in it calls mystery, unresolved (no answer)".to_string(),
+                "  1 more could reach it only if mystery is held as a value, and this graph \
+                 cannot rule that out (dynamic reflective access in the domain)."
+                    .to_string(),
+            ]
+        );
+    }
+
+    /// A candidate row is addressed by its caller's id and its line in that
+    /// caller. Its file rides only as the labelled projection every reference
+    /// row serves, never as a bare path.
+    #[test]
+    fn a_candidate_row_serves_its_file_as_a_projection() {
+        let fixture = fixture(true);
+        let focal = spanned_entity(
+            "mystery",
+            "lib.py",
+            LanguageId::Python,
+            0,
+            "def mystery(data):\n    pass\n",
+        );
+        let escape = FocalEscape::Unknown {
+            reason: "dynamic reflective access in the domain",
+        };
+        let scan = scan_focal(&fixture.store, &focal, &Body(BODY), escape).unwrap();
+        let block = named_block(&scan);
+        let rows = block["candidates"].as_array().expect("candidate rows");
+        assert!(!rows.is_empty(), "{block}");
+        for row in rows {
+            assert!(row.get("caller_file").is_none(), "{row}");
+            assert!(row.get("file_path").is_none(), "{row}");
+            assert!(
+                row["projection"]["path"].is_string(),
+                "the caller's file is a labelled projection: {row}"
+            );
+            assert!(row["caller"].is_string(), "{row}");
+        }
+    }
+
+    #[test]
     fn a_spanned_focal_with_no_ledger_reads_as_owed_enrichment() {
         let fixture = fixture(false);
         let block = focal_block(&fixture.store, &fixture.run, &Body(BODY));
@@ -1140,54 +2411,98 @@ mod tests {
         );
     }
 
+    fn set_validation(store: &InMemoryGraph, state: Option<kin_model::ContextValidationState>) {
+        use kin_model::{EntityStore, ResolutionRecord, ResolutionRecordDelta};
+        let id = ResolutionRecordId::context_validation(LanguageId::Python);
+        let old = store.lookup_resolution_record(&id).unwrap();
+        let new = state.map(|state| {
+            ResolutionRecord::ContextValidation(kin_model::ContextValidation {
+                language: LanguageId::Python,
+                state,
+            })
+        });
+        let delta = match (old, new) {
+            (Some(old), Some(new)) => ResolutionRecordDelta::Modified { old, new },
+            (None, Some(new)) => ResolutionRecordDelta::Added { new },
+            (Some(old), None) => ResolutionRecordDelta::Removed { old },
+            (None, None) => return,
+        };
+        store
+            .apply_transaction_delta(&kin_model::TransactionDelta {
+                resolution_record_deltas: vec![delta],
+                ..Default::default()
+            })
+            .unwrap();
+    }
+
     #[test]
-    fn a_ledger_proven_under_another_context_reads_as_stale() {
+    fn context_validation_selected_graph_controls_stale_and_current_readings() {
         let fixture = fixture(true);
-        let newer = id_of(&proof_context(LanguageId::Python, "1.1.401"));
-        let _guard = test_support::scoped_proof_contexts(&[(LanguageId::Python, newer)]);
+        let newer = proof_context(LanguageId::Python, "1.1.401");
+        set_validation(
+            &fixture.store,
+            Some(kin_model::ContextValidationState::Validated {
+                context: newer.as_proof_context().unwrap().clone(),
+            }),
+        );
         let block = focal_block(&fixture.store, &fixture.run, &Body(BODY));
         assert_eq!(block["reading"], "proof_context_stale", "{block}");
         assert_eq!(block["callers_stale"], 1);
         assert_eq!(block["by_state"]["proof_context_stale"], 4);
-        assert_eq!(block["rows"][0]["state"], "proof_context_stale");
         assert_eq!(block["rows"][0]["recorded_state"], "proven_target");
         assert_eq!(block["stale_context"], fixture.context.to_string());
-        drop(_guard);
 
-        let _same = test_support::scoped_proof_contexts(&[(LanguageId::Python, fixture.context)]);
-        let block = focal_block(&fixture.store, &fixture.run, &Body(BODY));
+        let historical = self::fixture(true);
+        // Publishing another resolver's context cannot change this selected graph.
+        publish_current_proof_contexts(HashMap::from([(LanguageId::Python, newer.id())]));
+        let block = focal_block(&historical.store, &historical.run, &Body(BODY));
+        publish_current_proof_contexts(HashMap::new());
         assert_eq!(block["reading"], "current", "{block}");
     }
 
     #[test]
-    fn a_published_context_is_the_one_every_reader_holds_a_ledger_against() {
-        // Kotlin, because no other test in this crate holds a Kotlin ledger,
-        // and the publication is process-wide.
-        let store = InMemoryGraph::new();
-        let body = "fun main() {\n    greet()\n}\n";
-        let main = spanned_entity("main", "Main.kt", LanguageId::Kotlin, 0, body);
-        let context = proof_context(LanguageId::Kotlin, "1.0");
-        let recorded = ledger(
-            &main,
-            body,
-            id_of(&context),
-            vec![("greet", CallSiteState::ProvenOutside)],
-        );
-        admit(&store, &[&main], vec![context, recorded]);
-        let newer = id_of(&proof_context(LanguageId::Kotlin, "2.0"));
-        publish_current_proof_contexts(HashMap::from([(LanguageId::Kotlin, newer)]));
-        assert_eq!(
-            published_current_proof_contexts()
-                .and_then(|contexts| contexts.get(&LanguageId::Kotlin).copied()),
-            Some(newer)
-        );
-        let reading = read_caller_sites(&GraphSiteFacts::new(&store), &main);
-        publish_current_proof_contexts(HashMap::new());
-        assert!(matches!(reading, CallerSites::Stale(_)), "{reading:?}");
-        assert!(matches!(
-            read_caller_sites(&GraphSiteFacts::new(&store), &main),
-            CallerSites::Current(_)
-        ));
+    fn context_validation_missing_or_unverified_survives_reopen_and_preserves_proof() {
+        for state in [
+            None,
+            Some(kin_model::ContextValidationState::Unverified {
+                reason: "server could not start; validation not completed".into(),
+            }),
+        ] {
+            let fixture = fixture(true);
+            set_validation(&fixture.store, state.clone());
+            let reopened = InMemoryGraph::from_snapshot(fixture.store.to_snapshot()).unwrap();
+            let block = focal_block(&reopened, &fixture.run, &Body(BODY));
+            assert_eq!(block["reading"], "proof_context_unverified", "{block}");
+            assert_eq!(block["settled"], false);
+            assert_eq!(block["callers_unverified"], 1);
+            assert_eq!(block["by_state"]["proof_context_unverified"], 4);
+            assert_eq!(block["rows"][0]["recorded_state"], "proven_target");
+            assert!(!block["rows"][0]["target"].is_null());
+            assert_eq!(block["unverified_context"], fixture.context.to_string());
+            assert!(block["clauses"][0]
+                .as_str()
+                .unwrap()
+                .starts_with("proof_context_unverified:"));
+            assert!(!block["clauses"][0].as_str().unwrap().contains("; "));
+            if state.is_some() {
+                assert_eq!(
+                    block["validation_reason"],
+                    "server could not start; validation not completed"
+                );
+            } else {
+                assert!(block["validation_reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("no recorded"));
+            }
+            assert!(!owed_files(&reopened, std::slice::from_ref(&fixture.run)).is_empty());
+            let good = self::fixture(true);
+            let good_reopened = InMemoryGraph::from_snapshot(good.store.to_snapshot()).unwrap();
+            assert_eq!(
+                focal_block(&good_reopened, &good.run, &Body(BODY))["reading"],
+                "current"
+            );
+        }
     }
 
     #[test]
@@ -1350,13 +2665,22 @@ mod owed_outside_tests {
             Some(format!("def cut_short(): {}", "x".repeat(9000))),
         );
         body("no_preview", None);
-        // The graph names the focal by its owner, and a call spells only
-        // the member, so the qualified name is what the reading is handed.
+        // The graph names the focal by its owner, but an ordinary method
+        // call spells the member, so derive its call names from the entity.
+        let mut focal = super::fixture::spanned_entity(
+            "App.ensure_sync",
+            "pkg/app.py",
+            kin_model::LanguageId::Python,
+            0,
+            "def ensure_sync(self, f): return f",
+        );
+        focal.kind = kin_model::EntityKind::Method;
+        let names = super::focal_call_names(&focal);
         let owed = super::owed_outside(
             &graph,
             kin_model::LanguageId::Python,
             &std::collections::HashSet::new(),
-            "App.ensure_sync",
+            &names,
         )
         .expect("the index reads");
         let files: Vec<&str> = owed.iter().map(|file| file.file.as_str()).collect();
@@ -1367,18 +2691,33 @@ mod owed_outside_tests {
         );
     }
 
-    /// A call spells a member without its owner, or the owner alone for a
-    /// constructor, so a body is searched for every segment of the focal's
-    /// name, whichever separator the language uses.
+    /// An ordinary method call spells its member, while a constructor may
+    /// spell the owner instead. Qualified owners alone must not widen a method.
     #[test]
     fn a_focal_is_named_by_every_segment_a_call_may_spell() {
-        fn names(name: &str) -> Vec<&str> {
-            super::focal_call_names(name).collect()
+        use kin_model::EntityKind;
+        fn names(name: &str, kind: EntityKind) -> Vec<String> {
+            let mut focal = super::fixture::spanned_entity(
+                name,
+                "pkg/focal.py",
+                kin_model::LanguageId::Python,
+                0,
+                "def f(): pass",
+            );
+            focal.kind = kind;
+            super::focal_call_names(&focal)
         }
-        assert_eq!(names("App.ensure_sync"), ["App", "ensure_sync"]);
-        assert_eq!(names("Store::open"), ["Store", "open"]);
-        assert_eq!(names("parse_note"), ["parse_note"]);
-        assert_eq!(names("Trailing."), ["Trailing"]);
+        assert_eq!(
+            names("App.ensure_sync", EntityKind::Method),
+            ["ensure_sync"]
+        );
+        assert_eq!(names("Store::open", EntityKind::Method), ["open"]);
+        assert_eq!(names("parse_note", EntityKind::Function), ["parse_note"]);
+        assert_eq!(names("Trailing.", EntityKind::Class), ["Trailing"]);
+        assert_eq!(
+            names("HTTPAdapter.__init__", EntityKind::Method),
+            ["HTTPAdapter", "__init__"]
+        );
 
         let entity = |preview: &str| {
             let mut entity = super::fixture::spanned_entity(
@@ -1395,11 +2734,25 @@ mod owed_outside_tests {
             entity
         };
         let constructs = entity("def make(): return HTTPAdapter()");
-        assert!(super::could_name_focal(&constructs, "HTTPAdapter.__init__"));
+        assert!(super::could_name_focal(
+            &constructs,
+            &names("HTTPAdapter.__init__", EntityKind::Method)
+        ));
         let sends = entity("def go(self): return self.send(req)");
-        assert!(super::could_name_focal(&sends, "Session.send"));
+        assert!(super::could_name_focal(
+            &sends,
+            &names("Session.send", EntityKind::Method)
+        ));
         let unrelated = entity("def go(): return print(1)");
-        assert!(!super::could_name_focal(&unrelated, "Session.send"));
+        assert!(!super::could_name_focal(
+            &unrelated,
+            &names("Session.send", EntityKind::Method)
+        ));
+        let owner_only = entity("def go(): return Session()");
+        assert!(!super::could_name_focal(
+            &owner_only,
+            &names("Session.send", EntityKind::Method)
+        ));
     }
 
     /// Impact's zero consumer counts are not whole while a caller outside a

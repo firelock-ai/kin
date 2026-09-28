@@ -80,17 +80,39 @@ It installs the `kin` CLI and does not connect AI coding tools, because WSL2 rem
 recommended path on Windows. The Windows entry under [Beta limits](#beta-limits)
 says what works there. No native Windows ARM64 build is published. On an ARM64 machine, run
 that line from x64 PowerShell to install the x86_64 build under emulation, or use WSL2.
+The installer adds `kin` to your user PATH, so open a new PowerShell window in place of
+`exec "$SHELL" -l` before the next step.
 
 For other installers or troubleshooting, see the [full quickstart](docs/quickstart.md#1-install).
 
 ### 2. Initialize the repository
 
-At the new prompt, replace the path below:
+At the new prompt, clone a repository with Kin:
+
+```sh
+kin clone https://github.com/pallets/itsdangerous
+```
+
+Or initialize one you already have, replacing the path below:
 
 ```sh
 cd /path/to/your/repository &&
 kin init . &&
 kin overview &&
+kin status
+```
+
+Both end with the next command to run, a `kin refs` question about a function in that
+repository. They also connect Codex CLI and Grok CLI to it when you allowed that in setup,
+because those clients keep one entry that names a repository.
+
+Windows PowerShell 5.1 has no `&&`, so on native Windows run the same commands one at a
+time and stop if one fails:
+
+```powershell
+cd C:\path\to\your\repository
+kin init .
+kin overview
 kin status
 ```
 
@@ -114,15 +136,19 @@ kin impact ExactEntityName
 
 `refs` returns recorded references, `trace` brings in nearby context, and `impact` explores potential effects through the graph. Check the results against the source.
 
-### 4. Connect your agent
+### 4. Your AI coding tools and semantic search
 
-Prepare local embeddings, then configure detected MCP clients. On Windows, do this inside
-WSL2:
+`kin setup` already asked before connecting the AI coding tools it found, and connected them
+if you said yes. There is no separate linking step. After you install another tool, run
+`kin setup` again, and `kin setup status` shows what is connected. On Windows, connect AI
+tools inside WSL2.
+
+Semantic search runs on a local model of about 523 MB, and setup asks before anything
+downloads it. If you said no, or `kin init` says the search index is waiting for the model,
+this downloads it and builds the index:
 
 ```sh
-kin embed &&
-kin setup --intent agent &&
-kin setup status --json
+kin embed
 ```
 
 Kin supports Claude Code, Codex, Cursor, Gemini, and other MCP clients. Use `kin setup --intent editor` for VS Code. Kin also includes `kin agent run` for local or hosted OpenAI-compatible model endpoints.
