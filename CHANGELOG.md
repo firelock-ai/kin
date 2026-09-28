@@ -81,6 +81,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Language-server enrichment covers `.mjs`, `.cjs`, `.mts` and `.cts` modules.
+  The sweep read them as an unsupported language, so their callers stayed owed
+  after every sweep and a repository holding one never reported enrichment
+  complete.
+- A language-server sweep that runs to its end retires the memory-pressure
+  refusal a daemon's start recorded. Only a later start used to retire it, so
+  every answer on the store kept reporting `degraded.memory_pressure` after the
+  machine had room again.
 - A store whose binding history is unchecked but whose every head and
   workspace already hold exactly what this build derives, as a clone or a pull
   from a peer of the same release leaves it, is checked automatically the next

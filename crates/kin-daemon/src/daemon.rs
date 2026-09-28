@@ -4423,6 +4423,20 @@ pub(crate) fn clear_pressure_refusal_for_work(
     kin_core::memory_pressure::PressureRefusal::clear_for_work(state.layout.root(), completed_work)
 }
 
+/// Retire this store's language-server pressure refusal once a sweep has run
+/// to its own end, and say whether one was retired.
+///
+/// A sweep that finished did the heavy work an earlier refusal declined, so the
+/// refusal no longer describes anything owed. A start that queues a sweep
+/// retires it too, but an explicit `kin daemon sweep` that finished used to
+/// leave it standing, and every answer on the store kept reading
+/// `degraded.memory_pressure` until the next restart, long after the machine
+/// had room again. A sweep that ended early leaves the refusal where it is.
+fn retire_sweep_refusal_after(state: &DaemonState, tally: &SweepTally) -> bool {
+    !tally.ended_early
+        && clear_pressure_refusal_for_work(state, kin_core::memory_pressure::HeavyWork::LspSweep)
+}
+
 /// Forget a spoken pressure level only when its durable refusal was retired.
 ///
 /// Completion is a lifecycle boundary, not merely another nominal sample. If
@@ -5411,6 +5425,64 @@ pub fn lsp_entity_ref(entity: &kin_model::Entity, file_path: &str) -> Option<kin
         declares_name: kin_lsp::EntityRef::kind_declares_name(entity.kind),
         kind: entity.kind,
     })
+}
+
+/// The language server that enriches a repository file, by the same extension
+/// table the parser admits it under, or `None` for a language no enrichment
+/// server covers.
+///
+/// A private copy of that table once left `.mjs`, `.cjs`, `.mts` and `.cts`
+/// out, so every ES or CommonJS module a parser read was counted unsupported
+/// and its callers stayed owed after every sweep. C++ goes to the C server,
+/// which serves both.
+fn enrichment_language(path: &str) -> Option<kin_model::LanguageId> {
+    use kin_model::LanguageId;
+    match kin_model::call_site_reading::language_of_path(path)? {
+        LanguageId::Cpp => Some(LanguageId::C),
+        language @ (LanguageId::Rust
+        | LanguageId::Python
+        | LanguageId::TypeScript
+        | LanguageId::JavaScript
+        | LanguageId::Go
+        | LanguageId::Java
+        | LanguageId::C) => Some(language),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod enrichment_language_tests {
+    use super::enrichment_language;
+    use kin_model::LanguageId;
+
+    /// Every JavaScript and TypeScript module extension the parser admits is
+    /// enriched by its language server. Falsify by dropping `mjs` from the
+    /// table: React's `.mjs` build scripts read unsupported and their callers
+    /// stay owed after every sweep.
+    #[test]
+    fn module_extensions_reach_their_language_server() {
+        for (path, language) in [
+            ("scripts/build.mjs", LanguageId::JavaScript),
+            ("scripts/config.cjs", LanguageId::JavaScript),
+            ("src/app.jsx", LanguageId::JavaScript),
+            ("src/index.mts", LanguageId::TypeScript),
+            ("src/legacy.cts", LanguageId::TypeScript),
+            ("src/view.tsx", LanguageId::TypeScript),
+            ("src/lib.rs", LanguageId::Rust),
+            ("pkg/types.pyi", LanguageId::Python),
+            ("src/engine.cpp", LanguageId::C),
+            ("include/engine.hh", LanguageId::C),
+        ] {
+            assert_eq!(enrichment_language(path), Some(language), "{path}");
+        }
+    }
+
+    #[test]
+    fn a_language_without_an_enrichment_server_is_unsupported() {
+        for path in ["app/models.rb", "infra/main.tf", "README.md", "Makefile"] {
+            assert_eq!(enrichment_language(path), None, "{path}");
+        }
+    }
 }
 
 /// What a cold sweep did with every file it walked.
@@ -8960,19 +9032,7 @@ pub async fn run_with_authority_on(
                         // graph-owned repository path. didOpen content is
                         // loaded separately from repository authority below.
                         let path = lsp_root.join(&request.file_id.0);
-                        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-                        let language = match ext {
-                            "rs" => Some(kin_model::LanguageId::Rust),
-                            "py" | "pyi" => Some(kin_model::LanguageId::Python),
-                            "ts" | "tsx" => Some(kin_model::LanguageId::TypeScript),
-                            "js" | "jsx" => Some(kin_model::LanguageId::JavaScript),
-                            "go" => Some(kin_model::LanguageId::Go),
-                            "java" => Some(kin_model::LanguageId::Java),
-                            "c" | "h" | "cpp" | "hpp" | "cc" | "cxx" => {
-                                Some(kin_model::LanguageId::C)
-                            }
-                            _ => None,
-                        };
+                        let language = enrichment_language(&request.file_id.0);
 
                         let Some(lang) = language else {
                             // Not a language this worker enriches. The file was
@@ -9469,20 +9529,7 @@ pub async fn run_with_authority_on(
                             let tally_before_file = tally;
                             let abs_path = lsp_root.join(&file_id.0);
 
-                            // Determine language from file extension.
-                            let ext = abs_path.extension().and_then(|e| e.to_str()).unwrap_or("");
-                            let language = match ext {
-                                "rs" => Some(kin_model::LanguageId::Rust),
-                                "py" | "pyi" => Some(kin_model::LanguageId::Python),
-                                "ts" | "tsx" => Some(kin_model::LanguageId::TypeScript),
-                                "js" | "jsx" => Some(kin_model::LanguageId::JavaScript),
-                                "go" => Some(kin_model::LanguageId::Go),
-                                "java" => Some(kin_model::LanguageId::Java),
-                                "c" | "h" | "cpp" | "hpp" | "cc" | "cxx" => {
-                                    Some(kin_model::LanguageId::C)
-                                }
-                                _ => None,
-                            };
+                            let language = enrichment_language(&file_id.0);
                             let Some(lang) = language else {
                                 tally.unsupported_language += 1;
                                 continue;
@@ -10900,6 +10947,7 @@ pub async fn run_with_authority_on(
                         } else if !tally.ended_early {
                             kin_daemon_spawn::RefusedEnrichment::clear(lsp_state.layout.root());
                         }
+                        retire_sweep_refusal_after(&lsp_state, &tally);
 
                         info!(
                             files = tally.files_processed(),
@@ -20098,6 +20146,42 @@ mod memory_pressure_tests {
         assert!(PressureRefusal::read(state.layout.root()).is_some());
         assert!(clear_pressure_refusal_for_work(&state, HeavyWork::LspSweep));
         assert!(PressureRefusal::read(state.layout.root()).is_none());
+    }
+
+    /// A sweep that runs to its end retires the language-server refusal a
+    /// start under pressure recorded, and leaves every other work's refusal.
+    /// Falsify by retiring only at a start that queues a sweep: the refusal
+    /// outlives a finished explicit sweep and every answer stays degraded.
+    #[test]
+    fn a_finished_sweep_retires_the_start_time_sweep_refusal() {
+        use super::{DaemonState, SweepTally};
+        let _lock = crate::test_env_lock();
+        let _budget = super::budget_no_test_can_fill();
+        let dir = tempfile::tempdir().unwrap();
+        let state = open_store(dir.path());
+        write_pressure_refusal(state.layout.root(), HeavyWork::LspSweep.id());
+        write_pressure_refusal(state.layout.root(), HeavyWork::EmbedBatch.id());
+        let refused = |state: &DaemonState| {
+            PressureRefusal::read_all(state.layout.root())
+                .into_iter()
+                .map(|record| record.work)
+                .collect::<Vec<_>>()
+        };
+
+        let stopped = SweepTally {
+            ended_early: true,
+            ..SweepTally::default()
+        };
+        assert!(!super::retire_sweep_refusal_after(&state, &stopped));
+        assert!(refused(&state).contains(&HeavyWork::LspSweep.id().to_string()));
+
+        let finished = SweepTally::default();
+        assert!(super::retire_sweep_refusal_after(&state, &finished));
+        assert_eq!(
+            refused(&state),
+            vec![HeavyWork::EmbedBatch.id().to_string()],
+            "only the sweep's own refusal is retired"
+        );
     }
 
     #[test]
