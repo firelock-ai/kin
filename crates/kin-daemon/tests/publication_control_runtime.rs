@@ -170,16 +170,36 @@ fn publication_control_reads_cross_from_sync_to_async_with_keep_alive() {
             .unwrap();
         let store = ObjectStorePublicationControlStore::new(Arc::new(client), "fixture");
         assert!(tokio::runtime::Handle::try_current().is_err());
-        for _ in 0..2 {
+        // The HTTP client races checking a pooled connection out against
+        // dialling a new one, so a warm read can open a second connection
+        // while the first is still on its way back to the pool. What this
+        // fixture must establish is that some warm read reused a connection
+        // with keep-alive on, and that none ever did with it off, so it reads
+        // until reuse shows, within a bound.
+        let mut warm_reads = 0;
+        loop {
             let loaded = store.load().expect("synchronous control read").unwrap();
             assert_eq!(loaded.record, record);
             assert_eq!(loaded.version.version.as_deref(), Some("1"));
+            warm_reads += 1;
+            let connections = server.connections.load(Ordering::SeqCst);
+            if !keep_alive {
+                assert_eq!(
+                    connections, warm_reads,
+                    "closed connections are never reused"
+                );
+                if warm_reads == 2 {
+                    break;
+                }
+            } else if warm_reads >= 2 && connections < warm_reads {
+                break;
+            }
+            assert!(
+                warm_reads < 8,
+                "the warm reads must establish that this fixture reuses its connection \
+                 (keep_alive={keep_alive}, connections={connections}, reads={warm_reads})"
+            );
         }
-        assert_eq!(
-            server.connections.load(Ordering::SeqCst),
-            if keep_alive { 1 } else { 2 },
-            "the warm reads must establish whether this fixture reuses its connection"
-        );
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -195,7 +215,11 @@ fn publication_control_reads_cross_from_sync_to_async_with_keep_alive() {
             )
         });
         assert_eq!(loaded.unwrap().record, record);
-        assert_eq!(requests.len(), 3, "no retries or silently skipped reads");
+        assert_eq!(
+            requests.len(),
+            warm_reads + 1,
+            "no retries or silently skipped reads"
+        );
         assert!(requests.iter().all(|line| {
             line == "GET /fixture%2Dbucket/fixture%2F%2Ekin%2Dgraph%2Dpublication%2Dcontrol%2Ejson HTTP/1.1"
         }));
